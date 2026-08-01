@@ -1,0 +1,33 @@
+[package]
+name = "deploy-core"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/aicers/deploy-core"
+
+[dependencies]
+base64 = "0.22"
+hostname = "0.4"
+ring = "0.17"
+rustls-pki-types = "1"
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+thiserror = "2"
+toml = "0.8"
+x509-parser = "0.17"
+zstd = "0.13"
+
+[features]
+# Exposes the test-only `Principal::Fixture`/`ServiceAccount::Fixture` account
+# fixtures so a dependent crate's tests can construct them across the crate
+# boundary (`cfg(test)` alone is invisible to dependents). Enable this ONLY as a
+# `[dev-dependencies]` feature — never under normal `[dependencies]` — so the
+# fixtures stay absent from every release build.
+test-support = []
+
+[dev-dependencies]
+rcgen = "0.14"
+time = "0.3"
