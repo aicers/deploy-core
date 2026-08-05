@@ -2,7 +2,7 @@
 //!
 //! Registering a certificate consumer with bootroot — `service info` to check,
 //! `service add` to mint — is generic: it needs only the resolved registration
-//! facts (the service name, delivery mode, the paths the agent reads, the AppRole
+//! facts (the service name, delivery mode, the paths the agent reads, the `AppRole`
 //! to authenticate with), not any product's `Component`
 //! catalog. This module holds those primitives plus the small value types the
 //! phase reports through.
@@ -131,7 +131,7 @@ pub struct ServiceAddSpec<'a> {
     pub service_name: &'a str,
     /// The delivery mode derived from placement.
     pub delivery: DeliveryMode,
-    /// The rotation AppRole the registration authenticates with.
+    /// The rotation `AppRole` the registration authenticates with.
     pub approle: &'a AppRole,
     /// The raw `[hosts]` label the component is placed on (the SAN host label,
     /// not the client-facing FQDN).
@@ -166,7 +166,7 @@ pub struct ServiceAddSpec<'a> {
 /// [`ServiceAddSpec`].
 ///
 /// Common flags register the service under `--auth-mode approle` with the
-/// rotation AppRole, the placement-derived delivery mode, the cert/key/
+/// rotation `AppRole`, the placement-derived delivery mode, the cert/key/
 /// agent-config paths, and the reload-hook preset. `--cert-group` is emitted only
 /// for a container consumer whose gid has resolved (a deferred gid emits nothing,
 /// mirroring the deferred-port rule). The remote-bootstrap mode additionally
@@ -177,7 +177,7 @@ pub struct ServiceAddSpec<'a> {
 /// `None`: its agent runs on the bootroot host, where the loopback defaults are
 /// correct.
 ///
-/// The rotation AppRole is passed with the direct `--approle-role-id`/
+/// The rotation `AppRole` is passed with the direct `--approle-role-id`/
 /// `--approle-secret-id` flags. On the single-tenant, root-controlled bootroot
 /// host this is an accepted tradeoff for a small argv-exposure window; a
 /// file-based (`--approle-*-file`) hand-off is the follow-up if that window ever

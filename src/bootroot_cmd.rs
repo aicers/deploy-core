@@ -81,12 +81,12 @@ impl<'a> BootrootRunner<'a> {
     }
 }
 
-/// One AppRole captured from the `init` summary — the service-registration
+/// One `AppRole` captured from the `init` summary — the service-registration
 /// credential and the two rotation credentials (RFC 0001 §6 Phase 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRole {
-    /// The AppRole role id.
+    /// The `AppRole` role id.
     pub role_id: String,
-    /// The AppRole secret id.
+    /// The `AppRole` secret id.
     pub secret_id: String,
 }

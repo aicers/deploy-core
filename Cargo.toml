@@ -31,3 +31,7 @@ test-support = []
 [dev-dependencies]
 rcgen = "0.14"
 time = "0.3"
+
+[lints.clippy]
+pedantic = "warn"
+unwrap_used = "warn"

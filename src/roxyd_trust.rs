@@ -712,8 +712,7 @@ const SYSTEMCTL: &str = "systemctl";
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 // --- small filesystem helpers that annotate their path on error ---
@@ -797,6 +796,14 @@ mod tests {
     /// generated cert's default 1-year-ish window straddles it deterministically.
     const NOW: u64 = 1_686_787_200;
 
+    /// [`NOW`] as the signed timestamp `OffsetDateTime` takes. `u64` to `i64`
+    /// is not a lossless conversion in general, so it is checked; here it
+    /// cannot fail, because `NOW` is a literal far below `i64::MAX`.
+    fn now_offset() -> OffsetDateTime {
+        let seconds = i64::try_from(NOW).expect("NOW is a literal below i64::MAX");
+        OffsetDateTime::from_unix_timestamp(seconds).expect("NOW is a valid timestamp")
+    }
+
     /// A CA usable as a signing issuer, holding its own PEM. The `Issuer` owns its
     /// key so it can sign many leaves without re-consuming a `KeyPair`.
     struct Ca {
@@ -872,7 +879,7 @@ mod tests {
     }
 
     fn window() -> (OffsetDateTime, OffsetDateTime) {
-        let now = OffsetDateTime::from_unix_timestamp(NOW as i64).unwrap();
+        let now = now_offset();
         (
             now - time::Duration::days(1),
             now + time::Duration::days(30),
@@ -965,7 +972,7 @@ mod tests {
     #[test]
     fn validate_material_rejects_an_expired_leaf() {
         let root = self_signed_ca("root");
-        let now = OffsetDateTime::from_unix_timestamp(NOW as i64).unwrap();
+        let now = now_offset();
         let (cert, key) = leaf(
             &root,
             true,

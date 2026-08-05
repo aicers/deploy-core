@@ -264,7 +264,10 @@ fn to_hex(bytes: &[u8]) -> String {
 /// so no artifact is ever buffered in memory in full.
 fn hash_copy<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    // On the heap: 64 KiB is a large frame to claim on a thread whose stack
+    // size this crate does not choose, and the one allocation disappears
+    // against the I/O and hashing it serves.
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buf)?;
         if read == 0 {

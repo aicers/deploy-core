@@ -93,6 +93,11 @@ impl CorrectionReport {
 /// because that is what the write asks for, not because a later command widened
 /// it; there is no window in which the runner's binary exists non-executable, or
 /// any other artifact exists at the umask.
+/// # Errors
+///
+/// Returns [`CoreError::Staging`] if the parent directory cannot be created,
+/// [`CoreError::Payload`] if `source` cannot be read from the staging area, and
+/// whatever [`Executor::put_file`] reports if the write on the host fails.
 pub fn place_file(
     executor: &dyn Executor,
     host_name: &str,
@@ -118,6 +123,12 @@ pub fn place_file(
 /// the folded `crate::install::InstallError::Component` reads the same as
 /// before); the generic layer itself carries no product concept. The command's
 /// `stderr` rides through verbatim.
+/// # Errors
+///
+/// Returns the executor's own error if the command cannot be run at all — a
+/// transport failure, or a missing binary — and [`CoreError::Command`] if it
+/// runs and exits non-zero, carrying `subject`, `host`, and the command's
+/// trimmed `stderr`.
 pub fn run_root_checked(
     executor: &dyn Executor,
     subject: &str,
@@ -141,6 +152,11 @@ pub fn run_root_checked(
 /// before a swap overwrites it, so a failed update (no automatic rollback, RFC
 /// 0001 §9) leaves the prior artifact recoverable on disk. A newly-added artifact
 /// has no prior file on disk, so the backup is skipped.
+/// # Errors
+///
+/// Returns the executor's own error if the `test -e` probe cannot be run, and
+/// [`CoreError::Command`] if the copy itself fails. A probe that runs and
+/// reports the path absent is not an error: there is nothing to preserve.
 pub fn backup_previous_artifact(
     executor: &dyn Executor,
     subject: &str,
@@ -171,6 +187,11 @@ pub fn backup_previous_artifact(
 /// exit to [`CoreError::Command`] labelled with `subject`. This is the apply
 /// path's load, distinct from the Phase-4 stage engine's load in
 /// `crate::staging`, which reports through the installer's error.
+/// # Errors
+///
+/// Returns the executor's own error if `docker` cannot be run, and
+/// [`CoreError::Command`] if it exits non-zero — an unreadable tarball, a
+/// daemon that is not running, or an image the daemon rejects.
 pub fn docker_load_image(
     executor: &dyn Executor,
     subject: &str,
@@ -189,6 +210,11 @@ pub fn docker_load_image(
 /// Extracts a staged tar archive into `dest_dir` on `host` (as root), mapping a
 /// non-zero exit to [`CoreError::Command`] labelled with `subject` — the apply
 /// path's compose-bundle unpack.
+/// # Errors
+///
+/// Returns the executor's own error if `tar` cannot be run, and
+/// [`CoreError::Command`] if it exits non-zero — a corrupt or absent archive,
+/// or a destination it cannot write into.
 pub fn tar_extract(
     executor: &dyn Executor,
     subject: &str,
@@ -219,6 +245,11 @@ pub fn tar_extract(
 /// [`FileMeta::ROOT_RESTRICTED_DIR`] (RFC 0003 §7.1). The staged *files* keep their
 /// own `meta` (a binary stays `root:root 0755`, excluded from the confidentiality
 /// boundary because execution requires read, §11.7).
+/// # Errors
+///
+/// Returns [`CoreError::Staging`] if the directory cannot be created or cannot
+/// be given the ownership and mode `dir_meta` names, naming the directory and
+/// the host.
 pub fn make_dir(
     executor: &dyn Executor,
     host_name: &str,
@@ -240,6 +271,7 @@ pub fn make_dir(
 /// The directory meta for staged artifacts written under a product's `<opt>` tree:
 /// the namespace root and its `bin/` are root-owned, group the product account,
 /// `0751` (RFC 0003 §7.1).
+#[must_use]
 pub fn opt_dir_meta(account: ServiceAccount) -> FileMeta {
     FileMeta::namespace_root(account, NAMESPACE_ROOT_TRAVERSE_MODE)
 }
@@ -254,6 +286,10 @@ pub fn opt_dir_meta(account: ServiceAccount) -> FileMeta {
 /// explicitly first (idempotent; a wrong meta left by an earlier phase is
 /// corrected, since it is root-owned) fixes that, and the leaves below keep the
 /// same meta so they need no separate correction.
+/// # Errors
+///
+/// Returns [`CoreError::Staging`] if the namespace root cannot be created or
+/// corrected, as [`make_dir`] reports it.
 pub fn ensure_opt_root(
     executor: &dyn Executor,
     host_name: &str,
