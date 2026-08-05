@@ -722,17 +722,37 @@ fn read_file(path: &Path) -> Result<Vec<u8>, TrustError> {
     std::fs::read(path).map_err(|e| TrustError::io(path, e))
 }
 
+/// Writes `bytes` to a new file that is `0600` from the moment it exists.
+///
+/// The mode is asked for at creation rather than applied afterwards. Creating
+/// first and tightening second leaves the contents readable by anyone on the
+/// host for as long as the two calls take, and what goes through here is a
+/// certificate, a CA bundle, and a private key. `create_new` also makes a
+/// pre-existing path an error rather than a silent overwrite, which is what
+/// staged trust material wants.
 fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), TrustError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::write(path, bytes).map_err(|e| TrustError::io(path, e))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| TrustError::io(path, e))
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| TrustError::io(path, e))?;
+    file.write_all(bytes).map_err(|e| TrustError::io(path, e))
 }
 
+/// Creates `path` as a directory that is `0700` from the moment it exists.
+///
+/// Same reasoning as [`write_file_0600`]: a directory created with the umask's
+/// mode and narrowed afterwards is traversable in between.
 fn make_dir_0700(path: &Path) -> Result<(), TrustError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::create_dir(path).map_err(|e| TrustError::io(path, e))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
         .map_err(|e| TrustError::io(path, e))
 }
 
@@ -769,8 +789,8 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Activation, RoxydTrustPaths, TrustError, activate_with_paths, parse_generation,
-        parse_pem_strict, validate_anchor, validate_material,
+        Activation, RoxydTrustPaths, TrustError, activate_with_paths, make_dir_0700,
+        parse_generation, parse_pem_strict, validate_anchor, validate_material, write_file_0600,
     };
 
     /// A fixed "now" all validity-sensitive tests share (2023-06-15T00:00:00Z), so a
@@ -1145,6 +1165,48 @@ mod tests {
         );
         assert_eq!(active_target(&fx), "gen-2");
         assert!(!fx.paths.generation_dir(1).exists(), "gen-1 pruned");
+    }
+
+    /// The mode has to arrive with the file, not after it. A regression to
+    /// create-then-chmod cannot be observed from a single thread -- the window
+    /// closes before any assertion could run -- so what is pinned here is the
+    /// `create_new` behaviour that came with the fix, plus the resulting mode.
+    #[test]
+    fn trust_material_is_written_private_and_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("tempdir");
+        let nested = dir.path().join("gen");
+        make_dir_0700(&nested).expect("mkdir");
+        assert_eq!(
+            std::fs::metadata(&nested)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+        );
+        assert!(
+            make_dir_0700(&nested).is_err(),
+            "an existing directory is an error, not a silent reuse",
+        );
+
+        let key = nested.join("key.pem");
+        write_file_0600(&key, b"secret").expect("write");
+        assert_eq!(
+            std::fs::metadata(&key).expect("stat").permissions().mode() & 0o777,
+            0o600,
+        );
+        assert_eq!(std::fs::read(&key).expect("read"), b"secret");
+        assert!(
+            write_file_0600(&key, b"other").is_err(),
+            "an existing path is an error, not a silent overwrite",
+        );
+        assert_eq!(
+            std::fs::read(&key).expect("read"),
+            b"secret",
+            "the rejected write left the original alone",
+        );
     }
 
     #[test]
