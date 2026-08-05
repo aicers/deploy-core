@@ -357,8 +357,9 @@ impl<W: Write> Write for CountingWriter<W> {
 ///
 /// Returns [`PayloadError`] when a `source` file cannot be read, the derived
 /// manifest is invalid (empty dispositions, unsafe or duplicate `archive_path`,
-/// a malformed `commit`, an empty `trust_set`), or serialization, archive
-/// construction, or writing to `out` fails.
+/// a malformed `commit`, a `spec` violating a rule
+/// [`validate`](crate::module_spec::validate) enforces, an empty `trust_set`),
+/// or serialization, archive construction, or writing to `out` fails.
 pub fn append_trailer<B: Read, W: Write>(
     mut base: B,
     mut out: W,
