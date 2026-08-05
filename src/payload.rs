@@ -149,6 +149,16 @@ pub struct ArtifactInput {
     pub component: String,
     /// Version string of the built component.
     pub version: String,
+    /// Immutable build identity of the artifact, stamped onto the manifest entry
+    /// derived from this input: a full 40-hex git commit SHA for an artifact
+    /// built from a clone, or a 64-hex image digest with its `sha256:` prefix
+    /// stripped for a third-party container image.
+    ///
+    /// Required on the producer side — absence is a read-side baseline state
+    /// only — and validated by
+    /// [`is_valid_commit`](crate::manifest::is_valid_commit) when the manifest
+    /// is assembled.
+    pub commit: String,
     /// Architecture the artifact is built for.
     pub target_arch: TargetArch,
     /// Kind of artifact.
@@ -325,15 +335,26 @@ impl<W: Write> Write for CountingWriter<W> {
 /// recipe rather than letting the asset's name merely claim one. Pass `None` only
 /// where no recipe is in play (for example a test fixture).
 ///
+/// `trust_set` is the signed release-signing generation container the installer
+/// seeds from, stored verbatim and opaquely; pass `None` where the producer has
+/// no generation to stamp, which is a legitimate state and not a claim that the
+/// payload is old.
+///
+/// The manifest's `format_version` is stamped from
+/// [`MANIFEST_FORMAT_VERSION`](crate::manifest::MANIFEST_FORMAT_VERSION) with no
+/// caller-supplied value.
+///
 /// # Errors
 ///
 /// Returns [`PayloadError`] when a `source` file cannot be read, the derived
-/// manifest is invalid (empty dispositions, unsafe or duplicate `archive_path`),
-/// or serialization, archive construction, or writing to `out` fails.
+/// manifest is invalid (empty dispositions, unsafe or duplicate `archive_path`,
+/// a malformed `commit`, an empty `trust_set`), or serialization, archive
+/// construction, or writing to `out` fails.
 pub fn append_trailer<B: Read, W: Write>(
     mut base: B,
     mut out: W,
     pinset: Option<&str>,
+    trust_set: Option<&[u8]>,
     inputs: &[ArtifactInput],
 ) -> Result<(), PayloadError> {
     let mut artifacts = Vec::with_capacity(inputs.len());
@@ -343,6 +364,7 @@ pub fn append_trailer<B: Read, W: Write>(
         artifacts.push(PayloadArtifact {
             component: input.component.clone(),
             version: input.version.clone(),
+            commit: Some(input.commit.clone()),
             target_arch: input.target_arch,
             kind: input.kind,
             dispositions: input.dispositions.clone(),
@@ -351,6 +373,10 @@ pub fn append_trailer<B: Read, W: Write>(
         });
     }
     let manifest = PayloadManifest::new(pinset.map(str::to_string), artifacts)?;
+    let manifest = match trust_set {
+        Some(generation) => manifest.with_trust_set(generation)?,
+        None => manifest,
+    };
     let manifest_json = serde_json::to_vec(&manifest).map_err(PayloadError::ManifestSerialize)?;
 
     let manifest_offset = std::io::copy(&mut base, &mut out)?;
@@ -406,6 +432,13 @@ pub fn append_trailer<B: Read, W: Write>(
 /// `source` must carry a trailer; `new_base` is streamed first, then the copied
 /// trailer body, then the rewritten footer, so a GB-scale payload never resides
 /// in memory in full.
+///
+/// Because the manifest is never decoded here, the shape it was read in is
+/// preserved in both directions by construction: a pre-versioned baseline
+/// payload rewraps as one, with no `format_version`, `commit` or `trust_set`
+/// synthesized into it — upgraded bytes would claim a build identity nobody
+/// resolved, or a trust anchor nobody signed — and a current-format payload
+/// round-trips all three unchanged.
 ///
 /// # Errors
 ///
@@ -593,8 +626,11 @@ impl<R: Read + Seek> Payload<R> {
 /// # Errors
 ///
 /// Returns [`PayloadError`] when the magic matches but the trailer is unusable:
-/// an unrecognized version, offsets pointing outside the file, or a manifest
-/// that fails to parse or validate.
+/// an unrecognized container version, offsets pointing outside the file, a
+/// manifest whose `format_version` this build does not implement (reported as
+/// [`PayloadError::InvalidManifest`] carrying
+/// [`ManifestError::UnsupportedManifestFormat`]), or a manifest that fails to
+/// parse or validate.
 pub fn open<R: Read + Seek>(mut src: R) -> Result<Option<Payload<R>>, PayloadError> {
     let file_len = src.seek(SeekFrom::End(0))?;
     let footer_size = FOOTER_SIZE as u64;
@@ -628,8 +664,16 @@ pub fn open<R: Read + Seek>(mut src: R) -> Result<Option<Payload<R>>, PayloadErr
     src.seek(SeekFrom::Start(footer.manifest_offset))?;
     let mut manifest_bytes = vec![0u8; manifest_len];
     src.read_exact(&mut manifest_bytes)?;
-    let manifest = serde_json::from_slice::<PayloadManifest>(&manifest_bytes)
-        .map_err(PayloadError::ManifestParse)?;
+    // The manifest is read through the two-stage parse rather than a direct
+    // `serde_json::from_slice`, because only a reader that already knows the
+    // container footer version can evaluate the pre-versioned baseline
+    // conjunction. An undecodable manifest block keeps reporting as
+    // `ManifestParse`, distinct from a version this build does not implement.
+    let manifest =
+        PayloadManifest::parse(&manifest_bytes, footer.version).map_err(|error| match error {
+            ManifestError::Decode(source) => PayloadError::ManifestParse(source),
+            other => PayloadError::InvalidManifest(other),
+        })?;
 
     Ok(Some(Payload {
         src,
@@ -738,9 +782,19 @@ mod tests {
         ArtifactInput, FOOTER_SIZE, FORMAT_VERSION, Footer, MAGIC, PayloadError, PayloadManifest,
         append_trailer, open, open_current_exe, parse_footer, rewrap_trailer, sha256_hex,
     };
-    use crate::manifest::{ArtifactKind, Disposition, ManifestError, PayloadArtifact, TargetArch};
+    use crate::manifest::{
+        ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact,
+        TargetArch,
+    };
 
     const BASE: &[u8] = b"#!/bin/false\nnot a real executable, just a base binary\n";
+
+    /// A full 40-hex git commit SHA, the build identity a producer stamps onto
+    /// every current-format artifact.
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Opaque stand-in for the signed trust-set generation container.
+    const GENERATION: &[u8] = b"a signed generation container, opaque to this crate";
 
     fn dispositions(values: &[Disposition]) -> BTreeSet<Disposition> {
         values.iter().copied().collect()
@@ -760,6 +814,7 @@ mod tests {
         ArtifactInput {
             component: "example".to_string(),
             version: "1.0.0".to_string(),
+            commit: COMMIT.to_string(),
             target_arch: TargetArch::X86_64,
             kind: ArtifactKind::NativeBinary,
             dispositions: dispositions(dispositions_values),
@@ -771,8 +826,12 @@ mod tests {
     /// Builds the combined binary the streaming writer would produce for
     /// `inputs`, returning it as a buffer the in-memory reader tests consume.
     fn build_binary(inputs: &[ArtifactInput]) -> Vec<u8> {
+        build_binary_with_trust_set(inputs, None)
+    }
+
+    fn build_binary_with_trust_set(inputs: &[ArtifactInput], trust_set: Option<&[u8]>) -> Vec<u8> {
         let mut binary = Vec::new();
-        append_trailer(Cursor::new(BASE), &mut binary, None, inputs)
+        append_trailer(Cursor::new(BASE), &mut binary, None, trust_set, inputs)
             .expect("writer should succeed");
         binary
     }
@@ -908,12 +967,31 @@ mod tests {
         PayloadArtifact {
             component: "example".to_string(),
             version: "1.0.0".to_string(),
+            commit: Some(COMMIT.to_string()),
             target_arch: TargetArch::X86_64,
             kind: ArtifactKind::NativeBinary,
             dispositions: dispositions(&[Disposition::Install]),
             archive_path: archive_path.to_string(),
             sha256: sha256_hex(bytes),
         }
+    }
+
+    /// Hand-rolls the wire JSON of a **pre-versioned baseline** manifest: no
+    /// `format_version`, no artifact `commit`, no `trust_set`. It cannot come
+    /// from [`PayloadManifest::new`], which stamps the current schema version,
+    /// so the already-published assets this shape stands for are reproduced
+    /// byte-wise here instead.
+    fn baseline_manifest_json(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let artifacts: Vec<String> = entries
+            .iter()
+            .map(|(archive_path, bytes)| {
+                format!(
+                    r#"{{"component":"example","version":"1.0.0","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"{archive_path}","sha256":"{}"}}"#,
+                    sha256_hex(bytes)
+                )
+            })
+            .collect();
+        format!(r#"{{"artifacts":[{}]}}"#, artifacts.join(",")).into_bytes()
     }
 
     #[test]
@@ -1032,6 +1110,226 @@ mod tests {
     }
 
     #[test]
+    fn a_written_payload_carries_the_format_version_and_each_commit() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            b"roxyd binary bytes",
+            &[Disposition::Install],
+        )];
+        let binary = build_binary(&inputs);
+
+        let payload = open(Cursor::new(binary))
+            .expect("reader should succeed")
+            .expect("trailer should be present");
+        assert_eq!(
+            payload.manifest().format_version(),
+            Some(MANIFEST_FORMAT_VERSION)
+        );
+        assert_eq!(
+            payload
+                .manifest()
+                .artifacts()
+                .first()
+                .expect("one artifact")
+                .commit
+                .as_deref(),
+            Some(COMMIT)
+        );
+    }
+
+    #[test]
+    fn a_trust_set_round_trips_byte_for_byte_and_adds_no_artifact() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            b"roxyd binary bytes",
+            &[Disposition::Install],
+        )];
+
+        let with = build_binary_with_trust_set(&inputs, Some(GENERATION));
+        let payload = open(Cursor::new(with))
+            .expect("reader should succeed")
+            .expect("trailer should be present");
+        assert_eq!(payload.manifest().trust_set(), Some(GENERATION));
+        assert_eq!(payload.manifest().artifacts().len(), 1);
+
+        let without = build_binary_with_trust_set(&inputs, None);
+        let payload = open(Cursor::new(without))
+            .expect("reader should succeed")
+            .expect("trailer should be present");
+        assert_eq!(payload.manifest().trust_set(), None);
+        assert_eq!(payload.manifest().artifacts().len(), 1);
+    }
+
+    #[test]
+    fn the_writer_rejects_an_empty_trust_set() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            b"roxyd binary bytes",
+            &[Disposition::Install],
+        )];
+        let error = append_trailer(Cursor::new(BASE), &mut Vec::new(), None, Some(b""), &inputs)
+            .expect_err("an empty generation must be rejected");
+        assert!(
+            matches!(
+                error,
+                PayloadError::InvalidManifest(ManifestError::EmptyTrustSet)
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_versioned_baseline_payload_opens_verifies_and_extracts() {
+        // The already-published release assets carry none of the three fields
+        // and sit at footer version 1; a required CI preflight reads exactly
+        // those, so they must keep opening.
+        let roxyd = b"roxyd binary bytes";
+        let json = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let binary = assemble(BASE, &json, &archive, &footer);
+
+        let mut payload = open(Cursor::new(binary))
+            .expect("a baseline payload must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.manifest().format_version(), None);
+        assert_eq!(payload.manifest().trust_set(), None);
+        assert_eq!(
+            payload
+                .manifest()
+                .artifacts()
+                .first()
+                .expect("one artifact")
+                .commit,
+            None
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extracted = payload
+            .extract_to(dir.path())
+            .expect("extraction should succeed");
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(std::fs::read(dir.path().join("bin/roxyd")).unwrap(), roxyd);
+    }
+
+    #[test]
+    fn a_baseline_payload_with_a_commit_on_one_artifact_is_rejected() {
+        let roxyd = b"roxyd binary bytes";
+        let baseline = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        // Hand-edit a `commit` into the otherwise unversioned manifest: no
+        // producer ever wrote that shape, since all three fields land in one
+        // bump.
+        let json = String::from_utf8(baseline)
+            .expect("fixture is utf-8")
+            .replace(
+                r#""component":"example""#,
+                &format!(r#""component":"example","commit":"{COMMIT}""#),
+            )
+            .into_bytes();
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let binary = assemble(BASE, &json, &archive, &footer);
+
+        let error = open(Cursor::new(binary)).expect_err("a half-legacy manifest must be rejected");
+        assert!(
+            matches!(
+                error,
+                PayloadError::InvalidManifest(ManifestError::BaselineWithCommit(ref path))
+                    if path == "bin/roxyd"
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rewrap_preserves_the_manifest_shape_in_both_directions() {
+        let new_base: &[u8] = b"a freshly built base binary, of a different length entirely";
+        assert_ne!(new_base.len(), BASE.len());
+        let roxyd = b"roxyd binary bytes";
+
+        // A baseline payload rewraps as a baseline payload: nothing is
+        // synthesized into it, because the trailer body is copied verbatim.
+        let json = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let baseline = assemble(BASE, &json, &archive, &footer);
+
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(
+            Cursor::new(&baseline),
+            Cursor::new(new_base),
+            &mut rewrapped,
+        )
+        .expect("rewrap should succeed");
+        let payload = open(Cursor::new(rewrapped))
+            .expect("the rewrapped baseline must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.manifest().format_version(), None);
+        assert_eq!(payload.manifest().trust_set(), None);
+        assert_eq!(
+            payload
+                .manifest()
+                .artifacts()
+                .first()
+                .expect("one artifact")
+                .commit,
+            None
+        );
+
+        // A current-format payload carrying all three fields round-trips each
+        // of them unchanged.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            roxyd,
+            &[Disposition::Install],
+        )];
+        let current = build_binary_with_trust_set(&inputs, Some(GENERATION));
+
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(Cursor::new(&current), Cursor::new(new_base), &mut rewrapped)
+            .expect("rewrap should succeed");
+        let payload = open(Cursor::new(rewrapped))
+            .expect("the rewrapped payload must open")
+            .expect("trailer should be present");
+        assert_eq!(
+            payload.manifest().format_version(),
+            Some(MANIFEST_FORMAT_VERSION)
+        );
+        assert_eq!(payload.manifest().trust_set(), Some(GENERATION));
+        assert_eq!(
+            payload
+                .manifest()
+                .artifacts()
+                .first()
+                .expect("one artifact")
+                .commit
+                .as_deref(),
+            Some(COMMIT)
+        );
+    }
+
+    #[test]
     fn writer_rejects_dot_prefixed_archive_path() {
         // The `tar` crate normalizes away a leading `./`, so a `./`-bearing
         // `archive_path` would be recorded in the manifest yet stored under a
@@ -1047,7 +1345,7 @@ mod tests {
             &[Disposition::Install],
         )];
         let mut out = Vec::new();
-        let error = append_trailer(Cursor::new(BASE), &mut out, None, &inputs)
+        let error = append_trailer(Cursor::new(BASE), &mut out, None, None, &inputs)
             .expect_err("dot-prefixed archive_path must be rejected");
         assert!(
             matches!(
