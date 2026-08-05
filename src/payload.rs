@@ -783,8 +783,8 @@ mod tests {
         append_trailer, open, open_current_exe, parse_footer, rewrap_trailer, sha256_hex,
     };
     use crate::manifest::{
-        ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact,
-        TargetArch,
+        ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
+        MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact, TargetArch,
     };
 
     const BASE: &[u8] = b"#!/bin/false\nnot a real executable, just a base binary\n";
@@ -1182,6 +1182,67 @@ mod tests {
             matches!(
                 error,
                 PayloadError::InvalidManifest(ManifestError::EmptyTrustSet)
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_unimplemented_manifest_format_version_reaches_open_as_invalid_manifest() {
+        // The out-of-range refusal needs no new `PayloadError` variant: it
+        // rides the existing `InvalidManifest` channel, and stays distinct from
+        // the `ManifestParse` an undecodable block reports. The body here is
+        // deliberately one this build cannot decode — `artifacts` is not even an
+        // array — so reaching the version variant proves `open` refused it for
+        // its version rather than for its shape.
+        let found = MAX_MANIFEST_FORMAT_VERSION + 1;
+        let json =
+            format!(r#"{{"format_version":{found},"artifacts":"a future shape"}}"#).into_bytes();
+        let archive = zstd_tar(&[]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let binary = assemble(BASE, &json, &archive, &footer);
+
+        let error =
+            open(Cursor::new(binary)).expect_err("an unimplemented format version must be refused");
+        assert!(
+            matches!(
+                error,
+                PayloadError::InvalidManifest(ManifestError::UnsupportedManifestFormat {
+                    found: got,
+                    min,
+                    max,
+                }) if got == found
+                    && min == MIN_MANIFEST_FORMAT_VERSION
+                    && max == MAX_MANIFEST_FORMAT_VERSION
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_writer_rejects_an_abbreviated_commit_on_an_input() {
+        // `ArtifactInput::commit` is a plain `String`, so the width and charset
+        // rule is enforced where the manifest is assembled rather than by the
+        // type. A producer that stamps an abbreviation is refused here.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let mut inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            b"roxyd binary bytes",
+            &[Disposition::Install],
+        )];
+        inputs[0].commit = "abc1234".to_string();
+
+        let error = append_trailer(Cursor::new(BASE), &mut Vec::new(), None, None, &inputs)
+            .expect_err("an abbreviated commit must be rejected");
+        assert!(
+            matches!(
+                error,
+                PayloadError::InvalidManifest(ManifestError::InvalidCommit {
+                    ref archive_path,
+                    ref commit,
+                }) if archive_path == "bin/roxyd" && commit == "abc1234"
             ),
             "got: {error:?}"
         );

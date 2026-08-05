@@ -137,8 +137,12 @@ pub enum ManifestError {
     /// pre-versioned baseline shape.
     #[error("payload manifest carries no `format_version`")]
     MissingFormatVersion,
-    /// `format_version` was present but was not an unsigned integer.
-    #[error("payload manifest `format_version` is not an unsigned integer")]
+    /// `format_version` was present but was not a `u32` — a string, a float, a
+    /// negative number, or an integer too large for the field. Like
+    /// [`ManifestError::UnsupportedManifestFormat`] this is a refusal made from
+    /// the version alone, before the body is decoded; it is separate because no
+    /// `found: u32` can carry the offending value.
+    #[error("payload manifest `format_version` is not a 32-bit unsigned integer")]
     MalformedFormatVersion,
     /// The manifest declared a `format_version` outside the range this build
     /// implements.
@@ -645,9 +649,10 @@ impl PayloadManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactKind, Disposition, LEGACY_UNVERSIONED_FOOTER_VERSION, MANIFEST_FORMAT_VERSION,
-        MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact,
-        PayloadManifest, TargetArch, is_pre_versioned_baseline, is_valid_commit,
+        ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN,
+        LEGACY_UNVERSIONED_FOOTER_VERSION, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
+        MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact, PayloadManifest, TargetArch,
+        is_pre_versioned_baseline, is_valid_commit,
     };
 
     fn artifact(
@@ -934,6 +939,51 @@ mod tests {
     }
 
     #[test]
+    fn the_two_accepted_widths_are_exported_so_a_consumer_narrows_without_the_literal() {
+        // A producer accepts exactly one width per artifact — the git width for
+        // an artifact built from a clone, the digest width for a third-party
+        // image — and must be able to say so through the constants rather than
+        // by restating `40` or `64`.
+        assert_eq!(GIT_COMMIT.len(), GIT_COMMIT_HEX_LEN);
+        assert_eq!(IMAGE_DIGEST.len(), IMAGE_DIGEST_HEX_LEN);
+        assert_ne!(GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN);
+
+        let narrowed_to_git =
+            |value: &str| is_valid_commit(value) && value.len() == GIT_COMMIT_HEX_LEN;
+        assert!(narrowed_to_git(GIT_COMMIT));
+        assert!(!narrowed_to_git(IMAGE_DIGEST));
+
+        let narrowed_to_digest =
+            |value: &str| is_valid_commit(value) && value.len() == IMAGE_DIGEST_HEX_LEN;
+        assert!(narrowed_to_digest(IMAGE_DIGEST));
+        assert!(!narrowed_to_digest(GIT_COMMIT));
+    }
+
+    #[test]
+    fn an_image_digest_width_commit_is_accepted_on_a_manifest_artifact() {
+        // The validator covers both widths; this pins that the manifest-level
+        // check accepts the digest width too, so a third-party container image
+        // is expressible.
+        let mut digest_artifact = artifact(
+            "images/vendor.tar",
+            ArtifactKind::ContainerImage,
+            &[Disposition::Install],
+        );
+        digest_artifact.commit = Some(IMAGE_DIGEST.to_string());
+        let manifest = PayloadManifest::new(None, vec![digest_artifact])
+            .expect("a digest-width commit must be accepted");
+        assert_eq!(
+            manifest
+                .artifacts()
+                .first()
+                .expect("one artifact")
+                .commit
+                .as_deref(),
+            Some(IMAGE_DIGEST)
+        );
+    }
+
+    #[test]
     fn a_current_format_manifest_rejects_a_missing_or_malformed_commit() {
         let mut without = artifact(
             "bin/native",
@@ -1191,14 +1241,30 @@ mod tests {
     }
 
     #[test]
-    fn a_non_integer_format_version_is_rejected_as_malformed() {
-        let entry = entry_json("bin/c", Some(GIT_COMMIT));
-        let json = format!(r#"{{"format_version":"1","artifacts":[{entry}]}}"#);
-        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
-            .expect_err("a non-integer format_version must be rejected");
-        assert!(
-            matches!(error, ManifestError::MalformedFormatVersion),
-            "got: {error:?}"
-        );
+    fn a_format_version_that_is_not_a_u32_is_rejected_as_malformed() {
+        // Each of these is refused from the version alone, before the body is
+        // decoded — the same guarantee `UnsupportedManifestFormat` gives, under
+        // a separate variant because no `found: u32` can carry the value.
+        for value in ["\"1\"", "1.5", "-1", "4294967296", "true"] {
+            let entry = entry_json("bin/c", Some(GIT_COMMIT));
+            let json = format!(r#"{{"format_version":{value},"artifacts":[{entry}]}}"#);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("a non-u32 format_version must be rejected");
+            assert!(
+                matches!(error, ManifestError::MalformedFormatVersion),
+                "value {value}: got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_null_format_version_reads_as_absent() {
+        // A missing key and an explicit `null` must mean the same thing, so the
+        // two stages cannot disagree about which manifests are unversioned.
+        let entry = entry_json("bin/c", None);
+        let json = format!(r#"{{"format_version":null,"artifacts":[{entry}]}}"#);
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("an explicit null format_version is the baseline shape");
+        assert_eq!(manifest.format_version(), None);
     }
 }
