@@ -27,6 +27,18 @@ jobs:
           # later would go unlinted without this.
           globs: "**/*.md"
 
+  # Ungated and unconditional, like Markdown: AGENTS.md is itself Markdown,
+  # so a documentation-only change is exactly the change that can edit a
+  # generated region. Pinned to a release tag rather than a branch, so an
+  # edit upstream reaches this repository through its sync pull request
+  # instead of turning every unrelated pull request red.
+  instructions:
+    name: Instructions
+    uses: aicers/agent-instructions/.github/workflows/check-drift.yml@main
+    with:
+      blocks: "workflow rust"
+      instructions-ref: v2
+
   check:
     runs-on: ubuntu-latest
     steps:
