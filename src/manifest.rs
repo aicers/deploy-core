@@ -1088,6 +1088,38 @@ mod tests {
     }
 
     #[test]
+    fn a_baseline_manifest_refuses_a_trust_set_through_the_builder_too() {
+        // The builder is the only way to attach a value, so it runs the same
+        // conjunction the read path does: a manifest that came off the baseline
+        // path cannot gain a generation without also gaining a
+        // `format_version`, which no constructor can give it.
+        let entry = entry_json("bin/c", None);
+        let json = format!(r#"{{"artifacts":[{entry}]}}"#);
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("baseline manifest should parse")
+            .with_trust_set(GENERATION)
+            .expect_err("a baseline manifest must not gain a trust_set");
+        assert!(
+            matches!(error, ManifestError::BaselineWithTrustSet),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_serde_door_is_no_laxer_about_the_accepted_range() {
+        // `TryFrom<RawManifest>` runs the same range check as the footer-aware
+        // parse, so a direct `from_slice` cannot admit a version this build does
+        // not implement either.
+        let json = versioned_json(MAX_MANIFEST_FORMAT_VERSION + 1);
+        let error = serde_json::from_str::<PayloadManifest>(&json)
+            .expect_err("the serde path must refuse an out-of-range version");
+        assert!(
+            error.to_string().contains("unsupported manifest format"),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
     fn a_version_above_the_ceiling_is_rejected_for_its_version_alone() {
         // The body is unreadable to this build — `artifacts` is not even an
         // array — so passing proves the range decision was made from
