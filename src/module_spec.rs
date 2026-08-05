@@ -1238,6 +1238,22 @@ WantedBy=multi-user.target
     }
 
     #[test]
+    fn a_registration_template_omitting_reload_fails_to_deserialize() {
+        // `reload` is required rather than optional, so a template that declares
+        // none is refused by the decode instead of reaching a consumer that
+        // would have to invent a reload for it.
+        let without_reload =
+            WIRE_SPEC.replace(r#""reload":{"docker-sighup":{"container":"giganto"}},"#, "");
+        assert!(
+            !without_reload.contains("docker-sighup"),
+            "{without_reload}"
+        );
+        let error = serde_json::from_str::<ModuleSpec>(&without_reload)
+            .expect_err("an omitted `reload` must not decode");
+        assert!(error.to_string().contains("reload"), "{error}");
+    }
+
+    #[test]
     fn a_spec_with_no_unit_and_no_gid_omits_both_keys() {
         let json = serde_json::to_string(&spec(None)).expect("serialization");
         assert!(!json.contains("unit"), "got: {json}");
