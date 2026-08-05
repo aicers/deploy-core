@@ -1188,6 +1188,33 @@ mod tests {
     }
 
     #[test]
+    fn an_undecodable_trust_set_reaches_open_as_invalid_manifest() {
+        // The trust-set refusals ride the same `InvalidManifest` channel the
+        // version gate does, so a hand-edited generation blob is reported for
+        // what it is rather than swallowed as a generic `ManifestParse`.
+        let roxyd = b"roxyd binary bytes";
+        let json = String::from_utf8(manifest_json(vec![artifact("bin/roxyd", roxyd)]))
+            .expect("fixture is utf-8")
+            .replacen('{', r#"{"trust_set":"not base64!!","#, 1)
+            .into_bytes();
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let binary = assemble(BASE, &json, &archive, &footer);
+
+        let error = open(Cursor::new(binary)).expect_err("a non-base64 trust_set must be refused");
+        assert!(
+            matches!(
+                error,
+                PayloadError::InvalidManifest(ManifestError::TrustSetNotBase64(_))
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
     fn an_unimplemented_manifest_format_version_reaches_open_as_invalid_manifest() {
         // The out-of-range refusal needs no new `PayloadError` variant: it
         // rides the existing `InvalidManifest` channel, and stays distinct from

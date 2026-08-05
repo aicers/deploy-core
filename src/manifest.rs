@@ -1013,6 +1013,44 @@ mod tests {
     }
 
     #[test]
+    fn the_read_path_rejects_a_versioned_artifact_with_no_commit() {
+        // `new` enforces this on the producer side, but the invariant a
+        // consumer relies on is the read-side one: every artifact of a manifest
+        // that is not on the baseline path carries a `commit`. A missing key
+        // and an explicit `null` are the same absence.
+        let absent = entry_json("bin/c", None);
+        let explicit_null =
+            absent.replace(r#""component":"c""#, r#""component":"c","commit":null"#);
+        for entry in [absent, explicit_null] {
+            let json =
+                format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("a current-format artifact must carry a commit");
+            assert!(
+                matches!(error, ManifestError::MissingCommit(ref path) if path == "bin/c"),
+                "entry {entry}: got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_path_rejects_a_malformed_commit() {
+        let entry = entry_json("bin/c", Some("abc1234"));
+        let json =
+            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("an abbreviated commit must be rejected on read too");
+        assert!(
+            matches!(
+                error,
+                ManifestError::InvalidCommit { ref archive_path, ref commit }
+                    if archive_path == "bin/c" && commit == "abc1234"
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
     fn a_trust_set_round_trips_through_the_wire_encoding() {
         let manifest = PayloadManifest::new(
             Some(PINSET.to_string()),
