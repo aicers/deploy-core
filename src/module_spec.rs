@@ -632,7 +632,7 @@ mod tests {
     fn render_value(arg: &Arg, bind: &dyn Fn(RenderVar) -> &'static str) -> String {
         match arg {
             Arg::Literal(text) => text.clone(),
-            Arg::Var(RenderVar::MainPid) => "$MAINPID".to_string(),
+            Arg::Var(RenderVar::MainPid) => render(UnitValue::MainPid),
             Arg::Var(var) => bind(*var).to_string(),
         }
     }
