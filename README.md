@@ -16,13 +16,13 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **registration** — service registration against the on-host PKI.
 - **roxyd_trust** — trust-material activation for the on-host agent.
 
-It carries no product concept — no component catalog, no per-component renderers —
-so both the installer and the per-machine root daemon depend on it and share one
-implementation.
+It carries no product concept — no component catalog, no per-component
+renderers — so both the installer and the per-machine root daemon depend
+on it and share one implementation.
 
 ## Testing
 
-```
+```sh
 cargo test
 ```
 

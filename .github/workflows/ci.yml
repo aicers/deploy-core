@@ -1,0 +1,64 @@
+name: CI
+
+# This crate is consumed by `bootler` at a pinned git rev, so a break here
+# reaches a shipping installer. Until now nothing ran on push or on a pull
+# request at all.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  markdown:
+    name: Markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@v20
+        with:
+          # Recursive. The action's default glob is `*.{md,markdown}` --
+          # repository root only -- so anything added under a directory
+          # later would go unlinted without this.
+          globs: "**/*.md"
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # `group_imports` is still nightly-gated, so it cannot live in a
+      # `rustfmt.toml`. Passing it here is what makes the grouping actually
+      # checked, and contributors have to pass it too.
+      - name: Check formatting
+        run: cargo fmt -- --check --config group_imports=StdExternalCrate
+
+      # Twice, because `--all-targets` covers lib, bins, tests, benches, and
+      # examples but touches no features: code behind `test-support` would
+      # never be linted by the first run.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (test-support)
+        run: cargo clippy --all-targets --features test-support -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test
+      # `test-support` exposes fixtures across the crate boundary, so it
+      # changes what compiles. Run the suite under it as well.
+      - name: Test (test-support)
+        run: cargo test --features test-support
