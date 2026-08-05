@@ -1255,8 +1255,13 @@ WantedBy=multi-user.target
 
     #[test]
     fn a_spec_with_no_unit_and_no_gid_omits_both_keys() {
+        // Asserted as whole bytes rather than as two absent substrings, so this
+        // pins the wire form a producer emits for a unitless spec — key order
+        // included — and not merely that two names are missing from it.
         let json = serde_json::to_string(&spec(None)).expect("serialization");
-        assert!(!json.contains("unit"), "got: {json}");
-        assert!(!json.contains("cert_group_gid"), "got: {json}");
+        assert_eq!(
+            json,
+            r#"{"registration":{"package_id":"example","service_name":"review","reload":{"sighup":{"process_path":"/opt/clumit-security/bin/review"}}},"placement":"core-hosts"}"#
+        );
     }
 }
