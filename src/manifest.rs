@@ -15,14 +15,16 @@ use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
+use crate::module_spec::{ModuleSpec, ModuleSpecError};
+
 /// `format_version` a producer stamps into every manifest it writes.
-pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// Inclusive floor of the `format_version` range this build accepts.
-pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 1;
+pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// Inclusive ceiling of the `format_version` range this build accepts.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 1;
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// Container footer version the pre-versioned baseline payloads were written
 /// at.
@@ -112,6 +114,16 @@ pub struct PayloadArtifact {
     pub archive_path: String,
     /// Lowercase hex SHA-256 over the artifact bytes, verified on extraction.
     pub sha256: String,
+    /// How this artifact is installed, declared by the package itself rather
+    /// than hardcoded per component by an engine.
+    ///
+    /// Optional per artifact: `None` means the package declares nothing and a
+    /// consumer falls back to whatever it did before, which is the state every
+    /// artifact shipping today is in. When present it is validated by
+    /// [`crate::module_spec::validate`] on every read path, so a malformed spec
+    /// never reaches the root daemon that executes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<ModuleSpec>,
 }
 
 /// Errors raised while validating a payload manifest.
@@ -171,10 +183,23 @@ pub enum ManifestError {
     /// so it is not the pre-versioned baseline shape.
     #[error("manifest carries no `format_version` yet artifact `{0}` carries a `commit`")]
     BaselineWithCommit(String),
+    /// A manifest carrying no `format_version` had an artifact with a `spec`,
+    /// so it is not the pre-versioned baseline shape.
+    #[error("manifest carries no `format_version` yet artifact `{0}` carries a `spec`")]
+    BaselineWithSpec(String),
     /// A manifest carrying no `format_version` had a `trust_set`, so it is not
     /// the pre-versioned baseline shape.
     #[error("manifest carries no `format_version` yet carries a `trust_set`")]
     BaselineWithTrustSet,
+    /// An artifact declared a [`ModuleSpec`] that violates a spec rule.
+    #[error("artifact `{archive_path}` declares an invalid spec")]
+    InvalidSpec {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The rule that was violated.
+        #[source]
+        source: ModuleSpecError,
+    },
     /// The `trust_set` value was not valid base64.
     #[error("manifest `trust_set` is not valid base64: {0}")]
     TrustSetNotBase64(#[source] base64::DecodeError),
@@ -359,14 +384,13 @@ fn read_format_version(document: &serde_json::Value) -> Result<Option<u32>, Mani
 }
 
 /// Returns the `archive_path` of the first artifact in the stage-1 document
-/// that carries a `commit`, or its index when that entry has no string
-/// `archive_path`.
+/// carrying `key`, or its index when that entry has no string `archive_path`.
 ///
 /// Only the presence of the key is read, never its value.
-fn artifact_with_commit(document: &serde_json::Value) -> Option<String> {
+fn artifact_with_key(document: &serde_json::Value, key: &str) -> Option<String> {
     let artifacts = document.get("artifacts")?.as_array()?;
     artifacts.iter().enumerate().find_map(|(index, artifact)| {
-        artifact.get("commit").filter(|value| !value.is_null())?;
+        artifact.get(key).filter(|value| !value.is_null())?;
         Some(
             artifact
                 .get("archive_path")
@@ -374,6 +398,20 @@ fn artifact_with_commit(document: &serde_json::Value) -> Option<String> {
                 .map_or_else(|| format!("#{index}"), str::to_string),
         )
     })
+}
+
+/// Returns the `archive_path` of the first artifact carrying a `commit`.
+fn artifact_with_commit(document: &serde_json::Value) -> Option<String> {
+    artifact_with_key(document, "commit")
+}
+
+/// Returns the `archive_path` of the first artifact carrying a `spec`.
+///
+/// `spec` lands in the same schema bump as `commit` and `trust_set`, so it is a
+/// term of the baseline conjunction on exactly the same grounds and reads
+/// presence only, through the same helper.
+fn artifact_with_spec(document: &serde_json::Value) -> Option<String> {
+    artifact_with_key(document, "spec")
 }
 
 /// Reports whether the stage-1 `document` carries a `trust_set`. Presence only.
@@ -384,17 +422,19 @@ fn has_trust_set(document: &serde_json::Value) -> bool {
 }
 
 /// Reports whether a manifest is the pre-existing, pre-versioned baseline: it
-/// carries no `format_version`, no artifact `commit` and no `trust_set`, and it
-/// sits in a container whose footer version is
+/// carries no `format_version`, no artifact `commit`, no `trust_set` and no
+/// artifact `spec`, and it sits in a container whose footer version is
 /// [`LEGACY_UNVERSIONED_FOOTER_VERSION`].
 ///
 /// The core payloads already published as release assets were assembled before
-/// any of the three fields existed, and a required CI preflight reads exactly
+/// any of those fields existed, and a required CI preflight reads exactly
 /// those assets, so they have to keep opening. The allowance is a conjunction
 /// rather than "any manifest missing `format_version`" precisely so it cannot
-/// widen: all three fields land in one schema bump, so a manifest carrying one
-/// of them without `format_version` was never written by a producer and is
-/// corrupt or hand-edited.
+/// widen: every field of a schema bump lands together, so a manifest carrying
+/// one of them without `format_version` was never written by a producer and is
+/// corrupt or hand-edited. `spec` is a term for that reason and for one more:
+/// without it, a hand-edited manifest could hand a root daemon an instruction
+/// set that bypassed the version gate entirely.
 ///
 /// Note the asymmetry this does *not* create: a `trust_set` on a current-format
 /// manifest is normal, and its absence is normal on every manifest — only its
@@ -411,6 +451,7 @@ fn is_pre_versioned_baseline(footer_version: u8, document: &serde_json::Value) -
         && footer_version == LEGACY_UNVERSIONED_FOOTER_VERSION
         && artifact_with_commit(document).is_none()
         && !has_trust_set(document)
+        && artifact_with_spec(document).is_none()
 }
 
 /// Names which field made an unversioned manifest fail the baseline
@@ -421,6 +462,8 @@ fn non_baseline_reason(document: &serde_json::Value) -> ManifestError {
         ManifestError::BaselineWithCommit(archive_path)
     } else if has_trust_set(document) {
         ManifestError::BaselineWithTrustSet
+    } else if let Some(archive_path) = artifact_with_spec(document) {
+        ManifestError::BaselineWithSpec(archive_path)
     } else {
         ManifestError::MissingFormatVersion
     }
@@ -443,7 +486,8 @@ impl PayloadManifest {
     ///
     /// Returns [`ManifestError`] when an artifact carries no dispositions, uses
     /// an unsafe `archive_path`, shares an `archive_path` with another artifact,
-    /// or carries no valid `commit`.
+    /// carries no valid `commit`, or declares a [`ModuleSpec`] that violates a
+    /// spec rule.
     pub fn new(
         pinset: Option<String>,
         artifacts: Vec<PayloadArtifact>,
@@ -487,9 +531,9 @@ impl PayloadManifest {
     /// and before the typed decode, so a future manifest whose *body* this build
     /// cannot make sense of is refused for its version rather than as a generic
     /// decode error. When it is absent there is no version to gate, and stage 1
-    /// additionally reads the two presence flags
+    /// additionally reads the presence flags
     /// `is_pre_versioned_baseline` takes — whether any artifact carries a
-    /// `commit`, and whether a `trust_set` is present — which is the one
+    /// `commit` or a `spec`, and whether a `trust_set` is present — which is the one
     /// sanctioned exception to the version-gate rule. **Stage 2** decodes the
     /// typed manifest, and only once a decision has been made.
     ///
@@ -503,7 +547,8 @@ impl PayloadManifest {
     /// [`ManifestError::UnsupportedManifestFormat`] when `format_version` falls
     /// outside [`MIN_MANIFEST_FORMAT_VERSION`]`..=`[`MAX_MANIFEST_FORMAT_VERSION`],
     /// [`ManifestError::MissingFormatVersion`],
-    /// [`ManifestError::BaselineWithCommit`] or
+    /// [`ManifestError::BaselineWithCommit`],
+    /// [`ManifestError::BaselineWithSpec`] or
     /// [`ManifestError::BaselineWithTrustSet`] when an unversioned manifest is
     /// not the baseline shape, or any validation error [`PayloadManifest::new`]
     /// raises.
@@ -524,7 +569,7 @@ impl PayloadManifest {
             }
         } else if !is_pre_versioned_baseline(footer_version, &document) {
             // Only on the absent-`format_version` path does stage 1 read the
-            // two extra presence flags the baseline predicate takes.
+            // extra presence flags the baseline predicate takes.
             return Err(non_baseline_reason(&document));
         }
 
@@ -590,6 +635,19 @@ impl PayloadManifest {
                 }
                 _ => {}
             }
+            if let Some(spec) = &artifact.spec {
+                if format_version.is_none() {
+                    return Err(ManifestError::BaselineWithSpec(
+                        artifact.archive_path.clone(),
+                    ));
+                }
+                crate::module_spec::validate(spec, &artifact.component, artifact.kind).map_err(
+                    |source| ManifestError::InvalidSpec {
+                        archive_path: artifact.archive_path.clone(),
+                        source,
+                    },
+                )?;
+            }
         }
 
         if let Some(bytes) = &trust_set {
@@ -651,8 +709,12 @@ mod tests {
     use super::{
         ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN,
         LEGACY_UNVERSIONED_FOOTER_VERSION, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
-        MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact, PayloadManifest, TargetArch,
-        is_pre_versioned_baseline, is_valid_commit,
+        MIN_MANIFEST_FORMAT_VERSION, ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest,
+        TargetArch, is_pre_versioned_baseline, is_valid_commit,
+    };
+    use crate::module_spec::{
+        Arg, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
+        RestartPolicy, SystemdTarget, UnitTemplate,
     };
 
     fn artifact(
@@ -669,6 +731,7 @@ mod tests {
             dispositions: dispositions.iter().copied().collect(),
             archive_path: archive_path.to_string(),
             sha256: "00".repeat(32),
+            spec: None,
         }
     }
 
@@ -703,6 +766,74 @@ mod tests {
     fn versioned_json(version: u32) -> String {
         let entry = entry_json("bin/c", Some(GIT_COMMIT));
         format!(r#"{{"format_version":{version},"artifacts":[{entry}]}}"#)
+    }
+
+    /// Renders the same entry as [`entry_json`] with `spec` spliced in, so the
+    /// read-path spec tests exercise the wire form a producer writes.
+    fn entry_json_with_spec(archive_path: &str, commit: Option<&str>, spec: &str) -> String {
+        let entry = entry_json(archive_path, commit);
+        let body = entry.strip_suffix('}').expect("an entry ends with a brace");
+        format!(r#"{body},"spec":{spec}}}"#)
+    }
+
+    /// Wire JSON of a spec for the `c` component `entry_json` writes, carrying
+    /// `unit` verbatim so a test can vary only the unit template.
+    fn spec_json(unit: &str) -> String {
+        format!(
+            r#"{{"unit":{unit},"registration":{{"package_id":"c","service_name":"c","reload":{{"sighup":{{"process_path":"/opt/c"}}}}}},"placement":"core-hosts"}}"#
+        )
+    }
+
+    /// Wire JSON of a unit template whose `exec_start`/`exec_reload` block is
+    /// `exec` verbatim; every other field is a valid fixed value.
+    fn unit_json(exec: &str) -> String {
+        format!(
+            r#"{{"description":"C","after":[],"wants":[],"wanted_by":["multi-user"],{exec},"environment":[],"restart":"always","restart_sec":5,"protect_home":false,"private_tmp":false,"no_new_privileges":false}}"#
+        )
+    }
+
+    /// The `exec_start` a valid unit template carries.
+    const VALID_EXEC_START: &str = r#""exec_start":[{"var":"artifact-path"}]"#;
+
+    /// A spec a `native-binary` artifact of component `example` may declare.
+    fn module_spec() -> ModuleSpec {
+        ModuleSpec {
+            unit: Some(UnitTemplate {
+                description: "Example module".to_string(),
+                after: vec![SystemdTarget::NetworkOnline],
+                wants: vec![SystemdTarget::NetworkOnline],
+                wanted_by: vec![SystemdTarget::MultiUser],
+                exec_start: vec![
+                    Arg::Var(RenderVar::ArtifactPath),
+                    Arg::Literal("-c".to_string()),
+                    Arg::Var(RenderVar::ConfigPath),
+                ],
+                exec_reload: Some(vec![
+                    Arg::Literal("/bin/kill".to_string()),
+                    Arg::Literal("-HUP".to_string()),
+                    Arg::Var(RenderVar::MainPid),
+                ]),
+                working_directory: Some(Arg::Var(RenderVar::DataDir)),
+                environment: vec![
+                    ("RUST_LOG".to_string(), Arg::Literal("info".to_string())),
+                    ("HOST".to_string(), Arg::Var(RenderVar::Hostname)),
+                ],
+                restart: RestartPolicy::Always,
+                restart_sec: 5,
+                protect_home: true,
+                private_tmp: true,
+                no_new_privileges: true,
+            }),
+            registration: RegistrationTemplate {
+                package_id: "example".to_string(),
+                service_name: "example".to_string(),
+                reload: ReloadSpec::DockerSighup {
+                    container: "example".to_string(),
+                },
+                cert_group_gid: Some(1000),
+            },
+            placement: PlacementClass::ModuleHosts,
+        }
     }
 
     #[test]
@@ -1325,6 +1456,282 @@ mod tests {
                 "value {value}: got {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_spec_round_trips_through_the_manifest() {
+        let mut declaring = artifact(
+            "bin/native",
+            ArtifactKind::NativeBinary,
+            &[Disposition::Install],
+        );
+        declaring.spec = Some(module_spec());
+        let manifest = PayloadManifest::new(None, vec![declaring.clone()])
+            .expect("a valid spec must be accepted");
+
+        let json = serde_json::to_string(&manifest).expect("serialization should succeed");
+        let restored = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a manifest carrying a spec must parse");
+        assert_eq!(restored, manifest);
+
+        let read = restored.artifacts().first().expect("one artifact");
+        assert_eq!(read, &declaring);
+        let spec = read
+            .spec
+            .as_ref()
+            .expect("the spec survives the round trip");
+        assert_eq!(spec, &module_spec());
+        let unit = spec.unit.as_ref().expect("the unit survives too");
+        let expected = module_spec().unit.expect("fixture carries a unit");
+        assert_eq!(unit.description, expected.description);
+        assert_eq!(unit.after, expected.after);
+        assert_eq!(unit.wants, expected.wants);
+        assert_eq!(unit.wanted_by, expected.wanted_by);
+        assert_eq!(unit.exec_start, expected.exec_start);
+        assert_eq!(unit.exec_reload, expected.exec_reload);
+        assert_eq!(unit.working_directory, expected.working_directory);
+        // Order is significant and preserved: one `Environment=` directive is
+        // rendered per entry in declared order.
+        assert_eq!(unit.environment, expected.environment);
+        assert_eq!(unit.restart, expected.restart);
+        assert_eq!(unit.restart_sec, expected.restart_sec);
+        assert_eq!(unit.protect_home, expected.protect_home);
+        assert_eq!(unit.private_tmp, expected.private_tmp);
+        assert_eq!(unit.no_new_privileges, expected.no_new_privileges);
+        assert_eq!(spec.registration, module_spec().registration);
+        assert_eq!(spec.placement, PlacementClass::ModuleHosts);
+    }
+
+    #[test]
+    fn the_read_path_runs_the_spec_validator_rather_than_trusting_the_producer() {
+        // Each of these decodes cleanly and is refused by the validator, so a
+        // consumer that never links a producer still refuses it. The case is
+        // named by the source variant, not by "some error occurred".
+        /// Names which spec rule a read-path rejection must report.
+        type RuleCheck = fn(&ModuleSpecError) -> bool;
+
+        let cases: [(&str, RuleCheck); 4] = [
+            (
+                r#""exec_start":[{"var":"artifact-path"},{"var":"main-pid"}]"#,
+                |error| matches!(error, ModuleSpecError::MainPidOutsideExecReload),
+            ),
+            (r#""exec_start":[]"#, |error| {
+                matches!(error, ModuleSpecError::EmptyExecStart)
+            }),
+            (r#""exec_start":[{"literal":"/bin/sh"}]"#, |error| {
+                matches!(error, ModuleSpecError::ExecStartNotArtifactPath)
+            }),
+            (
+                r#""exec_start":[{"var":"artifact-path"}],"exec_reload":[]"#,
+                |error| matches!(error, ModuleSpecError::EmptyExecReload),
+            ),
+        ];
+        for (exec, is_expected) in cases {
+            let entry =
+                entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit_json(exec)));
+            let json =
+                format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("a malformed spec must be refused on read");
+            let ManifestError::InvalidSpec {
+                ref archive_path,
+                ref source,
+            } = error
+            else {
+                panic!("exec {exec}: expected a spec rejection, got {error:?}");
+            };
+            assert_eq!(archive_path, "bin/c");
+            assert!(is_expected(source), "exec {exec}: got {source:?}");
+        }
+    }
+
+    #[test]
+    fn the_read_path_enforces_the_kind_conditional_unit_rule() {
+        // A `native-binary` artifact declaring a spec with no unit.
+        let no_unit = r#"{"registration":{"package_id":"c","service_name":"c","reload":{"sighup":{"process_path":"/opt/c"}}},"placement":"core-hosts"}"#;
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), no_unit);
+        let json =
+            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("a native-binary spec must carry a unit");
+        assert!(
+            matches!(
+                error,
+                ManifestError::InvalidSpec {
+                    source: ModuleSpecError::MissingUnit(_),
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+
+        // An artifact declaring no spec at all stays valid for every kind, and
+        // that is exactly what every artifact shipping today does.
+        for kind in [
+            ArtifactKind::NativeBinary,
+            ArtifactKind::ComposeBundle,
+            ArtifactKind::StaticAssets,
+            ArtifactKind::ContainerImage,
+        ] {
+            PayloadManifest::new(None, vec![artifact("bin/c", kind, &[Disposition::Install])])
+                .expect("an artifact declaring no spec is valid for every kind");
+        }
+    }
+
+    #[test]
+    fn the_read_path_rejects_a_mismatched_package_id() {
+        // The entry's component is `c`; the spec claims another package.
+        let spec = spec_json(&unit_json(VALID_EXEC_START))
+            .replace(r#""package_id":"c""#, r#""package_id":"somewhere-else""#);
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec);
+        let json =
+            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("a mismatched package_id must be rejected");
+        assert!(
+            matches!(
+                error,
+                ManifestError::InvalidSpec {
+                    source: ModuleSpecError::PackageIdMismatch { .. },
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_spec_parses_off_the_wire_form() {
+        let entry = entry_json_with_spec(
+            "bin/c",
+            Some(GIT_COMMIT),
+            &spec_json(&unit_json(VALID_EXEC_START)),
+        );
+        let json =
+            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a valid spec must parse");
+        let spec = manifest
+            .artifacts()
+            .first()
+            .expect("one artifact")
+            .spec
+            .as_ref()
+            .expect("the spec is carried");
+        assert_eq!(spec.placement, PlacementClass::CoreHosts);
+        assert_eq!(spec.registration.cert_group_gid, None);
+    }
+
+    #[test]
+    fn an_unknown_render_var_name_fails_to_deserialize_on_the_manifest_read_path() {
+        // The typed argv element is what makes an unknown variable
+        // unrepresentable: it never reaches the validator, let alone a
+        // rendered `ExecStart=`.
+        let unit = unit_json(r#""exec_start":[{"var":"manager-address"}]"#);
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
+        let json =
+            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("an unknown variable must not decode");
+        assert!(matches!(error, ManifestError::Decode(_)), "got: {error:?}");
+    }
+
+    #[test]
+    fn an_unknown_artifact_field_is_still_ignored() {
+        // The spec structs deny unknown fields; `PayloadArtifact` keeps the
+        // behaviour it has today, because the envelope's skew is caught by the
+        // `format_version` range instead.
+        let entry = entry_json("bin/c", Some(GIT_COMMIT))
+            .replace(r#""component":"c""#, r#""component":"c","surprise":true"#);
+        let json =
+            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("an unknown artifact field must be ignored");
+        assert_eq!(manifest.artifacts().len(), 1);
+    }
+
+    #[test]
+    fn an_artifact_declaring_no_spec_serializes_to_the_bytes_it_did_before() {
+        // Byte-for-byte, with no `spec` key: adding the field must not change
+        // the wire form of any payload that exists today.
+        let manifest = PayloadManifest::new(
+            None,
+            vec![artifact(
+                "bin/native",
+                ArtifactKind::NativeBinary,
+                &[Disposition::Install],
+            )],
+        )
+        .expect("manifest should be valid");
+        let json = serde_json::to_string(&manifest).expect("serialization should succeed");
+        let sha256 = "00".repeat(32);
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{{"component":"example","version":"1.2.3","commit":"{GIT_COMMIT}","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"bin/native","sha256":"{sha256}"}}]}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn the_bumped_range_refuses_the_previous_format_version_and_accepts_the_current_one() {
+        // Both are written by interpolating the constants, so the next bump
+        // stays a repoint of the three rather than a search for a literal.
+        let previous = MANIFEST_FORMAT_VERSION - 1;
+        let error = PayloadManifest::parse(
+            versioned_json(previous).as_bytes(),
+            LEGACY_UNVERSIONED_FOOTER_VERSION,
+        )
+        .expect_err("the previous format version must be refused");
+        assert!(
+            matches!(
+                error,
+                ManifestError::UnsupportedManifestFormat { found, .. } if found == previous
+            ),
+            "got: {error:?}"
+        );
+
+        let manifest = PayloadManifest::parse(
+            versioned_json(MANIFEST_FORMAT_VERSION).as_bytes(),
+            LEGACY_UNVERSIONED_FOOTER_VERSION,
+        )
+        .expect("the current format version must be accepted");
+        assert_eq!(manifest.format_version(), Some(MANIFEST_FORMAT_VERSION));
+    }
+
+    #[test]
+    fn an_unversioned_manifest_carrying_a_spec_is_rejected() {
+        // Without this term the version gate would not hold: a hand-edited
+        // manifest with no `format_version` but a `spec` would parse as a
+        // legacy payload and hand a root daemon an instruction set that
+        // bypassed the gate entirely.
+        let entry = entry_json_with_spec("bin/c", None, &spec_json(&unit_json(VALID_EXEC_START)));
+        let json = format!(r#"{{"artifacts":[{entry}]}}"#);
+        let document: serde_json::Value =
+            serde_json::from_str(&json).expect("document should decode");
+        assert!(!is_pre_versioned_baseline(
+            LEGACY_UNVERSIONED_FOOTER_VERSION,
+            &document
+        ));
+
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("an unversioned manifest carrying a spec must be rejected");
+        assert!(
+            matches!(error, ManifestError::BaselineWithSpec(ref path) if path == "bin/c"),
+            "got: {error:?}"
+        );
+
+        // The same manifest with the spec removed is the genuine legacy shape
+        // and still opens exactly as it does today.
+        let baseline = format!(r#"{{"artifacts":[{}]}}"#, entry_json("bin/c", None));
+        let manifest =
+            PayloadManifest::parse(baseline.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect("a genuine legacy payload still parses");
+        assert_eq!(manifest.format_version(), None);
+        assert_eq!(
+            manifest.artifacts().first().expect("one artifact").spec,
+            None
+        );
     }
 
     #[test]
