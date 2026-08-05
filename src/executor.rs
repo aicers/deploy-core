@@ -837,7 +837,7 @@ pub trait Executor {
     /// component (`chown --no-dereference`).
     ///
     /// This is the ownership half of the RFC 0003 §11.3 handoff: `bootroot service
-    /// add` creates `agent.toml` and the AppRole credentials root-owned before the
+    /// add` creates `agent.toml` and the `AppRole` credentials root-owned before the
     /// agent's unit exists, so ownership cannot come from agent identity alone and
     /// a first install chowns the enumerated set to the account. It is enumerated,
     /// per-path, and never recursive — a privileged recursive walk into a tree a
@@ -931,6 +931,10 @@ pub fn file_present(executor: &dyn Executor, path: &Path) -> Result<bool, Execut
 /// via a root-identity `test -e`. Unlike [`file_present`] this does not narrow to
 /// regular files, so the §11.3 handoff can tell an already-created agent
 /// directory from an absent one.
+/// # Errors
+///
+/// Returns [`ExecutorError`] if the probe cannot be run at all. A probe that
+/// runs and finds nothing is `Ok(false)`, not an error.
 pub fn path_present(executor: &dyn Executor, path: &Path) -> Result<bool, ExecutorError> {
     let output = executor.run(Identity::Root, TEST, &["-e", &path.to_string_lossy()])?;
     Ok(output.success())
@@ -945,6 +949,11 @@ pub fn path_present(executor: &dyn Executor, path: &Path) -> Result<bool, Execut
 /// the update path's stop-agent-then-verify step, and `verify`. A missing path is
 /// propagated as [`ExecutorError::Transfer`] from [`Executor::owner_of`], so an
 /// absent enumerated artifact is a checkable condition rather than a silent pass.
+/// # Errors
+///
+/// Returns whatever [`Executor::owner_of`] reports, which includes
+/// [`ExecutorError::Transfer`] for a path that is not there — an absent
+/// artifact is a condition to be checked, not a silent match.
 pub fn ownership_mismatch(
     executor: &dyn Executor,
     path: &Path,
@@ -1416,6 +1425,7 @@ fn shell_join<'a>(words: impl IntoIterator<Item = &'a str>) -> String {
 }
 
 /// Reports whether `sudo` refused because it needs a password or a terminal.
+#[must_use]
 pub fn sudo_needs_password(stderr: &[u8]) -> bool {
     let text = String::from_utf8_lossy(stderr);
     text.contains("a password is required")
@@ -1727,9 +1737,8 @@ impl SshExecutor {
         auth: SudoAuth,
         prompt: SshPrompt,
     ) -> Self {
-        let ssh_bin = std::env::var_os(SSH_BIN_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(SSH));
+        let ssh_bin =
+            std::env::var_os(SSH_BIN_ENV).map_or_else(|| PathBuf::from(SSH), PathBuf::from);
         Self {
             host: host.into(),
             target: format!("{}@{address}", ssh.user),

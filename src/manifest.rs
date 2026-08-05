@@ -1,7 +1,7 @@
 //! Product and component manifest types.
 //!
 //! A manifest describes which components make up a product stack (for example
-//! Bootroot + REview + aice-web-next for Clumit Security) together with their
+//! Bootroot + `REview` + aice-web-next for Clumit Security) together with their
 //! versions and per-product namespaces. That broader product/component manifest
 //! format is still reserved space; this module currently defines the **payload
 //! manifest** that describes the artifacts carried in a bootler payload trailer
@@ -51,7 +51,7 @@ pub enum ArtifactKind {
 pub enum Disposition {
     /// bootler installs the artifact on a placement host.
     Install,
-    /// bootler places the artifact in REview's module store for later
+    /// bootler places the artifact in `REview`'s module store for later
     /// distribution.
     Stage,
 }
@@ -104,6 +104,7 @@ pub enum ManifestError {
 /// stored as `bin/roxyd`, breaking the deterministic manifest-to-member
 /// mapping. The raw `/`-separated segments are inspected directly rather than
 /// [`Path::components`], which itself normalizes interior `.` away.
+#[must_use]
 pub fn is_safe_archive_path(path: &str) -> bool {
     // Reject OS-absolute paths and platform prefixes (e.g. a Windows drive or
     // UNC root) that a segment scan alone would miss.
