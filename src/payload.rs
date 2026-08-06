@@ -41,8 +41,8 @@ use tempfile::Builder as TempBuilder;
 use zstd::{Decoder, Encoder};
 
 use crate::manifest::{
-    ArtifactKind, Disposition, ManifestError, PayloadArtifact, PayloadManifest, TargetArch,
-    is_safe_archive_path,
+    ArchiveMember, ArtifactKind, Disposition, ManifestError, PayloadArtifact, PayloadManifest,
+    TargetArch, is_safe_archive_path,
 };
 use crate::module_spec::ModuleSpec;
 
@@ -211,10 +211,44 @@ pub enum PayloadError {
     #[error("archive member `{0}` appears more than once")]
     DuplicateMember(String),
 
+    /// The archive block's members disagreed with the ordered member list the
+    /// manifest binds — in name, order, count, or per-member length.
+    ///
+    /// This is a whole-sequence verdict decided once the archive has been
+    /// walked, so it is the one rejection here that no single member is
+    /// individually guilty of: a permuted archive holds nothing but members
+    /// that pass every per-member check. The position and the two sides are
+    /// carried rather than the whole list, which is what a reader needs to act
+    /// on and is already in front of it.
+    #[error(
+        "archive members disagree with the manifest at position {index}: manifest binds {}, archive carries {}",
+        describe_member(.expected.as_ref()),
+        describe_member(.found.as_ref())
+    )]
+    MemberListMismatch {
+        /// Zero-based position in archive order where the two first disagree.
+        index: usize,
+        /// What the manifest's bound list holds there, or `None` when the list
+        /// ends at that position and the archive carried more.
+        expected: Option<ArchiveMember>,
+        /// What the archive carried there, or `None` when the archive ended at
+        /// that position and the bound list held more.
+        found: Option<ArchiveMember>,
+    },
+
     /// The source binary handed to [`rewrap_trailer`] carries no payload
     /// trailer, so there is nothing to graft onto the new base.
     #[error("source binary carries no payload trailer to rewrap")]
     NoTrailer,
+}
+
+/// Renders one side of a [`PayloadError::MemberListMismatch`], where absence
+/// means the sequence ended before the position under comparison.
+fn describe_member(member: Option<&ArchiveMember>) -> String {
+    member.map_or_else(
+        || "nothing".to_string(),
+        |member| format!("`{}` ({} bytes)", member.name, member.length),
+    )
 }
 
 /// One artifact to embed, referenced by the file that holds its bytes.
@@ -355,13 +389,17 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Streams `reader` into `writer` in bounded-size chunks, returning the
-/// lowercase hex SHA-256 of the bytes copied.
+/// lowercase hex SHA-256 of the bytes copied and how many of them there were.
 ///
 /// This is the streaming primitive behind both writing (hash a source file into
 /// [`std::io::sink`]) and extraction (hash a member while spooling it to disk),
-/// so no artifact is ever buffered in memory in full.
-fn hash_copy<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Result<String> {
+/// so no artifact is ever buffered in memory in full. The byte count comes out
+/// of the same pass as the digest, which is what lets both sides state a length
+/// that is a property of the bytes they hashed rather than of a size field
+/// consulted separately.
+fn hash_copy<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Result<(String, u64)> {
     let mut hasher = Sha256::new();
+    let mut length = 0u64;
     // On the heap: 64 KiB is a large frame to claim on a thread whose stack
     // size this crate does not choose, and the one allocation disappears
     // against the I/O and hashing it serves.
@@ -376,8 +414,9 @@ fn hash_copy<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Result
             .expect("read never exceeds the buffer length");
         hasher.update(chunk);
         writer.write_all(chunk)?;
+        length += chunk.len() as u64;
     }
-    Ok(to_hex(&hasher.finalize()))
+    Ok((to_hex(&hasher.finalize()), length))
 }
 
 /// A `Write` wrapper that counts the bytes written through it, used to measure
@@ -432,6 +471,15 @@ impl<W: Write> Write for CountingWriter<W> {
 /// [`MANIFEST_FORMAT_VERSION`](crate::manifest::MANIFEST_FORMAT_VERSION) with no
 /// caller-supplied value.
 ///
+/// The ordered archive member list the manifest binds is derived here too, in
+/// `inputs` order, from the same pre-pass that computes each artifact's
+/// SHA-256. There is no member-list parameter and no override hook, for the
+/// reason there is none for `sha256`: this function is the only one that writes
+/// an archive, so a list it did not derive would be a caller's *prediction* of
+/// what its `tar` writer does — the writer's ordering and framing rules
+/// restated in a second place, which is exactly the two-implementations-must-
+/// agree failure the bound list exists to prevent.
+///
 /// # Errors
 ///
 /// Returns [`PayloadError`] when a `source` file cannot be read, the derived
@@ -449,10 +497,22 @@ pub fn append_trailer<B: Read, W: Write>(
     trust_set: Option<&[u8]>,
     inputs: &[ArtifactInput],
 ) -> Result<(), PayloadError> {
+    // The member list is derived here, from the pre-pass that already streams
+    // every input: the manifest block is written before the archive block, so
+    // it cannot be collected while the `tar` is being built. Each input is
+    // measured exactly once, and that one count becomes both the member's
+    // recorded `length` and the size written into its `tar` header below —
+    // two reads of the same file can disagree, and the whole point of the
+    // field is that they cannot.
+    let mut archive_members = Vec::with_capacity(inputs.len());
     let mut artifacts = Vec::with_capacity(inputs.len());
     for input in inputs {
         let source = std::fs::File::open(&input.source)?;
-        let sha256 = hash_copy(source, std::io::sink())?;
+        let (sha256, length) = hash_copy(source, std::io::sink())?;
+        archive_members.push(ArchiveMember {
+            name: input.archive_path.clone(),
+            length,
+        });
         artifacts.push(PayloadArtifact {
             component: input.component.clone(),
             version: input.version.clone(),
@@ -465,7 +525,11 @@ pub fn append_trailer<B: Read, W: Write>(
             spec: input.spec.clone(),
         });
     }
-    let manifest = PayloadManifest::new(pinset.map(str::to_string), artifacts)?;
+    // Taken off the member list itself, so the number the header states below
+    // is the very one the manifest binds rather than a second measurement of
+    // the same file.
+    let member_lengths: Vec<u64> = archive_members.iter().map(|member| member.length).collect();
+    let manifest = PayloadManifest::new(pinset.map(str::to_string), archive_members, artifacts)?;
     let manifest = match trust_set {
         Some(generation) => manifest.with_trust_set(generation)?,
         None => manifest,
@@ -481,9 +545,12 @@ pub fn append_trailer<B: Read, W: Write>(
         let mut counter = CountingWriter::new(&mut out);
         let encoder = Encoder::new(&mut counter, ZSTD_LEVEL)?;
         let mut builder = Builder::new(encoder);
-        for input in inputs {
+        // The header's size is the length the manifest now binds, not a second
+        // look at the source file's metadata: the two are required to be the
+        // same number, and the only way to guarantee that is for there to be
+        // one number.
+        for (input, length) in inputs.iter().zip(member_lengths) {
             let source = std::fs::File::open(&input.source)?;
-            let size = source.metadata()?.len();
             let mut header = Header::new_gnu();
             // The name is written into the header block and the header is
             // appended verbatim, because `Builder::append_data` falls back to a
@@ -497,7 +564,7 @@ pub fn append_trailer<B: Read, W: Write>(
                     path: input.archive_path.clone(),
                     len: input.archive_path.len(),
                 })?;
-            header.set_size(size);
+            header.set_size(length);
             header.set_mode(0o644);
             header.set_mtime(0);
             header.set_entry_type(EntryType::Regular);
@@ -649,6 +716,13 @@ impl<R: Read + Seek> Payload<R> {
     /// manifest entry with no archive member is rejected so nothing the
     /// manifest promises is silently skipped.
     ///
+    /// Also after the walk, the sequence of members the archive turned out to
+    /// hold — each one's resolved name and the byte count this reader consumed
+    /// for it — must equal the ordered list the manifest binds as
+    /// `archive_members`, in name, order, count and per-member length. That
+    /// check is skipped, and only that check, for a manifest read off the
+    /// pre-versioned baseline path, which binds no list to compare against.
+    ///
     /// Each member streams from the archive into a staging directory while its
     /// SHA-256 is computed, so no member is buffered in memory in full and a
     /// GB-scale artifact still streams.
@@ -656,8 +730,9 @@ impl<R: Read + Seek> Payload<R> {
     /// # All-or-nothing
     ///
     /// On any rejection this function decides — a refused member, a hash
-    /// mismatch, or an I/O failure met while reading the archive or staging a
-    /// member — `dest` is left exactly as it was found: no extracted artifact,
+    /// mismatch, a member sequence disagreeing with the bound list, or an I/O
+    /// failure met while reading the archive or staging a member — `dest` is
+    /// left exactly as it was found: no extracted artifact,
     /// no directory created to hold one, no staging directory and no temporary
     /// file. `dest` and its missing ancestors are created if absent, and that
     /// is the only difference a rejection is allowed to leave behind: after a
@@ -682,8 +757,10 @@ impl<R: Read + Seek> Payload<R> {
     /// absent from the manifest, is a repeated `archive_path`, or fails its
     /// hash check; when the archive block carries bytes past the
     /// end-of-archive marker; when a manifest artifact has no matching member;
-    /// or when the archive cannot be read or a staged member cannot be
-    /// written.
+    /// when the members walked disagree with the manifest's bound
+    /// `archive_members` in name, order, count or per-member length
+    /// ([`PayloadError::MemberListMismatch`]); or when the archive cannot be
+    /// read or a staged member cannot be written.
     pub fn extract_to(&mut self, dest: &Path) -> Result<Vec<ExtractedArtifact>, PayloadError> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
@@ -717,6 +794,10 @@ impl<R: Read + Seek> Payload<R> {
 
         let mut staged: Vec<(PathBuf, &PayloadArtifact)> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
+        // What the archive actually turned out to hold, recorded member by
+        // member as it streams past and compared against the bound list only
+        // once the walk is over: count and order are not decidable before then.
+        let mut walked: Vec<ArchiveMember> = Vec::new();
         for entry in archive.entries()? {
             let mut entry = entry?;
             let member_path = admitted_member_path(&entry)?;
@@ -741,12 +822,20 @@ impl<R: Read + Seek> Payload<R> {
                 .create_new(true)
                 .mode(0o600)
                 .open(&staged_path)?;
-            let digest = hash_copy(&mut entry, &mut file)?;
+            let (digest, length) = hash_copy(&mut entry, &mut file)?;
             if !digest.eq_ignore_ascii_case(&artifact.sha256) {
                 return Err(PayloadError::HashMismatch {
                     path: artifact.archive_path.clone(),
                 });
             }
+            // The length recorded is the count of data bytes this reader
+            // consumed while hashing the member, never the size read back out
+            // of its `tar` header: the bound length has to be a property of the
+            // bytes that were hashed.
+            walked.push(ArchiveMember {
+                name: member_path,
+                length,
+            });
             staged.push((relative, artifact));
         }
 
@@ -758,6 +847,17 @@ impl<R: Read + Seek> Payload<R> {
                     artifact.archive_path.clone(),
                 ));
             }
+        }
+
+        // The walk against the list the manifest binds — an addition to every
+        // check above, never a replacement for one. It is compared against
+        // `archive_members` and never reconstructed from `artifacts`: deriving
+        // the expected sequence from the other field would leave the
+        // enumeration exactly as unstated as it was before it was recorded. A
+        // manifest read off the pre-versioned baseline path binds no list, so
+        // there is nothing to compare against and this check alone is skipped.
+        if let Some(bound) = manifest.archive_members() {
+            compare_member_list(bound, &walked)?;
         }
 
         // Publish. Every check has passed, so from here a failure may leave
@@ -778,6 +878,37 @@ impl<R: Read + Seek> Payload<R> {
 
         Ok(extracted)
     }
+}
+
+/// Compares the sequence the archive walk produced against the ordered member
+/// list the manifest binds.
+///
+/// A whole-sequence check, not a per-member one: a permuted archive holds
+/// nothing but members that pass every individual check, and reducing this to a
+/// comparison made as each member streams past would let a prefix of the
+/// archive through before the disagreement is reached. The first position the
+/// two disagree at is reported, whether they differ in name, in length, or in
+/// having a member there at all.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::MemberListMismatch`] naming that position.
+fn compare_member_list(
+    bound: &[ArchiveMember],
+    walked: &[ArchiveMember],
+) -> Result<(), PayloadError> {
+    for index in 0..bound.len().max(walked.len()) {
+        let expected = bound.get(index);
+        let found = walked.get(index);
+        if expected != found {
+            return Err(PayloadError::MemberListMismatch {
+                index,
+                expected: expected.cloned(),
+                found: found.cloned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Admits one archive member on the archive format's own terms and returns the
@@ -1032,8 +1163,9 @@ mod tests {
         rewrap_trailer, sha256_hex,
     };
     use crate::manifest::{
-        ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
-        MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact, TargetArch,
+        ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
+        MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact,
+        TargetArch,
     };
     use crate::module_spec::{
         Arg, ModuleSpec, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
@@ -1426,9 +1558,87 @@ mod tests {
         out
     }
 
-    fn manifest_json(artifacts: Vec<PayloadArtifact>) -> Vec<u8> {
-        let manifest = PayloadManifest::new(None, artifacts).expect("manifest should be valid");
+    /// Wire JSON of a current-format manifest describing one artifact per entry
+    /// and binding one archive member per entry, both in the order given — the
+    /// shape the writer produces, since both lists come from one `inputs` slice.
+    fn manifest_json(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        manifest_json_binding(&members_of(entries), entries)
+    }
+
+    /// The same, with the bound member list stated outright, so a test can make
+    /// the manifest disagree with the archive in exactly one respect.
+    fn manifest_json_binding(members: &[ArchiveMember], entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let artifacts = entries
+            .iter()
+            .map(|(archive_path, bytes)| artifact(archive_path, bytes))
+            .collect();
+        let manifest = PayloadManifest::new(None, members.to_vec(), artifacts)
+            .expect("manifest should be valid");
         serde_json::to_vec(&manifest).expect("serialization should succeed")
+    }
+
+    /// The member list an archive holding exactly `entries`, in order, presents
+    /// to the reader.
+    fn members_of(entries: &[(&str, &[u8])]) -> Vec<ArchiveMember> {
+        entries
+            .iter()
+            .map(|(archive_path, bytes)| ArchiveMember {
+                name: (*archive_path).to_string(),
+                length: bytes.len() as u64,
+            })
+            .collect()
+    }
+
+    /// Slices `binary`'s trailer the way the reader locates it: the base, the
+    /// manifest block, and the archive block.
+    fn trailer_parts(binary: &[u8]) -> (&[u8], &[u8], &[u8]) {
+        let footer_start = binary.len() - FOOTER_SIZE;
+        let footer = parse_footer(binary.get(footer_start..).expect("footer in range"))
+            .expect("footer should parse")
+            .expect("magic should match");
+        let at = |offset: u64| usize::try_from(offset).expect("fixture offsets fit in usize");
+        let manifest_at = at(footer.manifest_offset);
+        let archive_at = at(footer.archive_offset);
+        (
+            binary.get(..manifest_at).expect("base in range"),
+            binary
+                .get(manifest_at..manifest_at + at(footer.manifest_len))
+                .expect("manifest block in range"),
+            binary
+                .get(archive_at..archive_at + at(footer.archive_len))
+                .expect("archive block in range"),
+        )
+    }
+
+    /// Rebuilds `binary` with `manifest_json` in place of its manifest block,
+    /// leaving the base and the archive block exactly as they were.
+    ///
+    /// This is what lets a mismatch case mutate only the bytes under test — one
+    /// recorded length, one member name — over an archive the writer produced.
+    fn with_manifest_block(binary: &[u8], manifest_json: &[u8]) -> Vec<u8> {
+        let (base, _, archive) = trailer_parts(binary);
+        let footer = valid_footer(base.len(), manifest_json, archive);
+        assemble(base, manifest_json, archive, &footer)
+    }
+
+    /// Decodes `binary`'s manifest block as a generic JSON document, hands the
+    /// bound member array to `mutate`, and rebuilds the container around the
+    /// rewritten block.
+    fn mutating_bound_members(
+        binary: &[u8],
+        mutate: impl FnOnce(&mut Vec<serde_json::Value>),
+    ) -> Vec<u8> {
+        let (_, block, _) = trailer_parts(binary);
+        let mut document: serde_json::Value =
+            serde_json::from_slice(block).expect("the manifest block decodes");
+        let members = document
+            .get_mut("archive_members")
+            .expect("a written manifest binds a member list")
+            .as_array_mut()
+            .expect("the bound list is an array");
+        mutate(members);
+        let json = serde_json::to_vec(&document).expect("serialization should succeed");
+        with_manifest_block(binary, &json)
     }
 
     fn artifact(archive_path: &str, bytes: &[u8]) -> PayloadArtifact {
@@ -1680,7 +1890,7 @@ mod tests {
         // version gate does, so a hand-edited generation blob is reported for
         // what it is rather than swallowed as a generic `ManifestParse`.
         let roxyd = b"roxyd binary bytes";
-        let json = String::from_utf8(manifest_json(vec![artifact("bin/roxyd", roxyd)]))
+        let json = String::from_utf8(manifest_json(&[("bin/roxyd", roxyd)]))
             .expect("fixture is utf-8")
             .replacen('{', r#"{"trust_set":"not base64!!","#, 1)
             .into_bytes();
@@ -1851,7 +2061,7 @@ mod tests {
 
     #[test]
     fn a_pre_versioned_baseline_payload_opens_verifies_and_extracts() {
-        // The already-published release assets carry none of the three fields
+        // The already-published release assets carry none of the bump's fields
         // and sit at footer version 1; a required CI preflight reads exactly
         // those, so they must keep opening.
         let roxyd = b"roxyd binary bytes";
@@ -1878,12 +2088,52 @@ mod tests {
             None
         );
 
+        // It binds no member list, so that one check has nothing to compare
+        // against and is skipped.
+        assert_eq!(payload.manifest().archive_members(), None);
+        // Re-serializing it emits no `archive_members` key and no `null`, so
+        // the wire form of a published asset is unchanged by this field.
+        let round_tripped =
+            serde_json::to_string(payload.manifest()).expect("serialization should succeed");
+        assert!(
+            !round_tripped.contains("archive_members"),
+            "got: {round_tripped}"
+        );
+        assert!(!round_tripped.contains("null"), "got: {round_tripped}");
+
         let dir = tempfile::tempdir().expect("tempdir");
         let extracted = payload
             .extract_to(dir.path())
             .expect("extraction should succeed");
         assert_eq!(extracted.len(), 1);
         assert_eq!(std::fs::read(dir.path().join("bin/roxyd")).unwrap(), roxyd);
+    }
+
+    #[test]
+    fn a_baseline_payload_still_rejects_a_member_its_manifest_does_not_name() {
+        // Skipping the member-list check disables nothing else: every
+        // pre-existing member and archive check still runs on the baseline
+        // path, so a member the manifest never named is refused exactly as it
+        // is on the current-format path.
+        let roxyd = b"roxyd binary bytes";
+        let json = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        let archive = zstd_tar(&[
+            Member::File {
+                path: "bin/roxyd",
+                bytes: roxyd,
+            },
+            Member::File {
+                path: "bin/stowaway",
+                bytes: b"attacker bytes",
+            },
+        ]);
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(error, PayloadError::MemberNotInManifest(ref path) if path == "bin/stowaway"),
+            "got: {error:?}"
+        );
+        assert!(!dir.path().join("bin/roxyd").exists());
     }
 
     #[test]
@@ -2081,10 +2331,7 @@ mod tests {
         // verified before the read fails — and must still not survive.
         let roxyd = b"roxyd binary bytes";
         let web = b"static web assets";
-        let json = manifest_json(vec![
-            artifact("bin/roxyd", roxyd),
-            artifact("assets/web.tar", web),
-        ]);
+        let json = manifest_json(&[("bin/roxyd", roxyd), ("assets/web.tar", web)]);
         let first = Member::File {
             path: "bin/roxyd",
             bytes: roxyd,
@@ -2143,7 +2390,7 @@ mod tests {
         let byte = tampered.get_mut(0).expect("non-empty");
         *byte ^= 0x01;
 
-        let json = manifest_json(vec![artifact("bin/roxyd", original)]);
+        let json = manifest_json(&[("bin/roxyd", original)]);
         let archive = zstd_tar(&[Member::File {
             path: "bin/roxyd",
             bytes: &tampered,
@@ -2161,7 +2408,7 @@ mod tests {
     #[test]
     fn truncated_trailer_is_rejected() {
         let bytes = b"payload bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[Member::File {
             path: "bin/roxyd",
             bytes,
@@ -2181,7 +2428,7 @@ mod tests {
     #[test]
     fn bad_footer_version_is_rejected() {
         let bytes = b"payload bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[Member::File {
             path: "bin/roxyd",
             bytes,
@@ -2222,7 +2469,7 @@ mod tests {
         // The manifest itself is valid (a safe path); the archive smuggles in a
         // member with an unsafe path. Extraction must reject the member on its
         // path, before it can be joined onto the extraction root.
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[Member::RawFile {
             path: "../escape",
             bytes,
@@ -2244,7 +2491,7 @@ mod tests {
         // exactly what the reader resolved — so this is a path defect, and the
         // normalization rule is what catches it.
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[
             Member::File {
                 path: "bin/roxyd",
@@ -2273,7 +2520,7 @@ mod tests {
         // Only the raw header field disagrees, and that disagreement is the
         // defect.
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[Member::GnuLongName {
             header_path: "harmless.txt",
             resolved_path: "bin/roxyd",
@@ -2301,7 +2548,7 @@ mod tests {
         // hash, so neither `UnsafeMemberPath` nor `UnsupportedEntryType` would
         // be true of it and a silent pass is exactly the hole.
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[Member::PaxPath {
             header_path: "harmless.txt",
             resolved_path: "bin/roxyd",
@@ -2333,7 +2580,7 @@ mod tests {
             path: "bin/roxyd",
             bytes: b"attacker bytes",
         }]);
-        let json = manifest_json(vec![artifact("bin/roxyd", &smuggled)]);
+        let json = manifest_json(&[("bin/roxyd", &smuggled)]);
         let archive = zstd_tar(&[Member::PaxSize {
             path: "bin/roxyd",
             header_size: 0,
@@ -2361,7 +2608,7 @@ mod tests {
         // would never see it, while a reader that keeps going finds a member
         // the manifest never named.
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let smuggled = tar_bytes(&[Member::File {
             path: "bin/stowaway",
             bytes: b"attacker bytes",
@@ -2390,7 +2637,7 @@ mod tests {
         // well-formed archive leaves exactly one block unread and that block
         // must not be mistaken for trailing content.
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar_with_trailing(
             &[Member::File {
                 path: "bin/roxyd",
@@ -2420,7 +2667,7 @@ mod tests {
         // next byte is trailing content even though it names no member and no
         // reader could resynchronize inside it.
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar_with_trailing(
             &[Member::File {
                 path: "bin/roxyd",
@@ -2444,10 +2691,7 @@ mod tests {
         // not survive the second's rejection.
         let roxyd = b"roxyd binary bytes";
         let web = b"static web assets";
-        let json = manifest_json(vec![
-            artifact("bin/roxyd", roxyd),
-            artifact("assets/web.tar", web),
-        ]);
+        let json = manifest_json(&[("bin/roxyd", roxyd), ("assets/web.tar", web)]);
         let archive = zstd_tar(&[
             Member::File {
                 path: "bin/roxyd",
@@ -2475,7 +2719,7 @@ mod tests {
         // a missing-destination I/O error — and leave nothing behind but, at
         // most, the empty directory itself.
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[Member::Symlink {
             path: "bin/roxyd",
             target: "/etc/passwd",
@@ -2510,10 +2754,7 @@ mod tests {
         // The manifest promises two artifacts, but the archive carries only one.
         // The absent one is neither extracted nor hash-verified, so extraction
         // must fail rather than silently return the shorter set.
-        let json = manifest_json(vec![
-            artifact("bin/roxyd", present),
-            artifact("bin/missing", b"absent bytes"),
-        ]);
+        let json = manifest_json(&[("bin/roxyd", present), ("bin/missing", b"absent bytes")]);
         let archive = zstd_tar(&[Member::File {
             path: "bin/roxyd",
             bytes: present,
@@ -2529,7 +2770,7 @@ mod tests {
     #[test]
     fn absolute_member_path_is_rejected() {
         let bytes = b"evil";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         let archive = zstd_tar(&[Member::RawFile {
             path: "/etc/evil",
             bytes,
@@ -2544,7 +2785,7 @@ mod tests {
 
     #[test]
     fn symlink_member_is_rejected() {
-        let json = manifest_json(vec![artifact("bin/roxyd", b"bytes")]);
+        let json = manifest_json(&[("bin/roxyd", b"bytes")]);
         let archive = zstd_tar(&[Member::Symlink {
             path: "bin/roxyd",
             target: "/etc/passwd",
@@ -2559,7 +2800,7 @@ mod tests {
 
     #[test]
     fn hardlink_member_is_rejected() {
-        let json = manifest_json(vec![artifact("bin/roxyd", b"bytes")]);
+        let json = manifest_json(&[("bin/roxyd", b"bytes")]);
         let archive = zstd_tar(&[Member::Hardlink {
             path: "bin/roxyd",
             target: "bin/other",
@@ -2574,7 +2815,7 @@ mod tests {
 
     #[test]
     fn char_device_member_is_rejected() {
-        let json = manifest_json(vec![artifact("bin/roxyd", b"bytes")]);
+        let json = manifest_json(&[("bin/roxyd", b"bytes")]);
         let archive = zstd_tar(&[Member::CharDevice { path: "bin/roxyd" }]);
 
         let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
@@ -2586,7 +2827,7 @@ mod tests {
 
     #[test]
     fn directory_member_is_rejected_as_non_regular() {
-        let json = manifest_json(vec![artifact("bin/roxyd", b"bytes")]);
+        let json = manifest_json(&[("bin/roxyd", b"bytes")]);
         let archive = zstd_tar(&[Member::Directory { path: "bin/" }]);
 
         let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
@@ -2598,7 +2839,7 @@ mod tests {
 
     #[test]
     fn member_absent_from_manifest_is_rejected() {
-        let json = manifest_json(vec![artifact("bin/roxyd", b"bytes")]);
+        let json = manifest_json(&[("bin/roxyd", b"bytes")]);
         // Archive holds a different, safe, regular file not named in the manifest.
         let archive = zstd_tar(&[Member::File {
             path: "bin/stowaway",
@@ -2616,7 +2857,7 @@ mod tests {
     #[test]
     fn duplicate_archive_member_is_rejected() {
         let bytes = b"roxyd binary bytes";
-        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let json = manifest_json(&[("bin/roxyd", bytes)]);
         // Two regular members share one `archive_path`; both even match the
         // manifest hash. A single manifest artifact must map to one member, so
         // the second occurrence is rejected rather than extracted twice.
@@ -2636,6 +2877,349 @@ mod tests {
             matches!(error, PayloadError::DuplicateMember(ref path) if path == "bin/roxyd"),
             "got: {error:?}"
         );
+    }
+
+    /// The two-member payload the member-list cases are built from, written by
+    /// this crate's own writer with nothing supplied by a caller.
+    fn two_member_binary(dir: &Path) -> Vec<u8> {
+        let inputs = vec![
+            input(
+                dir,
+                "roxyd.src",
+                "bin/roxyd",
+                ROXYD,
+                &[Disposition::Install],
+            ),
+            input(
+                dir,
+                "web.src",
+                "assets/web.tar",
+                WEB,
+                &[Disposition::Install],
+            ),
+        ];
+        build_binary(&inputs)
+    }
+
+    /// Bytes of the first member of [`two_member_binary`].
+    const ROXYD: &[u8] = b"roxyd binary bytes";
+
+    /// Bytes of its second member, of a different length.
+    const WEB: &[u8] = b"static web assets, of another length entirely";
+
+    #[test]
+    fn a_written_payload_binds_the_member_list_its_own_archive_presents() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = two_member_binary(src.path());
+
+        // The manifest block, read as a generic document, pins the on-disk
+        // shape rather than only the round trip: an array of `{name, length}`
+        // objects in archive order, each length the member's uncompressed byte
+        // length.
+        let (_, block, _) = trailer_parts(&binary);
+        let document: serde_json::Value =
+            serde_json::from_slice(block).expect("the manifest block decodes");
+        assert_eq!(
+            document.get("archive_members"),
+            Some(&serde_json::json!([
+                {"name": "bin/roxyd", "length": ROXYD.len()},
+                {"name": "assets/web.tar", "length": WEB.len()},
+            ]))
+        );
+
+        let mut payload = open(Cursor::new(binary))
+            .expect("reader should succeed")
+            .expect("trailer should be present");
+        assert_eq!(
+            payload.manifest().archive_members(),
+            Some(members_of(&[("bin/roxyd", ROXYD), ("assets/web.tar", WEB)]).as_slice())
+        );
+
+        // And the walk agrees with it, on bytes this crate's writer produced.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extracted = payload
+            .extract_to(dir.path())
+            .expect("extraction should succeed");
+        assert_eq!(extracted.len(), 2);
+    }
+
+    #[test]
+    fn a_member_name_disagreeing_with_the_bound_list_is_a_mismatch() {
+        // Only the bound name is touched; the archive is the one the writer
+        // produced, and its member is still named by the manifest's artifacts,
+        // so every per-member check passes.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = mutating_bound_members(&two_member_binary(src.path()), |members| {
+            let first = members.first_mut().expect("two bound members");
+            *first
+                .get_mut("name")
+                .expect("a bound member carries a name") = serde_json::json!("bin/other");
+        });
+        let (_, json, archive) = trailer_parts(&binary);
+        let (json, archive) = (json.to_vec(), archive.to_vec());
+
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(
+                error,
+                PayloadError::MemberListMismatch {
+                    index: 0,
+                    expected: Some(ref expected),
+                    found: Some(ref found),
+                } if expected.name == "bin/other" && found.name == "bin/roxyd"
+            ),
+            "got: {error:?}"
+        );
+        // The rendered message carries the position and both sides, so it is
+        // actionable without the list.
+        let message = error.to_string();
+        assert!(message.contains("position 0"), "got: {message}");
+        assert!(message.contains("bin/other"), "got: {message}");
+        assert!(message.contains("bin/roxyd"), "got: {message}");
+    }
+
+    #[test]
+    fn a_permuted_archive_is_a_mismatch() {
+        // The case nothing else in the crate catches: every member is a regular
+        // file at a safe, manifest-listed path, hashes correctly, appears once,
+        // and every artifact is seen. Only the order differs.
+        let entries: [(&str, &[u8]); 2] = [("bin/roxyd", ROXYD), ("assets/web.tar", WEB)];
+        let json = manifest_json(&entries);
+        let archive = zstd_tar(&[
+            Member::File {
+                path: "assets/web.tar",
+                bytes: WEB,
+            },
+            Member::File {
+                path: "bin/roxyd",
+                bytes: ROXYD,
+            },
+        ]);
+
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(
+                error,
+                PayloadError::MemberListMismatch {
+                    index: 0,
+                    expected: Some(ref expected),
+                    found: Some(ref found),
+                } if expected.name == "bin/roxyd" && found.name == "assets/web.tar"
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_member_count_disagreeing_with_the_bound_list_is_a_mismatch() {
+        let entries: [(&str, &[u8]); 2] = [("bin/roxyd", ROXYD), ("assets/web.tar", WEB)];
+        let both = zstd_tar(&[
+            Member::File {
+                path: "bin/roxyd",
+                bytes: ROXYD,
+            },
+            Member::File {
+                path: "assets/web.tar",
+                bytes: WEB,
+            },
+        ]);
+
+        // One member too many for the bound list. Both members are named by the
+        // manifest's artifacts, so nothing refuses either one individually.
+        let short = manifest_json_binding(&members_of(&entries[..1]), &entries);
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&short, &both);
+        assert!(
+            matches!(
+                error,
+                PayloadError::MemberListMismatch {
+                    index: 1,
+                    expected: None,
+                    found: Some(ref found),
+                } if found.name == "assets/web.tar"
+            ),
+            "got: {error:?}"
+        );
+
+        // One member too few: the bound list names a second member the manifest
+        // declares no artifact for, so the every-artifact-was-seen loop has
+        // nothing to say about it either.
+        let long = manifest_json_binding(&members_of(&entries), &entries[..1]);
+        let only_first = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: ROXYD,
+        }]);
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&long, &only_first);
+        assert!(
+            matches!(
+                error,
+                PayloadError::MemberListMismatch {
+                    index: 1,
+                    expected: Some(ref expected),
+                    found: None,
+                } if expected.name == "assets/web.tar"
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_recorded_length_disagreeing_is_a_mismatch() {
+        // The archive is exactly what the writer produced; one recorded length
+        // is off by one byte.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = mutating_bound_members(&two_member_binary(src.path()), |members| {
+            let second = members.get_mut(1).expect("two bound members");
+            let length = second
+                .get_mut("length")
+                .expect("a bound member carries a length");
+            *length = serde_json::json!(WEB.len() + 1);
+        });
+        let (_, json, archive) = trailer_parts(&binary);
+        let (json, archive) = (json.to_vec(), archive.to_vec());
+
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        let expected_len = WEB.len() as u64;
+        assert!(
+            matches!(
+                error,
+                PayloadError::MemberListMismatch {
+                    index: 1,
+                    expected: Some(ref expected),
+                    found: Some(ref found),
+                } if expected.length == expected_len + 1 && found.length == expected_len
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_on_the_last_member_leaves_the_destination_unchanged() {
+        // The first member is individually valid, hashes correctly and agrees
+        // with the bound list; the disagreement is only reachable once the
+        // whole archive has been walked. Deciding it before the publish loop is
+        // what keeps `dest` in the state every other rejection leaves it in.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = mutating_bound_members(&two_member_binary(src.path()), |members| {
+            let second = members.get_mut(1).expect("two bound members");
+            *second
+                .get_mut("name")
+                .expect("a bound member carries a name") = serde_json::json!("assets/other.tar");
+        });
+        let (_, json, archive) = trailer_parts(&binary);
+        let (json, archive) = (json.to_vec(), archive.to_vec());
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(error, PayloadError::MemberListMismatch { index: 1, .. }),
+            "got: {error:?}"
+        );
+        assert!(!dir.path().join("bin/roxyd").exists());
+        assert!(!dir.path().join("bin").exists());
+        assert!(!dir.path().join("assets").exists());
+    }
+
+    #[test]
+    fn a_header_length_the_stream_does_not_deliver_never_passes_silently() {
+        // The raw `ustar` header claims a whole block of data and the stream
+        // stops after 18 bytes, so the header's size and the bytes the reader
+        // consumes disagree while nothing overrides anything: `entry.size()`
+        // and the header field are the same number, and the manifest binds it.
+        // A comparison that trusted that number would pass this; one made from
+        // the bytes actually consumed cannot. Which layer says so is not the
+        // point: the `tar` reader refuses to resynchronize on a stream that
+        // ends inside a member, and if it ever stopped doing that the byte
+        // count would be the disagreement the comparison reports.
+        let declared = TAR_BLOCK_SIZE as u64;
+        let header = raw_regular_header("bin/roxyd", declared);
+        let mut stream = header.as_bytes().to_vec();
+        stream.extend_from_slice(ROXYD);
+        let archive = zstd_compress(&stream);
+        let json = manifest_json_binding(
+            &[ArchiveMember {
+                name: "bin/roxyd".to_string(),
+                length: declared,
+            }],
+            &[("bin/roxyd", ROXYD)],
+        );
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(
+                error,
+                PayloadError::MemberListMismatch { .. } | PayloadError::Io(_)
+            ),
+            "got: {error:?}"
+        );
+        assert!(!dir.path().join("bin/roxyd").exists());
+    }
+
+    #[test]
+    fn a_versioned_manifest_binding_no_member_list_is_refused_by_both_doors() {
+        // Through the container read path, where it rides the existing
+        // `InvalidManifest` channel and needs no payload-layer variant of its
+        // own...
+        let json =
+            String::from_utf8(manifest_json(&[("bin/roxyd", ROXYD)])).expect("fixture is utf-8");
+        let start = json
+            .find(r#""archive_members""#)
+            .expect("the key is written");
+        let end = json
+            .find(r#""artifacts""#)
+            .expect("the artifacts follow it");
+        let stripped = format!("{}{}", &json[..start], &json[end..]).into_bytes();
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: ROXYD,
+        }]);
+        let footer = valid_footer(BASE.len(), &stripped, &archive);
+        let binary = assemble(BASE, &stripped, &archive, &footer);
+
+        let error =
+            open(Cursor::new(binary)).expect_err("a versioned manifest must bind a member list");
+        assert!(
+            matches!(
+                error,
+                PayloadError::InvalidManifest(ManifestError::MissingArchiveMembers)
+            ),
+            "got: {error:?}"
+        );
+
+        // ...and through plain deserialization of the same manifest block, so
+        // neither door is laxer than the other.
+        let error = serde_json::from_slice::<PayloadManifest>(&stripped)
+            .expect_err("the serde door must be no laxer");
+        assert!(
+            error.to_string().contains("archive_members"),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_rewrapped_container_copies_the_manifest_block_verbatim() {
+        // A graft leaves the archive block untouched, so the member list needs
+        // no recomputation: the rewrapped manifest block must be byte-identical
+        // to its source's, and the rewrapped container must still read back
+        // through the member-list check.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let asset = two_member_binary(src.path());
+        let new_base: &[u8] = b"a freshly built base binary, of a different length entirely";
+        assert_ne!(new_base.len(), BASE.len());
+
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(Cursor::new(&asset), Cursor::new(new_base), &mut rewrapped)
+            .expect("rewrap should succeed");
+        let (_, source_block, _) = trailer_parts(&asset);
+        let (_, rewrapped_block, _) = trailer_parts(&rewrapped);
+        assert_eq!(source_block, rewrapped_block);
+
+        let mut payload = open(Cursor::new(rewrapped))
+            .expect("the rewrapped container must open")
+            .expect("trailer should be present");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extracted = payload
+            .extract_to(dir.path())
+            .expect("the rewrapped container reads back with no mismatch");
+        assert_eq!(extracted.len(), 2);
     }
 
     #[test]
