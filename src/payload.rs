@@ -8,7 +8,13 @@
 //!
 //! # On-disk layout
 //!
-//! From the start of the appended region to end-of-file:
+//! The same container is read whether it rides on a base executable or not. A
+//! self-contained release asset is `base ‖ trailer`; a **`.pkg` module package**
+//! is the very same trailer with **no base**, so its manifest block starts at
+//! offset `0`. One reader serves both (see [`open`] and [`open_package`]).
+//!
+//! From the start of the appended region to end-of-file, the trailer holds four
+//! kinds of block followed by the footer:
 //!
 //! 1. **Manifest block** — a [`PayloadManifest`] serialized as JSON.
 //! 2. **Archive block** — a `tar` archive of the artifact files (each member
@@ -17,26 +23,61 @@
 //!    one is — is stated by the manifest's `archive_members`, which the reader
 //!    compares the sequence it walked against rather than reconstructing it
 //!    from the per-artifact entries.
-//! 3. **Footer** — a fixed-size record at the very end of the file with an
-//!    exact binary layout (see [`FOOTER_SIZE`]): the [`MAGIC`] bytes, a `u8`
-//!    format version ([`FORMAT_VERSION`]), then four `u64` little-endian fields
-//!    — the manifest and archive absolute file offsets and lengths, in that
-//!    order.
+//! 3. **Signature block** — the detached signature over the container, absent
+//!    in everything this build writes (see [`Payload::signature`]).
+//! 4. **`key_id` block** — the identifier of the key that signature was made
+//!    with, absent alongside it (see [`Payload::key_id`]).
+//! 5. **Footer** — a fixed-size record at the very end of the file with an
+//!    exact binary layout: the [`MAGIC`] bytes (8), a `u8` container format
+//!    version, then **eight** `u64` little-endian fields — the manifest,
+//!    archive, signature and `key_id` absolute file offsets and lengths, in
+//!    that order. At the current [`FORMAT_VERSION`] that is [`FOOTER_SIZE`] =
+//!    73 bytes; a version-1 footer stops after the archive pair and is 41.
 //!
-//! The footer makes the trailer locatable: the reader seeks to
-//! `file_len - FOOTER_SIZE`, checks the magic, then uses the recorded offsets.
+//! ## Absent blocks
+//!
+//! Only the signature and `key_id` pairs may be absent, and **absent is the
+//! all-zero pair**: offset `0` *and* length `0`. Present means a non-zero
+//! length at an offset inside the trailer body. A half-zero pair — one of the
+//! two zero and the other not — is [`PayloadError::MalformedFooter`], never
+//! read as either state: zero is a legal offset in this layout, since a `.pkg`
+//! has no base and its manifest block therefore starts at `0`.
+//!
+//! Present blocks sit in the order above, adjacent: the first starts at the
+//! trailer body's start, each subsequent one starts exactly where the previous
+//! present block ended, and the last ends exactly where the footer begins. An
+//! absent pair occupies no bytes, so the walk steps over it — which is why an
+//! unsigned container, whose archive block is the last present block, is valid.
+//! A gap, an overlap, or a last present block that stops short of the footer is
+//! [`PayloadError::MalformedFooter`].
+//!
+//! ## Locating the footer
+//!
+//! Two footer sizes exist, so the reader probes: it walks the known sizes in
+//! **ascending order** (41 paired with version 1, then 73 with version 2),
+//! reading a candidate at `file_len - size` and skipping any size the file is
+//! shorter than. A candidate is *selected* only when its [`MAGIC`] matches and
+//! its version byte equals the version that size belongs to; the walk stops
+//! there, and every later check validates that candidate rather than sending
+//! the walk on. Ascending order is what makes both directions safe, and the
+//! reasons are stated beside the size list in this module's source.
 //!
 //! # Empty payload versus corrupt trailer
 //!
-//! A file shorter than [`FOOTER_SIZE`], or whose trailing [`FOOTER_SIZE`] bytes
-//! do not match [`MAGIC`], is an **empty payload** — the normal state of an
-//! ordinary binary with no trailer, reported as `Ok(None)` rather than an
-//! error. Once the magic matches, any further problem (unrecognized version,
-//! offsets outside the file, unparseable manifest, hash mismatch, unsafe or
-//! unknown archive member) is a [`PayloadError`].
+//! A file in which no probed candidate is a footer is an **empty payload** —
+//! the normal state of an ordinary binary with no trailer, reported as
+//! `Ok(None)` from [`open`] and as [`PayloadError::NoTrailer`] from
+//! [`open_package`], for which a missing trailer is a broken package. A
+//! candidate whose [`MAGIC`] matches under a version byte naming no version
+//! this build implements is instead
+//! [`PayloadError::UnsupportedContainerFormat`], decided once the whole list
+//! has been walked with nothing selected. Past a selected footer, any further
+//! problem (offsets outside the file, a malformed block layout, an unparseable
+//! manifest, a hash mismatch, an unsafe or unknown archive member) is a
+//! [`PayloadError`].
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -56,12 +97,100 @@ pub const MAGIC: [u8; 8] = *b"BTLRPYLD";
 /// Length of [`MAGIC`] in bytes.
 const MAGIC_LEN: usize = MAGIC.len();
 
-/// Current trailer format version.
-pub const FORMAT_VERSION: u8 = 1;
+/// Current container format version.
+///
+/// This versions the **container layout** — which offset/length pairs the
+/// footer carries and in what order — and nothing else. The manifest's own
+/// `format_version` versions the manifest schema and is gated separately by
+/// [`PayloadManifest::parse`], so adding a manifest field is not a container
+/// change and a container change is not a manifest one.
+pub const FORMAT_VERSION: u8 = 2;
 
-/// Total size of the footer in bytes: [`MAGIC`] (8) + version (1) + four `u64`
-/// fields (32) = 41.
-pub const FOOTER_SIZE: usize = MAGIC_LEN + 1 + 4 * 8;
+/// Footer size of a version-1 container: [`MAGIC`] (8) + version (1) + four
+/// `u64` fields (32).
+const FOOTER_SIZE_V1: usize = MAGIC_LEN + 1 + 4 * 8;
+
+/// Footer size of a version-2 container: [`MAGIC`] (8) + version (1) + eight
+/// `u64` fields (64).
+const FOOTER_SIZE_V2: usize = MAGIC_LEN + 1 + 8 * 8;
+
+/// Total size of the footer of a container written at [`FORMAT_VERSION`], in
+/// bytes: [`MAGIC`] (8) + version (1) + eight `u64` fields (64) = 73.
+///
+/// This names the **current** version's size only. A reader must not seek to
+/// `file_len - FOOTER_SIZE`; it walks the module's ordered list of known
+/// footer sizes, which is where the sizes of every version this build still
+/// opens are stated.
+pub const FOOTER_SIZE: usize = FOOTER_SIZE_V2;
+
+/// First container version whose footer carries the signature and `key_id`
+/// pairs.
+///
+/// A footer written at any earlier version stops after the archive pair, so
+/// its two envelope pairs are read as absent rather than from bytes that are
+/// not there.
+const FIRST_ENVELOPE_VERSION: u8 = 2;
+
+/// One entry of the footer-size probe: a footer size and the single container
+/// version a footer of that size records.
+struct FooterSize {
+    /// Total size of the footer in bytes.
+    bytes: usize,
+    /// Container version this size belongs to. A candidate at this size is
+    /// selected only when its version byte equals this.
+    version: u8,
+}
+
+/// The footer sizes this build knows, **in ascending size order**, one entry
+/// per container version it implements.
+///
+/// Order is part of the format, not an implementation detail, and both
+/// directions of the walk rest on this layout's arithmetic rather than on a
+/// probability argument:
+///
+/// - In a **version-1** payload the 73-byte candidate offset falls inside the
+///   archive block, whose bytes are artifact content and can carry [`MAGIC`]
+///   followed by any byte at all — including `2`, which pairs with 73 and
+///   would therefore be selected, sending the reader off a fabricated footer's
+///   offsets. Reading 41 first means the real footer is selected before that
+///   candidate is ever read.
+/// - In a **version-2** container the 41-byte candidate offset falls inside the
+///   footer's own field region: `file_len - 41` is the most significant byte of
+///   `archive_offset`, so the candidate's first magic byte could only be `0x42`
+///   (`B`) in a container of at least `0x42 << 56` bytes — about 4.7 exabytes.
+///   Below that bound the walk falls through to 73 and finds the real footer.
+///
+/// This list is the format's compatibility surface: a footer whose [`MAGIC`]
+/// lands at no probed offset is indistinguishable from absent, so every future
+/// container version must be inserted here at its ascending position — and its
+/// ordering argument re-checked at the same time, since what protects a
+/// smaller probed offset is that it lands inside a larger real footer's field
+/// region, on a byte that cannot be `0x42`.
+const KNOWN_FOOTER_SIZES: [FooterSize; 2] = [
+    FooterSize {
+        bytes: FOOTER_SIZE_V1,
+        version: 1,
+    },
+    FooterSize {
+        bytes: FOOTER_SIZE_V2,
+        version: FORMAT_VERSION,
+    },
+];
+
+/// Container versions this build implements, in [`KNOWN_FOOTER_SIZES`] order.
+///
+/// Derived from the probe list rather than restated, so adding a footer size
+/// cannot leave [`PayloadError::UnsupportedContainerFormat`] announcing the old
+/// set.
+const SUPPORTED_CONTAINER_VERSIONS: [u8; KNOWN_FOOTER_SIZES.len()] = {
+    let mut versions = [0u8; KNOWN_FOOTER_SIZES.len()];
+    let mut index = 0;
+    while index < KNOWN_FOOTER_SIZES.len() {
+        versions[index] = KNOWN_FOOTER_SIZES[index].version;
+        index += 1;
+    }
+    versions
+};
 
 /// zstd compression level used by the writer.
 const ZSTD_LEVEL: i32 = 3;
@@ -102,18 +231,41 @@ pub enum PayloadError {
     #[error("invalid payload manifest: {0}")]
     InvalidManifest(#[from] ManifestError),
 
-    /// The footer recorded a format version this build does not understand.
-    #[error("unrecognized trailer format version {found} (expected {expected})")]
-    UnsupportedVersion {
-        /// Version read from the footer.
+    /// The footer recorded a container format version this build does not
+    /// implement.
+    ///
+    /// Raised exactly when no probed candidate was a footer and at least one
+    /// of them matched [`MAGIC`] under a version byte naming no version this
+    /// build implements — the only signal a newer container format can give a
+    /// reader that cannot even locate its manifest. Every other no-footer
+    /// outcome is "this file carries no trailer", resolved per entry point.
+    #[error("unrecognized container format version {found} (this build implements {})", describe_versions(.supported))]
+    UnsupportedContainerFormat {
+        /// Version read from the candidate footer. When several candidates
+        /// carried an unknown version, this is the first in probe order.
         found: u8,
-        /// Version this build understands.
-        expected: u8,
+        /// Container versions this build implements, in the probe list's
+        /// ascending order.
+        supported: &'static [u8],
     },
 
     /// The footer's offsets or lengths point outside the file.
     #[error("trailer offsets point outside the file (truncated trailer)")]
     TruncatedTrailer,
+
+    /// The footer's block layout is internally inconsistent: a half-zero
+    /// signature or `key_id` pair, or present blocks that do not sit adjacent
+    /// in the fixed order and end where the footer begins.
+    ///
+    /// Distinct from [`PayloadError::TruncatedTrailer`], which is about blocks
+    /// falling outside the file rather than about how they sit inside it, and
+    /// from "no trailer": the footer was selected, so this is a corrupt
+    /// container and never a file that simply carries no trailer.
+    #[error("malformed trailer footer: {reason}")]
+    MalformedFooter {
+        /// What about the block layout was rejected.
+        reason: &'static str,
+    },
 
     /// The manifest block failed to parse.
     #[error("failed to parse payload manifest: {0}")]
@@ -246,6 +398,16 @@ pub enum PayloadError {
     NoTrailer,
 }
 
+/// Renders the container versions a build implements for
+/// [`PayloadError::UnsupportedContainerFormat`]'s message, as `1, 2`.
+fn describe_versions(versions: &[u8]) -> String {
+    versions
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Renders one side of a [`PayloadError::MemberListMismatch`], where absence
 /// means the sequence ended before the position under comparison.
 fn describe_member(member: Option<&ArchiveMember>) -> String {
@@ -307,16 +469,32 @@ pub struct ExtractedArtifact {
 }
 
 /// The parsed footer of a trailer. Fields are absolute file offsets/lengths.
+///
+/// A footer read at a version below [`FIRST_ENVELOPE_VERSION`] carries no
+/// signature or `key_id` fields on the wire; they are filled in here with the
+/// all-zero absent encoding, so the rest of the reader treats an old container
+/// as an unsigned one rather than as a special case.
 struct Footer {
     version: u8,
     manifest_offset: u64,
     manifest_len: u64,
     archive_offset: u64,
     archive_len: u64,
+    signature_offset: u64,
+    signature_len: u64,
+    key_id_offset: u64,
+    key_id_len: u64,
 }
 
 impl Footer {
-    /// Encodes the footer to its exact [`FOOTER_SIZE`]-byte wire form.
+    /// Encodes the footer to the exact wire form of **its own** `version`.
+    ///
+    /// The size is a function of the version, not of [`FORMAT_VERSION`]: a
+    /// version-1 footer stops after the archive pair and is [`FOOTER_SIZE_V1`]
+    /// bytes, which is what lets a version-1 payload be rewrapped as a
+    /// version-1 payload. Writing the two extra pairs into it would move its
+    /// magic 32 bytes away from where the probe pairs that version's size with,
+    /// and the container would no longer open at all.
     fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(FOOTER_SIZE);
         buf.extend_from_slice(&MAGIC);
@@ -325,52 +503,298 @@ impl Footer {
         buf.extend_from_slice(&self.manifest_len.to_le_bytes());
         buf.extend_from_slice(&self.archive_offset.to_le_bytes());
         buf.extend_from_slice(&self.archive_len.to_le_bytes());
+        if self.version >= FIRST_ENVELOPE_VERSION {
+            buf.extend_from_slice(&self.signature_offset.to_le_bytes());
+            buf.extend_from_slice(&self.signature_len.to_le_bytes());
+            buf.extend_from_slice(&self.key_id_offset.to_le_bytes());
+            buf.extend_from_slice(&self.key_id_len.to_le_bytes());
+        }
         buf
     }
 }
 
-/// Reads a little-endian `u64` from `reader`.
-fn read_u64<R: Read>(reader: &mut R) -> std::io::Result<u64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
+/// Whether an offset/length pair carries the all-zero absent encoding.
+///
+/// The two fields are read as a unit because zero is a legal offset in this
+/// layout — a `.pkg` has no base executable, so its manifest block starts at
+/// `0` — which is why a half-zero pair is malformed rather than absent.
+fn is_absent_pair(offset: u64, len: u64) -> bool {
+    offset == 0 && len == 0
 }
 
-/// Parses a candidate footer.
+/// Cursor over a candidate footer's field region, handing out its little-endian
+/// `u64`s in wire order.
+struct FieldReader<'a> {
+    bytes: &'a [u8],
+    next: usize,
+}
+
+impl<'a> FieldReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            next: MAGIC_LEN + 1,
+        }
+    }
+
+    /// Returns the next field, or `None` once the region is exhausted.
+    fn next_u64(&mut self) -> Option<u64> {
+        let end = self.next.checked_add(8)?;
+        let field: [u8; 8] = self.bytes.get(self.next..end)?.try_into().ok()?;
+        self.next = end;
+        Some(u64::from_le_bytes(field))
+    }
+}
+
+/// What one probed candidate turned out to be.
 ///
-/// Returns `Ok(None)` when the magic does not match (an empty payload), or the
-/// parsed [`Footer`] once the magic and version check out.
-fn parse_footer(bytes: &[u8]) -> Result<Option<Footer>, PayloadError> {
-    let mut cursor = Cursor::new(bytes);
+/// Inspecting a candidate raises nothing: all four outcomes are ordinary return
+/// values, because an unknown version byte at one probed offset must be
+/// recorded while the walk continues to the next size rather than ending it.
+enum Candidate {
+    /// The bytes at this offset do not begin with [`MAGIC`] — or, unreachably,
+    /// the candidate region was too short to hold the fields its size promises,
+    /// which the probe's own sizing rules out.
+    NoMagic,
+    /// [`MAGIC`] under the version this candidate's size is paired with: a
+    /// footer, and the one thing the walk stops at.
+    Selected(Footer),
+    /// [`MAGIC`] under a version this build implements but which belongs to a
+    /// *different* footer size. Neither a footer nor an unknown format, so the
+    /// walk ignores it: a magic-plus-known-version byte pattern at a fixed
+    /// distance from end-of-file is a coincidence any archive block can carry.
+    Mismatched,
+    /// [`MAGIC`] under a version this build does not implement.
+    Unknown(u8),
+}
 
-    let mut magic = [0u8; MAGIC_LEN];
-    cursor.read_exact(&mut magic)?;
-    if magic != MAGIC {
-        return Ok(None);
+/// Classifies the candidate footer `bytes` read at the offset [`FooterSize`]
+/// `size` names, without deciding anything else about the container.
+fn classify_candidate(bytes: &[u8], size: &FooterSize) -> Candidate {
+    if bytes.get(..MAGIC_LEN) != Some(MAGIC.as_slice()) {
+        return Candidate::NoMagic;
+    }
+    let Some(&version) = bytes.get(MAGIC_LEN) else {
+        return Candidate::NoMagic;
+    };
+    if version != size.version {
+        return if SUPPORTED_CONTAINER_VERSIONS.contains(&version) {
+            Candidate::Mismatched
+        } else {
+            Candidate::Unknown(version)
+        };
     }
 
-    let mut version_buf = [0u8; 1];
-    cursor.read_exact(&mut version_buf)?;
-    let [version] = version_buf;
-    if version != FORMAT_VERSION {
-        return Err(PayloadError::UnsupportedVersion {
-            found: version,
-            expected: FORMAT_VERSION,
-        });
-    }
+    let mut fields = FieldReader::new(bytes);
+    let (Some(manifest_offset), Some(manifest_len), Some(archive_offset), Some(archive_len)) = (
+        fields.next_u64(),
+        fields.next_u64(),
+        fields.next_u64(),
+        fields.next_u64(),
+    ) else {
+        return Candidate::NoMagic;
+    };
+    let (signature_offset, signature_len, key_id_offset, key_id_len) = if version
+        >= FIRST_ENVELOPE_VERSION
+    {
+        let (Some(signature_offset), Some(signature_len), Some(key_id_offset), Some(key_id_len)) = (
+            fields.next_u64(),
+            fields.next_u64(),
+            fields.next_u64(),
+            fields.next_u64(),
+        ) else {
+            return Candidate::NoMagic;
+        };
+        (signature_offset, signature_len, key_id_offset, key_id_len)
+    } else {
+        // A pre-envelope footer records neither pair, which is exactly the
+        // absent encoding.
+        (0, 0, 0, 0)
+    };
 
-    let manifest_offset = read_u64(&mut cursor)?;
-    let manifest_len = read_u64(&mut cursor)?;
-    let archive_offset = read_u64(&mut cursor)?;
-    let archive_len = read_u64(&mut cursor)?;
-
-    Ok(Some(Footer {
+    Candidate::Selected(Footer {
         version,
         manifest_offset,
         manifest_len,
         archive_offset,
         archive_len,
-    }))
+        signature_offset,
+        signature_len,
+        key_id_offset,
+        key_id_len,
+    })
+}
+
+/// Where the probe left off once the whole of [`KNOWN_FOOTER_SIZES`] had been
+/// walked.
+enum Located {
+    /// A candidate was selected: the container's footer, and the absolute
+    /// offset its own bytes start at.
+    Found { footer: Footer, footer_start: u64 },
+    /// No candidate was a footer and none carried an unknown version, so the
+    /// file carries no trailer. What that means is the caller's to decide: an
+    /// empty payload for [`open`], [`PayloadError::NoTrailer`] for
+    /// [`open_package`] and [`rewrap_trailer`], and the whole file as its own
+    /// base for [`read_base_executable`].
+    NoTrailer,
+}
+
+/// Locates the container's footer in `src` by walking [`KNOWN_FOOTER_SIZES`] in
+/// ascending size order.
+///
+/// This is the one implementation every entry point locates a footer through,
+/// and the one place [`PayloadError::UnsupportedContainerFormat`] is
+/// constructed. Selection is the only decision made here: an offsets check, the
+/// block-layout walk and the manifest parse all validate an already-selected
+/// candidate, and their failures never send the walk to another size — a probe
+/// that re-entered the walk on a validation failure would report a genuinely
+/// corrupt footer as "no trailer".
+///
+/// # Errors
+///
+/// Returns [`PayloadError::UnsupportedContainerFormat`] when nothing was
+/// selected and some candidate matched [`MAGIC`] under a version this build
+/// does not implement, or [`PayloadError::Io`] when a candidate cannot be read.
+fn locate_footer<R: Read + Seek>(src: &mut R, file_len: u64) -> Result<Located, PayloadError> {
+    // The first unknown version seen, in probe order — the smallest size, the
+    // offset nearest end-of-file. Recorded once and never overwritten, so which
+    // value the error reports is fixed by the format rather than by which
+    // candidate an implementation happened to look at last.
+    let mut first_unknown: Option<u8> = None;
+
+    for size in &KNOWN_FOOTER_SIZES {
+        let size_bytes = size.bytes as u64;
+        if file_len < size_bytes {
+            continue;
+        }
+        let candidate_start = file_len - size_bytes;
+        src.seek(SeekFrom::Start(candidate_start))?;
+        let mut bytes = vec![0u8; size.bytes];
+        src.read_exact(&mut bytes)?;
+
+        match classify_candidate(&bytes, size) {
+            Candidate::Selected(footer) => {
+                return Ok(Located::Found {
+                    footer,
+                    footer_start: candidate_start,
+                });
+            }
+            Candidate::Unknown(version) => {
+                first_unknown.get_or_insert(version);
+            }
+            Candidate::NoMagic | Candidate::Mismatched => {}
+        }
+    }
+
+    // Classification happens here and nowhere else: only now is it settled that
+    // no later size held the real footer.
+    match first_unknown {
+        Some(found) => Err(PayloadError::UnsupportedContainerFormat {
+            found,
+            supported: &SUPPORTED_CONTAINER_VERSIONS,
+        }),
+        None => Ok(Located::NoTrailer),
+    }
+}
+
+/// Checks that a selected footer's blocks fall inside the file and sit adjacent
+/// in the fixed order.
+///
+/// Three checks, in the order their errors are decided:
+///
+/// 1. Neither envelope pair is half-zero — the absent encoding is all-zero, and
+///    a pair that is half of it is neither present nor absent.
+/// 2. Every block ends at or before `footer_start`, so nothing points outside
+///    the file.
+/// 3. The **present** blocks — manifest, archive, then whichever of the
+///    signature and `key_id` are present — start at the trailer body's start,
+///    each where the previous one ended, and the last ends exactly at
+///    `footer_start`. An absent pair occupies no bytes and is stepped over.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::MalformedFooter`] for a half-zero pair or a gap,
+/// overlap or short final block, and [`PayloadError::TruncatedTrailer`] when a
+/// block runs past the footer or an offset plus length overflows.
+fn validate_footer(footer: &Footer, footer_start: u64) -> Result<(), PayloadError> {
+    // Only the two envelope pairs have an absent encoding; the manifest and the
+    // archive are always present, so an all-zero pair there is a layout to be
+    // checked rather than a block to be stepped over.
+    let signature_present = envelope_present(
+        footer.signature_offset,
+        footer.signature_len,
+        "signature pair is half-zero: neither present nor absent",
+    )?;
+    let key_id_present = envelope_present(
+        footer.key_id_offset,
+        footer.key_id_len,
+        "key_id pair is half-zero: neither present nor absent",
+    )?;
+
+    let blocks = [
+        (footer.manifest_offset, footer.manifest_len, true),
+        (footer.archive_offset, footer.archive_len, true),
+        (
+            footer.signature_offset,
+            footer.signature_len,
+            signature_present,
+        ),
+        (footer.key_id_offset, footer.key_id_len, key_id_present),
+    ];
+
+    let end_of = |offset: u64, len: u64| {
+        offset
+            .checked_add(len)
+            .ok_or(PayloadError::TruncatedTrailer)
+    };
+    for (offset, len, _) in blocks {
+        if end_of(offset, len)? > footer_start {
+            return Err(PayloadError::TruncatedTrailer);
+        }
+    }
+
+    // The trailer body starts where the manifest block does: a container's base
+    // executable, if it has one, is exactly the prefix before it.
+    let mut cursor = footer.manifest_offset;
+    for (offset, len, present) in blocks {
+        if !present {
+            continue;
+        }
+        if offset != cursor {
+            return Err(PayloadError::MalformedFooter {
+                reason: "trailer blocks are not adjacent in the fixed order",
+            });
+        }
+        cursor = end_of(offset, len)?;
+    }
+    if cursor != footer_start {
+        return Err(PayloadError::MalformedFooter {
+            reason: "the last present block does not end where the footer begins",
+        });
+    }
+
+    Ok(())
+}
+
+/// Resolves one envelope pair to whether the block it describes is present,
+/// refusing the half-zero spelling that is neither state.
+///
+/// The two fields are read as a unit because zero is a legal offset in this
+/// layout: a `.pkg` has no base executable, so its manifest block starts at
+/// `0`, and "offset zero" therefore cannot on its own mean "no block".
+///
+/// # Errors
+///
+/// Returns [`PayloadError::MalformedFooter`] carrying `reason` when one field
+/// is zero and the other is not.
+fn envelope_present(offset: u64, len: u64, reason: &'static str) -> Result<bool, PayloadError> {
+    if is_absent_pair(offset, len) {
+        Ok(false)
+    } else if offset == 0 || len == 0 {
+        Err(PayloadError::MalformedFooter { reason })
+    } else {
+        Ok(true)
+    }
 }
 
 /// Computes the lowercase hex SHA-256 of `bytes`.
@@ -473,7 +897,13 @@ impl<W: Write> Write for CountingWriter<W> {
 ///
 /// The manifest's `format_version` is stamped from
 /// [`MANIFEST_FORMAT_VERSION`](crate::manifest::MANIFEST_FORMAT_VERSION) with no
-/// caller-supplied value.
+/// caller-supplied value, and the container's own [`FORMAT_VERSION`] into the
+/// footer. Both envelope pairs — signature and `key_id` — are written absent.
+///
+/// Passing an empty `base` (for example [`std::io::empty`]) writes a **`.pkg`
+/// module package**: the same container with no base executable, whose manifest
+/// block therefore starts at offset `0`. It is read back with
+/// [`open_package`], not [`open`].
 ///
 /// The ordered archive member list the manifest binds is derived here too, in
 /// `inputs` order, from the same pre-pass that computes each artifact's
@@ -580,30 +1010,52 @@ pub fn append_trailer<B: Read, W: Write>(
         counter.count()
     };
 
+    // Both envelope pairs are written all-zero: producing a signature is later
+    // work, and the layout's one encoding for a block that does not exist is
+    // offset `0` with length `0`. Nothing here can fill them, and a placeholder
+    // that looked present would be worse than an absent one.
     let footer = Footer {
         version: FORMAT_VERSION,
         manifest_offset,
         manifest_len,
         archive_offset,
         archive_len,
+        signature_offset: 0,
+        signature_len: 0,
+        key_id_offset: 0,
+        key_id_len: 0,
     };
     out.write_all(&footer.encode())?;
     Ok(())
 }
 
 /// Copies an existing payload's trailer verbatim onto a different base binary,
-/// rewriting only the footer's two absolute offsets by the base-length delta.
+/// rewriting every present block's absolute offset by the base-length delta.
 ///
 /// A self-contained release asset is a base executable with a trailer appended
 /// (`base | manifest | archive | footer`). To run a CI-built `bootler-security`
 /// against the operator's frozen payload, the payload trailer must be grafted
 /// onto that fresh base. Rather than re-extracting and re-hashing the (GB-scale)
-/// payload, this streams the source's trailer body (`manifest | archive`)
-/// straight onto `new_base`, then writes a fresh footer whose `manifest_offset`
-/// and `archive_offset` are shifted by `new_base_len - old_base_len`; the two
-/// lengths are unchanged. The archive bytes and their manifest SHA-256s stay
+/// payload, this streams the source's trailer body — the present blocks in
+/// their fixed order, which adjacency makes one contiguous run from the
+/// manifest to the footer — straight onto `new_base`, then writes a fresh footer
+/// whose **present** offsets are each shifted by `new_base_len - old_base_len`;
+/// every length is unchanged. The archive bytes and their manifest SHA-256s stay
 /// byte-identical, so the reader still hash-verifies every artifact — a caller
 /// can confirm the graft by re-opening the output with [`open`].
+///
+/// An **absent** signature or `key_id` pair is carried across untouched, still
+/// exactly all-zero. Adding the delta to it would make offset `0` a non-zero
+/// offset beside a zero length — a half-zero pair, which the reader refuses as
+/// [`PayloadError::MalformedFooter`] — so a blind shift would turn every
+/// unsigned container, which is every container this crate writes, into a
+/// malformed one.
+///
+/// The body is copied **verbatim** and the manifest is never re-serialized, so
+/// the manifest block is byte-identical across the graft: that is what will let
+/// a signature computed over those bytes survive a rewrap once signing lands.
+/// The source footer's own `version` is written back rather than the current
+/// one, so a version-1 payload stays a version-1 payload — footer size and all.
 ///
 /// `source` must carry a trailer; `new_base` is streamed first, then the copied
 /// trailer body, then the rewritten footer, so a GB-scale payload never resides
@@ -619,9 +1071,12 @@ pub fn append_trailer<B: Read, W: Write>(
 /// # Errors
 ///
 /// Returns [`PayloadError::NoTrailer`] when `source` carries no trailer,
-/// [`PayloadError::UnsupportedVersion`] for an unrecognized footer version,
+/// [`PayloadError::UnsupportedContainerFormat`] when a probed candidate's magic
+/// matched under a container version this build does not implement,
 /// [`PayloadError::TruncatedTrailer`] when the footer's offsets fall outside
-/// `source`, or [`PayloadError::Io`] on any read or write failure.
+/// `source`, [`PayloadError::MalformedFooter`] when its blocks do not sit
+/// adjacent in order or an envelope pair is half-zero, or [`PayloadError::Io`]
+/// on any read or write failure.
 pub fn rewrap_trailer<S, B, W>(
     mut source: S,
     mut new_base: B,
@@ -633,34 +1088,22 @@ where
     W: Write,
 {
     let source_len = source.seek(SeekFrom::End(0))?;
-    let footer_size = FOOTER_SIZE as u64;
-    if source_len < footer_size {
-        return Err(PayloadError::NoTrailer);
-    }
-
-    let footer_start = source_len - footer_size;
-    source.seek(SeekFrom::Start(footer_start))?;
-    let mut footer_bytes = vec![0u8; FOOTER_SIZE];
-    source.read_exact(&mut footer_bytes)?;
-    let Some(footer) = parse_footer(&footer_bytes)? else {
+    let Located::Found {
+        footer,
+        footer_start,
+    } = locate_footer(&mut source, source_len)?
+    else {
         return Err(PayloadError::NoTrailer);
     };
 
-    // Validate the source footer's offsets before trusting them (mirrors `open`).
-    let manifest_end = footer
-        .manifest_offset
-        .checked_add(footer.manifest_len)
-        .ok_or(PayloadError::TruncatedTrailer)?;
-    let archive_end = footer
-        .archive_offset
-        .checked_add(footer.archive_len)
-        .ok_or(PayloadError::TruncatedTrailer)?;
-    if manifest_end > footer_start || archive_end > footer_start {
-        return Err(PayloadError::TruncatedTrailer);
-    }
+    // Validate the source footer before trusting it (the same check `open`
+    // makes). Adjacency is what makes the whole-body copy below valid: the body
+    // is the present blocks in fixed order, contiguous from the manifest to the
+    // footer start.
+    validate_footer(&footer, footer_start)?;
 
     // The trailer body is everything from the manifest to the start of the
-    // footer (`manifest | archive`); it is copied verbatim.
+    // footer; it is copied verbatim.
     let old_base_len = footer.manifest_offset;
     let body_len = footer_start - old_base_len;
 
@@ -671,18 +1114,38 @@ where
         return Err(PayloadError::TruncatedTrailer);
     }
 
-    // Shift only the two absolute offsets by the base-length delta; the two
-    // lengths are unchanged. The trailer body is contiguous `manifest | archive`
-    // placed right after the new base, so the manifest starts at `new_base_len`
-    // and the archive at `new_base_len + manifest_len`.
+    // Every present block sits at a fixed distance from the start of the
+    // trailer body, so its new offset is that distance past the new base.
+    let shifted = |offset: u64| -> Result<u64, PayloadError> {
+        offset
+            .checked_sub(old_base_len)
+            .and_then(|within_body| new_base_len.checked_add(within_body))
+            .ok_or(PayloadError::TruncatedTrailer)
+    };
+    // An absent envelope pair is left exactly all-zero: it is nowhere, so there
+    // is nothing to shift, and shifting it would spell a half-zero pair. The
+    // manifest and archive have no absent encoding and are always shifted.
+    let shifted_envelope = |offset: u64, len: u64| -> Result<u64, PayloadError> {
+        if is_absent_pair(offset, len) {
+            Ok(0)
+        } else {
+            shifted(offset)
+        }
+    };
+
+    // The version is the source's own, never [`FORMAT_VERSION`], so a
+    // version-1 payload rewraps as a version-1 payload — including the footer
+    // size `encode` derives from it.
     let rewritten = Footer {
         version: footer.version,
         manifest_offset: new_base_len,
         manifest_len: footer.manifest_len,
-        archive_offset: new_base_len
-            .checked_add(footer.manifest_len)
-            .ok_or(PayloadError::TruncatedTrailer)?,
+        archive_offset: shifted(footer.archive_offset)?,
         archive_len: footer.archive_len,
+        signature_offset: shifted_envelope(footer.signature_offset, footer.signature_len)?,
+        signature_len: footer.signature_len,
+        key_id_offset: shifted_envelope(footer.key_id_offset, footer.key_id_len)?,
+        key_id_len: footer.key_id_len,
     };
     out.write_all(&rewritten.encode())?;
     Ok(())
@@ -696,6 +1159,8 @@ pub struct Payload<R: Read + Seek> {
     manifest: PayloadManifest,
     archive_offset: u64,
     archive_len: u64,
+    signature: Option<Vec<u8>>,
+    key_id: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek> Payload<R> {
@@ -703,6 +1168,30 @@ impl<R: Read + Seek> Payload<R> {
     #[must_use]
     pub fn manifest(&self) -> &PayloadManifest {
         &self.manifest
+    }
+
+    /// Returns the container's detached signature block, or `None` when the
+    /// container carries none.
+    ///
+    /// An absent block is `None` and never an empty slice, so a caller cannot
+    /// mistake "nothing was signed" for "a zero-byte signature was". Nothing
+    /// writes this block today. Whether an *unsigned* container is acceptable
+    /// is not this layer's call: the container reader reports what is there,
+    /// and a verifier decides what that is worth.
+    #[must_use]
+    pub fn signature(&self) -> Option<&[u8]> {
+        self.signature.as_deref()
+    }
+
+    /// Returns the identifier of the key the [`signature`](Self::signature) was
+    /// made with, or `None` when the container carries none.
+    ///
+    /// Independent of the signature at this layer: the container layout does
+    /// not require one to arrive with the other, and defines no error for one
+    /// without it.
+    #[must_use]
+    pub fn key_id(&self) -> Option<&[u8]> {
+        self.key_id.as_deref()
     }
 
     /// Extracts every artifact into `dest`, verifying each member against its
@@ -1001,46 +1490,56 @@ fn reject_trailing_bytes<R: Read>(reader: &mut R) -> Result<(), PayloadError> {
     }
 }
 
+/// Reads one trailer block into memory, or reports it absent.
+///
+/// Only the small envelope blocks are read this way; the archive streams. A
+/// crafted length cannot make one large, because the caller has already run
+/// [`validate_footer`], whose adjacency walk and offsets check together confine
+/// every present block to bytes the file actually holds.
+fn read_block<R: Read + Seek>(
+    src: &mut R,
+    offset: u64,
+    len: u64,
+) -> Result<Option<Vec<u8>>, PayloadError> {
+    if is_absent_pair(offset, len) {
+        return Ok(None);
+    }
+    let len = usize::try_from(len).map_err(|_| PayloadError::TruncatedTrailer)?;
+    src.seek(SeekFrom::Start(offset))?;
+    let mut block = vec![0u8; len];
+    src.read_exact(&mut block)?;
+    Ok(Some(block))
+}
+
 /// Locates and reads a trailer from `src`.
 ///
-/// Returns `Ok(None)` for an empty payload — a file shorter than
-/// [`FOOTER_SIZE`], or one whose trailing bytes do not match [`MAGIC`].
+/// Returns `Ok(None)` for an empty payload — a file in which the size probe
+/// selected no footer, which is the normal state of an ordinary dev or CI
+/// build. Use [`open_package`] for a `.pkg`, where the same condition is a
+/// broken package rather than an ordinary file.
 ///
 /// # Errors
 ///
-/// Returns [`PayloadError`] when the magic matches but the trailer is unusable:
-/// an unrecognized container version, offsets pointing outside the file, a
-/// manifest whose `format_version` this build does not implement (reported as
-/// [`PayloadError::InvalidManifest`] carrying
-/// [`ManifestError::UnsupportedManifestFormat`]), or a manifest that fails to
-/// parse or validate.
+/// Returns [`PayloadError`] when a container was found but is unusable: a
+/// candidate magic under a container version this build does not implement
+/// ([`PayloadError::UnsupportedContainerFormat`]), offsets pointing outside the
+/// file ([`PayloadError::TruncatedTrailer`]), a half-zero envelope pair or
+/// blocks that do not sit adjacent in order
+/// ([`PayloadError::MalformedFooter`]), a manifest whose `format_version` this
+/// build does not implement (reported as [`PayloadError::InvalidManifest`]
+/// carrying [`ManifestError::UnsupportedManifestFormat`]), or a manifest that
+/// fails to parse or validate.
 pub fn open<R: Read + Seek>(mut src: R) -> Result<Option<Payload<R>>, PayloadError> {
     let file_len = src.seek(SeekFrom::End(0))?;
-    let footer_size = FOOTER_SIZE as u64;
-    if file_len < footer_size {
-        return Ok(None);
-    }
-
-    let footer_start = file_len - footer_size;
-    src.seek(SeekFrom::Start(footer_start))?;
-    let mut footer_bytes = vec![0u8; FOOTER_SIZE];
-    src.read_exact(&mut footer_bytes)?;
-
-    let Some(footer) = parse_footer(&footer_bytes)? else {
+    let Located::Found {
+        footer,
+        footer_start,
+    } = locate_footer(&mut src, file_len)?
+    else {
         return Ok(None);
     };
 
-    let manifest_end = footer
-        .manifest_offset
-        .checked_add(footer.manifest_len)
-        .ok_or(PayloadError::TruncatedTrailer)?;
-    let archive_end = footer
-        .archive_offset
-        .checked_add(footer.archive_len)
-        .ok_or(PayloadError::TruncatedTrailer)?;
-    if manifest_end > footer_start || archive_end > footer_start {
-        return Err(PayloadError::TruncatedTrailer);
-    }
+    validate_footer(&footer, footer_start)?;
 
     let manifest_len =
         usize::try_from(footer.manifest_len).map_err(|_| PayloadError::TruncatedTrailer)?;
@@ -1052,17 +1551,24 @@ pub fn open<R: Read + Seek>(mut src: R) -> Result<Option<Payload<R>>, PayloadErr
     // container footer version can evaluate the pre-versioned baseline
     // conjunction. An undecodable manifest block keeps reporting as
     // `ManifestParse`, distinct from a version this build does not implement.
+    // The two versions stay distinct here: this is the container's, and what it
+    // gates is the baseline conjunction, not the manifest schema range.
     let manifest =
         PayloadManifest::parse(&manifest_bytes, footer.version).map_err(|error| match error {
             ManifestError::Decode(source) => PayloadError::ManifestParse(source),
             other => PayloadError::InvalidManifest(other),
         })?;
 
+    let signature = read_block(&mut src, footer.signature_offset, footer.signature_len)?;
+    let key_id = read_block(&mut src, footer.key_id_offset, footer.key_id_len)?;
+
     Ok(Some(Payload {
         src,
         manifest,
         archive_offset: footer.archive_offset,
         archive_len: footer.archive_len,
+        signature,
+        key_id,
     }))
 }
 
@@ -1077,6 +1583,48 @@ pub fn open<R: Read + Seek>(mut src: R) -> Result<Option<Payload<R>>, PayloadErr
 pub fn open_path(path: &Path) -> Result<Option<Payload<std::fs::File>>, PayloadError> {
     let file = std::fs::File::open(path)?;
     open(file)
+}
+
+/// Opens a **`.pkg` module package** read from `src`.
+///
+/// A `.pkg` is this module's container with no base executable: the same
+/// manifest, archive, signature and `key_id` blocks under the same footer, with
+/// the manifest block starting at offset `0`. It is read by exactly the reader
+/// [`open`] uses — the same size probe, the same footer validation, the same
+/// manifest parse — under one different answer: a package with no trailer is
+/// broken, so this returns [`PayloadError::NoTrailer`] where [`open`] would
+/// report an empty payload, and yields a [`Payload`] rather than an `Option`.
+///
+/// That is also what makes a package self-verifying wherever it lands,
+/// air-gapped transfer included: the footer says what the container holds, and
+/// nothing about the transport does.
+///
+/// There is no `.pkg` counterpart of [`open_current_exe`]: the running
+/// executable is a payload, not a package.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::NoTrailer`] when `src` carries no trailer, and
+/// otherwise every error [`open`] raises.
+pub fn open_package<R: Read + Seek>(src: R) -> Result<Payload<R>, PayloadError> {
+    // The one place "no trailer found" becomes `NoTrailer` for the package
+    // side, so no wrapper can quietly reclassify it.
+    open(src)?.ok_or(PayloadError::NoTrailer)
+}
+
+/// Opens the `.pkg` at `path` and reads its container.
+///
+/// Carries no logic of its own: it opens the file and delegates to
+/// [`open_package`], exactly as [`open_path`] delegates to [`open`].
+///
+/// # Errors
+///
+/// Returns [`PayloadError`] when the file cannot be opened, or any error
+/// [`open_package`] raises — including [`PayloadError::NoTrailer`] when the
+/// file carries no container.
+pub fn open_package_path(path: &Path) -> Result<Payload<std::fs::File>, PayloadError> {
+    let file = std::fs::File::open(path)?;
+    open_package(file)
 }
 
 /// Reads the running executable's own trailer via
@@ -1096,11 +1644,13 @@ pub fn open_current_exe() -> Result<Option<Payload<std::fs::File>>, PayloadError
 /// Reads the **payload-free base executable** out of `src` — the ELF bytes before
 /// any appended trailer.
 ///
-/// A trailered release binary is `base ‖ manifest ‖ archive ‖ footer`, so the base
-/// is exactly the first `footer.manifest_offset` bytes (`rewrap_trailer` relies on
-/// the same prefix). A binary with no trailer (a dev/CI build, or one already
-/// stripped) *is* its own base, so the whole file is returned. Only the base bytes
-/// are read into memory, never the multi-hundred-megabyte payload.
+/// A trailered release binary is `base ‖ trailer`, so the base is exactly the
+/// first `footer.manifest_offset` bytes (`rewrap_trailer` relies on the same
+/// prefix). A binary with no trailer (a dev/CI build, or one already stripped)
+/// *is* its own base, so the whole file is returned — a third answer to "no
+/// trailer found", neither [`open`]'s empty payload nor [`open_package`]'s
+/// [`PayloadError::NoTrailer`]. Only the base bytes are read into memory, never
+/// the multi-hundred-megabyte payload.
 ///
 /// bootler self-installs these bytes onto each core host so the `roxyd-activate`
 /// oneshot has a small, root-owned validator to run; the activation subcommand
@@ -1109,28 +1659,25 @@ pub fn open_current_exe() -> Result<Option<Payload<std::fs::File>>, PayloadError
 ///
 /// # Errors
 ///
-/// Returns [`PayloadError`] when `src` cannot be read or carries a corrupt trailer.
+/// Returns [`PayloadError`] when `src` cannot be read, a probed candidate names
+/// a container version this build does not implement
+/// ([`PayloadError::UnsupportedContainerFormat`]), or the located footer's
+/// manifest block starts past the footer ([`PayloadError::TruncatedTrailer`]).
 pub fn read_base_executable<R: Read + Seek>(mut src: R) -> Result<Vec<u8>, PayloadError> {
     let file_len = src.seek(SeekFrom::End(0))?;
-    let footer_size = FOOTER_SIZE as u64;
-    let base_len = if file_len < footer_size {
-        file_len
-    } else {
-        let footer_start = file_len - footer_size;
-        src.seek(SeekFrom::Start(footer_start))?;
-        let mut footer_bytes = vec![0u8; FOOTER_SIZE];
-        src.read_exact(&mut footer_bytes)?;
-        match parse_footer(&footer_bytes)? {
-            // The base is the prefix before the manifest block.
-            Some(footer) => {
-                if footer.manifest_offset > footer_start {
-                    return Err(PayloadError::TruncatedTrailer);
-                }
-                footer.manifest_offset
+    let base_len = match locate_footer(&mut src, file_len)? {
+        // The base is the prefix before the manifest block.
+        Located::Found {
+            footer,
+            footer_start,
+        } => {
+            if footer.manifest_offset > footer_start {
+                return Err(PayloadError::TruncatedTrailer);
             }
-            // No trailer: the file is its own base.
-            None => file_len,
+            footer.manifest_offset
         }
+        // No trailer: the file is its own base.
+        Located::NoTrailer => file_len,
     };
     let base_len = usize::try_from(base_len).map_err(|_| PayloadError::TruncatedTrailer)?;
     src.seek(SeekFrom::Start(0))?;
@@ -1162,9 +1709,11 @@ mod tests {
     use zstd::Encoder;
 
     use super::{
-        ArtifactInput, FOOTER_SIZE, FORMAT_VERSION, Footer, MAGIC, PayloadError, PayloadManifest,
-        TAR_BLOCK_SIZE, TAR_NAME_FIELD_LEN, append_trailer, open, open_current_exe, parse_footer,
-        rewrap_trailer, sha256_hex,
+        ArtifactInput, Candidate, FOOTER_SIZE, FOOTER_SIZE_V1, FOOTER_SIZE_V2, FORMAT_VERSION,
+        Footer, KNOWN_FOOTER_SIZES, MAGIC, MAGIC_LEN, PayloadError, PayloadManifest,
+        TAR_BLOCK_SIZE, TAR_NAME_FIELD_LEN, append_trailer, classify_candidate, open,
+        open_current_exe, open_package, open_package_path, read_base_executable, rewrap_trailer,
+        sha256_hex,
     };
     use crate::manifest::{
         ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
@@ -1519,7 +2068,18 @@ mod tests {
         json: &[u8],
         archive: &[u8],
     ) -> (PayloadError, tempfile::TempDir) {
-        let footer = valid_footer(BASE.len(), json, archive);
+        extract_error_at_version(FORMAT_VERSION, json, archive)
+    }
+
+    /// The same, at a stated container version — which a baseline manifest
+    /// needs, since the pre-versioned baseline path is keyed on footer
+    /// version 1.
+    fn extract_error_at_version(
+        version: u8,
+        json: &[u8],
+        archive: &[u8],
+    ) -> (PayloadError, tempfile::TempDir) {
+        let footer = footer_at_version(version, BASE.len(), json, archive);
         let binary = assemble(BASE, json, archive, &footer);
         let mut payload = open(Cursor::new(binary))
             .expect("reader should succeed")
@@ -1541,16 +2101,57 @@ mod tests {
         (error, dir)
     }
 
+    /// The footer a writer would stamp on `base | manifest | archive`: both
+    /// envelope pairs absent, so the archive block is the last present block
+    /// and ends where the footer begins.
     fn valid_footer(base_len: usize, manifest_json: &[u8], archive: &[u8]) -> Footer {
+        footer_at_version(FORMAT_VERSION, base_len, manifest_json, archive)
+    }
+
+    /// The same at a stated container version, so a fixture can reproduce a
+    /// published version-1 payload byte-for-byte — `encode` derives the 41-byte
+    /// wire form from the version it is given.
+    fn footer_at_version(
+        version: u8,
+        base_len: usize,
+        manifest_json: &[u8],
+        archive: &[u8],
+    ) -> Footer {
         let manifest_offset = base_len as u64;
         let manifest_len = manifest_json.len() as u64;
         Footer {
-            version: FORMAT_VERSION,
+            version,
             manifest_offset,
             manifest_len,
             archive_offset: manifest_offset + manifest_len,
             archive_len: archive.len() as u64,
+            signature_offset: 0,
+            signature_len: 0,
+            key_id_offset: 0,
+            key_id_len: 0,
         }
+    }
+
+    /// The container version the pre-versioned baseline payloads carry.
+    const LEGACY_VERSION: u8 = 1;
+
+    /// Locates and parses `binary`'s footer exactly as the reader's probe does:
+    /// the known sizes in ascending order, selecting on magic plus the
+    /// size/version pairing.
+    ///
+    /// Returns the footer and the offset its own bytes start at.
+    fn probe_footer(binary: &[u8]) -> (Footer, usize) {
+        for size in &KNOWN_FOOTER_SIZES {
+            if binary.len() < size.bytes {
+                continue;
+            }
+            let start = binary.len() - size.bytes;
+            let candidate = binary.get(start..).expect("candidate in range");
+            if let Candidate::Selected(footer) = classify_candidate(candidate, size) {
+                return (footer, start);
+            }
+        }
+        panic!("the fixture must carry a footer the probe selects");
     }
 
     fn assemble(base: &[u8], manifest_json: &[u8], archive: &[u8], footer: &Footer) -> Vec<u8> {
@@ -1596,10 +2197,7 @@ mod tests {
     /// Slices `binary`'s trailer the way the reader locates it: the base, the
     /// manifest block, and the archive block.
     fn trailer_parts(binary: &[u8]) -> (&[u8], &[u8], &[u8]) {
-        let footer_start = binary.len() - FOOTER_SIZE;
-        let footer = parse_footer(binary.get(footer_start..).expect("footer in range"))
-            .expect("footer should parse")
-            .expect("magic should match");
+        let (footer, _) = probe_footer(binary);
         let at = |offset: u64| usize::try_from(offset).expect("fixture offsets fit in usize");
         let manifest_at = at(footer.manifest_offset);
         let archive_at = at(footer.archive_offset);
@@ -2074,14 +2672,21 @@ mod tests {
             path: "bin/roxyd",
             bytes: roxyd,
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
+        let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
         let binary = assemble(BASE, &json, &archive, &footer);
+        // A published asset's footer is the 41-byte version-1 one, and the
+        // probe still finds it.
+        assert_eq!(probe_footer(&binary).0.version, LEGACY_VERSION);
+        assert_eq!(binary.len() - probe_footer(&binary).1, FOOTER_SIZE_V1);
 
         let mut payload = open(Cursor::new(binary))
             .expect("a baseline payload must open")
             .expect("trailer should be present");
         assert_eq!(payload.manifest().format_version(), None);
         assert_eq!(payload.manifest().trust_set(), None);
+        // A version-1 footer records neither envelope pair, so both read absent.
+        assert_eq!(payload.signature(), None);
+        assert_eq!(payload.key_id(), None);
         assert_eq!(
             payload
                 .manifest()
@@ -2137,7 +2742,7 @@ mod tests {
                 bytes: roxyd,
             },
         ]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
+        let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
         let binary = assemble(BASE, &json, &archive, &footer);
 
         let mut payload = open(Cursor::new(binary))
@@ -2178,7 +2783,7 @@ mod tests {
             },
         ]);
 
-        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        let (error, dir) = extract_error_at_version(LEGACY_VERSION, &json, &archive);
         assert!(
             matches!(error, PayloadError::MemberNotInManifest(ref path) if path == "bin/stowaway"),
             "got: {error:?}"
@@ -2204,7 +2809,7 @@ mod tests {
             path: "bin/roxyd",
             bytes: roxyd,
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
+        let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
         let binary = assemble(BASE, &json, &archive, &footer);
 
         let error = open(Cursor::new(binary)).expect_err("a half-legacy manifest must be rejected");
@@ -2231,7 +2836,7 @@ mod tests {
             path: "bin/roxyd",
             bytes: roxyd,
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
+        let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
         let baseline = assemble(BASE, &json, &archive, &footer);
 
         let mut rewrapped = Vec::new();
@@ -2432,6 +3037,32 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupted_magic_gives_each_site_its_own_no_trailer_answer() {
+        // One reader, four answers. A corrupted magic is not a version
+        // condition at all, so none of these is `UnsupportedContainerFormat`
+        // and none is `MalformedFooter`.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let mut binary = two_member_binary(src.path());
+        let footer_start = binary.len() - FOOTER_SIZE;
+        let magic_byte = binary.get_mut(footer_start).expect("footer start in range");
+        *magic_byte ^= 0xFF;
+
+        assert!(
+            open(Cursor::new(binary.clone()))
+                .expect("open reports an empty payload")
+                .is_none()
+        );
+        let error =
+            open_package(Cursor::new(binary.clone())).expect_err("a package must carry a trailer");
+        assert!(matches!(error, PayloadError::NoTrailer), "got: {error:?}");
+        let error = rewrap_trailer(Cursor::new(&binary), Cursor::new(BASE), &mut Vec::new())
+            .expect_err("there is nothing to rewrap");
+        assert!(matches!(error, PayloadError::NoTrailer), "got: {error:?}");
+        let base = read_base_executable(Cursor::new(&binary)).expect("the file is its own base");
+        assert_eq!(base, binary);
+    }
+
+    #[test]
     fn tampered_artifact_byte_fails_the_hash_check() {
         let original = b"roxyd binary bytes";
         // The manifest records the SHA-256 of the original bytes, but the
@@ -2476,23 +3107,58 @@ mod tests {
     }
 
     #[test]
-    fn bad_footer_version_is_rejected() {
-        let bytes = b"payload bytes";
-        let json = manifest_json(&[("bin/roxyd", bytes)]);
-        let archive = zstd_tar(&[Member::File {
-            path: "bin/roxyd",
-            bytes,
-        }]);
-        let mut footer = valid_footer(BASE.len(), &json, &archive);
-        footer.version = FORMAT_VERSION + 7;
-        let binary = assemble(BASE, &json, &archive, &footer);
+    fn an_unknown_container_version_is_rejected_from_every_probing_site() {
+        // Only the version byte moves: the container keeps its 73-byte footer,
+        // so its magic still sits at the 73-byte candidate offset and the probe
+        // still reaches it — it just names a version this build has never heard
+        // of. Every site that locates a footer must say so.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let mut binary = two_member_binary(src.path());
+        let unknown = FORMAT_VERSION + 7;
+        let version_at = binary.len() - FOOTER_SIZE + MAGIC_LEN;
+        let version_byte = binary.get_mut(version_at).expect("version byte in range");
+        *version_byte = unknown;
 
-        let error = open(Cursor::new(binary)).expect_err("bad version expected");
-        assert!(
-            matches!(error, PayloadError::UnsupportedVersion { found, expected }
-                if found == FORMAT_VERSION + 7 && expected == FORMAT_VERSION),
-            "got: {error:?}"
+        let expect_unsupported = |error: PayloadError, site: &str| {
+            assert!(
+                matches!(
+                    error,
+                    PayloadError::UnsupportedContainerFormat { found, supported }
+                        if found == unknown && supported == [1, FORMAT_VERSION]
+                ),
+                "{site} got: {error:?}"
+            );
+        };
+
+        expect_unsupported(
+            open(Cursor::new(binary.clone())).expect_err("open must reject it"),
+            "open",
         );
+        expect_unsupported(
+            open_package(Cursor::new(binary.clone())).expect_err("open_package must reject it"),
+            "open_package",
+        );
+        expect_unsupported(
+            rewrap_trailer(Cursor::new(&binary), Cursor::new(BASE), &mut Vec::new())
+                .expect_err("rewrap_trailer must reject it"),
+            "rewrap_trailer",
+        );
+        expect_unsupported(
+            read_base_executable(Cursor::new(&binary))
+                .expect_err("read_base_executable must reject it"),
+            "read_base_executable",
+        );
+    }
+
+    #[test]
+    fn the_unsupported_container_format_message_names_found_and_the_accepted_set() {
+        let error = PayloadError::UnsupportedContainerFormat {
+            found: 9,
+            supported: &[1, 2],
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains('9'), "got: {rendered}");
+        assert!(rendered.contains("1, 2"), "got: {rendered}");
     }
 
     #[test]
@@ -3280,18 +3946,719 @@ mod tests {
             manifest_len: 20,
             archive_offset: 30,
             archive_len: 40,
+            signature_offset: 70,
+            signature_len: 5,
+            key_id_offset: 75,
+            key_id_len: 3,
         };
         let encoded = footer.encode();
         assert_eq!(encoded.len(), FOOTER_SIZE);
+        assert_eq!(FOOTER_SIZE, 73);
         assert!(encoded.starts_with(&MAGIC));
 
-        let parsed = parse_footer(&encoded)
-            .expect("parse should succeed")
-            .expect("magic should match");
+        let Candidate::Selected(parsed) = classify_candidate(
+            &encoded,
+            KNOWN_FOOTER_SIZES
+                .get(1)
+                .expect("the current version is the second probe entry"),
+        ) else {
+            panic!("a freshly encoded footer must be selected at its own size");
+        };
+        assert_eq!(parsed.version, FORMAT_VERSION);
         assert_eq!(parsed.manifest_offset, 10);
         assert_eq!(parsed.manifest_len, 20);
         assert_eq!(parsed.archive_offset, 30);
         assert_eq!(parsed.archive_len, 40);
+        assert_eq!(parsed.signature_offset, 70);
+        assert_eq!(parsed.signature_len, 5);
+        assert_eq!(parsed.key_id_offset, 75);
+        assert_eq!(parsed.key_id_len, 3);
+    }
+
+    #[test]
+    fn a_version_1_footer_encodes_at_its_own_size_with_no_envelope_pairs() {
+        // The size is a function of the footer's own version, which is what
+        // lets `rewrap_trailer` write a version-1 payload back at version 1.
+        let footer = Footer {
+            version: 1,
+            manifest_offset: 10,
+            manifest_len: 20,
+            archive_offset: 30,
+            archive_len: 40,
+            signature_offset: 0,
+            signature_len: 0,
+            key_id_offset: 0,
+            key_id_len: 0,
+        };
+        let encoded = footer.encode();
+        assert_eq!(encoded.len(), FOOTER_SIZE_V1);
+        assert_eq!(FOOTER_SIZE_V1, 41);
+
+        let Candidate::Selected(parsed) = classify_candidate(
+            &encoded,
+            KNOWN_FOOTER_SIZES
+                .first()
+                .expect("version 1 is the first probe entry"),
+        ) else {
+            panic!("a version-1 footer must be selected at the 41-byte size");
+        };
+        assert_eq!(parsed.version, 1);
+        // A pre-envelope footer records neither pair, and both read as absent.
+        assert_eq!(parsed.signature_offset, 0);
+        assert_eq!(parsed.signature_len, 0);
+        assert_eq!(parsed.key_id_offset, 0);
+        assert_eq!(parsed.key_id_len, 0);
+    }
+
+    #[test]
+    fn the_probe_list_is_ascending_and_pairs_each_size_with_one_version() {
+        let sizes: Vec<usize> = KNOWN_FOOTER_SIZES.iter().map(|size| size.bytes).collect();
+        let versions: Vec<u8> = KNOWN_FOOTER_SIZES.iter().map(|size| size.version).collect();
+        assert_eq!(sizes, vec![FOOTER_SIZE_V1, FOOTER_SIZE_V2]);
+        assert_eq!(sizes, vec![41, 73]);
+        assert_eq!(versions, vec![1, 2]);
+        assert!(
+            sizes.windows(2).all(|pair| pair[0] < pair[1]),
+            "the probe walks ascending size order"
+        );
+        assert_eq!(FORMAT_VERSION, 2);
+        assert_eq!(FOOTER_SIZE, FOOTER_SIZE_V2);
+    }
+
+    /// Writes a `.pkg` module package: the same container with no base
+    /// executable, so its manifest block starts at offset `0`.
+    fn build_package(inputs: &[ArtifactInput]) -> Vec<u8> {
+        let mut pkg = Vec::new();
+        append_trailer(std::io::empty(), &mut pkg, None, None, inputs)
+            .expect("writer should succeed");
+        pkg
+    }
+
+    /// The two-member `.pkg` the package tests read.
+    fn two_member_package(dir: &Path) -> Vec<u8> {
+        let inputs = vec![
+            input(
+                dir,
+                "roxyd.src",
+                "bin/roxyd",
+                ROXYD,
+                &[Disposition::Install],
+            ),
+            input(
+                dir,
+                "web.src",
+                "assets/web.tar",
+                WEB,
+                &[Disposition::Install],
+            ),
+        ];
+        build_package(&inputs)
+    }
+
+    /// Rebuilds `binary` with `footer` in place of its own, leaving every byte
+    /// before the footer exactly as it was.
+    fn with_footer(binary: &[u8], footer: &Footer) -> Vec<u8> {
+        let (_, footer_start) = probe_footer(binary);
+        let mut out = binary
+            .get(..footer_start)
+            .expect("trailer body in range")
+            .to_vec();
+        out.extend_from_slice(&footer.encode());
+        out
+    }
+
+    /// One footer-mutation case: what it breaks, and the mutation that breaks
+    /// it.
+    type FooterCase = (&'static str, fn(&mut Footer));
+
+    /// Rebuilds `binary` with `mutate` applied to its footer.
+    fn mutating_footer(binary: &[u8], mutate: impl FnOnce(&mut Footer)) -> Vec<u8> {
+        let (mut footer, _) = probe_footer(binary);
+        mutate(&mut footer);
+        with_footer(binary, &footer)
+    }
+
+    #[test]
+    fn a_package_round_trips_through_open_package_and_open_package_path() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let pkg = two_member_package(src.path());
+
+        // A `.pkg` has no base, so its manifest block legitimately starts at
+        // offset `0` — a zero offset that is never read as absence.
+        let (footer, _) = probe_footer(&pkg);
+        assert_eq!(footer.manifest_offset, 0);
+        assert_eq!(footer.version, FORMAT_VERSION);
+
+        let mut package = open_package(Cursor::new(&pkg)).expect("the package must open");
+        assert_eq!(package.manifest().artifacts().len(), 2);
+        assert_eq!(package.signature(), None);
+        assert_eq!(package.key_id(), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extracted = package
+            .extract_to(dir.path())
+            .expect("extraction should succeed");
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(std::fs::read(dir.path().join("bin/roxyd")).unwrap(), ROXYD);
+        assert_eq!(
+            std::fs::read(dir.path().join("assets/web.tar")).unwrap(),
+            WEB
+        );
+
+        // And through the path entry point, which opens the file and delegates.
+        let on_disk = src.path().join("module.pkg");
+        std::fs::write(&on_disk, &pkg).expect("write the package");
+        let mut from_path = open_package_path(&on_disk).expect("the package must open by path");
+        assert_eq!(from_path.manifest().artifacts().len(), 2);
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            from_path
+                .extract_to(dir.path())
+                .expect("extraction should succeed")
+                .len(),
+            2
+        );
+        assert_eq!(std::fs::read(dir.path().join("bin/roxyd")).unwrap(), ROXYD);
+    }
+
+    #[test]
+    fn a_written_container_records_both_envelope_pairs_absent() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = two_member_binary(src.path());
+
+        // On the wire: the four fields after the archive pair are all zero.
+        let (footer, footer_start) = probe_footer(&binary);
+        assert_eq!(binary.len() - footer_start, FOOTER_SIZE_V2);
+        assert_eq!(
+            binary
+                .get(footer_start + MAGIC_LEN + 1 + 4 * 8..)
+                .expect("the envelope fields are in range"),
+            [0u8; 32].as_slice(),
+        );
+        assert_eq!(footer.signature_offset, 0);
+        assert_eq!(footer.signature_len, 0);
+        assert_eq!(footer.key_id_offset, 0);
+        assert_eq!(footer.key_id_len, 0);
+
+        // The archive block is the last present block, so it ends exactly where
+        // the footer begins.
+        assert_eq!(
+            footer.archive_offset + footer.archive_len,
+            footer_start as u64
+        );
+
+        // And the reader accepts it, reporting each pair as absent rather than
+        // as an empty block.
+        let payload = open(Cursor::new(binary))
+            .expect("the container must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.signature(), None);
+        assert_eq!(payload.key_id(), None);
+    }
+
+    #[test]
+    fn a_half_zero_envelope_pair_is_malformed() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = two_member_binary(src.path());
+
+        // A length with no offset, and an offset with no length, for each pair:
+        // four ways to be neither present nor absent.
+        let cases: [FooterCase; 4] = [
+            ("signature length without an offset", |footer| {
+                footer.signature_len = 7;
+            }),
+            ("signature offset without a length", |footer| {
+                footer.signature_offset = 7;
+            }),
+            ("key_id length without an offset", |footer| {
+                footer.key_id_len = 7;
+            }),
+            ("key_id offset without a length", |footer| {
+                footer.key_id_offset = 7;
+            }),
+        ];
+        for (label, mutate) in cases {
+            let broken = mutating_footer(&binary, mutate);
+            let error = open(Cursor::new(broken)).expect_err("a half-zero pair must be rejected");
+            assert!(
+                matches!(error, PayloadError::MalformedFooter { .. }),
+                "{label} got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_an_overlap_or_a_short_last_block_is_malformed() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = two_member_binary(src.path());
+
+        let cases: [FooterCase; 3] = [
+            // The archive starts one byte past where the manifest ended.
+            ("gap", |footer| {
+                footer.archive_offset += 1;
+                footer.archive_len -= 1;
+            }),
+            // And one byte before it.
+            ("overlap", |footer| {
+                footer.archive_offset -= 1;
+                footer.archive_len += 1;
+            }),
+            // The last present block stops short of the footer.
+            ("short last block", |footer| {
+                footer.archive_len -= 1;
+            }),
+        ];
+        for (label, mutate) in cases {
+            let broken = mutating_footer(&binary, mutate);
+            let error =
+                open(Cursor::new(broken)).expect_err("a broken block layout must be rejected");
+            assert!(
+                matches!(error, PayloadError::MalformedFooter { .. }),
+                "{label} got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_signature_block_is_accepted_and_still_held_to_adjacency() {
+        // Nothing writes a signature yet, so the container is hand-built from
+        // the writer's own manifest and archive blocks with one extra block
+        // between the archive and the footer.
+        const SIGNATURE: &[u8] = b"an opaque detached signature, meaningless to this layer";
+        const KEY_ID: &[u8] = b"key-2026-08";
+
+        let src = tempfile::tempdir().expect("source tempdir");
+        let written = two_member_binary(src.path());
+        let (base, manifest_block, archive) = trailer_parts(&written);
+
+        let signed = |slack: usize| {
+            let manifest_offset = base.len() as u64;
+            let archive_offset = manifest_offset + manifest_block.len() as u64;
+            let signature_offset = archive_offset + archive.len() as u64;
+            let key_id_offset = signature_offset + SIGNATURE.len() as u64;
+            let footer = Footer {
+                version: FORMAT_VERSION,
+                manifest_offset,
+                manifest_len: manifest_block.len() as u64,
+                archive_offset,
+                archive_len: archive.len() as u64,
+                signature_offset,
+                signature_len: SIGNATURE.len() as u64,
+                key_id_offset,
+                key_id_len: KEY_ID.len() as u64,
+            };
+            let mut out = Vec::new();
+            out.extend_from_slice(base);
+            out.extend_from_slice(manifest_block);
+            out.extend_from_slice(archive);
+            out.extend_from_slice(SIGNATURE);
+            out.extend_from_slice(KEY_ID);
+            // Bytes the footer accounts for nowhere.
+            out.extend(std::iter::repeat_n(0u8, slack));
+            out.extend_from_slice(&footer.encode());
+            out
+        };
+
+        let mut payload = open(Cursor::new(signed(0)))
+            .expect("a signed container must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.signature(), Some(SIGNATURE));
+        assert_eq!(payload.key_id(), Some(KEY_ID));
+        // The walk stepped over nothing here, and every other check still ran.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            payload
+                .extract_to(dir.path())
+                .expect("extraction should succeed")
+                .len(),
+            2
+        );
+
+        // One byte of slack before the footer, and the last present block no
+        // longer ends where the footer begins.
+        let error = open(Cursor::new(signed(1)))
+            .expect_err("a last present block short of the footer must be rejected");
+        assert!(
+            matches!(error, PayloadError::MalformedFooter { .. }),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn one_envelope_block_present_beside_an_absent_one_is_accepted() {
+        // The two pairs are independently present or absent, so the walk has to
+        // step over an absent block wherever it sits. A `key_id` with no
+        // signature is the discriminating case: the absent pair sits *between*
+        // two present blocks, so the `key_id` starts where the archive ended
+        // rather than where a signature would have.
+        const SIGNATURE: &[u8] = b"an opaque detached signature, meaningless to this layer";
+        const KEY_ID: &[u8] = b"key-2026-08";
+
+        let src = tempfile::tempdir().expect("source tempdir");
+        let written = two_member_binary(src.path());
+        let (base, manifest_block, archive) = trailer_parts(&written);
+
+        let one_present = |signature: Option<&[u8]>, key_id: Option<&[u8]>| {
+            let manifest_offset = base.len() as u64;
+            let archive_offset = manifest_offset + manifest_block.len() as u64;
+            let archive_end = archive_offset + archive.len() as u64;
+            let signature_len = signature.map_or(0, |bytes| bytes.len() as u64);
+            let key_id_len = key_id.map_or(0, |bytes| bytes.len() as u64);
+            let footer = Footer {
+                version: FORMAT_VERSION,
+                manifest_offset,
+                manifest_len: manifest_block.len() as u64,
+                archive_offset,
+                archive_len: archive.len() as u64,
+                // An absent pair is exactly all-zero; a present one starts where
+                // the previous *present* block ended.
+                signature_offset: if signature_len == 0 { 0 } else { archive_end },
+                signature_len,
+                key_id_offset: if key_id_len == 0 {
+                    0
+                } else {
+                    archive_end + signature_len
+                },
+                key_id_len,
+            };
+            let mut out = Vec::new();
+            out.extend_from_slice(base);
+            out.extend_from_slice(manifest_block);
+            out.extend_from_slice(archive);
+            if let Some(bytes) = signature {
+                out.extend_from_slice(bytes);
+            }
+            if let Some(bytes) = key_id {
+                out.extend_from_slice(bytes);
+            }
+            out.extend_from_slice(&footer.encode());
+            out
+        };
+
+        // A signature with no `key_id`: the absent pair is last, and the
+        // signature is the block that must end where the footer begins.
+        let mut payload = open(Cursor::new(one_present(Some(SIGNATURE), None)))
+            .expect("a signature with no key_id must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.signature(), Some(SIGNATURE));
+        assert_eq!(payload.key_id(), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            payload
+                .extract_to(dir.path())
+                .expect("extraction should succeed")
+                .len(),
+            2
+        );
+
+        // A `key_id` with no signature: the walk steps over the absent pair in
+        // the middle and still reads the block that follows it.
+        let payload = open(Cursor::new(one_present(None, Some(KEY_ID))))
+            .expect("a key_id with no signature must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.signature(), None);
+        assert_eq!(payload.key_id(), Some(KEY_ID));
+    }
+
+    #[test]
+    fn a_broken_layout_is_malformed_rather_than_falling_through_to_the_smaller_size() {
+        // Selection is the only decision the walk makes. A validation failure
+        // against the selected 73-byte footer must not send the probe back to
+        // the 41-byte candidate, which would report a genuinely corrupt
+        // container as "no trailer" and put `MalformedFooter` out of reach.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = two_member_binary(src.path());
+        let broken = mutating_footer(&binary, |footer| {
+            footer.archive_offset += 1;
+            footer.archive_len -= 1;
+        });
+
+        let error = open(Cursor::new(&broken)).expect_err("the broken layout must be reported");
+        assert!(
+            matches!(error, PayloadError::MalformedFooter { .. }),
+            "got: {error:?}"
+        );
+        let error = open_package(Cursor::new(&broken)).expect_err("likewise for a package");
+        assert!(
+            matches!(error, PayloadError::MalformedFooter { .. }),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_2_container_rewraps_with_its_absent_pairs_untouched() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let asset = two_member_binary(src.path());
+        let new_base: &[u8] = b"a freshly built base binary, of a different length entirely";
+        assert_ne!(new_base.len(), BASE.len());
+
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(Cursor::new(&asset), Cursor::new(new_base), &mut rewrapped)
+            .expect("rewrap should succeed");
+
+        // Asserted on the raw footer bytes as well as through the reader: a
+        // shifted absent pair is a half-zero pair, which would surface as
+        // `MalformedFooter` on re-open rather than as a wrong number.
+        let (footer, footer_start) = probe_footer(&rewrapped);
+        assert_eq!(footer.version, FORMAT_VERSION);
+        assert_eq!(
+            rewrapped
+                .get(footer_start + MAGIC_LEN + 1 + 4 * 8..)
+                .expect("the envelope fields are in range"),
+            [0u8; 32].as_slice(),
+        );
+
+        // Every present offset resolves against the new base.
+        assert_eq!(footer.manifest_offset, new_base.len() as u64);
+        assert_eq!(
+            footer.archive_offset,
+            footer.manifest_offset + footer.manifest_len
+        );
+        assert_eq!(
+            footer.archive_offset + footer.archive_len,
+            footer_start as u64
+        );
+
+        // The manifest block is byte-identical, and every length survived.
+        let (source_footer, _) = probe_footer(&asset);
+        let (_, source_block, _) = trailer_parts(&asset);
+        let (_, rewrapped_block, _) = trailer_parts(&rewrapped);
+        assert_eq!(source_block, rewrapped_block);
+        assert_eq!(footer.manifest_len, source_footer.manifest_len);
+        assert_eq!(footer.archive_len, source_footer.archive_len);
+
+        let mut payload = open(Cursor::new(rewrapped))
+            .expect("the rewrapped container must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.signature(), None);
+        assert_eq!(payload.key_id(), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            payload
+                .extract_to(dir.path())
+                .expect("extraction should succeed")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_version_1_payload_rewraps_at_version_1() {
+        // The published assets are version-1 containers, and a graft must not
+        // upgrade one: the source footer's own version is written back, and its
+        // 41-byte wire form with it.
+        let roxyd = b"roxyd binary bytes";
+        let json = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
+        let asset = assemble(BASE, &json, &archive, &footer);
+
+        let new_base: &[u8] = b"a freshly built base binary, of a different length entirely";
+        assert_ne!(new_base.len(), BASE.len());
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(Cursor::new(&asset), Cursor::new(new_base), &mut rewrapped)
+            .expect("rewrap should succeed");
+
+        let (rewritten, footer_start) = probe_footer(&rewrapped);
+        assert_eq!(rewritten.version, LEGACY_VERSION);
+        assert_eq!(rewrapped.len() - footer_start, FOOTER_SIZE_V1);
+        assert_eq!(rewritten.manifest_offset, new_base.len() as u64);
+        assert_eq!(rewritten.manifest_len, footer.manifest_len);
+        assert_eq!(rewritten.archive_len, footer.archive_len);
+
+        let mut payload = open(Cursor::new(rewrapped))
+            .expect("the rewrapped version-1 payload must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.manifest().format_version(), None);
+        assert_eq!(payload.signature(), None);
+        assert_eq!(payload.key_id(), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            payload
+                .extract_to(dir.path())
+                .expect("extraction should succeed")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_base_executable_returns_the_base_prefix_at_either_container_version() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let version_2 = two_member_binary(src.path());
+        assert_eq!(
+            read_base_executable(Cursor::new(&version_2)).expect("the base must be readable"),
+            BASE
+        );
+
+        let roxyd = b"roxyd binary bytes";
+        let json = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
+        let version_1 = assemble(BASE, &json, &archive, &footer);
+        assert_eq!(
+            read_base_executable(Cursor::new(&version_1)).expect("the base must be readable"),
+            BASE
+        );
+
+        // A binary with no trailer is its own base — the third no-trailer
+        // answer, and the state every dev and CI build is in.
+        assert_eq!(
+            read_base_executable(Cursor::new(BASE.to_vec())).expect("the base must be readable"),
+            BASE
+        );
+        // Including one shorter than the smallest known footer.
+        let stub = vec![0xABu8; 4];
+        assert_eq!(
+            read_base_executable(Cursor::new(stub.clone())).expect("the base must be readable"),
+            stub
+        );
+    }
+
+    #[test]
+    fn a_version_1_payload_opens_whatever_sits_at_the_73_byte_candidate_offset() {
+        // The 73-byte candidate offset of a version-1 payload falls inside its
+        // archive block, whose bytes are artifact content and can spell
+        // anything at all. The `2` case is the discriminating one: that
+        // candidate pairs with the 73-byte size, so a descending walk would
+        // select it and follow the archive's bytes as offsets. The ascending
+        // walk selects the real 41-byte footer before it is ever read.
+        let roxyd = b"roxyd binary bytes that comfortably outrun the 32 bytes under test";
+        let json = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
+        let asset = assemble(BASE, &json, &archive, &footer);
+
+        for version_byte in [1u8, 2, 200] {
+            let mut forged = asset.clone();
+            let candidate_at = forged.len() - FOOTER_SIZE_V2;
+            assert!(
+                candidate_at >= usize::try_from(footer.archive_offset).expect("fits"),
+                "the candidate offset must land inside the archive block"
+            );
+            let candidate = forged
+                .get_mut(candidate_at..candidate_at + MAGIC_LEN + 1)
+                .expect("candidate region in range");
+            candidate
+                .get_mut(..MAGIC_LEN)
+                .expect("magic in range")
+                .copy_from_slice(&MAGIC);
+            *candidate.get_mut(MAGIC_LEN).expect("version byte in range") = version_byte;
+
+            let (located, footer_start) = probe_footer(&forged);
+            assert_eq!(located.version, LEGACY_VERSION, "version {version_byte}");
+            assert_eq!(forged.len() - footer_start, FOOTER_SIZE_V1);
+
+            let payload = open(Cursor::new(forged))
+                .expect("the real version-1 footer must still be selected")
+                .expect("trailer should be present");
+            assert_eq!(payload.manifest().artifacts().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_version_2_containers_41_byte_candidate_carries_no_magic() {
+        // `file_len - 41` lands on the most significant byte of a version-2
+        // footer's own `archive_offset`, which is zero for any container below
+        // about 4.7 exabytes — so the walk falls through to 73 and finds the
+        // real footer.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = two_member_binary(src.path());
+        let candidate_at = binary.len() - FOOTER_SIZE_V1;
+        assert_eq!(
+            binary.get(candidate_at).copied(),
+            Some(0),
+            "the 41-byte candidate's first byte is `archive_offset`'s most significant one"
+        );
+        assert_ne!(
+            binary.get(candidate_at..candidate_at + MAGIC_LEN),
+            Some(MAGIC.as_slice())
+        );
+
+        let (footer, footer_start) = probe_footer(&binary);
+        assert_eq!(footer.version, FORMAT_VERSION);
+        assert_eq!(binary.len() - footer_start, FOOTER_SIZE_V2);
+    }
+
+    #[test]
+    fn two_unknown_version_candidates_report_the_first_in_probe_order() {
+        // Neither candidate is a footer, and both name versions this build has
+        // never implemented. `found` is the 41-byte candidate's byte: the first
+        // in probe order, recorded and never overwritten.
+        let mut file = vec![0xABu8; 400];
+        let len = file.len();
+        for (size, version) in [(FOOTER_SIZE_V1, 9u8), (FOOTER_SIZE_V2, 11u8)] {
+            let at = len - size;
+            let candidate = file
+                .get_mut(at..at + MAGIC_LEN + 1)
+                .expect("candidate region in range");
+            candidate
+                .get_mut(..MAGIC_LEN)
+                .expect("magic in range")
+                .copy_from_slice(&MAGIC);
+            *candidate.get_mut(MAGIC_LEN).expect("version byte in range") = version;
+        }
+
+        let error = open(Cursor::new(file)).expect_err("an unknown container version is an error");
+        assert!(
+            matches!(
+                error,
+                PayloadError::UnsupportedContainerFormat { found, supported }
+                    if found == 9 && supported == [1, 2]
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_magic_under_a_known_version_at_the_wrong_size_is_no_trailer() {
+        // The only matching magic sits at the 73-byte candidate offset under a
+        // version-1 byte. The pairing fails, so it is not a footer; the version
+        // is one this build implements, so it is not an unknown format either.
+        // Both buckets refuse it, and what is left is "this file carries no
+        // trailer" — never `UnsupportedContainerFormat` and never
+        // `MalformedFooter`.
+        let mut file = vec![0xABu8; 400];
+        let at = file.len() - FOOTER_SIZE_V2;
+        let candidate = file
+            .get_mut(at..at + MAGIC_LEN + 1)
+            .expect("candidate region in range");
+        candidate
+            .get_mut(..MAGIC_LEN)
+            .expect("magic in range")
+            .copy_from_slice(&MAGIC);
+        *candidate.get_mut(MAGIC_LEN).expect("version byte in range") = 1;
+
+        assert!(
+            open(Cursor::new(file.clone()))
+                .expect("an ignored candidate is not an error")
+                .is_none()
+        );
+        let error = open_package(Cursor::new(file)).expect_err("a package must carry a trailer");
+        assert!(matches!(error, PayloadError::NoTrailer), "got: {error:?}");
+    }
+
+    #[test]
+    fn a_file_shorter_than_the_smallest_known_footer_carries_no_trailer() {
+        for len in [0usize, 4, FOOTER_SIZE_V1 - 1] {
+            assert!(
+                open(Cursor::new(vec![0xABu8; len]))
+                    .expect("a short file is not an error")
+                    .is_none(),
+                "length {len}"
+            );
+            let error = open_package(Cursor::new(vec![0xABu8; len]))
+                .expect_err("a package must carry a trailer");
+            assert!(matches!(error, PayloadError::NoTrailer), "length {len}");
+        }
     }
 
     #[test]

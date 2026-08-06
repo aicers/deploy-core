@@ -2,7 +2,9 @@
 //!
 //! `deploy-core` is the slim, component-agnostic core of the deploy stack: the
 //! transport and execution vocabulary, the on-host directory layout, the payload
-//! and manifest formats, the declarative per-module install spec a package carries
+//! and manifest formats — one container whether it rides on a base executable or
+//! stands alone as a `.pkg` module package — the declarative per-module install
+//! spec a package carries
 //! in its manifest with the systemd serialization rule its strings are held to,
 //! the install/update diff engine, the apply primitives, the bootroot command
 //! wrapper, service registration, and the on-host trust-material activation. It
