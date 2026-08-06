@@ -9,6 +9,12 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **layout** — the on-host directory layout derived from a single namespace.
 - **manifest** / **payload** — the artifact manifest and the self-extracting
   payload format.
+- **module_spec** — the declarative per-module install spec a package carries in
+  its manifest (unit template, bootroot registration template, placement class),
+  and the validator every read path runs over it.
+- **systemd** — the one systemd serialization and rejection rule, which decides
+  whether a package-declared string is representable in a unit file at all and
+  turns a host-resolved value into directive text.
 - **engine** — the install/update diff engine (compute what changed).
 - **apply** — the apply primitives that actuate a diff on a host (place files,
   create directories, run root commands, load images, extract bundles).

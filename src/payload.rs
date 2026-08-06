@@ -44,6 +44,7 @@ use crate::manifest::{
     ArtifactKind, Disposition, ManifestError, PayloadArtifact, PayloadManifest, TargetArch,
     is_safe_archive_path,
 };
+use crate::module_spec::ModuleSpec;
 
 /// Magic bytes at the start of the footer, identifying a bootler payload.
 pub const MAGIC: [u8; 8] = *b"BTLRPYLD";
@@ -167,6 +168,14 @@ pub struct ArtifactInput {
     pub dispositions: std::collections::BTreeSet<Disposition>,
     /// Path of this artifact's member inside the tar archive.
     pub archive_path: String,
+    /// How this artifact is installed, stamped verbatim onto the manifest entry
+    /// derived from this input.
+    ///
+    /// `None` for an artifact whose package declares nothing, which is every
+    /// artifact shipping today. When present it is validated by
+    /// [`validate`](crate::module_spec::validate) as the manifest is assembled,
+    /// so a producer cannot write a spec a reader would refuse.
+    pub spec: Option<ModuleSpec>,
     /// File holding the raw artifact bytes.
     pub source: PathBuf,
 }
@@ -348,8 +357,9 @@ impl<W: Write> Write for CountingWriter<W> {
 ///
 /// Returns [`PayloadError`] when a `source` file cannot be read, the derived
 /// manifest is invalid (empty dispositions, unsafe or duplicate `archive_path`,
-/// a malformed `commit`, an empty `trust_set`), or serialization, archive
-/// construction, or writing to `out` fails.
+/// a malformed `commit`, a `spec` violating a rule
+/// [`validate`](crate::module_spec::validate) enforces, an empty `trust_set`),
+/// or serialization, archive construction, or writing to `out` fails.
 pub fn append_trailer<B: Read, W: Write>(
     mut base: B,
     mut out: W,
@@ -370,6 +380,7 @@ pub fn append_trailer<B: Read, W: Write>(
             dispositions: input.dispositions.clone(),
             archive_path: input.archive_path.clone(),
             sha256,
+            spec: input.spec.clone(),
         });
     }
     let manifest = PayloadManifest::new(pinset.map(str::to_string), artifacts)?;
@@ -786,6 +797,10 @@ mod tests {
         ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
         MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact, TargetArch,
     };
+    use crate::module_spec::{
+        Arg, ModuleSpec, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
+        RestartPolicy, SystemdTarget, UnitTemplate,
+    };
 
     const BASE: &[u8] = b"#!/bin/false\nnot a real executable, just a base binary\n";
 
@@ -819,6 +834,7 @@ mod tests {
             kind: ArtifactKind::NativeBinary,
             dispositions: dispositions(dispositions_values),
             archive_path: archive_path.to_string(),
+            spec: None,
             source,
         }
     }
@@ -973,6 +989,7 @@ mod tests {
             dispositions: dispositions(&[Disposition::Install]),
             archive_path: archive_path.to_string(),
             sha256: sha256_hex(bytes),
+            spec: None,
         }
     }
 
@@ -1241,6 +1258,93 @@ mod tests {
                 }) if got == found
                     && min == MIN_MANIFEST_FORMAT_VERSION
                     && max == MAX_MANIFEST_FORMAT_VERSION
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    /// A spec a producer may stamp onto the `example` component's native
+    /// binary.
+    fn module_spec() -> ModuleSpec {
+        ModuleSpec {
+            unit: Some(UnitTemplate {
+                description: "Roxyd host agent".to_string(),
+                after: vec![SystemdTarget::NetworkOnline],
+                wants: vec![SystemdTarget::NetworkOnline],
+                wanted_by: vec![SystemdTarget::MultiUser],
+                exec_start: vec![
+                    Arg::Var(RenderVar::ArtifactPath),
+                    Arg::Literal("-c".to_string()),
+                    Arg::Var(RenderVar::ConfigPath),
+                ],
+                exec_reload: None,
+                working_directory: None,
+                environment: Vec::new(),
+                restart: RestartPolicy::Always,
+                restart_sec: 5,
+                protect_home: true,
+                private_tmp: true,
+                no_new_privileges: true,
+            }),
+            registration: RegistrationTemplate {
+                package_id: "example".to_string(),
+                service_name: "example".to_string(),
+                reload: ReloadSpec::Sighup {
+                    process_path: "/opt/clumit-security/bin/roxyd".to_string(),
+                },
+                cert_group_gid: None,
+            },
+            placement: PlacementClass::ModuleHosts,
+        }
+    }
+
+    #[test]
+    fn the_writer_stamps_an_inputs_spec_onto_the_derived_manifest_entry() {
+        // `append_trailer` derives each entry from one `ArtifactInput`, so a
+        // field present only on `PayloadArtifact` would be one no producer
+        // could populate. It is copied across unchanged.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let mut inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            b"roxyd binary bytes",
+            &[Disposition::Install],
+        )];
+        inputs[0].spec = Some(module_spec());
+
+        let payload = open(Cursor::new(build_binary(&inputs)))
+            .expect("reader should succeed")
+            .expect("trailer should be present");
+        let entry = payload
+            .manifest()
+            .artifacts()
+            .first()
+            .expect("one artifact");
+        assert_eq!(entry.spec.as_ref(), Some(&module_spec()));
+    }
+
+    #[test]
+    fn the_writer_refuses_an_input_whose_spec_a_reader_would_reject() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let mut inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            b"roxyd binary bytes",
+            &[Disposition::Install],
+        )];
+        let mut spec = module_spec();
+        spec.registration.package_id = "somewhere-else".to_string();
+        inputs[0].spec = Some(spec);
+
+        let error = append_trailer(Cursor::new(BASE), &mut Vec::new(), None, None, &inputs)
+            .expect_err("a mismatched package_id must be rejected");
+        assert!(
+            matches!(
+                error,
+                PayloadError::InvalidManifest(ManifestError::InvalidSpec { ref archive_path, .. })
+                    if archive_path == "bin/roxyd"
             ),
             "got: {error:?}"
         );
