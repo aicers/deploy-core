@@ -4340,6 +4340,65 @@ mod tests {
     }
 
     #[test]
+    fn envelope_blocks_out_of_the_fixed_order_are_malformed() {
+        // Adjacency is a walk in a *fixed* order, so two present blocks that sit
+        // adjacent and fill the body exactly are still refused when each is
+        // claimed at the other's offset. Only the footer moves here: the body's
+        // bytes are the ones `with_envelope` laid down.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let signed = with_envelope(
+            &two_member_binary(src.path()),
+            Some(SIGNATURE),
+            Some(KEY_ID),
+            0,
+        );
+        let swapped = mutating_footer(&signed, |footer| {
+            let archive_end = footer.archive_offset + footer.archive_len;
+            footer.key_id_offset = archive_end;
+            footer.signature_offset = archive_end + footer.key_id_len;
+        });
+
+        let error =
+            open(Cursor::new(swapped)).expect_err("the signature must come before the key_id");
+        assert!(
+            matches!(error, PayloadError::MalformedFooter { .. }),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_present_envelope_block_claiming_bytes_the_file_lacks_is_truncated() {
+        // What makes reading the envelope blocks into memory safe: a crafted
+        // length is bounded against the footer start before any allocation is
+        // sized from it, so it can never name more than the container holds.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let binary = two_member_binary(src.path());
+
+        let cases: [FooterCase; 2] = [
+            // A block starting where the archive ended and running past the
+            // footer.
+            ("a length past the footer", |footer| {
+                footer.signature_offset = footer.archive_offset + footer.archive_len;
+                footer.signature_len = u64::from(u32::MAX);
+            }),
+            // And one whose offset plus length does not even fit a `u64`.
+            ("an offset plus length that overflows", |footer| {
+                footer.key_id_offset = u64::MAX;
+                footer.key_id_len = 1;
+            }),
+        ];
+        for (label, mutate) in cases {
+            let broken = mutating_footer(&binary, mutate);
+            let error = open(Cursor::new(broken))
+                .expect_err("a block outside the container must be rejected");
+            assert!(
+                matches!(error, PayloadError::TruncatedTrailer),
+                "{label} got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_broken_layout_is_malformed_rather_than_falling_through_to_the_smaller_size() {
         // Selection is the only decision the walk makes. A validation failure
         // against the selected 73-byte footer must not send the probe back to
