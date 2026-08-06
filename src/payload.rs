@@ -12,7 +12,11 @@
 //!
 //! 1. **Manifest block** — a [`PayloadManifest`] serialized as JSON.
 //! 2. **Archive block** — a `tar` archive of the artifact files (each member
-//!    keyed by its `archive_path`), `zstd`-compressed.
+//!    keyed by its `archive_path`), `zstd`-compressed. Its shape — how many
+//!    members it holds, what they are called, in what order and how long each
+//!    one is — is stated by the manifest's `archive_members`, which the reader
+//!    compares the sequence it walked against rather than reconstructing it
+//!    from the per-artifact entries.
 //! 3. **Footer** — a fixed-size record at the very end of the file with an
 //!    exact binary layout (see [`FOOTER_SIZE`]): the [`MAGIC`] bytes, a `u8`
 //!    format version ([`FORMAT_VERSION`]), then four `u64` little-endian fields
