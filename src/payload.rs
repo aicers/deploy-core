@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, EntryType, Header};
-use tempfile::NamedTempFile;
+use tempfile::Builder as TempBuilder;
 use zstd::{Decoder, Encoder};
 
 use crate::manifest::{
@@ -61,6 +61,24 @@ pub const FOOTER_SIZE: usize = MAGIC_LEN + 1 + 4 * 8;
 
 /// zstd compression level used by the writer.
 const ZSTD_LEVEL: i32 = 3;
+
+/// Size of one `tar` block, and the unit the end-of-archive marker is measured
+/// in.
+const TAR_BLOCK_SIZE: usize = 512;
+
+/// Most bytes allowed to remain in the decompressed archive block once the
+/// entry walk has stopped, and all of them must be zero.
+///
+/// The end-of-archive marker is two zero blocks. [`Archive::entries`] reads the
+/// first of them, sees an all-zero header, and reports the end without touching
+/// the second, so a well-formed archive leaves exactly one block unread. That
+/// block is the whole allowance: a zero byte past it belongs to no marker, and
+/// tolerating it would admit padding the manifest cannot bind.
+const MAX_END_OF_ARCHIVE_BYTES: usize = TAR_BLOCK_SIZE;
+
+/// Width of the `tar` header's name field, and so the longest `archive_path`
+/// the writer can store in the header block a member is named by.
+const TAR_NAME_FIELD_LEN: usize = 100;
 
 /// Errors raised while writing, locating, or extracting a payload trailer.
 ///
@@ -116,6 +134,67 @@ pub enum PayloadError {
         /// Path of the offending member.
         path: String,
     },
+
+    /// An archive member was named by an extension header — a PAX `path`
+    /// record or a GNU long-name entry — rather than by the raw `ustar`
+    /// header block it applies to.
+    ///
+    /// What this rejects is the name's provenance, not the path and not the
+    /// entry type: the resolved name may be a perfectly safe relative path and
+    /// the member an ordinary regular file. Two readers that disagree about
+    /// which of the two names is the member's are enough to make the manifest
+    /// bind one occurrence while extraction writes another.
+    #[error("archive member name `{resolved_name}` overrides header name `{header_name}`")]
+    NameOverridingHeader {
+        /// Name recorded in the raw `ustar` header block.
+        header_name: String,
+        /// Name the archive reader resolved the member to.
+        resolved_name: String,
+    },
+
+    /// An archive member's size came from a PAX `size` record rather than from
+    /// the raw `ustar` header block it applies to.
+    ///
+    /// The size decides where the member ends and so where the next header
+    /// begins: a reader that honours the record and one that does not disagree
+    /// about the whole remainder of the stream, and a second member at a
+    /// manifest-listed path fits inside the bytes only one of them attributes
+    /// to this one. That is the divergence
+    /// [`PayloadError::NameOverridingHeader`] rejects, reached through the
+    /// other field an extension header can override.
+    #[error(
+        "archive member `{path}` resolves to size {resolved_size}, overriding header size {header_size}"
+    )]
+    SizeOverridingHeader {
+        /// The member's path as the reader resolved it.
+        path: String,
+        /// Size recorded in the raw `ustar` header block.
+        header_size: u64,
+        /// Size the archive reader resolved the member to.
+        resolved_size: u64,
+    },
+
+    /// An `archive_path` did not fit the raw `tar` header's name field while
+    /// writing a trailer.
+    ///
+    /// Storing it would mean naming the member from a GNU long-name entry
+    /// instead of from its own header block, which [`Payload::extract_to`]
+    /// refuses as [`PayloadError::NameOverridingHeader`]. The writer refuses
+    /// the path here rather than emitting a payload its own reader rejects.
+    #[error(
+        "archive path `{path}` does not fit a tar header name field ({len} bytes, limit {TAR_NAME_FIELD_LEN})"
+    )]
+    ArchivePathTooLong {
+        /// The offending `archive_path`.
+        path: String,
+        /// Its length in bytes.
+        len: usize,
+    },
+
+    /// The decompressed archive block carried bytes past the end-of-archive
+    /// marker, where this reader stops and another reader would not.
+    #[error("archive block carries bytes after the end-of-archive marker")]
+    TrailingArchiveBytes,
 
     /// An archive member had no matching manifest entry, so it could not be
     /// hash-verified.
@@ -358,8 +437,11 @@ impl<W: Write> Write for CountingWriter<W> {
 /// Returns [`PayloadError`] when a `source` file cannot be read, the derived
 /// manifest is invalid (empty dispositions, unsafe or duplicate `archive_path`,
 /// a malformed `commit`, a `spec` violating a rule
-/// [`validate`](crate::module_spec::validate) enforces, an empty `trust_set`),
-/// or serialization, archive construction, or writing to `out` fails.
+/// [`validate`](crate::module_spec::validate) enforces, an empty `trust_set`), an
+/// `archive_path` is longer than a `tar` header's name field
+/// ([`PayloadError::ArchivePathTooLong`], since storing it would need a
+/// name-overriding extension header the reader refuses), or serialization,
+/// archive construction, or writing to `out` fails.
 pub fn append_trailer<B: Read, W: Write>(
     mut base: B,
     mut out: W,
@@ -403,12 +485,24 @@ pub fn append_trailer<B: Read, W: Write>(
             let source = std::fs::File::open(&input.source)?;
             let size = source.metadata()?.len();
             let mut header = Header::new_gnu();
+            // The name is written into the header block and the header is
+            // appended verbatim, because `Builder::append_data` falls back to a
+            // GNU long-name entry for a path the field cannot hold — and the
+            // reader refuses a member whose name comes from an extension header
+            // rather than from the block it applies to. Refusing the path is the
+            // only outcome that keeps the writer and the reader agreeing.
+            header
+                .set_path(&input.archive_path)
+                .map_err(|_| PayloadError::ArchivePathTooLong {
+                    path: input.archive_path.clone(),
+                    len: input.archive_path.len(),
+                })?;
             header.set_size(size);
             header.set_mode(0o644);
             header.set_mtime(0);
             header.set_entry_type(EntryType::Regular);
             header.set_cksum();
-            builder.append_data(&mut header, &input.archive_path, source)?;
+            builder.append(&header, source)?;
         }
         let encoder = builder.into_inner()?;
         encoder.finish()?;
@@ -543,22 +637,56 @@ impl<R: Read + Seek> Payload<R> {
     /// Extracts every artifact into `dest`, verifying each member against its
     /// manifest entry.
     ///
-    /// Each member is checked before its bytes reach a final path: only regular
-    /// files with safe relative paths that appear in the manifest are extracted.
-    /// A member is streamed into a temporary file in the destination directory
-    /// while its SHA-256 is computed, and only moved into place once the hash
-    /// matches — so a mismatching artifact never lands at its target path and no
-    /// member is buffered in memory in full. After iteration, every manifest
-    /// artifact must have been seen; a manifest entry with no archive member is
-    /// rejected so nothing the manifest promises is silently skipped.
+    /// The archive block is constrained to what the manifest can bind: a member
+    /// is admitted only when it is a regular file, is named and sized by its
+    /// own raw `ustar` header rather than by an overriding extension header,
+    /// uses a normalized relative path, appears in the manifest exactly once,
+    /// and hashes to the SHA-256 the manifest records. Every one of those checks
+    /// runs before the member's bytes can reach a final path. Nothing may
+    /// follow the end-of-archive marker, so a second archive appended past it —
+    /// invisible to this reader, visible to others — is refused rather than
+    /// ignored. After the walk, every manifest artifact must have been seen; a
+    /// manifest entry with no archive member is rejected so nothing the
+    /// manifest promises is silently skipped.
+    ///
+    /// Each member streams from the archive into a staging directory while its
+    /// SHA-256 is computed, so no member is buffered in memory in full and a
+    /// GB-scale artifact still streams.
+    ///
+    /// # All-or-nothing
+    ///
+    /// On any rejection this function decides — a refused member, a hash
+    /// mismatch, or an I/O failure met while reading the archive or staging a
+    /// member — `dest` is left exactly as it was found: no extracted artifact,
+    /// no directory created to hold one, no staging directory and no temporary
+    /// file. `dest` and its missing ancestors are created if absent, and that
+    /// is the only difference a rejection is allowed to leave behind: after a
+    /// rejection a previously absent `dest` is either still absent or exists
+    /// and is empty.
+    ///
+    /// Two cases lie outside that guarantee. It does not survive a process
+    /// crash. And it does not cover the final publish step — the moves that put
+    /// already-verified members at their target paths once every check has
+    /// passed. Publishing several files is not one atomic operation, so **a
+    /// failure during the publish step may leave already-verified members at
+    /// their target paths**; making it otherwise would mean owning `dest`
+    /// rather than writing into it, which is a different function's contract.
+    /// Even there, no staging directory and no temporary file survives, and no
+    /// partially written artifact appears at a target path, because each
+    /// individual move is atomic.
     ///
     /// # Errors
     ///
-    /// Returns [`PayloadError`] when a member is a non-regular entry, uses an
-    /// unsafe path, is absent from the manifest, is a repeated `archive_path`,
-    /// or fails its hash check; when a manifest artifact has no matching member;
-    /// or when the archive cannot be read.
+    /// Returns [`PayloadError`] when a member is a non-regular entry, is named
+    /// or sized by an overriding extension header, uses an unsafe path, is
+    /// absent from the manifest, is a repeated `archive_path`, or fails its
+    /// hash check; when the archive block carries bytes past the
+    /// end-of-archive marker; when a manifest artifact has no matching member;
+    /// or when the archive cannot be read or a staged member cannot be
+    /// written.
     pub fn extract_to(&mut self, dest: &Path) -> Result<Vec<ExtractedArtifact>, PayloadError> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
         let manifest = &self.manifest;
         let by_path: HashMap<&str, &PayloadArtifact> = manifest
             .artifacts()
@@ -566,56 +694,63 @@ impl<R: Read + Seek> Payload<R> {
             .map(|artifact| (artifact.archive_path.as_str(), artifact))
             .collect();
 
+        // `dest` is created up front rather than incidentally by the first
+        // member's parent directory, so how far the walk got before a rejection
+        // cannot decide whether it exists.
+        std::fs::create_dir_all(dest)?;
+        // Every member lands here first and is published only once the whole
+        // archive has been walked and every check has passed. The staging
+        // directory sits inside `dest` so the publishing renames stay on one
+        // filesystem, and its `Drop` removes it — with everything staged under
+        // it — on every path out of this function. Owner-only at creation, and
+        // not left to the umask: a member sits under it for the whole walk with
+        // its hash still unchecked, so nothing outside this process has any
+        // business reading it.
+        let staging = TempBuilder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(dest)?;
+
         self.src.seek(SeekFrom::Start(self.archive_offset))?;
         let limited = (&mut self.src).take(self.archive_len);
         let decoder = Decoder::new(limited)?;
         let mut archive = Archive::new(decoder);
 
-        let mut extracted = Vec::new();
+        let mut staged: Vec<(PathBuf, &PayloadArtifact)> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         for entry in archive.entries()? {
             let mut entry = entry?;
-            let entry_type = entry.header().entry_type();
-            let raw_path = entry.path()?.into_owned();
-            let display = raw_path.display().to_string();
-
-            if entry_type != EntryType::Regular {
-                return Err(PayloadError::UnsupportedEntryType { path: display });
-            }
-            let Some(path_str) = raw_path.to_str() else {
-                return Err(PayloadError::UnsafeMemberPath(display));
-            };
-            if !is_safe_archive_path(path_str) {
-                return Err(PayloadError::UnsafeMemberPath(display));
-            }
-            let Some(artifact) = by_path.get(path_str).copied() else {
-                return Err(PayloadError::MemberNotInManifest(display));
+            let member_path = admitted_member_path(&entry)?;
+            let Some(artifact) = by_path.get(member_path.as_str()).copied() else {
+                return Err(PayloadError::MemberNotInManifest(member_path));
             };
             if !seen.insert(artifact.archive_path.as_str()) {
-                return Err(PayloadError::DuplicateMember(display));
+                return Err(PayloadError::DuplicateMember(member_path));
             }
 
-            let out_path = dest.join(&raw_path);
-            let parent = match out_path.parent() {
-                Some(parent) => {
-                    std::fs::create_dir_all(parent)?;
-                    parent
-                }
-                None => dest,
-            };
-            let mut temp = NamedTempFile::new_in(parent)?;
-            let digest = hash_copy(&mut entry, &mut temp)?;
+            let relative = PathBuf::from(&member_path);
+            let staged_path = staging.path().join(&relative);
+            if let Some(parent) = staged_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Owner-only from the moment it is created, the mode the
+            // `NamedTempFile` this staging replaced gave a member's bytes: the
+            // artifact reaches its target path by rename, so this is the only
+            // moment its permissions are chosen.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&staged_path)?;
+            let digest = hash_copy(&mut entry, &mut file)?;
             if !digest.eq_ignore_ascii_case(&artifact.sha256) {
                 return Err(PayloadError::HashMismatch {
                     path: artifact.archive_path.clone(),
                 });
             }
-            temp.persist(&out_path).map_err(|error| error.error)?;
-            extracted.push(ExtractedArtifact {
-                artifact: artifact.clone(),
-                path: out_path,
-            });
+            staged.push((relative, artifact));
         }
+
+        reject_trailing_bytes(&mut archive.into_inner())?;
 
         for artifact in manifest.artifacts() {
             if !seen.contains(artifact.archive_path.as_str()) {
@@ -625,7 +760,109 @@ impl<R: Read + Seek> Payload<R> {
             }
         }
 
+        // Publish. Every check has passed, so from here a failure may leave
+        // already-verified members behind; each individual move is atomic, so
+        // no partial artifact can appear at a target path.
+        let mut extracted = Vec::with_capacity(staged.len());
+        for (relative, artifact) in staged {
+            let out_path = dest.join(&relative);
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(staging.path().join(&relative), &out_path)?;
+            extracted.push(ExtractedArtifact {
+                artifact: artifact.clone(),
+                path: out_path,
+            });
+        }
+
         Ok(extracted)
+    }
+}
+
+/// Admits one archive member on the archive format's own terms and returns the
+/// path it may be looked up in the manifest under.
+///
+/// Every rejection here is decided before any manifest lookup, so the member is
+/// refused for what the archive says about it rather than for what the manifest
+/// does or does not name. Each refusal carries its own variant: two readers that
+/// disagree about a member is a different defect from an unusable path, which is
+/// a different defect again from an entry that is not a file at all.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::UnsupportedEntryType`] for anything but a regular
+/// file, [`PayloadError::NameOverridingHeader`] or
+/// [`PayloadError::SizeOverridingHeader`] when an extension header replaces the
+/// name or the size the raw `ustar` header block states, and
+/// [`PayloadError::UnsafeMemberPath`] for a name that is not valid UTF-8 or not
+/// a normalized relative path.
+fn admitted_member_path<R: Read>(entry: &tar::Entry<'_, R>) -> Result<String, PayloadError> {
+    // The raw `ustar` name field, taken from the header block itself, against
+    // the name the archive library resolved — which a PAX `path` record or a
+    // GNU long-name entry silently replaces. The disagreement between the two
+    // is the whole diagnostic, so both are read before either is trusted.
+    let header_name = entry.header().path_bytes();
+    let resolved_name = entry.path_bytes();
+    let display = String::from_utf8_lossy(&resolved_name).into_owned();
+
+    if entry.header().entry_type() != EntryType::Regular {
+        return Err(PayloadError::UnsupportedEntryType { path: display });
+    }
+    if header_name != resolved_name {
+        return Err(PayloadError::NameOverridingHeader {
+            header_name: String::from_utf8_lossy(&header_name).into_owned(),
+            resolved_name: display,
+        });
+    }
+    // The name is not the only field an extension header can override. The size
+    // the reader attributes to the member decides where the member ends and so
+    // where the next header starts, so a PAX `size` record hides a whole second
+    // member inside this one's bytes from whichever of two readers honours it.
+    let header_size = entry.header().entry_size()?;
+    let resolved_size = entry.size();
+    if header_size != resolved_size {
+        return Err(PayloadError::SizeOverridingHeader {
+            path: display,
+            header_size,
+            resolved_size,
+        });
+    }
+    let Ok(path) = std::str::from_utf8(&resolved_name) else {
+        return Err(PayloadError::UnsafeMemberPath(display));
+    };
+    if !is_safe_archive_path(path) {
+        return Err(PayloadError::UnsafeMemberPath(display));
+    }
+    Ok(display)
+}
+
+/// Reads `reader` — the decompressed archive block, positioned where the entry
+/// walk stopped — to its end, refusing anything but the one zero block the
+/// end-of-archive marker leaves unread.
+///
+/// [`Archive::entries`] stops at that marker and reports nothing about what
+/// follows it, so a second archive appended past it is invisible to this reader
+/// and visible to one that keeps going. Draining the decoder is what makes the
+/// difference observable.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::TrailingArchiveBytes`] when a non-zero byte or more
+/// than [`MAX_END_OF_ARCHIVE_BYTES`] of them remain, and [`PayloadError::Io`]
+/// when the read itself fails.
+fn reject_trailing_bytes<R: Read>(reader: &mut R) -> Result<(), PayloadError> {
+    let mut buf = [0u8; TAR_BLOCK_SIZE];
+    let mut remaining = 0usize;
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            return Ok(());
+        }
+        remaining += read;
+        if buf.iter().take(read).any(|byte| *byte != 0) || remaining > MAX_END_OF_ARCHIVE_BYTES {
+            return Err(PayloadError::TrailingArchiveBytes);
+        }
     }
 }
 
@@ -783,7 +1020,7 @@ pub fn current_exe_base() -> Result<Vec<u8>, PayloadError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use std::path::Path;
 
     use tar::{Builder, EntryType, Header};
@@ -791,7 +1028,8 @@ mod tests {
 
     use super::{
         ArtifactInput, FOOTER_SIZE, FORMAT_VERSION, Footer, MAGIC, PayloadError, PayloadManifest,
-        append_trailer, open, open_current_exe, parse_footer, rewrap_trailer, sha256_hex,
+        TAR_BLOCK_SIZE, TAR_NAME_FIELD_LEN, append_trailer, open, open_current_exe, parse_footer,
+        rewrap_trailer, sha256_hex,
     };
     use crate::manifest::{
         ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
@@ -855,6 +1093,7 @@ mod tests {
     /// Builds a zstd-compressed tar archive from raw members, bypassing the
     /// writer so adversarial members (symlinks, unsafe paths, unknown files)
     /// can be crafted.
+    #[derive(Clone, Copy)]
     enum Member<'a> {
         File {
             path: &'a str,
@@ -881,10 +1120,107 @@ mod tests {
         Directory {
             path: &'a str,
         },
+        /// A GNU long-name entry (`L`) followed by the member it renames, so
+        /// the resolved name comes from the extension header while the raw
+        /// `ustar` name field says something else. The `tar` reader applies it
+        /// transparently.
+        GnuLongName {
+            /// Name written into the renamed member's raw header block.
+            header_path: &'a str,
+            /// Name the long-name entry resolves that member to.
+            resolved_path: &'a str,
+            bytes: &'a [u8],
+        },
+        /// A PAX local extension entry (`x`) carrying a `path` record, followed
+        /// by the member it renames. Also applied transparently.
+        PaxPath {
+            /// Name written into the renamed member's raw header block.
+            header_path: &'a str,
+            /// Name the `path` record resolves that member to.
+            resolved_path: &'a str,
+            bytes: &'a [u8],
+        },
+        /// A PAX local extension entry (`x`) carrying a `size` record that
+        /// disagrees with the raw `ustar` header's size field, followed by the
+        /// member it resizes. `tar` honours the record, so this reader
+        /// attributes all of `bytes` to the member while a reader that ignores
+        /// PAX stops after `header_size` and resynchronizes inside them.
+        PaxSize {
+            path: &'a str,
+            /// Size written into the member's raw header block.
+            header_size: u64,
+            /// Bytes actually following it, and the size the record names.
+            bytes: &'a [u8],
+        },
     }
 
-    fn zstd_tar(members: &[Member]) -> Vec<u8> {
-        let mut builder = Builder::new(Encoder::new(Vec::new(), 3).unwrap());
+    /// Builds the GNU header a raw regular member is named by, with the name
+    /// bytes written straight into the header block so `tar`'s write-time path
+    /// validation never sees them, and the size stated independently of the
+    /// bytes that will follow.
+    fn raw_regular_header(path: &str, size: u64) -> Header {
+        let mut header = Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_entry_type(EntryType::Regular);
+        {
+            let gnu = header.as_gnu_mut().expect("gnu header");
+            let name_bytes = path.as_bytes();
+            gnu.name[..name_bytes.len()].copy_from_slice(name_bytes);
+        }
+        header.set_cksum();
+        header
+    }
+
+    /// Appends a regular member whose name bytes go straight into the GNU
+    /// header, bypassing `tar`'s write-time path validation.
+    fn append_raw_regular<W: std::io::Write>(builder: &mut Builder<W>, path: &str, bytes: &[u8]) {
+        let header = raw_regular_header(path, bytes.len() as u64);
+        builder.append(&header, bytes).unwrap();
+    }
+
+    /// Encodes one PAX extended-header record, `"<len> <key>=<value>\n"`, whose
+    /// length field counts its own digits — so the width is found by fixed
+    /// point rather than assumed.
+    fn pax_record(key: &str, value: &str) -> Vec<u8> {
+        let without_len = key.len() + value.len() + 3;
+        let mut total = without_len + 1;
+        loop {
+            let candidate = without_len + total.to_string().len();
+            if candidate == total {
+                break;
+            }
+            total = candidate;
+        }
+        format!("{total} {key}={value}\n").into_bytes()
+    }
+
+    /// Appends an extension header entry of `entry_type` named `name` carrying
+    /// `body`, the shape both name-overriding fixtures are built from.
+    fn append_extension_header<W: std::io::Write>(
+        builder: &mut Builder<W>,
+        entry_type: EntryType,
+        name: &[u8],
+        body: &[u8],
+    ) {
+        let mut header = Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_entry_type(entry_type);
+        {
+            let gnu = header.as_gnu_mut().expect("gnu header");
+            gnu.name[..name.len()].copy_from_slice(name);
+        }
+        header.set_cksum();
+        builder.append(&header, body).unwrap();
+    }
+
+    /// Builds the uncompressed tar stream for `members`, terminated by the
+    /// two-block end-of-archive marker `Builder::into_inner` writes.
+    fn tar_bytes(members: &[Member]) -> Vec<u8> {
+        let mut builder = Builder::new(Vec::new());
         for member in members {
             match member {
                 Member::File { path, bytes } => {
@@ -897,17 +1233,54 @@ mod tests {
                     builder.append_data(&mut header, path, *bytes).unwrap();
                 }
                 Member::RawFile { path, bytes } => {
-                    let mut header = Header::new_gnu();
-                    header.set_size(bytes.len() as u64);
-                    header.set_mode(0o644);
-                    header.set_mtime(0);
-                    header.set_entry_type(EntryType::Regular);
-                    {
-                        let gnu = header.as_gnu_mut().expect("gnu header");
-                        let name_bytes = path.as_bytes();
-                        gnu.name[..name_bytes.len()].copy_from_slice(name_bytes);
-                    }
-                    header.set_cksum();
+                    append_raw_regular(&mut builder, path, bytes);
+                }
+                Member::GnuLongName {
+                    header_path,
+                    resolved_path,
+                    bytes,
+                } => {
+                    // GNU writes the long name as the body of an `L` entry
+                    // conventionally named `././@LongLink`, NUL-terminated.
+                    let mut name = resolved_path.as_bytes().to_vec();
+                    name.push(0);
+                    append_extension_header(
+                        &mut builder,
+                        EntryType::GNULongName,
+                        b"././@LongLink",
+                        &name,
+                    );
+                    append_raw_regular(&mut builder, header_path, bytes);
+                }
+                Member::PaxPath {
+                    header_path,
+                    resolved_path,
+                    bytes,
+                } => {
+                    let body = pax_record("path", resolved_path);
+                    append_extension_header(
+                        &mut builder,
+                        EntryType::XHeader,
+                        b"PaxHeaders.0/override",
+                        &body,
+                    );
+                    append_raw_regular(&mut builder, header_path, bytes);
+                }
+                Member::PaxSize {
+                    path,
+                    header_size,
+                    bytes,
+                } => {
+                    let body = pax_record("size", &bytes.len().to_string());
+                    append_extension_header(
+                        &mut builder,
+                        EntryType::XHeader,
+                        b"PaxHeaders.0/resize",
+                        &body,
+                    );
+                    // `Builder::append` pads from the bytes it copies, not from
+                    // the header's size field, so the two are free to disagree.
+                    let header = raw_regular_header(path, *header_size);
                     builder.append(&header, *bytes).unwrap();
                 }
                 Member::Symlink { path, target } => {
@@ -950,7 +1323,86 @@ mod tests {
                 }
             }
         }
-        builder.into_inner().unwrap().finish().unwrap()
+        builder.into_inner().unwrap()
+    }
+
+    fn zstd_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = Encoder::new(Vec::new(), 3).unwrap();
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Builds a zstd-compressed tar archive from raw members, bypassing the
+    /// writer so adversarial members (symlinks, unsafe paths, unknown files)
+    /// can be crafted.
+    fn zstd_tar(members: &[Member]) -> Vec<u8> {
+        zstd_compress(&tar_bytes(members))
+    }
+
+    /// The same, with `trailing` appended inside the compressed block, past the
+    /// end-of-archive marker where a `tar` reader stops looking.
+    fn zstd_tar_with_trailing(members: &[Member], trailing: &[u8]) -> Vec<u8> {
+        let mut bytes = tar_bytes(members);
+        bytes.extend_from_slice(trailing);
+        zstd_compress(&bytes)
+    }
+
+    /// Lists `root`'s contents recursively as sorted relative paths, with a
+    /// trailing `/` on directories, so an unchanged destination can be asserted
+    /// as an equality of two walks and a stray created directory fails as
+    /// loudly as a stray file.
+    fn walk(root: &Path) -> Vec<String> {
+        fn visit(dir: &Path, prefix: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let entry = entry.expect("directory entry");
+                let relative = prefix.join(entry.file_name());
+                if entry.file_type().expect("file type").is_dir() {
+                    out.push(format!("{}/", relative.display()));
+                    visit(&entry.path(), &relative, out);
+                } else {
+                    out.push(relative.display().to_string());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(root, Path::new(""), &mut out);
+        out.sort_unstable();
+        out
+    }
+
+    /// Drives extraction of a hand-built payload into a destination seeded with
+    /// pre-existing content, and asserts the rejection left that destination
+    /// exactly as it was found — walked recursively before and after.
+    ///
+    /// The temporary directory is returned alongside the error so a caller can
+    /// add assertions of its own before it is removed.
+    fn extract_error_leaving_dest_unchanged(
+        json: &[u8],
+        archive: &[u8],
+    ) -> (PayloadError, tempfile::TempDir) {
+        let footer = valid_footer(BASE.len(), json, archive);
+        let binary = assemble(BASE, json, archive, &footer);
+        let mut payload = open(Cursor::new(binary))
+            .expect("reader should succeed")
+            .expect("trailer present");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("pre/existing")).expect("seed directory");
+        std::fs::write(dir.path().join("pre/existing/file"), b"kept").expect("seed file");
+        let before = walk(dir.path());
+
+        let error = payload
+            .extract_to(dir.path())
+            .expect_err("extraction should be rejected");
+        assert_eq!(
+            walk(dir.path()),
+            before,
+            "a rejection must leave the destination exactly as it was found"
+        );
+        (error, dir)
     }
 
     fn valid_footer(base_len: usize, manifest_json: &[u8], archive: &[u8]) -> Footer {
@@ -1115,6 +1567,24 @@ mod tests {
         assert_eq!(std::fs::read(&roxyd_out).unwrap(), roxyd);
         let web_out = dir.path().join("assets/web.tar");
         assert_eq!(std::fs::read(&web_out).unwrap(), web);
+        // Owner-only, as the staged file was created — the rename that
+        // publishes it carries its mode across unchanged.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&roxyd_out).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "got: {mode:o}");
+        }
+        // The two artifacts and their parents, and nothing else: a successful
+        // extraction leaves no staging directory behind either.
+        assert_eq!(
+            walk(dir.path()),
+            vec![
+                "assets/".to_string(),
+                "assets/web.tar".to_string(),
+                "bin/".to_string(),
+                "bin/roxyd".to_string(),
+            ]
+        );
 
         let roxyd_entry = extracted
             .iter()
@@ -1549,6 +2019,94 @@ mod tests {
     }
 
     #[test]
+    fn writer_rejects_an_archive_path_longer_than_a_header_name_field() {
+        // `tar` stores a path the name field cannot hold in a GNU long-name
+        // entry, which the reader refuses as `NameOverridingHeader`. The writer
+        // must therefore refuse the path up front, at the producer, rather than
+        // emitting a payload whose members its own reader rejects.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let long = format!("bin/{}", "a".repeat(TAR_NAME_FIELD_LEN));
+        let inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            &long,
+            b"roxyd binary bytes",
+            &[Disposition::Install],
+        )];
+        let mut out = Vec::new();
+        let error = append_trailer(Cursor::new(BASE), &mut out, None, None, &inputs)
+            .expect_err("an over-long archive_path must be rejected");
+        assert!(
+            matches!(error, PayloadError::ArchivePathTooLong { ref path, len }
+                if path == &long && len == long.len()),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_archive_path_filling_the_header_name_field_still_round_trips() {
+        // The boundary from the other side: a path that exactly fills the name
+        // field needs no extension header, so the guard above must not reject
+        // it and extraction must accept the member it produces.
+        let bytes = b"roxyd binary bytes";
+        let exact = format!("bin/{}", "a".repeat(TAR_NAME_FIELD_LEN - 4));
+        assert_eq!(exact.len(), TAR_NAME_FIELD_LEN);
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = vec![input(
+            src.path(),
+            "roxyd.src",
+            &exact,
+            bytes,
+            &[Disposition::Install],
+        )];
+        let binary = build_binary(&inputs);
+
+        let mut payload = open(Cursor::new(binary))
+            .expect("reader should succeed")
+            .expect("trailer present");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extracted = payload.extract_to(dir.path()).expect("extraction succeeds");
+        let [only] = extracted.as_slice() else {
+            panic!("expected exactly one artifact, got {extracted:?}");
+        };
+        assert_eq!(only.artifact.archive_path, exact);
+        assert_eq!(std::fs::read(&only.path).expect("read extracted"), bytes);
+    }
+
+    #[test]
+    fn an_io_failure_mid_walk_leaves_the_destination_unchanged() {
+        // The all-or-nothing guarantee covers I/O failures met while reading the
+        // archive, not only refused members. The tar stream is cut inside the
+        // second member's header, so the first member is fully staged and
+        // verified before the read fails — and must still not survive.
+        let roxyd = b"roxyd binary bytes";
+        let web = b"static web assets";
+        let json = manifest_json(vec![
+            artifact("bin/roxyd", roxyd),
+            artifact("assets/web.tar", web),
+        ]);
+        let first = Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        };
+        let second = Member::File {
+            path: "assets/web.tar",
+            bytes: web,
+        };
+        // Everything `tar_bytes` writes for the first member alone, less the
+        // two-block end-of-archive marker: the offset the second member's
+        // header starts at.
+        let second_header_at = tar_bytes(&[first]).len() - 2 * TAR_BLOCK_SIZE;
+        let mut stream = tar_bytes(&[first, second]);
+        stream.truncate(second_header_at + TAR_BLOCK_SIZE / 2);
+        let archive = zstd_compress(&stream);
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(matches!(error, PayloadError::Io(_)), "got: {error:?}");
+        assert!(!dir.path().join("bin/roxyd").exists());
+    }
+
+    #[test]
     fn binary_without_trailer_is_an_empty_payload() {
         // Shorter than the footer.
         assert!(open(Cursor::new(vec![0u8; 4])).unwrap().is_none());
@@ -1590,16 +2148,8 @@ mod tests {
             path: "bin/roxyd",
             bytes: &tampered,
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should locate the trailer")
-            .expect("trailer should be present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("hash mismatch expected");
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
             matches!(error, PayloadError::HashMismatch { ref path } if path == "bin/roxyd"),
             "got: {error:?}"
@@ -1677,6 +2227,177 @@ mod tests {
             path: "../escape",
             bytes,
         }]);
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(error, PayloadError::UnsafeMemberPath(_)),
+            "got: {error:?}"
+        );
+        assert!(!dir.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
+    fn a_dot_prefixed_alias_of_a_manifest_listed_path_is_an_unsafe_member_path() {
+        // `./bin/roxyd` resolves to the same file as the manifest-listed
+        // `bin/roxyd` for a reader that normalizes, and to a second member for
+        // one that does not. The name is not overridden — the raw header says
+        // exactly what the reader resolved — so this is a path defect, and the
+        // normalization rule is what catches it.
+        let bytes = b"roxyd binary bytes";
+        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let archive = zstd_tar(&[
+            Member::File {
+                path: "bin/roxyd",
+                bytes,
+            },
+            Member::RawFile {
+                path: "./bin/roxyd",
+                bytes: b"attacker bytes",
+            },
+        ]);
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(error, PayloadError::UnsafeMemberPath(ref path) if path == "./bin/roxyd"),
+            "got: {error:?}"
+        );
+        // The earlier, individually valid member is not left behind either.
+        assert!(!dir.path().join("bin/roxyd").exists());
+    }
+
+    #[test]
+    fn a_gnu_long_name_entry_overriding_the_header_name_is_rejected() {
+        // The `L` entry renames a member the raw header calls `harmless.txt` to
+        // the manifest-listed `bin/roxyd`, and the `tar` reader applies it
+        // transparently — so the resolved name alone looks perfectly ordinary.
+        // Only the raw header field disagrees, and that disagreement is the
+        // defect.
+        let bytes = b"roxyd binary bytes";
+        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let archive = zstd_tar(&[Member::GnuLongName {
+            header_path: "harmless.txt",
+            resolved_path: "bin/roxyd",
+            bytes,
+        }]);
+
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(
+                error,
+                PayloadError::NameOverridingHeader {
+                    ref header_name,
+                    ref resolved_name,
+                } if header_name == "harmless.txt" && resolved_name == "bin/roxyd"
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_pax_path_record_overriding_the_header_name_is_rejected() {
+        // The same provenance defect through the other extension mechanism.
+        // The resolved name is a safe, manifest-listed relative path and the
+        // entry is an ordinary regular file whose bytes even match the manifest
+        // hash, so neither `UnsafeMemberPath` nor `UnsupportedEntryType` would
+        // be true of it and a silent pass is exactly the hole.
+        let bytes = b"roxyd binary bytes";
+        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let archive = zstd_tar(&[Member::PaxPath {
+            header_path: "harmless.txt",
+            resolved_path: "bin/roxyd",
+            bytes,
+        }]);
+
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(
+                error,
+                PayloadError::NameOverridingHeader {
+                    ref header_name,
+                    ref resolved_name,
+                } if header_name == "harmless.txt" && resolved_name == "bin/roxyd"
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_pax_size_record_overriding_the_header_size_is_rejected() {
+        // The name is not overridden and the member's bytes hash to exactly
+        // what the manifest records, so every other check passes. What the
+        // `size` record moves is where the member ends: this reader attributes
+        // the whole smuggled stream to `bin/roxyd`, while a reader that ignores
+        // PAX reads the raw header's `0`, resynchronizes at the next block, and
+        // finds a second `bin/roxyd` carrying attacker bytes waiting there.
+        let smuggled = tar_bytes(&[Member::File {
+            path: "bin/roxyd",
+            bytes: b"attacker bytes",
+        }]);
+        let json = manifest_json(vec![artifact("bin/roxyd", &smuggled)]);
+        let archive = zstd_tar(&[Member::PaxSize {
+            path: "bin/roxyd",
+            header_size: 0,
+            bytes: &smuggled,
+        }]);
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(
+                error,
+                PayloadError::SizeOverridingHeader {
+                    ref path,
+                    header_size: 0,
+                    resolved_size,
+                } if path == "bin/roxyd" && resolved_size == smuggled.len() as u64
+            ),
+            "got: {error:?}"
+        );
+        assert!(!dir.path().join("bin/roxyd").exists());
+    }
+
+    #[test]
+    fn bytes_after_the_end_of_archive_marker_are_rejected() {
+        // A second archive hides past the marker: this reader stops there and
+        // would never see it, while a reader that keeps going finds a member
+        // the manifest never named.
+        let bytes = b"roxyd binary bytes";
+        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let smuggled = tar_bytes(&[Member::File {
+            path: "bin/stowaway",
+            bytes: b"attacker bytes",
+        }]);
+        let archive = zstd_tar_with_trailing(
+            &[Member::File {
+                path: "bin/roxyd",
+                bytes,
+            }],
+            &smuggled,
+        );
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(error, PayloadError::TrailingArchiveBytes),
+            "got: {error:?}"
+        );
+        assert!(!dir.path().join("bin/roxyd").exists());
+        assert!(!dir.path().join("bin/stowaway").exists());
+    }
+
+    #[test]
+    fn the_end_of_archive_marker_alone_still_extracts() {
+        // One edge of the drain's allowance. `tar`'s reader consumes the first
+        // of the marker's two zero blocks before reporting the end, so a
+        // well-formed archive leaves exactly one block unread and that block
+        // must not be mistaken for trailing content.
+        let bytes = b"roxyd binary bytes";
+        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let archive = zstd_tar_with_trailing(
+            &[Member::File {
+                path: "bin/roxyd",
+                bytes,
+            }],
+            &[],
+        );
         let footer = valid_footer(BASE.len(), &json, &archive);
         let binary = assemble(BASE, &json, &archive, &footer);
 
@@ -1684,14 +2405,103 @@ mod tests {
             .expect("reader should succeed")
             .expect("trailer present");
         let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("unsafe path expected");
+        let extracted = payload.extract_to(dir.path()).expect("extraction succeeds");
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(
+            std::fs::read(dir.path().join("bin/roxyd")).expect("read extracted"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn a_single_zero_byte_past_the_end_of_archive_marker_is_rejected() {
+        // The other edge, one byte away from the test above. The allowance
+        // covers the marker's own unread block and nothing else, so the very
+        // next byte is trailing content even though it names no member and no
+        // reader could resynchronize inside it.
+        let bytes = b"roxyd binary bytes";
+        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let archive = zstd_tar_with_trailing(
+            &[Member::File {
+                path: "bin/roxyd",
+                bytes,
+            }],
+            &[0u8],
+        );
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
-            matches!(error, PayloadError::UnsafeMemberPath(_)),
+            matches!(error, PayloadError::TrailingArchiveBytes),
             "got: {error:?}"
         );
-        assert!(!dir.path().parent().unwrap().join("escape").exists());
+        assert!(!dir.path().join("bin/roxyd").exists());
+    }
+
+    #[test]
+    fn a_rejection_on_the_last_member_leaves_no_earlier_member_on_disk() {
+        // The first member is individually valid and hashes correctly; the
+        // second is a symlink. Extraction is all-or-nothing, so the first must
+        // not survive the second's rejection.
+        let roxyd = b"roxyd binary bytes";
+        let web = b"static web assets";
+        let json = manifest_json(vec![
+            artifact("bin/roxyd", roxyd),
+            artifact("assets/web.tar", web),
+        ]);
+        let archive = zstd_tar(&[
+            Member::File {
+                path: "bin/roxyd",
+                bytes: roxyd,
+            },
+            Member::Symlink {
+                path: "assets/web.tar",
+                target: "/etc/passwd",
+            },
+        ]);
+
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
+        assert!(
+            matches!(error, PayloadError::UnsupportedEntryType { .. }),
+            "got: {error:?}"
+        );
+        assert!(!dir.path().join("bin/roxyd").exists());
+        assert!(!dir.path().join("bin").exists());
+    }
+
+    #[test]
+    fn a_rejection_against_a_missing_destination_leaves_it_absent_or_empty() {
+        // A destination that does not exist is still accepted and created, so
+        // the call must fail with the rejection's own variant rather than with
+        // a missing-destination I/O error — and leave nothing behind but, at
+        // most, the empty directory itself.
+        let bytes = b"roxyd binary bytes";
+        let json = manifest_json(vec![artifact("bin/roxyd", bytes)]);
+        let archive = zstd_tar(&[Member::Symlink {
+            path: "bin/roxyd",
+            target: "/etc/passwd",
+        }]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let binary = assemble(BASE, &json, &archive, &footer);
+
+        let mut payload = open(Cursor::new(binary))
+            .expect("reader should succeed")
+            .expect("trailer present");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dest = parent.path().join("missing/destination");
+        assert!(!dest.exists());
+
+        let error = payload
+            .extract_to(&dest)
+            .expect_err("extraction should be rejected");
+        assert!(
+            matches!(error, PayloadError::UnsupportedEntryType { .. }),
+            "got: {error:?}"
+        );
+        assert!(
+            walk(&dest).is_empty(),
+            "a rejection may leave the destination absent or empty, nothing more: {:?}",
+            walk(&dest)
+        );
     }
 
     #[test]
@@ -1708,16 +2518,8 @@ mod tests {
             path: "bin/roxyd",
             bytes: present,
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("missing manifest artifact expected");
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
             matches!(error, PayloadError::ArtifactMissingFromArchive(ref path) if path == "bin/missing"),
             "got: {error:?}"
@@ -1732,21 +2534,10 @@ mod tests {
             path: "/etc/evil",
             bytes,
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("absolute path rejected");
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
-            matches!(
-                error,
-                PayloadError::UnsafeMemberPath(_) | PayloadError::MemberNotInManifest(_)
-            ),
+            matches!(error, PayloadError::UnsafeMemberPath(ref path) if path == "/etc/evil"),
             "got: {error:?}"
         );
     }
@@ -1758,16 +2549,8 @@ mod tests {
             path: "bin/roxyd",
             target: "/etc/passwd",
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("symlink rejected");
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
             matches!(error, PayloadError::UnsupportedEntryType { .. }),
             "got: {error:?}"
@@ -1781,16 +2564,8 @@ mod tests {
             path: "bin/roxyd",
             target: "bin/other",
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("hardlink rejected");
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
             matches!(error, PayloadError::UnsupportedEntryType { .. }),
             "got: {error:?}"
@@ -1801,16 +2576,8 @@ mod tests {
     fn char_device_member_is_rejected() {
         let json = manifest_json(vec![artifact("bin/roxyd", b"bytes")]);
         let archive = zstd_tar(&[Member::CharDevice { path: "bin/roxyd" }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("char device rejected");
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
             matches!(error, PayloadError::UnsupportedEntryType { .. }),
             "got: {error:?}"
@@ -1821,16 +2588,8 @@ mod tests {
     fn directory_member_is_rejected_as_non_regular() {
         let json = manifest_json(vec![artifact("bin/roxyd", b"bytes")]);
         let archive = zstd_tar(&[Member::Directory { path: "bin/" }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("directory rejected");
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
             matches!(error, PayloadError::UnsupportedEntryType { .. }),
             "got: {error:?}"
@@ -1845,16 +2604,8 @@ mod tests {
             path: "bin/stowaway",
             bytes: b"unexpected",
         }]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("unknown member rejected");
+        let (error, dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
             matches!(error, PayloadError::MemberNotInManifest(_)),
             "got: {error:?}"
@@ -1879,18 +2630,10 @@ mod tests {
                 bytes,
             },
         ]);
-        let footer = valid_footer(BASE.len(), &json, &archive);
-        let binary = assemble(BASE, &json, &archive, &footer);
 
-        let mut payload = open(Cursor::new(binary))
-            .expect("reader should succeed")
-            .expect("trailer present");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = payload
-            .extract_to(dir.path())
-            .expect_err("duplicate member rejected");
+        let (error, _dir) = extract_error_leaving_dest_unchanged(&json, &archive);
         assert!(
-            matches!(error, PayloadError::DuplicateMember(_)),
+            matches!(error, PayloadError::DuplicateMember(ref path) if path == "bin/roxyd"),
             "got: {error:?}"
         );
     }
