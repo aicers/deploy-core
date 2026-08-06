@@ -1,0 +1,11 @@
+globs:
+  - "**/*.md"
+ignores:
+  - "node_modules/**"
+  - ".github/**"
+config:
+  # Organisation-wide baseline: CHANGELOG files in Keep a Changelog format
+  # repeat `Added` and `Fixed` under every version. `siblings_only` allows
+  # that while still catching genuine duplicates inside one section.
+  MD024:
+    siblings_only: true
