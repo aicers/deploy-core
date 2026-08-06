@@ -371,7 +371,10 @@ impl TryFrom<RawManifest> for PayloadManifest {
 ///
 /// A missing key and an explicit `null` both read as absent, matching how the
 /// typed decode treats them, so the two stages cannot disagree about which
-/// manifests are unversioned.
+/// manifests are unversioned. This is the opposite reading from the presence-only
+/// fingerprint terms in [`artifact_with_key`] and [`has_trust_set`], and it is
+/// the safe direction for each: null-as-absent here routes the manifest *into*
+/// the strict baseline conjunction, where null-as-absent would have widened it.
 fn read_format_version(document: &serde_json::Value) -> Result<Option<u32>, ManifestError> {
     match document.get("format_version") {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -386,11 +389,18 @@ fn read_format_version(document: &serde_json::Value) -> Result<Option<u32>, Mani
 /// Returns the `archive_path` of the first artifact in the stage-1 document
 /// carrying `key`, or its index when that entry has no string `archive_path`.
 ///
-/// Only the presence of the key is read, never its value.
+/// Only the presence of the key is read, never its value: an explicit
+/// `"commit": null` or `"spec": null` counts as carrying it. The baseline terms
+/// do not ask what an artifact declares, they ask whether the document was
+/// written by a producer that knew about the schema bump — and every field of
+/// that bump is `skip_serializing_if = "Option::is_none"`, so a pre-bump
+/// producer could not have emitted the key in any form. The key itself is the
+/// fingerprint. This is why the stage-2 decode still reads a `null` value as
+/// absence and the two are not in conflict: they answer different questions.
 fn artifact_with_key(document: &serde_json::Value, key: &str) -> Option<String> {
     let artifacts = document.get("artifacts")?.as_array()?;
     artifacts.iter().enumerate().find_map(|(index, artifact)| {
-        artifact.get(key).filter(|value| !value.is_null())?;
+        artifact.get(key)?;
         Some(
             artifact
                 .get("archive_path")
@@ -414,11 +424,11 @@ fn artifact_with_spec(document: &serde_json::Value) -> Option<String> {
     artifact_with_key(document, "spec")
 }
 
-/// Reports whether the stage-1 `document` carries a `trust_set`. Presence only.
+/// Reports whether the stage-1 `document` carries a `trust_set`. Presence only,
+/// on the same grounds as [`artifact_with_key`], so all three fingerprint terms
+/// of the conjunction read the document the same way.
 fn has_trust_set(document: &serde_json::Value) -> bool {
-    document
-        .get("trust_set")
-        .is_some_and(|value| !value.is_null())
+    document.get("trust_set").is_some()
 }
 
 /// Reports whether a manifest is the pre-existing, pre-versioned baseline: it
@@ -1731,6 +1741,49 @@ mod tests {
         assert_eq!(
             manifest.artifacts().first().expect("one artifact").spec,
             None
+        );
+    }
+
+    #[test]
+    fn an_unversioned_manifest_carrying_an_explicit_null_bump_key_is_rejected() {
+        // The three fingerprint terms read presence, never the value. A
+        // pre-versioned producer emitted none of these keys in any form —
+        // each is `skip_serializing_if = "Option::is_none"` — so the key alone
+        // proves the document was hand-edited, and a `null` value must not buy
+        // it back into the baseline allowance.
+        let with_null_commit = entry_json("bin/c", None)
+            .replace(r#""component":"c""#, r#""component":"c","commit":null"#);
+        let json = format!(r#"{{"artifacts":[{with_null_commit}]}}"#);
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("an unversioned artifact with a null commit key must be rejected");
+        assert!(
+            matches!(error, ManifestError::BaselineWithCommit(ref path) if path == "bin/c"),
+            "got: {error:?}"
+        );
+
+        let with_null_spec = entry_json("bin/c", None)
+            .replace(r#""component":"c""#, r#""component":"c","spec":null"#);
+        let json = format!(r#"{{"artifacts":[{with_null_spec}]}}"#);
+        let document: serde_json::Value =
+            serde_json::from_str(&json).expect("document should decode");
+        assert!(!is_pre_versioned_baseline(
+            LEGACY_UNVERSIONED_FOOTER_VERSION,
+            &document
+        ));
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("an unversioned artifact with a null spec key must be rejected");
+        assert!(
+            matches!(error, ManifestError::BaselineWithSpec(ref path) if path == "bin/c"),
+            "got: {error:?}"
+        );
+
+        let entry = entry_json("bin/c", None);
+        let json = format!(r#"{{"trust_set":null,"artifacts":[{entry}]}}"#);
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("an unversioned manifest with a null trust_set key must be rejected");
+        assert!(
+            matches!(error, ManifestError::BaselineWithTrustSet),
+            "got: {error:?}"
         );
     }
 
