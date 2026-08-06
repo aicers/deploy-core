@@ -4071,6 +4071,51 @@ mod tests {
     /// it.
     type FooterCase = (&'static str, fn(&mut Footer));
 
+    /// A stand-in signature block. Opaque at this layer, which reports what is
+    /// there and leaves what it is worth to a verifier.
+    const SIGNATURE: &[u8] = b"an opaque detached signature, meaningless to this layer";
+
+    /// A stand-in `key_id` block, of another length.
+    const KEY_ID: &[u8] = b"key-2026-08";
+
+    /// Rebuilds `binary` with the envelope blocks nothing writes yet:
+    /// `signature` and `key_id` present or absent independently, and `slack`
+    /// bytes before the footer that the footer accounts for nowhere.
+    ///
+    /// A present block is appended after the archive in the fixed order and
+    /// recorded at the offset the previous *present* block ended at; an absent
+    /// one occupies no bytes and keeps the all-zero pair, so the layout is the
+    /// one the reader's adjacency walk expects.
+    fn with_envelope(
+        binary: &[u8],
+        signature: Option<&[u8]>,
+        key_id: Option<&[u8]>,
+        slack: usize,
+    ) -> Vec<u8> {
+        let (base, manifest_block, archive) = trailer_parts(binary);
+        let mut footer = valid_footer(base.len(), manifest_block, archive);
+        let mut cursor = footer.archive_offset + footer.archive_len;
+        if let Some(bytes) = signature {
+            footer.signature_offset = cursor;
+            footer.signature_len = bytes.len() as u64;
+            cursor += footer.signature_len;
+        }
+        if let Some(bytes) = key_id {
+            footer.key_id_offset = cursor;
+            footer.key_id_len = bytes.len() as u64;
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(base);
+        out.extend_from_slice(manifest_block);
+        out.extend_from_slice(archive);
+        out.extend_from_slice(signature.unwrap_or_default());
+        out.extend_from_slice(key_id.unwrap_or_default());
+        out.extend(std::iter::repeat_n(0u8, slack));
+        out.extend_from_slice(&footer.encode());
+        out
+    }
+
     /// Rebuilds `binary` with `mutate` applied to its footer.
     fn mutating_footer(binary: &[u8], mutate: impl FnOnce(&mut Footer)) -> Vec<u8> {
         let (mut footer, _) = probe_footer(binary);
@@ -4221,42 +4266,13 @@ mod tests {
     #[test]
     fn a_present_signature_block_is_accepted_and_still_held_to_adjacency() {
         // Nothing writes a signature yet, so the container is hand-built from
-        // the writer's own manifest and archive blocks with one extra block
+        // the writer's own manifest and archive blocks with two extra blocks
         // between the archive and the footer.
-        const SIGNATURE: &[u8] = b"an opaque detached signature, meaningless to this layer";
-        const KEY_ID: &[u8] = b"key-2026-08";
-
         let src = tempfile::tempdir().expect("source tempdir");
         let written = two_member_binary(src.path());
-        let (base, manifest_block, archive) = trailer_parts(&written);
-
-        let signed = |slack: usize| {
-            let manifest_offset = base.len() as u64;
-            let archive_offset = manifest_offset + manifest_block.len() as u64;
-            let signature_offset = archive_offset + archive.len() as u64;
-            let key_id_offset = signature_offset + SIGNATURE.len() as u64;
-            let footer = Footer {
-                version: FORMAT_VERSION,
-                manifest_offset,
-                manifest_len: manifest_block.len() as u64,
-                archive_offset,
-                archive_len: archive.len() as u64,
-                signature_offset,
-                signature_len: SIGNATURE.len() as u64,
-                key_id_offset,
-                key_id_len: KEY_ID.len() as u64,
-            };
-            let mut out = Vec::new();
-            out.extend_from_slice(base);
-            out.extend_from_slice(manifest_block);
-            out.extend_from_slice(archive);
-            out.extend_from_slice(SIGNATURE);
-            out.extend_from_slice(KEY_ID);
-            // Bytes the footer accounts for nowhere.
-            out.extend(std::iter::repeat_n(0u8, slack));
-            out.extend_from_slice(&footer.encode());
-            out
-        };
+        // The second argument is `slack`: bytes the footer accounts for
+        // nowhere.
+        let signed = |slack: usize| with_envelope(&written, Some(SIGNATURE), Some(KEY_ID), slack);
 
         let mut payload = open(Cursor::new(signed(0)))
             .expect("a signed container must open")
@@ -4290,55 +4306,19 @@ mod tests {
         // signature is the discriminating case: the absent pair sits *between*
         // two present blocks, so the `key_id` starts where the archive ended
         // rather than where a signature would have.
-        const SIGNATURE: &[u8] = b"an opaque detached signature, meaningless to this layer";
-        const KEY_ID: &[u8] = b"key-2026-08";
-
         let src = tempfile::tempdir().expect("source tempdir");
         let written = two_member_binary(src.path());
-        let (base, manifest_block, archive) = trailer_parts(&written);
-
-        let one_present = |signature: Option<&[u8]>, key_id: Option<&[u8]>| {
-            let manifest_offset = base.len() as u64;
-            let archive_offset = manifest_offset + manifest_block.len() as u64;
-            let archive_end = archive_offset + archive.len() as u64;
-            let signature_len = signature.map_or(0, |bytes| bytes.len() as u64);
-            let key_id_len = key_id.map_or(0, |bytes| bytes.len() as u64);
-            let footer = Footer {
-                version: FORMAT_VERSION,
-                manifest_offset,
-                manifest_len: manifest_block.len() as u64,
-                archive_offset,
-                archive_len: archive.len() as u64,
-                // An absent pair is exactly all-zero; a present one starts where
-                // the previous *present* block ended.
-                signature_offset: if signature_len == 0 { 0 } else { archive_end },
-                signature_len,
-                key_id_offset: if key_id_len == 0 {
-                    0
-                } else {
-                    archive_end + signature_len
-                },
-                key_id_len,
-            };
-            let mut out = Vec::new();
-            out.extend_from_slice(base);
-            out.extend_from_slice(manifest_block);
-            out.extend_from_slice(archive);
-            if let Some(bytes) = signature {
-                out.extend_from_slice(bytes);
-            }
-            if let Some(bytes) = key_id {
-                out.extend_from_slice(bytes);
-            }
-            out.extend_from_slice(&footer.encode());
-            out
-        };
 
         // A signature with no `key_id`: the absent pair is last, and the
         // signature is the block that must end where the footer begins.
-        let mut payload = open(Cursor::new(one_present(Some(SIGNATURE), None)))
-            .expect("a signature with no key_id must open")
-            .expect("trailer should be present");
+        let mut payload = open(Cursor::new(with_envelope(
+            &written,
+            Some(SIGNATURE),
+            None,
+            0,
+        )))
+        .expect("a signature with no key_id must open")
+        .expect("trailer should be present");
         assert_eq!(payload.signature(), Some(SIGNATURE));
         assert_eq!(payload.key_id(), None);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4352,7 +4332,7 @@ mod tests {
 
         // A `key_id` with no signature: the walk steps over the absent pair in
         // the middle and still reads the block that follows it.
-        let payload = open(Cursor::new(one_present(None, Some(KEY_ID))))
+        let payload = open(Cursor::new(with_envelope(&written, None, Some(KEY_ID), 0)))
             .expect("a key_id with no signature must open")
             .expect("trailer should be present");
         assert_eq!(payload.signature(), None);
@@ -4431,6 +4411,61 @@ mod tests {
             .expect("trailer should be present");
         assert_eq!(payload.signature(), None);
         assert_eq!(payload.key_id(), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            payload
+                .extract_to(dir.path())
+                .expect("extraction should succeed")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_rewrap_shifts_a_present_envelope_pair_with_the_rest_of_the_body() {
+        // The other half of the same rule: every container this crate writes has
+        // both pairs absent, so nothing it produces distinguishes "shift every
+        // present block's offset" from "shift the manifest and the archive".
+        // Nothing writes a signature yet, so the source is hand-built.
+        let src = tempfile::tempdir().expect("source tempdir");
+        let signed = with_envelope(
+            &two_member_binary(src.path()),
+            Some(SIGNATURE),
+            Some(KEY_ID),
+            0,
+        );
+        let (source, _) = probe_footer(&signed);
+
+        let new_base: &[u8] = b"a freshly built base binary, of a different length entirely";
+        assert_ne!(new_base.len(), BASE.len());
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(Cursor::new(&signed), Cursor::new(new_base), &mut rewrapped)
+            .expect("rewrap should succeed");
+
+        // Each present block sits at the same distance into the body as before,
+        // now measured from the new base, and every length survived.
+        let shifted =
+            |offset: u64| offset - source.manifest_offset + u64::try_from(new_base.len()).unwrap();
+        let (footer, footer_start) = probe_footer(&rewrapped);
+        assert_eq!(footer.manifest_offset, shifted(source.manifest_offset));
+        assert_eq!(footer.archive_offset, shifted(source.archive_offset));
+        assert_eq!(footer.signature_offset, shifted(source.signature_offset));
+        assert_eq!(footer.key_id_offset, shifted(source.key_id_offset));
+        assert_eq!(footer.manifest_len, source.manifest_len);
+        assert_eq!(footer.archive_len, source.archive_len);
+        assert_eq!(footer.signature_len, source.signature_len);
+        assert_eq!(footer.key_id_len, source.key_id_len);
+        // The `key_id` is the last present block, so it ends at the footer.
+        assert_eq!(
+            footer.key_id_offset + footer.key_id_len,
+            u64::try_from(footer_start).unwrap()
+        );
+
+        let mut payload = open(Cursor::new(rewrapped))
+            .expect("the rewrapped container must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.signature(), Some(SIGNATURE));
+        assert_eq!(payload.key_id(), Some(KEY_ID));
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(
             payload

@@ -4,13 +4,13 @@
 //! transport and execution vocabulary, the on-host directory layout, the payload
 //! and manifest formats — one container whether it rides on a base executable or
 //! stands alone as a `.pkg` module package — the declarative per-module install
-//! spec a package carries
-//! in its manifest with the systemd serialization rule its strings are held to,
-//! the install/update diff engine, the apply primitives, the bootroot command
-//! wrapper, service registration, and the on-host trust-material activation. It
-//! carries **no** product concept — no component catalog, no per-component
-//! renderers — so both the installer and the per-machine root daemon depend on it
-//! and share a single implementation rather than shelling out to a CLI.
+//! spec a package carries in its manifest with the systemd serialization rule its
+//! strings are held to, the install/update diff engine, the apply primitives, the
+//! bootroot command wrapper, service registration, and the on-host trust-material
+//! activation. It carries **no** product concept — no component catalog, no
+//! per-component renderers — so both the installer and the per-machine root daemon
+//! depend on it and share a single implementation rather than shelling out to a
+//! CLI.
 //!
 //! The product-specific install/update orchestration, the component catalog, and
 //! the per-component rendering stay in the installer crate, which depends on this
