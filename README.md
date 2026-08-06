@@ -7,8 +7,9 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **transport** / **exec** / **executor** — the SSH-and-local execution vocabulary
   and the elevated command runner.
 - **layout** — the on-host directory layout derived from a single namespace.
-- **manifest** / **payload** — the artifact manifest and the self-extracting
-  payload format.
+- **manifest** / **payload** — the artifact manifest and the container format it
+  rides in: a self-extracting payload appended to a base executable, and the very
+  same container with no base as a `.pkg` module package, read by one reader.
 - **module_spec** — the declarative per-module install spec a package carries in
   its manifest (unit template, bootroot registration template, placement class),
   and the validator every read path runs over it.
