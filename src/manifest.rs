@@ -653,8 +653,19 @@ impl PayloadManifest {
     /// [`ManifestError::BaselineWithSpec`],
     /// [`ManifestError::BaselineWithTrustSet`] or
     /// [`ManifestError::BaselineWithArchiveMembers`] when an unversioned
-    /// manifest is not the baseline shape, or any validation error
+    /// manifest is not the baseline shape,
+    /// [`ManifestError::MissingArchiveMembers`] when a manifest carries a
+    /// `format_version` but binds no member list, or any validation error
     /// [`PayloadManifest::new`] raises.
+    ///
+    /// [`ManifestError::MissingArchiveMembers`] is not among the errors that
+    /// closing catch-all covers: [`PayloadManifest::new`] takes its member list
+    /// as a required non-`Option` parameter, so it can never be handed the
+    /// shape that refusal rejects. Both halves of the field's rule are raised
+    /// on the read side instead — a versioned manifest binding no list here and
+    /// in the derived `Deserialize`, both of which validate through the same
+    /// place, and a baseline one binding a list only here, since `Deserialize`
+    /// refuses an absent `format_version` before any baseline check.
     pub fn parse(manifest_bytes: &[u8], footer_version: u8) -> Result<Self, ManifestError> {
         let document: serde_json::Value =
             serde_json::from_slice(manifest_bytes).map_err(ManifestError::Decode)?;

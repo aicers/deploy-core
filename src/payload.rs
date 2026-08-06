@@ -2114,6 +2114,52 @@ mod tests {
     }
 
     #[test]
+    fn a_baseline_payload_extracts_with_members_in_an_order_its_artifacts_do_not_repeat() {
+        // The archive walks `assets/web.tar` first, while the manifest names
+        // `bin/roxyd` first. A baseline manifest binds no member list, so there
+        // is nothing for the order to disagree with and the comparison is
+        // skipped outright. That permutation is what makes this test
+        // discriminating: were the expected sequence ever reconstructed from
+        // `artifacts` rather than the bound list, the walk would not match it
+        // and extraction would fail here. The single-member baseline test
+        // cannot catch that — with one member there is no order to permute and
+        // no count to disagree about.
+        let roxyd = b"roxyd binary bytes";
+        let web = b"static web assets";
+        let json = baseline_manifest_json(&[("bin/roxyd", roxyd), ("assets/web.tar", web)]);
+        let archive = zstd_tar(&[
+            Member::File {
+                path: "assets/web.tar",
+                bytes: web,
+            },
+            Member::File {
+                path: "bin/roxyd",
+                bytes: roxyd,
+            },
+        ]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let binary = assemble(BASE, &json, &archive, &footer);
+
+        let mut payload = open(Cursor::new(binary))
+            .expect("a baseline payload must open")
+            .expect("trailer should be present");
+        assert_eq!(payload.manifest().format_version(), None);
+        // Unambiguously the baseline path: no list is bound.
+        assert_eq!(payload.manifest().archive_members(), None);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extracted = payload
+            .extract_to(dir.path())
+            .expect("extraction should succeed");
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(std::fs::read(dir.path().join("bin/roxyd")).unwrap(), roxyd);
+        assert_eq!(
+            std::fs::read(dir.path().join("assets/web.tar")).unwrap(),
+            web
+        );
+    }
+
+    #[test]
     fn a_baseline_payload_still_rejects_a_member_its_manifest_does_not_name() {
         // Skipping the member-list check disables nothing else: every
         // pre-existing member and archive check still runs on the baseline
