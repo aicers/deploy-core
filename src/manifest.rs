@@ -18,13 +18,13 @@ use serde::{Deserialize, Serialize};
 use crate::module_spec::{ModuleSpec, ModuleSpecError};
 
 /// `format_version` a producer stamps into every manifest it writes.
-pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+pub const MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Inclusive floor of the `format_version` range this build accepts.
-pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 2;
+pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Inclusive ceiling of the `format_version` range this build accepts.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 2;
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Container footer version the pre-versioned baseline payloads were written
 /// at.
@@ -126,6 +126,28 @@ pub struct PayloadArtifact {
     pub spec: Option<ModuleSpec>,
 }
 
+/// One member of the archive block, named and sized as the archive stores it.
+///
+/// The ordered list of these is what binds the archive's *shape* to the
+/// manifest: how many members it holds, what they are called, in what order, and
+/// how long each one is. Every other manifest field is per-artifact, so without
+/// this list the enumeration is only ever *derived* — from a reader's own
+/// cross-checks agreeing — rather than stated by the producer and covered by
+/// whatever eventually signs the manifest block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveMember {
+    /// Member's stored name in the archive, byte-for-byte as the reader
+    /// resolves it — the same string an artifact's `archive_path` is matched
+    /// against, and identical to the raw `ustar` header name because a member
+    /// whose two names disagree is already refused.
+    pub name: String,
+    /// Member's **uncompressed** data byte length: the `tar` entry's data size.
+    ///
+    /// Deliberately not a compressed size. The archive block is one `zstd`
+    /// stream, so a per-member compressed length is not well defined.
+    pub length: u64,
+}
+
 /// Errors raised while validating a payload manifest.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -170,6 +192,10 @@ pub enum ManifestError {
     /// An artifact in a current-format manifest carried no `commit`.
     #[error("artifact `{0}` carries no `commit`")]
     MissingCommit(String),
+    /// A current-format manifest carried no `archive_members`, so it states
+    /// nothing about the archive block's shape.
+    #[error("payload manifest carries no `archive_members`")]
+    MissingArchiveMembers,
     /// An artifact's `commit` was not a 40- or 64-character lowercase-hex
     /// identifier (see [`is_valid_commit`]).
     #[error("artifact `{archive_path}` has an invalid `commit` identifier `{commit}`")]
@@ -191,6 +217,10 @@ pub enum ManifestError {
     /// the pre-versioned baseline shape.
     #[error("manifest carries no `format_version` yet carries a `trust_set`")]
     BaselineWithTrustSet,
+    /// A manifest carrying no `format_version` had an `archive_members`, so it
+    /// is not the pre-versioned baseline shape.
+    #[error("manifest carries no `format_version` yet carries an `archive_members`")]
+    BaselineWithArchiveMembers,
     /// An artifact declared a [`ModuleSpec`] that violates a spec rule.
     #[error("artifact `{archive_path}` declares an invalid spec")]
     InvalidSpec {
@@ -306,12 +336,19 @@ mod trust_set_codec {
 
 /// The whole payload trailer manifest: the schema version, the pin-set digest
 /// the payload was built from, the release-signing trust-set generation the
-/// installer seeds from, plus an ordered list of artifacts.
+/// installer seeds from, the ordered archive member list, plus an ordered list
+/// of artifacts.
 ///
 /// Constructed through [`PayloadManifest::new`], which enforces the manifest
 /// invariants (non-empty dispositions, unique `archive_path`, a valid `commit`
 /// per artifact). Deserialization runs the same validation, so a manifest read
 /// back from JSON is always valid.
+///
+/// This is the one validated type that models `archive_members`, and it models
+/// it as an `Option` so the pre-versioned baseline shape — the only shape that
+/// carries no list — remains expressible. Nothing downstream re-models it: a
+/// second optional member list is a second place that could disagree about what
+/// absence means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawManifest")]
 pub struct PayloadManifest {
@@ -324,6 +361,8 @@ pub struct PayloadManifest {
         serialize_with = "trust_set_codec::serialize"
     )]
     trust_set: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_members: Option<Vec<ArchiveMember>>,
     artifacts: Vec<PayloadArtifact>,
 }
 
@@ -344,6 +383,12 @@ pub struct PayloadManifest {
 ///
 /// `trust_set` is carried as its wire string rather than decoded bytes so an
 /// undecodable value is reported as a [`ManifestError`], not a serde error.
+///
+/// `archive_members` is `#[serde(default)]` for the same reason
+/// `format_version` is: the unvalidated wire form has to be able to *see* the
+/// key's absence in order to reject it. That is not a second validated type
+/// modelling the field — validation happens in `from_parts`, where an absent
+/// list on a versioned manifest is [`ManifestError::MissingArchiveMembers`].
 #[derive(Deserialize)]
 struct RawManifest {
     #[serde(default)]
@@ -352,6 +397,8 @@ struct RawManifest {
     pinset: Option<String>,
     #[serde(default)]
     trust_set: Option<String>,
+    #[serde(default)]
+    archive_members: Option<Vec<ArchiveMember>>,
     artifacts: Vec<PayloadArtifact>,
 }
 
@@ -363,7 +410,13 @@ impl TryFrom<RawManifest> for PayloadManifest {
             .format_version
             .ok_or(ManifestError::MissingFormatVersion)?;
         let trust_set = trust_set_codec::decode(raw.trust_set.as_deref())?;
-        Self::from_parts(Some(format_version), raw.pinset, raw.artifacts, trust_set)
+        Self::from_parts(
+            Some(format_version),
+            raw.pinset,
+            raw.archive_members,
+            raw.artifacts,
+            trust_set,
+        )
     }
 }
 
@@ -425,16 +478,23 @@ fn artifact_with_spec(document: &serde_json::Value) -> Option<String> {
 }
 
 /// Reports whether the stage-1 `document` carries a `trust_set`. Presence only,
-/// on the same grounds as [`artifact_with_key`], so all three fingerprint terms
+/// on the same grounds as [`artifact_with_key`], so all four fingerprint terms
 /// of the conjunction read the document the same way.
 fn has_trust_set(document: &serde_json::Value) -> bool {
     document.get("trust_set").is_some()
 }
 
+/// Reports whether the stage-1 `document` carries an `archive_members`, read
+/// exactly as [`has_trust_set`] reads its key: presence alone, an explicit
+/// `null` counting as carrying it.
+fn has_archive_members(document: &serde_json::Value) -> bool {
+    document.get("archive_members").is_some()
+}
+
 /// Reports whether a manifest is the pre-existing, pre-versioned baseline: it
-/// carries no `format_version`, no artifact `commit`, no `trust_set` and no
-/// artifact `spec`, and it sits in a container whose footer version is
-/// [`LEGACY_UNVERSIONED_FOOTER_VERSION`].
+/// carries no `format_version`, no artifact `commit`, no `trust_set`, no
+/// artifact `spec` and no `archive_members`, and it sits in a container whose
+/// footer version is [`LEGACY_UNVERSIONED_FOOTER_VERSION`].
 ///
 /// The core payloads already published as release assets were assembled before
 /// any of those fields existed, and a required CI preflight reads exactly
@@ -444,7 +504,11 @@ fn has_trust_set(document: &serde_json::Value) -> bool {
 /// one of them without `format_version` was never written by a producer and is
 /// corrupt or hand-edited. `spec` is a term for that reason and for one more:
 /// without it, a hand-edited manifest could hand a root daemon an instruction
-/// set that bypassed the version gate entirely.
+/// set that bypassed the version gate entirely. `archive_members` is a term for
+/// that reason and for one more too: an unversioned manifest carrying a member
+/// list would otherwise reach the path where the member-list check is skipped,
+/// leaving the list either honoured or dropped depending on how the parse
+/// happens to be written.
 ///
 /// Note the asymmetry this does *not* create: a `trust_set` on a current-format
 /// manifest is normal, and its absence is normal on every manifest — only its
@@ -462,6 +526,7 @@ fn is_pre_versioned_baseline(footer_version: u8, document: &serde_json::Value) -
         && artifact_with_commit(document).is_none()
         && !has_trust_set(document)
         && artifact_with_spec(document).is_none()
+        && !has_archive_members(document)
 }
 
 /// Names which field made an unversioned manifest fail the baseline
@@ -474,6 +539,8 @@ fn non_baseline_reason(document: &serde_json::Value) -> ManifestError {
         ManifestError::BaselineWithTrustSet
     } else if let Some(archive_path) = artifact_with_spec(document) {
         ManifestError::BaselineWithSpec(archive_path)
+    } else if has_archive_members(document) {
+        ManifestError::BaselineWithArchiveMembers
     } else {
         ManifestError::MissingFormatVersion
     }
@@ -492,6 +559,16 @@ impl PayloadManifest {
     /// express a pre-versioned baseline manifest. The trust-set generation is
     /// attached afterwards through [`PayloadManifest::with_trust_set`].
     ///
+    /// `archive_members` is an ordinary required parameter, and it is required
+    /// because every constructor routes through the one validation point, where
+    /// a versioned manifest carrying no member list is refused — a constructor
+    /// that could not be given one could never return a valid manifest. A
+    /// hand-assembled manifest is paired with no archive, so a list it carries
+    /// misdescribes nothing; a list becomes a claim about real bytes only when
+    /// an archive is written, and
+    /// [`append_trailer`](crate::payload::append_trailer) derives its own there
+    /// rather than accepting one.
+    ///
     /// # Errors
     ///
     /// Returns [`ManifestError`] when an artifact carries no dispositions, uses
@@ -500,9 +577,16 @@ impl PayloadManifest {
     /// spec rule.
     pub fn new(
         pinset: Option<String>,
+        archive_members: Vec<ArchiveMember>,
         artifacts: Vec<PayloadArtifact>,
     ) -> Result<Self, ManifestError> {
-        Self::from_parts(Some(MANIFEST_FORMAT_VERSION), pinset, artifacts, None)
+        Self::from_parts(
+            Some(MANIFEST_FORMAT_VERSION),
+            pinset,
+            Some(archive_members),
+            artifacts,
+            None,
+        )
     }
 
     /// Attaches the signed trust-set generation container `generation` carries,
@@ -517,6 +601,11 @@ impl PayloadManifest {
     /// This is the only way to attach a value, so the producer path runs the
     /// same rejection as the read path.
     ///
+    /// It takes no member-list parameter: it consumes a manifest that already
+    /// carries a list and forwards that field unchanged, exactly as it forwards
+    /// `format_version`, `pinset` and `artifacts`. A parameter here would let a
+    /// caller replace the list an already-validated manifest holds.
+    ///
     /// # Errors
     ///
     /// Returns [`ManifestError::EmptyTrustSet`] when `generation` is empty, or
@@ -526,6 +615,7 @@ impl PayloadManifest {
         Self::from_parts(
             self.format_version,
             self.pinset,
+            self.archive_members,
             self.artifacts,
             Some(generation.to_vec()),
         )
@@ -543,12 +633,14 @@ impl PayloadManifest {
     /// decode error. When it is absent there is no version to gate, and stage 1
     /// additionally reads the presence flags
     /// `is_pre_versioned_baseline` takes — whether any artifact carries a
-    /// `commit` or a `spec`, and whether a `trust_set` is present — which is the one
+    /// `commit` or a `spec`, and whether a `trust_set` or an `archive_members`
+    /// is present — which is the one
     /// sanctioned exception to the version-gate rule. **Stage 2** decodes the
     /// typed manifest, and only once a decision has been made.
     ///
     /// This is the only door in the crate that can return a manifest whose
-    /// [`PayloadManifest::format_version`] is `None`.
+    /// [`PayloadManifest::format_version`] or
+    /// [`PayloadManifest::archive_members`] is `None`.
     ///
     /// # Errors
     ///
@@ -558,10 +650,11 @@ impl PayloadManifest {
     /// outside [`MIN_MANIFEST_FORMAT_VERSION`]`..=`[`MAX_MANIFEST_FORMAT_VERSION`],
     /// [`ManifestError::MissingFormatVersion`],
     /// [`ManifestError::BaselineWithCommit`],
-    /// [`ManifestError::BaselineWithSpec`] or
-    /// [`ManifestError::BaselineWithTrustSet`] when an unversioned manifest is
-    /// not the baseline shape, or any validation error [`PayloadManifest::new`]
-    /// raises.
+    /// [`ManifestError::BaselineWithSpec`],
+    /// [`ManifestError::BaselineWithTrustSet`] or
+    /// [`ManifestError::BaselineWithArchiveMembers`] when an unversioned
+    /// manifest is not the baseline shape, or any validation error
+    /// [`PayloadManifest::new`] raises.
     pub fn parse(manifest_bytes: &[u8], footer_version: u8) -> Result<Self, ManifestError> {
         let document: serde_json::Value =
             serde_json::from_slice(manifest_bytes).map_err(ManifestError::Decode)?;
@@ -585,7 +678,13 @@ impl PayloadManifest {
 
         let raw: RawManifest = serde_json::from_value(document).map_err(ManifestError::Decode)?;
         let trust_set = trust_set_codec::decode(raw.trust_set.as_deref())?;
-        Self::from_parts(format_version, raw.pinset, raw.artifacts, trust_set)
+        Self::from_parts(
+            format_version,
+            raw.pinset,
+            raw.archive_members,
+            raw.artifacts,
+            trust_set,
+        )
     }
 
     /// Validates and assembles a manifest from its parts.
@@ -598,6 +697,7 @@ impl PayloadManifest {
     fn from_parts(
         format_version: Option<u32>,
         pinset: Option<String>,
+        archive_members: Option<Vec<ArchiveMember>>,
         artifacts: Vec<PayloadArtifact>,
         trust_set: Option<Vec<u8>>,
     ) -> Result<Self, ManifestError> {
@@ -609,6 +709,17 @@ impl PayloadManifest {
                 min: MIN_MANIFEST_FORMAT_VERSION,
                 max: MAX_MANIFEST_FORMAT_VERSION,
             });
+        }
+
+        // The same conditional shape `MissingCommit` is raised under, so the
+        // two doors that reach this point — `TryFrom<RawManifest>`, which
+        // cannot see the container footer, and `PayloadManifest::parse` — are
+        // equally strict with one implementation. `None` therefore means the
+        // pre-existing-baseline path and nothing else.
+        match (&archive_members, format_version) {
+            (None, Some(_)) => return Err(ManifestError::MissingArchiveMembers),
+            (Some(_), None) => return Err(ManifestError::BaselineWithArchiveMembers),
+            _ => {}
         }
 
         let mut seen = BTreeSet::new();
@@ -673,6 +784,7 @@ impl PayloadManifest {
             format_version,
             pinset,
             trust_set,
+            archive_members,
             artifacts,
         })
     }
@@ -707,6 +819,19 @@ impl PayloadManifest {
         self.trust_set.as_deref()
     }
 
+    /// Returns the ordered archive member list the manifest binds, or `None`
+    /// for a manifest read off the pre-versioned baseline path.
+    ///
+    /// What this reports is the shape the manifest was read in, never that the
+    /// member-list check passed: that check compares a real archive walk
+    /// against this list and lives in
+    /// [`Payload::extract_to`](crate::payload::Payload::extract_to), where the
+    /// bytes are.
+    #[must_use]
+    pub fn archive_members(&self) -> Option<&[ArchiveMember]> {
+        self.archive_members.as_deref()
+    }
+
     /// Returns the artifacts described by this manifest.
     #[must_use]
     pub fn artifacts(&self) -> &[PayloadArtifact] {
@@ -717,7 +842,7 @@ impl PayloadManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN,
+        ArchiveMember, ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN,
         LEGACY_UNVERSIONED_FOOTER_VERSION, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
         MIN_MANIFEST_FORMAT_VERSION, ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest,
         TargetArch, is_pre_versioned_baseline, is_valid_commit,
@@ -726,6 +851,35 @@ mod tests {
         Arg, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
         RestartPolicy, SystemdTarget, UnitTemplate,
     };
+
+    /// Length every member of a fixture archive is given, where the value under
+    /// test is something other than the member list itself.
+    const FIXTURE_MEMBER_LEN: u64 = 12;
+
+    /// Names one member per artifact, in the same order — the shape
+    /// `append_trailer` produces, since both lists come from one `inputs` slice.
+    /// A test whose subject *is* the member list states its list outright
+    /// instead.
+    fn members_for(artifacts: &[PayloadArtifact]) -> Vec<ArchiveMember> {
+        artifacts
+            .iter()
+            .map(|artifact| ArchiveMember {
+                name: artifact.archive_path.clone(),
+                length: FIXTURE_MEMBER_LEN,
+            })
+            .collect()
+    }
+
+    /// [`PayloadManifest::new`] with the member list derived by
+    /// [`members_for`], so a test that is not about the list does not restate
+    /// it.
+    fn manifest_of(
+        pinset: Option<String>,
+        artifacts: Vec<PayloadArtifact>,
+    ) -> Result<PayloadManifest, ManifestError> {
+        let members = members_for(&artifacts);
+        PayloadManifest::new(pinset, members, artifacts)
+    }
 
     fn artifact(
         archive_path: &str,
@@ -771,11 +925,15 @@ mod tests {
         )
     }
 
-    /// Wire JSON for a manifest carrying `format_version` and one current-format
-    /// artifact.
+    /// The `archive_members` fragment a versioned wire fixture carries, naming
+    /// the one `bin/c` member [`entry_json`] writes, with its trailing comma.
+    const MEMBERS_JSON: &str = r#""archive_members":[{"name":"bin/c","length":12}],"#;
+
+    /// Wire JSON for a manifest carrying `format_version`, the member list every
+    /// versioned manifest must bind, and one current-format artifact.
     fn versioned_json(version: u32) -> String {
         let entry = entry_json("bin/c", Some(GIT_COMMIT));
-        format!(r#"{{"format_version":{version},"artifacts":[{entry}]}}"#)
+        format!(r#"{{"format_version":{version},{MEMBERS_JSON}"artifacts":[{entry}]}}"#)
     }
 
     /// Renders the same entry as [`entry_json`] with `spec` spliced in, so the
@@ -848,7 +1006,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_serde_covering_all_kinds_and_both_dispositions() {
-        let manifest = PayloadManifest::new(
+        let manifest = manifest_of(
             Some(PINSET.to_string()),
             vec![
                 artifact(
@@ -901,7 +1059,7 @@ mod tests {
         // `RawManifest` carries no `deny_unknown_fields`, so a reader predating
         // the field ignores it; omitting it when absent additionally keeps such a
         // manifest's wire form byte-identical to the pre-stamp format.
-        let manifest = PayloadManifest::new(
+        let manifest = manifest_of(
             None,
             vec![artifact(
                 "bin/native",
@@ -919,7 +1077,7 @@ mod tests {
         // The forward-compatibility half of the same rule: a manifest carrying a
         // field this build does not know must not fail to parse.
         let json = format!(
-            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"pinset":"abc","surprise":true,"artifacts":[]}}"#
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"pinset":"abc","surprise":true,"archive_members":[],"artifacts":[]}}"#
         );
         let manifest: PayloadManifest =
             serde_json::from_str(&json).expect("an unknown field must be ignored");
@@ -928,7 +1086,7 @@ mod tests {
 
     #[test]
     fn kinds_and_dispositions_use_kebab_case_strings() {
-        let manifest = PayloadManifest::new(
+        let manifest = manifest_of(
             Some(PINSET.to_string()),
             vec![artifact(
                 "images/roxyd.tar",
@@ -948,15 +1106,14 @@ mod tests {
     #[test]
     fn new_rejects_empty_disposition_set() {
         let bad = artifact("bin/native", ArtifactKind::NativeBinary, &[]);
-        let error =
-            PayloadManifest::new(None, vec![bad]).expect_err("empty dispositions must be rejected");
+        let error = manifest_of(None, vec![bad]).expect_err("empty dispositions must be rejected");
         assert!(matches!(error, ManifestError::EmptyDispositions(_)));
     }
 
     #[test]
     fn deserialization_rejects_empty_disposition_set() {
         let json = format!(
-            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{{"component":"c","version":"1","commit":"{GIT_COMMIT}","target_arch":"x86_64","kind":"native-binary","dispositions":[],"archive_path":"bin/c","sha256":"00"}}]}}"#
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{{"component":"c","version":"1","commit":"{GIT_COMMIT}","target_arch":"x86_64","kind":"native-binary","dispositions":[],"archive_path":"bin/c","sha256":"00"}}]}}"#
         );
         let result: Result<PayloadManifest, _> = serde_json::from_str(&json);
         assert!(
@@ -967,7 +1124,7 @@ mod tests {
 
     #[test]
     fn new_rejects_duplicate_archive_path() {
-        let error = PayloadManifest::new(
+        let error = manifest_of(
             None,
             vec![
                 artifact(
@@ -986,7 +1143,7 @@ mod tests {
     fn deserialization_rejects_duplicate_archive_path() {
         let entry = entry_json("bin/dup", Some(GIT_COMMIT));
         let json = format!(
-            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry},{entry}]}}"#
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry},{entry}]}}"#
         );
         let result: Result<PayloadManifest, _> = serde_json::from_str(&json);
         assert!(
@@ -1007,7 +1164,7 @@ mod tests {
             ".",
             "bin/./roxyd",
         ] {
-            let error = PayloadManifest::new(
+            let error = manifest_of(
                 None,
                 vec![artifact(
                     bad,
@@ -1026,8 +1183,9 @@ mod tests {
     #[test]
     fn deserialization_rejects_unsafe_archive_path() {
         let entry = entry_json("../escape", Some(GIT_COMMIT));
-        let json =
-            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
         let result: Result<PayloadManifest, _> = serde_json::from_str(&json);
         assert!(
             result.is_err(),
@@ -1037,7 +1195,7 @@ mod tests {
 
     #[test]
     fn empty_manifest_is_valid() {
-        let manifest = PayloadManifest::new(None, Vec::new()).expect("empty manifest is valid");
+        let manifest = manifest_of(None, Vec::new()).expect("empty manifest is valid");
         assert!(manifest.artifacts().is_empty());
     }
 
@@ -1052,7 +1210,7 @@ mod tests {
 
     #[test]
     fn new_stamps_the_current_format_version() {
-        let manifest = PayloadManifest::new(
+        let manifest = manifest_of(
             None,
             vec![artifact(
                 "bin/native",
@@ -1111,7 +1269,7 @@ mod tests {
             &[Disposition::Install],
         );
         digest_artifact.commit = Some(IMAGE_DIGEST.to_string());
-        let manifest = PayloadManifest::new(None, vec![digest_artifact])
+        let manifest = manifest_of(None, vec![digest_artifact])
             .expect("a digest-width commit must be accepted");
         assert_eq!(
             manifest
@@ -1132,7 +1290,7 @@ mod tests {
             &[Disposition::Install],
         );
         without.commit = None;
-        let error = PayloadManifest::new(None, vec![without])
+        let error = manifest_of(None, vec![without])
             .expect_err("a current-format artifact must carry a commit");
         assert!(
             matches!(error, ManifestError::MissingCommit(ref path) if path == "bin/native"),
@@ -1145,7 +1303,7 @@ mod tests {
             &[Disposition::Install],
         );
         abbreviated.commit = Some("abc1234".to_string());
-        let error = PayloadManifest::new(None, vec![abbreviated])
+        let error = manifest_of(None, vec![abbreviated])
             .expect_err("an abbreviated commit must be rejected");
         assert!(
             matches!(error, ManifestError::InvalidCommit { ref archive_path, .. } if archive_path == "bin/native"),
@@ -1163,8 +1321,9 @@ mod tests {
         let explicit_null =
             absent.replace(r#""component":"c""#, r#""component":"c","commit":null"#);
         for entry in [absent, explicit_null] {
-            let json =
-                format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+            let json = format!(
+                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+            );
             let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
                 .expect_err("a current-format artifact must carry a commit");
             assert!(
@@ -1177,8 +1336,9 @@ mod tests {
     #[test]
     fn the_read_path_rejects_a_malformed_commit() {
         let entry = entry_json("bin/c", Some("abc1234"));
-        let json =
-            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
         let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect_err("an abbreviated commit must be rejected on read too");
         assert!(
@@ -1193,7 +1353,7 @@ mod tests {
 
     #[test]
     fn a_trust_set_round_trips_through_the_wire_encoding() {
-        let manifest = PayloadManifest::new(
+        let manifest = manifest_of(
             Some(PINSET.to_string()),
             vec![artifact(
                 "bin/native",
@@ -1219,7 +1379,7 @@ mod tests {
 
     #[test]
     fn a_manifest_without_a_trust_set_emits_no_key() {
-        let manifest = PayloadManifest::new(None, Vec::new()).expect("empty manifest is valid");
+        let manifest = manifest_of(None, Vec::new()).expect("empty manifest is valid");
         let json = serde_json::to_string(&manifest).expect("serialization should succeed");
         assert!(!json.contains("trust_set"), "got: {json}");
         let restored: PayloadManifest =
@@ -1231,7 +1391,7 @@ mod tests {
     fn an_undecodable_trust_set_is_rejected_with_its_own_variant() {
         let entry = entry_json("bin/c", Some(GIT_COMMIT));
         let json = format!(
-            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"trust_set":"not base64!!","artifacts":[{entry}]}}"#
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"trust_set":"not base64!!",{MEMBERS_JSON}"artifacts":[{entry}]}}"#
         );
         let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect_err("a non-base64 trust_set must be rejected");
@@ -1246,7 +1406,7 @@ mod tests {
         // Read side: a value that decodes to zero bytes.
         let entry = entry_json("bin/c", Some(GIT_COMMIT));
         let json = format!(
-            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"trust_set":"","artifacts":[{entry}]}}"#
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"trust_set":"",{MEMBERS_JSON}"artifacts":[{entry}]}}"#
         );
         let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect_err("an empty trust_set must be rejected");
@@ -1256,7 +1416,7 @@ mod tests {
         );
 
         // Producer side: the same rejection, through the same check.
-        let error = PayloadManifest::new(None, Vec::new())
+        let error = manifest_of(None, Vec::new())
             .expect("empty manifest is valid")
             .with_trust_set(b"")
             .expect_err("an empty generation must be rejected");
@@ -1343,6 +1503,8 @@ mod tests {
             .expect("a baseline manifest at the legacy footer version must parse");
         assert_eq!(manifest.format_version(), None);
         assert_eq!(manifest.trust_set(), None);
+        // The one door that can yield a manifest binding no member list.
+        assert_eq!(manifest.archive_members(), None);
         assert_eq!(
             manifest
                 .artifacts()
@@ -1377,6 +1539,105 @@ mod tests {
         );
         assert!(!round_tripped.contains("null"), "got: {round_tripped}");
         assert!(!round_tripped.contains("commit"), "got: {round_tripped}");
+        assert!(
+            !round_tripped.contains("archive_members"),
+            "got: {round_tripped}"
+        );
+    }
+
+    #[test]
+    fn a_versioned_manifest_binding_no_member_list_is_rejected_at_both_doors() {
+        // The refusal lives in `from_parts`, so the footer-aware parse and
+        // plain deserialization — which cannot see the footer — are equally
+        // strict with one implementation. A missing key and an explicit `null`
+        // are the same absence.
+        let entry = entry_json("bin/c", Some(GIT_COMMIT));
+        let absent =
+            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let explicit_null = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"archive_members":null,"artifacts":[{entry}]}}"#
+        );
+        for json in [absent, explicit_null] {
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("a versioned manifest must bind a member list");
+            assert!(
+                matches!(error, ManifestError::MissingArchiveMembers),
+                "json {json}: got {error:?}"
+            );
+
+            let error = serde_json::from_slice::<PayloadManifest>(json.as_bytes())
+                .expect_err("the serde door must be no laxer");
+            assert!(
+                error.to_string().contains("archive_members"),
+                "json {json}: got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unversioned_manifest_carrying_an_archive_members_key_is_rejected() {
+        // The sixth term of the baseline conjunction, read presence-only like
+        // `trust_set`: the field is `skip_serializing_if = "Option::is_none"`,
+        // so no pre-bump producer could have emitted the key in any form, and a
+        // `null` value must not buy it back into the allowance. Without the
+        // term such a manifest would reach the path where the member-list check
+        // is skipped, carrying a list nothing compares against.
+        let entry = entry_json("bin/c", None);
+        for value in [r#"[{"name":"bin/c","length":12}]"#, "null"] {
+            let json = format!(r#"{{"archive_members":{value},"artifacts":[{entry}]}}"#);
+            let document: serde_json::Value =
+                serde_json::from_str(&json).expect("document should decode");
+            assert!(!is_pre_versioned_baseline(
+                LEGACY_UNVERSIONED_FOOTER_VERSION,
+                &document
+            ));
+
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("an unversioned manifest with a member list must be rejected");
+            assert!(
+                matches!(error, ManifestError::BaselineWithArchiveMembers),
+                "value {value}: got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_member_list_round_trips_and_the_builder_forwards_it_unchanged() {
+        let members = vec![
+            ArchiveMember {
+                name: "bin/roxyd".to_string(),
+                length: 12_345_678,
+            },
+            ArchiveMember {
+                name: "images/aimer.tar".to_string(),
+                length: 987_654_321,
+            },
+        ];
+        let manifest = PayloadManifest::new(
+            None,
+            members.clone(),
+            vec![artifact(
+                "bin/roxyd",
+                ArtifactKind::NativeBinary,
+                &[Disposition::Install],
+            )],
+        )
+        .expect("manifest should be valid");
+        assert_eq!(manifest.archive_members(), Some(members.as_slice()));
+
+        // `with_trust_set` takes no member-list parameter: it forwards the list
+        // its receiver already holds, so a caller cannot replace the list of an
+        // already-validated manifest.
+        let with_generation = manifest
+            .with_trust_set(GENERATION)
+            .expect("a non-empty generation is accepted");
+        assert_eq!(with_generation.archive_members(), Some(members.as_slice()));
+
+        let json = serde_json::to_string(&with_generation).expect("serialization should succeed");
+        let restored: PayloadManifest =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+        assert_eq!(restored.archive_members(), Some(members.as_slice()));
+        assert_eq!(restored, with_generation);
     }
 
     #[test]
@@ -1476,8 +1737,8 @@ mod tests {
             &[Disposition::Install],
         );
         declaring.spec = Some(module_spec());
-        let manifest = PayloadManifest::new(None, vec![declaring.clone()])
-            .expect("a valid spec must be accepted");
+        let manifest =
+            manifest_of(None, vec![declaring.clone()]).expect("a valid spec must be accepted");
 
         let json = serde_json::to_string(&manifest).expect("serialization should succeed");
         let restored = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
@@ -1539,8 +1800,9 @@ mod tests {
         for (exec, is_expected) in cases {
             let entry =
                 entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit_json(exec)));
-            let json =
-                format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+            let json = format!(
+                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+            );
             let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
                 .expect_err("a malformed spec must be refused on read");
             let ManifestError::InvalidSpec {
@@ -1560,8 +1822,9 @@ mod tests {
         // A `native-binary` artifact declaring a spec with no unit.
         let no_unit = r#"{"registration":{"package_id":"c","service_name":"c","reload":{"sighup":{"process_path":"/opt/c"}}},"placement":"core-hosts"}"#;
         let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), no_unit);
-        let json =
-            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
         let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect_err("a native-binary spec must carry a unit");
         assert!(
@@ -1583,7 +1846,7 @@ mod tests {
             ArtifactKind::StaticAssets,
             ArtifactKind::ContainerImage,
         ] {
-            PayloadManifest::new(None, vec![artifact("bin/c", kind, &[Disposition::Install])])
+            manifest_of(None, vec![artifact("bin/c", kind, &[Disposition::Install])])
                 .expect("an artifact declaring no spec is valid for every kind");
         }
     }
@@ -1594,8 +1857,9 @@ mod tests {
         let spec = spec_json(&unit_json(VALID_EXEC_START))
             .replace(r#""package_id":"c""#, r#""package_id":"somewhere-else""#);
         let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec);
-        let json =
-            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
         let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect_err("a mismatched package_id must be rejected");
         assert!(
@@ -1617,8 +1881,9 @@ mod tests {
             Some(GIT_COMMIT),
             &spec_json(&unit_json(VALID_EXEC_START)),
         );
-        let json =
-            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
         let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect("a valid spec must parse");
         let spec = manifest
@@ -1639,8 +1904,9 @@ mod tests {
         // rendered `ExecStart=`.
         let unit = unit_json(r#""exec_start":[{"var":"manager-address"}]"#);
         let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
-        let json =
-            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
         let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect_err("an unknown variable must not decode");
         assert!(matches!(error, ManifestError::Decode(_)), "got: {error:?}");
@@ -1653,18 +1919,20 @@ mod tests {
         // `format_version` range instead.
         let entry = entry_json("bin/c", Some(GIT_COMMIT))
             .replace(r#""component":"c""#, r#""component":"c","surprise":true"#);
-        let json =
-            format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{entry}]}}"#);
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
         let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect("an unknown artifact field must be ignored");
         assert_eq!(manifest.artifacts().len(), 1);
     }
 
     #[test]
-    fn an_artifact_declaring_no_spec_serializes_to_the_bytes_it_did_before() {
-        // Byte-for-byte, with no `spec` key: adding the field must not change
-        // the wire form of any payload that exists today.
-        let manifest = PayloadManifest::new(
+    fn a_current_format_manifest_serializes_to_the_shape_this_schema_fixes() {
+        // Byte-for-byte, so the on-disk shape is pinned rather than only the
+        // round trip: no `spec` key on an artifact that declares none, and
+        // `archive_members` as an array of `{"name","length"}` objects.
+        let manifest = manifest_of(
             None,
             vec![artifact(
                 "bin/native",
@@ -1678,7 +1946,7 @@ mod tests {
         assert_eq!(
             json,
             format!(
-                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"artifacts":[{{"component":"example","version":"1.2.3","commit":"{GIT_COMMIT}","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"bin/native","sha256":"{sha256}"}}]}}"#
+                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"archive_members":[{{"name":"bin/native","length":{FIXTURE_MEMBER_LEN}}}],"artifacts":[{{"component":"example","version":"1.2.3","commit":"{GIT_COMMIT}","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"bin/native","sha256":"{sha256}"}}]}}"#
             )
         );
     }
@@ -1746,7 +2014,7 @@ mod tests {
 
     #[test]
     fn an_unversioned_manifest_carrying_an_explicit_null_bump_key_is_rejected() {
-        // The three fingerprint terms read presence, never the value. A
+        // Every fingerprint term reads presence, never the value. A
         // pre-versioned producer emitted none of these keys in any form —
         // each is `skip_serializing_if = "Option::is_none"` — so the key alone
         // proves the document was hand-edited, and a `null` value must not buy
