@@ -474,6 +474,21 @@ mod tests {
     /// assert the unused bindings reach no output byte.
     const UNUSED: &str = "UNUSED-BINDING";
 
+    /// Every [`RenderVar`] the context resolves, which is the closed set minus
+    /// [`RenderVar::MainPid`] — systemd's own expansion and the one variant
+    /// with no context field.
+    const HOST_RESOLVED_VARS: [RenderVar; 9] = [
+        RenderVar::ArtifactPath,
+        RenderVar::ConfigPath,
+        RenderVar::DataDir,
+        RenderVar::InstanceId,
+        RenderVar::Hostname,
+        RenderVar::Domain,
+        RenderVar::CertPath,
+        RenderVar::KeyPath,
+        RenderVar::CaBundlePath,
+    ];
+
     fn review_unit() -> UnitTemplate {
         UnitTemplate {
             description: "Clumit Security review".to_string(),
@@ -713,29 +728,32 @@ WantedBy=multi-user.target
 
     #[test]
     fn a_spec_declaring_no_unit_is_a_valid_input_answered_with_none() {
-        let mut context = review_context();
-        context.kind = ArtifactKind::StaticAssets;
-        // A static-asset module with a registration template and a placement
-        // class legitimately runs no service.
-        assert!(
-            render_unit(&spec(None), &context)
-                .expect("a unit-less spec is not a failure")
-                .is_none()
-        );
+        for kind in [ArtifactKind::StaticAssets, ArtifactKind::ContainerImage] {
+            let mut context = review_context();
+            context.kind = kind;
+            // A static-asset or container-image module with a registration
+            // template and a placement class legitimately runs no service.
+            assert!(
+                render_unit(&spec(None), &context)
+                    .expect("a unit-less spec is not a failure")
+                    .is_none(),
+                "{kind:?}"
+            );
 
-        // `None` is the valid-but-unit-less answer, not a swallowed failure:
-        // the same spec with a unit added is still refused by the kind rule.
-        let error = render_unit(&spec(Some(review_unit())), &context)
-            .expect_err("a unit on a static-assets artifact must be rejected");
-        assert!(
-            matches!(
-                error,
-                RenderError::InvalidSpec(ModuleSpecError::UnexpectedUnit(
-                    ArtifactKind::StaticAssets
-                ))
-            ),
-            "got: {error:?}"
-        );
+            // `None` is the valid-but-unit-less answer, not a swallowed
+            // failure: the same spec with a unit added is still refused by the
+            // kind rule.
+            let error = render_unit(&spec(Some(review_unit())), &context)
+                .expect_err("a unit on a unit-less kind must be rejected");
+            assert!(
+                matches!(
+                    error,
+                    RenderError::InvalidSpec(ModuleSpecError::UnexpectedUnit(refused))
+                        if refused == kind
+                ),
+                "{kind:?} got: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -801,6 +819,87 @@ WantedBy=multi-user.target
         }
     }
 
+    /// A unit referring to every host-resolved [`RenderVar`], in the order the
+    /// two tests below read them back.
+    fn every_var_unit() -> UnitTemplate {
+        let mut unit = review_unit();
+        unit.exec_start = HOST_RESOLVED_VARS.iter().copied().map(Arg::Var).collect();
+        unit
+    }
+
+    /// A context binding each host-resolved variable to its own field name, so
+    /// a crossed wire in the resolver shows up as the wrong word.
+    fn every_var_context() -> RenderContext<'static> {
+        RenderContext {
+            artifact_path: "artifact-path",
+            config_path: "config-path",
+            data_dir: "data-dir",
+            instance_id: "instance-id",
+            hostname: "hostname",
+            domain: "domain",
+            cert_path: "cert-path",
+            key_path: "key-path",
+            ca_bundle_path: "ca-bundle-path",
+            ..review_context()
+        }
+    }
+
+    /// Binds `var`'s context field to `value`.
+    fn bind(context: &mut RenderContext<'static>, var: RenderVar, value: &'static str) {
+        match var {
+            RenderVar::ArtifactPath => context.artifact_path = value,
+            RenderVar::ConfigPath => context.config_path = value,
+            RenderVar::DataDir => context.data_dir = value,
+            RenderVar::InstanceId => context.instance_id = value,
+            RenderVar::Hostname => context.hostname = value,
+            RenderVar::Domain => context.domain = value,
+            RenderVar::CertPath => context.cert_path = value,
+            RenderVar::KeyPath => context.key_path = value,
+            RenderVar::CaBundlePath => context.ca_bundle_path = value,
+            RenderVar::MainPid => panic!("`main-pid` is not a context field"),
+        }
+    }
+
+    #[test]
+    fn every_host_resolved_variable_reads_its_own_context_field() {
+        // Resolution is total — every variant has a field — and each variant
+        // reads the field it names rather than a neighbour's.
+        let text = rendered(&spec(Some(every_var_unit())), &every_var_context()).text;
+        assert!(
+            text.contains(
+                "ExecStart=artifact-path config-path data-dir instance-id hostname domain \
+                 cert-path key-path ca-bundle-path\n"
+            ),
+            "got: {text}"
+        );
+        // `working_directory` resolves through the same field.
+        assert!(text.contains("WorkingDirectory=data-dir\n"), "got: {text}");
+    }
+
+    #[test]
+    fn every_host_resolved_value_goes_through_the_representability_rule() {
+        // The check is applied to whatever the host resolved, not to one
+        // favoured field: corrupting any of the nine refuses, naming that one.
+        for var in HOST_RESOLVED_VARS {
+            for bad in ["", "a\nb"] {
+                let mut context = every_var_context();
+                bind(&mut context, var, bad);
+                let error = render_unit(&spec(Some(every_var_unit())), &context)
+                    .expect_err("an unrepresentable resolved value must be rejected");
+                assert!(
+                    matches!(
+                        error,
+                        RenderError::UnrepresentableValue {
+                            var: rejected,
+                            ref value,
+                        } if rejected == var && value == bad
+                    ),
+                    "{var:?} {bad:?} got: {error:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_file_name_component_outside_the_dns_label_rule_is_refused() {
         for bad in [
@@ -814,35 +913,36 @@ WantedBy=multi-user.target
             "",
             &"a".repeat(64),
         ] {
+            // All three components of the name are held to the same rule; the
+            // context `service_name` included, which is the one a valid
+            // registration template could otherwise be mistaken for covering.
             let mut namespace = review_context();
             namespace.namespace = bad;
-            let error = render_unit(&spec(Some(review_unit())), &namespace)
-                .expect_err("a non-label namespace must be rejected");
-            assert!(
-                matches!(
-                    error,
-                    RenderError::InvalidNameComponent {
-                        field: NameField::Namespace,
-                        ref value,
-                    } if value == bad
-                ),
-                "namespace {bad:?} got: {error:?}"
-            );
-
+            let mut service_name = review_context();
+            service_name.service_name = bad;
             let mut instance = review_context();
             instance.instance = Some(bad);
-            let error = render_unit(&spec(Some(review_unit())), &instance)
-                .expect_err("a non-label instance must be rejected");
-            assert!(
-                matches!(
-                    error,
-                    RenderError::InvalidNameComponent {
-                        field: NameField::Instance,
-                        ref value,
-                    } if value == bad
-                ),
-                "instance {bad:?} got: {error:?}"
-            );
+
+            for (field, context) in [
+                (NameField::Namespace, namespace),
+                (NameField::ServiceName, service_name),
+                (NameField::Instance, instance),
+            ] {
+                let error = render_unit(&spec(Some(review_unit())), &context)
+                    .expect_err("a non-label file-name component must be rejected");
+                assert!(
+                    matches!(
+                        error,
+                        RenderError::InvalidNameComponent {
+                            field: refused,
+                            ref value,
+                        } if refused == field && value == bad
+                    ),
+                    "{field} {bad:?} got: {error:?}"
+                );
+                // The refusal names which context field carried the value.
+                assert!(error.to_string().contains(field.as_str()), "got: {error}");
+            }
         }
 
         // The 63-octet counterpart of the rejected 64-octet one renders.
