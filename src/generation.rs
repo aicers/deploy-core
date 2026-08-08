@@ -31,16 +31,26 @@
 //!
 //! # The tree root holds more than generations
 //!
+//! Four names at the tree root are the engine's own: `active`, the `active.tmp`
+//! scratch link the swap goes through, `gen-<n>` and `gen-<n>.tmp`. Every other entry
+//! is somebody else's, and the engine leaves it alone.
+//!
 //! Allocation and pruning both iterate the tree root and parse root-level entry
-//! names, so an entry that is none of the three the engine itself creates — `active`,
-//! `gen-<n>` and `gen-<n>.tmp` — is enumerated and ignored, never removed. Both are
-//! matched against the canonical spelling the engine writes rather than by prefix, so
-//! a root entry that merely resembles one — `gen-retention.tmp`, or the non-canonical
-//! `gen-01` and `gen-01.tmp` — survives a prune along with a trust anchor snapshot or
-//! a marker file, and moves the next index not at all. That is what makes the root a
-//! safe home for such a file. Material files, by contrast, live
-//! *inside* a generation directory, so a material file named `active` or `gen-2` is
-//! inert: nothing at the root ever sees it.
+//! names, matching against the canonical spelling the engine writes rather than by
+//! prefix, so a root entry that merely resembles a generation — `gen-retention.tmp`,
+//! or the non-canonical `gen-01` and `gen-01.tmp` — survives a prune along with a
+//! trust anchor snapshot or a marker file, and moves the next index not at all. That
+//! is what makes the root a safe home for such a file.
+//!
+//! `active.tmp` is the one name that carries no such tolerance, and it is reserved
+//! rather than merely parsed: [`swap_active_symlink`] clears whatever sits there
+//! before every swap, because a leftover from an aborted swap would otherwise wedge
+//! the tree for good. Root-owned state must not use that name — a file placed there
+//! is removed by the next activation. It is the swap protocol's scratch entry, not
+//! part of any generation, and nothing else at the root is treated this way.
+//!
+//! Material files, by contrast, live *inside* a generation directory, so a material
+//! file named `active` or `gen-2` is inert: nothing at the root ever sees it.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -418,6 +428,15 @@ fn tmp_generation_dir(root: &Path, generation: u64) -> PathBuf {
 /// Atomically repoints `active` at `gen-<generation>` by creating a temporary symlink
 /// and renaming it over the existing one (rename replaces a symlink without following
 /// it, so a reader never observes a missing or half-written `active`).
+///
+/// `<root>/active.tmp` is the scratch entry that protocol needs, and the name is
+/// **reserved for it**: whatever sits there is removed before the link is created,
+/// because `symlink` refuses an existing path and a leftover from an aborted swap
+/// would otherwise fail every later activation at the same step. So this is the one
+/// root entry the engine deletes without parsing it — root-owned state kept beside a
+/// tree's generations may carry any other name, but not this one. A *directory* there
+/// is not removed at all: `remove_file` fails on it and the swap returns that error,
+/// with `gen-<n>` already finalised and `active` still on the previous generation.
 fn swap_active_symlink(root: &Path, active: &Path, generation: u64) -> Result<(), GenerationError> {
     let target = format!("{GENERATION_PREFIX}{generation}");
     let tmp_link = root.join(format!("{ACTIVE_LINK}.{TMP_EXTENSION}"));
@@ -931,6 +950,40 @@ mod tests {
                 "gen-retention.tmp",
             ],
         );
+    }
+
+    /// `active.tmp` is the swap protocol's scratch entry and the one root name the
+    /// engine reserves: whatever sits there is removed before the link is created,
+    /// since `symlink` refuses an existing path and a leftover from an aborted swap
+    /// would otherwise fail every later activation at that step. The boundary is
+    /// exact — the reservation is the literal name, so a neighbour that merely starts
+    /// with it survives like any other root-owned file.
+    #[test]
+    fn the_swap_scratch_name_is_reserved_and_its_neighbours_are_not() {
+        let t = tree();
+        activate(&t.root, &material(&[("one", b"first")])).expect("seed");
+
+        let scratch = t.root.join("active.tmp");
+        std::fs::write(&scratch, b"aborted swap debris").expect("write scratch");
+        let neighbour = t.root.join("active.tmp.bak");
+        std::fs::write(&neighbour, b"root-owned state").expect("write neighbour");
+
+        let rotated = activate(&t.root, &material(&[("one", b"second")])).expect("rotate");
+        assert_eq!(
+            rotated.generation, 2,
+            "debris at the scratch name does not wedge the swap",
+        );
+        assert_eq!(read_link_target(&t.root), "gen-2");
+        assert!(
+            !scratch.exists(),
+            "the engine clears `active.tmp` before every swap, whatever put it there",
+        );
+        assert_eq!(
+            std::fs::read(&neighbour).expect("read neighbour"),
+            b"root-owned state",
+            "only the exact name is reserved",
+        );
+        assert_eq!(entries(&t.root), vec!["active", "active.tmp.bak", "gen-2"]);
     }
 
     /// Both predicates decide a removal, so each accepts only the canonical spelling
