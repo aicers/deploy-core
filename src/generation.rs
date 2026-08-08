@@ -437,13 +437,14 @@ fn tmp_generation_dir(root: &Path, generation: u64) -> PathBuf {
 /// it, so a reader never observes a missing or half-written `active`).
 ///
 /// `<root>/active.tmp` is the scratch entry that protocol needs, and the name is
-/// **reserved for it**: whatever sits there is removed before the link is created,
-/// because `symlink` refuses an existing path and a leftover from an aborted swap
-/// would otherwise fail every later activation at the same step. So this is the one
-/// root entry the engine deletes without parsing it — root-owned state kept beside a
-/// tree's generations may carry any other name, but not this one. A *directory* there
-/// is not removed at all: `remove_file` fails on it and the swap returns that error,
-/// with `gen-<n>` already finalised and `active` still on the previous generation.
+/// **reserved for it**: a removable entry there — a symlink or a plain file, which is
+/// what an aborted swap can leave — is removed before the link is created, because
+/// `symlink` refuses an existing path and such a leftover would otherwise fail every
+/// later activation at the same step. So this is the one root entry the engine deletes
+/// without parsing it — root-owned state kept beside a tree's generations may carry
+/// any other name, but not this one. A *directory* there is not removed at all:
+/// `remove_file` fails on it and the swap returns that error, with `gen-<n>` already
+/// finalised and `active` still on the previous generation.
 fn swap_active_symlink(root: &Path, active: &Path, generation: u64) -> Result<(), GenerationError> {
     let target = format!("{GENERATION_PREFIX}{generation}");
     let tmp_link = root.join(format!("{ACTIVE_LINK}.{TMP_EXTENSION}"));
@@ -983,7 +984,8 @@ mod tests {
         assert_eq!(read_link_target(&t.root), "gen-2");
         assert!(
             !scratch.exists(),
-            "the engine clears `active.tmp` before every swap, whatever put it there",
+            "the engine clears a file or symlink at `active.tmp` before every swap, \
+             whatever put it there",
         );
         assert_eq!(
             std::fs::read(&neighbour).expect("read neighbour"),
