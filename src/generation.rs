@@ -205,11 +205,12 @@ pub(crate) struct GenerationTree<'a> {
 ///
 /// - **Before `gen-<n>` is finalised** — a refused material set, any I/O fault in
 ///   steps 2 to 4, or a validator rejection. Fail-closed and nothing published:
-///   `active` resolves to exactly what it resolved to before the call, and no
-///   generation directory exists that did not exist before it. A copy the validator
-///   rejected is removed; one an I/O fault abandoned part-way through staging stays
-///   behind as `gen-<n>.tmp`, which the next activation removes before it reuses the
-///   name, and which any prune removes in any case.
+///   `active` resolves to exactly what it resolved to before the call, and no final
+///   `gen-<n>` exists that did not exist before it. A half-staged copy may: the
+///   directory is created before the files are written, so an I/O fault anywhere in
+///   steps 3 and 4 leaves `gen-<n>.tmp` behind, which the next activation removes
+///   before it reuses the name, and which any prune removes in any case. A copy the
+///   validator rejected is removed on the way out.
 /// - **Finalised but not yet live** — the `rename` of step 5 succeeded and the
 ///   `active` swap right after it failed; a directory left at the reserved
 ///   `active.tmp` scratch name is one way to reach it, since clearing that name is a
