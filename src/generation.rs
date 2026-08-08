@@ -33,11 +33,12 @@
 //!
 //! Allocation and pruning both iterate the tree root and parse root-level entry
 //! names, so an entry that is none of the three the engine itself creates — `active`,
-//! `gen-<n>` and `gen-<n>.tmp` — is enumerated and ignored, never removed. A staging
-//! name is parsed in both halves rather than prefix-matched, so a root entry that
-//! merely resembles one, such as `gen-retention.tmp`, survives a prune along with a
-//! trust anchor snapshot or a marker file. That is what makes the root a safe home
-//! for such a file. Material files, by contrast, live
+//! `gen-<n>` and `gen-<n>.tmp` — is enumerated and ignored, never removed. Both are
+//! matched against the canonical spelling the engine writes rather than by prefix, so
+//! a root entry that merely resembles one — `gen-retention.tmp`, or the non-canonical
+//! `gen-01` and `gen-01.tmp` — survives a prune along with a trust anchor snapshot or
+//! a marker file, and moves the next index not at all. That is what makes the root a
+//! safe home for such a file. Material files, by contrast, live
 //! *inside* a generation directory, so a material file named `active` or `gen-2` is
 //! inert: nothing at the root ever sees it.
 
@@ -348,21 +349,30 @@ fn prune_generations(root: &Path, keep: u64) -> Result<(), GenerationError> {
 
 /// Parses a `gen-<n>` directory name into its generation number, ignoring `active`,
 /// `gen-<n>.tmp`, and every other entry a tree root may hold.
+///
+/// The spelling must be the canonical one the engine writes. `u64::from_str` also
+/// accepts a leading `+` and leading zeros, so `gen-01` and `gen-+1` would otherwise
+/// parse as generation 1 — names the engine never creates, and therefore somebody
+/// else's directories, which pruning would remove and allocation would count toward
+/// the next index. Requiring the digits to round-trip through `to_string` keeps the
+/// predicate to exactly the names the engine owns.
 pub(crate) fn parse_generation(name: &Path) -> Option<u64> {
     let name = name.file_name()?.to_str()?;
     let digits = name.strip_prefix(GENERATION_PREFIX)?;
-    digits.parse::<u64>().ok()
+    let generation = digits.parse::<u64>().ok()?;
+    (digits == generation.to_string()).then_some(generation)
 }
 
 /// Parses a `gen-<n>.tmp` staging directory's name into its generation number, and
 /// nothing else.
 ///
 /// Both halves are parsed — the extension must be exactly `tmp` and the stem exactly
-/// `gen-<n>` — rather than the name being prefix-matched, because pruning removes what
-/// this accepts. Only the engine creates a staging directory, and only ever under this
-/// name, so anything else the tree root holds is somebody else's file and survives:
-/// `gen-retention.tmp` is not a generation. Parsing also needs no lossy UTF-8 view of
-/// the name, since a name that is not valid UTF-8 is by construction not this one.
+/// the canonical `gen-<n>` [`parse_generation`] accepts — rather than the name being
+/// prefix-matched, because pruning removes what this accepts. Only the engine creates
+/// a staging directory, and only ever under this name, so anything else the tree root
+/// holds is somebody else's file and survives: neither `gen-retention.tmp` nor
+/// `gen-01.tmp` is a generation. Parsing also needs no lossy UTF-8 view of the name,
+/// since a name that is not valid UTF-8 is by construction not this one.
 fn parse_tmp_generation(name: &Path) -> Option<u64> {
     let name = Path::new(name.file_name()?);
     if name.extension()? != TMP_EXTENSION {
@@ -501,6 +511,7 @@ mod tests {
 
     use super::{
         GenerationError, GenerationFile, GenerationTree, SYSTEMCTL_CALLS, activate_generation,
+        parse_generation, parse_tmp_generation,
     };
     use crate::layout::REQUIRE_TRUST_PIN_MARKER;
 
@@ -853,24 +864,69 @@ mod tests {
         // without being a generation, beside real debris from an aborted run.
         let retention = t.root.join("gen-retention.tmp");
         std::fs::write(&retention, b"root-owned state").expect("write retention");
+        // A non-canonical numeric spelling the engine never writes: `u64::from_str`
+        // parses it, but `gen-01` and `gen-01.tmp` are somebody else's names.
+        let padded_tmp = t.root.join("gen-01.tmp");
+        std::fs::write(&padded_tmp, b"not staging").expect("write padded tmp");
+        let padded_gen = t.root.join("gen-007");
+        std::fs::create_dir(&padded_gen).expect("padded gen");
         let debris = t.root.join("gen-9.tmp");
         std::fs::create_dir(&debris).expect("stale tmp");
 
         let rotated = activate(&t.root, &material(&[("one", b"second")])).expect("rotate");
         assert_eq!(
             rotated.generation, 2,
-            "neither entry parses as a generation, so neither moves the index",
+            "no entry parses as a generation, so none moves the index",
         );
         assert_eq!(
             std::fs::read(&retention).expect("read retention"),
             b"root-owned state",
             "`gen-retention.tmp` is not a staging directory the engine ever created",
         );
+        assert_eq!(
+            std::fs::read(&padded_tmp).expect("read padded tmp"),
+            b"not staging",
+            "`gen-01.tmp` is not the canonical staging name the engine writes",
+        );
+        assert!(
+            padded_gen.is_dir(),
+            "`gen-007` is not the canonical generation name the engine writes",
+        );
         assert!(!debris.exists(), "a real `gen-<n>.tmp` leftover is pruned");
         assert_eq!(
             entries(&t.root),
-            vec!["active", "gen-2", "gen-retention.tmp"],
+            vec![
+                "active",
+                "gen-007",
+                "gen-01.tmp",
+                "gen-2",
+                "gen-retention.tmp",
+            ],
         );
+    }
+
+    /// Both predicates decide a removal, so each accepts only the canonical spelling
+    /// the engine writes — never every spelling `u64::from_str` happens to parse.
+    #[test]
+    fn the_generation_predicates_accept_only_canonical_names() {
+        for (name, generation, staging) in [
+            ("gen-1", Some(1), None),
+            ("gen-12", Some(12), None),
+            ("gen-1.tmp", None, Some(1)),
+            ("gen-01", None, None),
+            ("gen-01.tmp", None, None),
+            ("gen-007", None, None),
+            ("gen-+1", None, None),
+            ("gen-+1.tmp", None, None),
+            ("gen-", None, None),
+            ("gen-retention.tmp", None, None),
+            ("gen-1.tmp.tmp", None, None),
+            ("active", None, None),
+        ] {
+            let path = Path::new(name);
+            assert_eq!(parse_generation(path), generation, "{name}");
+            assert_eq!(parse_tmp_generation(path), staging, "{name}");
+        }
     }
 
     /// A material file's bytes are a private key on the mTLS tree, so formatting one
