@@ -34,9 +34,16 @@
 //! directory, never the staged file the agent can still rewrite. A staged file that
 //! passes a check and is then swapped before it is copied is a TOCTOU the agent
 //! wins; copying first and validating the copy closes it (RFC 0003 §8.3, AC).
+//!
+//! # What is here and what is in the engine
+//!
+//! The staged-to-validate-to-activate sequence itself is **not** here: it is a
+//! crate-internal engine that drives it for any root-owned trust tree over any
+//! material set. What this module holds is roxyd's half — the X.509 validator above,
+//! and [`activate_with_paths`], the adapter that hands the engine roxyd's staged
+//! triple, roxyd's unit to reload, and [`validate_material`] as the verdict.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -50,7 +57,12 @@ use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use x509_parser::time::ASN1Time;
 
-use crate::layout::{ROXYD_ACTIVE_LINK, ROXYD_GENERATION_PREFIX};
+use crate::generation::{GenerationError, GenerationFile, GenerationTree, activate_generation};
+// The generation engine owns these primitives now; this module's own tests still
+// reach them through `super::`, which is why the imports are here rather than in the
+// test module.
+#[cfg(test)]
+use crate::generation::{make_dir_0700, parse_generation, write_file_0600};
 
 /// The signature algorithms the chain check accepts. bootroot issues ECDSA P-256
 /// leaves today (rcgen's default), but P-384 and RSA are listed so a future CA
@@ -70,13 +82,25 @@ const LABEL_CERTIFICATE: &str = "CERTIFICATE";
 /// The PEM label of a PKCS#8 private key (what rcgen's `serialize_pem` emits).
 const LABEL_PRIVATE_KEY: &str = "PRIVATE KEY";
 
-/// A failure to validate or activate roxyd's trust material. Every variant is
-/// fail-closed: on any of them the caller leaves `active/` untouched, so roxyd keeps
-/// serving the last material a root helper vouched for (RFC 0003 §8.3).
+/// A failure to validate or activate roxyd's trust material.
+///
+/// Every variant that can arise before the `active` swap is fail-closed: the caller
+/// leaves `active/` as it found it, so roxyd keeps serving the last material a root
+/// helper vouched for (RFC 0003 §8.3). That is every validation variant, and [`Io`]
+/// raised while reading or staging. The two faults the activation sequence can raise
+/// *after* the swap — [`Reload`], and [`Io`] from pruning superseded generations —
+/// report a material set that is already live; see [`activate_with_paths`].
+///
+/// [`Io`]: TrustError::Io
+/// [`Reload`]: TrustError::Reload
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
     /// A file could not be read or written, or a directory operation failed.
-    #[error("roxyd trust i/o error at {path}: {source}")]
+    ///
+    /// The message names no tree: the filesystem half of an activation is the shared
+    /// crate-internal generation engine's, which reports for every root-owned trust
+    /// tree and not only for roxyd's.
+    #[error("trust i/o error at {path}: {source}")]
     Io {
         /// The path the operation targeted.
         path: String,
@@ -159,6 +183,60 @@ impl TrustError {
         }
     }
 }
+
+/// Bridges the generation engine's faults onto roxyd's taxonomy — the only link
+/// between the two error types, and the reason [`TrustError`] needs no variant for
+/// the engine and callers keep matching on [`TrustError`] alone.
+///
+/// Every mapping lands where today's code already lands for the same input:
+///
+/// - I/O and reload failures are the engine's rendering of the same failures
+///   [`TrustError::Io`] and [`TrustError::Reload`] carry today.
+/// - A duplicate material name is [`TrustError::Io`] with
+///   [`std::io::ErrorKind::AlreadyExists`], because `create_new` is what refuses two
+///   staged paths sharing a basename today — the engine only refuses it earlier,
+///   before anything is staged.
+/// - A name that is not a single path component is [`TrustError::Io`] too: today
+///   `dir.join("")` targets the directory itself and `dir.join("a/b")` a missing
+///   parent, and both already fail at `create_new`.
+/// - An empty material set is [`TrustError::Io`] with
+///   [`std::io::ErrorKind::InvalidInput`] — std's kind for a filesystem parameter
+///   that is wrong. It is unreachable through [`activate_with_paths`], which always
+///   passes exactly three files, and needs a mapping only because this impl must be
+///   total.
+impl From<GenerationError> for TrustError {
+    fn from(err: GenerationError) -> Self {
+        match err {
+            GenerationError::Io { path, source } => TrustError::Io { path, source },
+            GenerationError::Reload { reason, .. } => TrustError::Reload(reason),
+            GenerationError::EmptyMaterial => TrustError::Io {
+                path: MATERIAL_SET_TARGET.to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the material set is empty",
+                ),
+            },
+            GenerationError::DuplicateName(name) => TrustError::Io {
+                path: name.to_string_lossy().into_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "two material files carry the same name",
+                ),
+            },
+            GenerationError::InvalidName(name) => TrustError::Io {
+                path: name.to_string_lossy().into_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a material file name is not a single path component",
+                ),
+            },
+        }
+    }
+}
+
+/// What [`TrustError::Io`]'s `path` names for a fault of the material set as a whole,
+/// which targets no one path.
+const MATERIAL_SET_TARGET: &str = "<material set>";
 
 /// One decoded PEM block: its label and its DER contents.
 struct PemBlock {
@@ -246,13 +324,6 @@ fn require_all(blocks: &[PemBlock], label: &str, role: &str) -> Result<Vec<Vec<u
         });
     }
     Ok(blocks.iter().map(|b| b.der.clone()).collect())
-}
-
-/// The three staged files, already read into memory, that one activation validates.
-struct StagedBytes {
-    cert: Vec<u8>,
-    key: Vec<u8>,
-    ca_bundle: Vec<u8>,
 }
 
 /// Validates roxyd's staged trust material against the root-owned client-identity
@@ -466,24 +537,13 @@ impl RoxydTrustPaths {
     /// The `active` symlink roxyd reads its material through.
     #[must_use]
     pub fn active_link(&self) -> PathBuf {
-        self.tls_dir.join(ROXYD_ACTIVE_LINK)
+        crate::generation::active_link(&self.tls_dir)
     }
 
     /// The generation directory `roxyd-tls/gen-<n>/`.
     #[must_use]
     pub fn generation_dir(&self, generation: u64) -> PathBuf {
-        self.tls_dir
-            .join(format!("{ROXYD_GENERATION_PREFIX}{generation}"))
-    }
-
-    /// The cert/key/CA triple inside `dir` (a generation directory or the `active`
-    /// symlink), named to match the staged files.
-    fn material_in(&self, dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
-        (
-            dir.join(file_name(&self.staging_cert)),
-            dir.join(file_name(&self.staging_key)),
-            dir.join(file_name(&self.staging_ca)),
-        )
+        crate::generation::generation_dir(&self.tls_dir, generation)
     }
 }
 
@@ -498,214 +558,73 @@ pub struct Activation {
 }
 
 /// Activates a product's roxyd trust material from a caller-resolved
-/// [`RoxydTrustPaths`]: the path-driven activation core, which the installer's
+/// [`RoxydTrustPaths`]: the path-driven activation entry point, which the installer's
 /// manifest-driven entry point (`crate::roxyd::activate_roxyd_trust`, called by
 /// the `roxyd-activate` oneshot, RFC 0003 §8.3) drives, and which a test can drive
 /// directly against a temporary tree.
 ///
-/// The sequence is: read the staged material and the anchor; if the staged bytes
-/// already match `active`, return an idempotent no-op; otherwise copy the staged
-/// bytes into a fresh root-only `gen-<n>.tmp`, **validate that copy**, finalise it to
-/// `gen-<n>`, atomically repoint `active` at it, reload roxyd if it is running, and
-/// prune superseded generations. A failure before the `active` swap leaves the live
-/// material untouched.
+/// The sequence is the tree-neutral one the crate's shared generation engine
+/// runs, over roxyd's material: read the staged material and the anchor; if the
+/// staged bytes already match `active`, return an idempotent no-op; otherwise copy
+/// the staged bytes into a fresh root-only `gen-<n>.tmp`, **validate that copy**
+/// against the anchor, finalise it to `gen-<n>`, atomically repoint `active` at it,
+/// reload roxyd if it is running, and prune superseded generations.
+///
+/// The generation's files carry the staged basenames, in the staged order, so a
+/// generation is a like-named copy of `agent/roxyd/` — including a basename that is
+/// not valid UTF-8, which is installed verbatim rather than converted.
 ///
 /// # Errors
 ///
-/// Returns [`TrustError`] on any I/O, validation, or reload failure. On error the
-/// `active` tree is left exactly as it was (fail-closed).
+/// Returns [`TrustError`] on any I/O, validation, or reload failure. An error before
+/// the `active` swap — every I/O fault up to that point, and every validation
+/// failure — is fail-closed: roxyd keeps resolving the material it resolved before
+/// the call. An error after it is not: [`TrustError::Reload`], and an I/O fault while
+/// pruning superseded generations, both return `Err` with the new generation already
+/// active and roxyd's material already replaced. Treat those as "installed, but the
+/// unit may not have been told" rather than as a failed activation.
 pub fn activate_with_paths(paths: &RoxydTrustPaths) -> Result<Activation, TrustError> {
-    let staged = read_staged(paths)?;
+    // roxyd's material set: the staged triple, read in the order this module has
+    // always read it, under the basenames the bootroot agent wrote it as.
+    let material = [
+        GenerationFile::new(
+            file_name(&paths.staging_cert),
+            read_file(&paths.staging_cert)?,
+        ),
+        GenerationFile::new(
+            file_name(&paths.staging_key),
+            read_file(&paths.staging_key)?,
+        ),
+        GenerationFile::new(file_name(&paths.staging_ca), read_file(&paths.staging_ca)?),
+    ];
     let anchor = read_file(&paths.anchor)?;
 
-    let active = paths.active_link();
-    if let Some(current) = current_generation(paths)?
-        && active_matches(paths, &active, &staged)?
-    {
-        return Ok(Activation {
-            generation: current,
-            changed: false,
-        });
-    }
-
-    let generation = next_generation(paths)?;
-    let final_dir = paths.generation_dir(generation);
-    let tmp_dir = tmp_generation_dir(paths, generation);
-
-    // Fresh, root-only staging copy. Remove any leftover from a prior aborted run.
-    remove_dir_all_if_present(&tmp_dir)?;
-    make_dir_0700(&tmp_dir)?;
-    let (tmp_cert, tmp_key, tmp_ca) = paths.material_in(&tmp_dir);
-    write_file_0600(&tmp_cert, &staged.cert)?;
-    write_file_0600(&tmp_key, &staged.key)?;
-    write_file_0600(&tmp_ca, &staged.ca_bundle)?;
-
-    // Validate the bytes now on disk in the root-owned copy — not the staged files —
-    // so what is validated is exactly what is installed.
-    let copied = StagedBytes {
-        cert: read_file(&tmp_cert)?,
-        key: read_file(&tmp_key)?,
-        ca_bundle: read_file(&tmp_ca)?,
+    let tree = GenerationTree {
+        root: &paths.tls_dir,
+        reload_unit: Some(&paths.reload_unit),
     };
-    if let Err(err) = validate_material(
-        &copied.cert,
-        &copied.key,
-        &copied.ca_bundle,
-        &anchor,
-        now_unix(),
-    ) {
-        // Fail closed: discard the rejected copy, leave `active` as it was.
-        let _ = remove_dir_all_if_present(&tmp_dir);
-        return Err(err);
-    }
-
-    // Finalise the generation, then swap `active` onto it atomically.
-    rename(&tmp_dir, &final_dir)?;
-    swap_active_symlink(paths, &active, generation)?;
-    reload_roxyd_if_active(&paths.reload_unit)?;
-    prune_generations(paths, generation)?;
-    Ok(Activation {
-        generation,
-        changed: true,
+    activate_generation(&tree, &material, |_dir, copied| {
+        let [cert, key, ca_bundle] = copied else {
+            // The engine reads back exactly the files it was handed, and what it was
+            // handed is the triple above, so this arm is unreachable. Fail closed
+            // rather than index into the slice blindly.
+            return Err(TrustError::Io {
+                path: paths.tls_dir.to_string_lossy().into_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the staged copy is not a cert/key/CA triple",
+                ),
+            });
+        };
+        validate_material(
+            &cert.bytes,
+            &key.bytes,
+            &ca_bundle.bytes,
+            &anchor,
+            now_unix(),
+        )
     })
 }
-
-/// Reads the three staged files into memory.
-fn read_staged(paths: &RoxydTrustPaths) -> Result<StagedBytes, TrustError> {
-    Ok(StagedBytes {
-        cert: read_file(&paths.staging_cert)?,
-        key: read_file(&paths.staging_key)?,
-        ca_bundle: read_file(&paths.staging_ca)?,
-    })
-}
-
-/// Returns whether the material under `active` byte-matches `staged` — the
-/// idempotence check that makes repeated `.path` events (and a no-op fast-poll write)
-/// cheap and keeps generation numbers from churning.
-fn active_matches(
-    paths: &RoxydTrustPaths,
-    active: &Path,
-    staged: &StagedBytes,
-) -> Result<bool, TrustError> {
-    let (cert, key, ca) = paths.material_in(active);
-    for (path, want) in [
-        (cert, &staged.cert),
-        (key, &staged.key),
-        (ca, &staged.ca_bundle),
-    ] {
-        match std::fs::read(&path) {
-            Ok(bytes) if &bytes == want => {}
-            Ok(_) => return Ok(false),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(TrustError::io(&path, e)),
-        }
-    }
-    Ok(true)
-}
-
-/// Returns the generation `active` currently points at, if any.
-fn current_generation(paths: &RoxydTrustPaths) -> Result<Option<u64>, TrustError> {
-    let active = paths.active_link();
-    match std::fs::read_link(&active) {
-        Ok(target) => Ok(parse_generation(&target)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(TrustError::io(&active, e)),
-    }
-}
-
-/// Returns one greater than the highest existing generation number, or 1 when none
-/// exist. Numbering only ever increases, so a just-superseded generation's directory
-/// is never reused while it might still be resolved through an in-flight read.
-fn next_generation(paths: &RoxydTrustPaths) -> Result<u64, TrustError> {
-    let mut max = 0;
-    for entry in read_dir(&paths.tls_dir)? {
-        let entry = entry.map_err(|e| TrustError::io(&paths.tls_dir, e))?;
-        if let Some(n) = parse_generation(&PathBuf::from(entry.file_name())) {
-            max = max.max(n);
-        }
-    }
-    Ok(max + 1)
-}
-
-/// Removes every generation directory other than `keep`, plus any leftover
-/// `gen-<n>.tmp`.
-fn prune_generations(paths: &RoxydTrustPaths, keep: u64) -> Result<(), TrustError> {
-    for entry in read_dir(&paths.tls_dir)? {
-        let entry = entry.map_err(|e| TrustError::io(&paths.tls_dir, e))?;
-        let name = PathBuf::from(entry.file_name());
-        let is_stale_tmp = name.to_string_lossy().starts_with(ROXYD_GENERATION_PREFIX)
-            && name.extension().is_some_and(|ext| ext == "tmp");
-        let is_old_gen = parse_generation(&name).is_some_and(|n| n != keep);
-        if is_stale_tmp || is_old_gen {
-            remove_dir_all_if_present(&paths.tls_dir.join(name))?;
-        }
-    }
-    Ok(())
-}
-
-/// Parses a `gen-<n>` directory name into its generation number, ignoring `active`,
-/// `client-anchor.pem`, and `gen-<n>.tmp`.
-fn parse_generation(name: &Path) -> Option<u64> {
-    let name = name.file_name()?.to_str()?;
-    let digits = name.strip_prefix(ROXYD_GENERATION_PREFIX)?;
-    digits.parse::<u64>().ok()
-}
-
-/// The temporary directory a generation is assembled and validated in before it is
-/// finalised (`gen-<n>.tmp`).
-fn tmp_generation_dir(paths: &RoxydTrustPaths, generation: u64) -> PathBuf {
-    paths
-        .tls_dir
-        .join(format!("{ROXYD_GENERATION_PREFIX}{generation}.tmp"))
-}
-
-/// Atomically repoints `active` at `gen-<generation>` by creating a temporary symlink
-/// and renaming it over the existing one (rename replaces a symlink without following
-/// it, so roxyd never observes a missing or half-written `active`).
-fn swap_active_symlink(
-    paths: &RoxydTrustPaths,
-    active: &Path,
-    generation: u64,
-) -> Result<(), TrustError> {
-    let target = format!("{ROXYD_GENERATION_PREFIX}{generation}");
-    let tmp_link = paths.tls_dir.join(format!("{ROXYD_ACTIVE_LINK}.tmp"));
-    // Remove a leftover temp link from a prior aborted swap, then create ours.
-    match std::fs::remove_file(&tmp_link) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(TrustError::io(&tmp_link, e)),
-    }
-    std::os::unix::fs::symlink(&target, &tmp_link).map_err(|e| TrustError::io(&tmp_link, e))?;
-    rename(&tmp_link, active)
-}
-
-/// Reloads roxyd only when it is running, so a first-install seed (roxyd not yet
-/// started) and a test host (no such unit) skip cleanly, while a live rotation
-/// reloads. A reload that is attempted and fails is a hard error.
-fn reload_roxyd_if_active(unit: &str) -> Result<(), TrustError> {
-    let active = Command::new(SYSTEMCTL)
-        .args(["is-active", "--quiet", unit])
-        .status();
-    match active {
-        Ok(status) if status.success() => {
-            let reload = Command::new(SYSTEMCTL)
-                .args(["reload", unit])
-                .status()
-                .map_err(|e| TrustError::Reload(e.to_string()))?;
-            if !reload.success() {
-                return Err(TrustError::Reload(format!(
-                    "`systemctl reload {unit}` exited with {reload}"
-                )));
-            }
-            Ok(())
-        }
-        // Not active, or systemctl unavailable (seed time / test): nothing to reload.
-        _ => Ok(()),
-    }
-}
-
-/// The `systemctl` binary the reload step invokes.
-const SYSTEMCTL: &str = "systemctl";
 
 /// Returns the current time in seconds since the Unix epoch, saturating at 0 for a
 /// clock set before the epoch.
@@ -715,60 +634,8 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-// --- small filesystem helpers that annotate their path on error ---
-
 fn read_file(path: &Path) -> Result<Vec<u8>, TrustError> {
     std::fs::read(path).map_err(|e| TrustError::io(path, e))
-}
-
-/// Writes `bytes` to a new file that is `0600` from the moment it exists.
-///
-/// The mode is asked for at creation rather than applied afterwards. Creating
-/// first and tightening second leaves the contents readable by anyone on the
-/// host for as long as the two calls take, and what goes through here is a
-/// certificate, a CA bundle, and a private key. `create_new` also makes a
-/// pre-existing path an error rather than a silent overwrite, which is what
-/// staged trust material wants.
-fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), TrustError> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| TrustError::io(path, e))?;
-    file.write_all(bytes).map_err(|e| TrustError::io(path, e))
-}
-
-/// Creates `path` as a directory that is `0700` from the moment it exists.
-///
-/// Same reasoning as [`write_file_0600`]: a directory created with the umask's
-/// mode and narrowed afterwards is traversable in between.
-fn make_dir_0700(path: &Path) -> Result<(), TrustError> {
-    use std::os::unix::fs::DirBuilderExt as _;
-
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(path)
-        .map_err(|e| TrustError::io(path, e))
-}
-
-fn rename(from: &Path, to: &Path) -> Result<(), TrustError> {
-    std::fs::rename(from, to).map_err(|e| TrustError::io(to, e))
-}
-
-fn read_dir(path: &Path) -> Result<std::fs::ReadDir, TrustError> {
-    std::fs::read_dir(path).map_err(|e| TrustError::io(path, e))
-}
-
-fn remove_dir_all_if_present(path: &Path) -> Result<(), TrustError> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(TrustError::io(path, e)),
-    }
 }
 
 fn file_name(path: &Path) -> std::ffi::OsString {
@@ -1236,5 +1103,158 @@ mod tests {
         assert_eq!(active_target(&fx), "gen-1");
         assert!(!fx.paths.tls_dir.join("gen-2.tmp").exists());
         assert!(fx.staging_dir.exists());
+    }
+
+    // --- what the adapter must keep observably unchanged ---
+
+    /// Two staged paths sharing a basename name the same file inside a generation.
+    /// Before the generalization the second `create_new` refused it; the engine now
+    /// refuses the material set before staging anything, and the caller sees the same
+    /// variant on the same input.
+    #[test]
+    fn staged_paths_sharing_a_basename_still_fail_as_already_exists() {
+        let fx = fixture();
+        stage_valid(&fx);
+        activate_with_paths(&fx.paths).expect("seed gen-1");
+
+        // A second staging directory whose key file carries the cert's basename.
+        let alt = fx
+            .staging_dir
+            .parent()
+            .expect("staging parent")
+            .join("roxyd-alt");
+        std::fs::create_dir_all(&alt).unwrap();
+        let clashing = alt.join("roxyd-cert.pem");
+        std::fs::copy(&fx.paths.staging_key, &clashing).unwrap();
+        let mut paths = fx.paths.clone();
+        paths.staging_key = clashing;
+
+        let err = activate_with_paths(&paths).expect_err("a duplicate basename is refused");
+        match err {
+            TrustError::Io { ref source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+            }
+            other => panic!("want TrustError::Io, got {other:?}"),
+        }
+        assert_eq!(active_target(&fx), "gen-1");
+        assert!(!fx.paths.generation_dir(2).exists());
+        assert!(!fx.paths.tls_dir.join("gen-2.tmp").exists());
+    }
+
+    /// `RoxydTrustPaths` is public and its staged paths are `PathBuf`s, so a
+    /// basename need not be valid UTF-8. Those bytes are what roxyd's unit reads
+    /// through `active/`, so they are installed verbatim — no lossy conversion, and
+    /// no refusal the adapter did not make before.
+    #[test]
+    fn non_utf8_staged_basenames_are_installed_verbatim() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let fx = fixture();
+        let names: Vec<OsString> = [
+            &b"roxyd-cert-\xff.pem"[..],
+            &b"roxyd-key-\xff.pem"[..],
+            &b"ca-bundle-\xff.pem"[..],
+        ]
+        .iter()
+        .map(|bytes| OsString::from_vec(bytes.to_vec()))
+        .collect();
+        assert!(
+            names.iter().all(|name| name.to_str().is_none()),
+            "the fixture names must not be valid UTF-8",
+        );
+
+        let mut paths = fx.paths.clone();
+        paths.staging_cert = fx.staging_dir.join(&names[0]);
+        paths.staging_key = fx.staging_dir.join(&names[1]);
+        paths.staging_ca = fx.staging_dir.join(&names[2]);
+
+        // APFS and HFS+ enforce UTF-8 filenames, so on a macOS working copy the
+        // property under test cannot even be set up: the staged file cannot exist. On
+        // the Linux filesystems this ships on — and that CI runs — name bytes are
+        // stored verbatim and the assertions below run.
+        if let Err(e) = std::fs::write(&paths.staging_cert, b"probe") {
+            eprintln!("skipped: this filesystem refuses a non-UTF-8 file name: {e}");
+            return;
+        }
+        std::fs::remove_file(&paths.staging_cert).unwrap();
+
+        let (not_before, not_after) = window_now();
+        let (cert, key) = leaf(&fx.root, true, not_before, not_after);
+        std::fs::write(&paths.staging_cert, cert.as_bytes()).unwrap();
+        std::fs::write(&paths.staging_key, key.as_bytes()).unwrap();
+        std::fs::write(&paths.staging_ca, fx.root.pem.as_bytes()).unwrap();
+
+        let first = activate_with_paths(&paths).expect("seed");
+        assert_eq!(
+            first,
+            Activation {
+                generation: 1,
+                changed: true
+            }
+        );
+        let installed: Vec<OsString> = std::fs::read_dir(paths.generation_dir(1))
+            .expect("read_dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        for name in &names {
+            assert!(
+                installed.contains(name),
+                "{name:?} landed byte-for-byte in the generation",
+            );
+        }
+        assert_eq!(
+            std::fs::read(paths.generation_dir(1).join(&names[0])).expect("read"),
+            cert.as_bytes(),
+        );
+
+        // The idempotence pre-check finds the same bytes under the same names again.
+        let second = activate_with_paths(&paths).expect("idempotent");
+        assert_eq!(
+            second,
+            Activation {
+                generation: 1,
+                changed: false
+            }
+        );
+        assert!(!paths.generation_dir(2).exists());
+    }
+
+    /// The engine's faults reach a caller as variants `TrustError` already had, so
+    /// downstream matching is unaffected by the generalization — and the rendering
+    /// they arrive with names no tree.
+    #[test]
+    fn every_engine_fault_maps_onto_an_existing_trust_error_variant() {
+        use std::ffi::OsString;
+
+        use crate::generation::GenerationError;
+
+        let faults = [
+            GenerationError::Io {
+                path: "/etc/clumit-security/roxyd-tls".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
+            GenerationError::EmptyMaterial,
+            GenerationError::DuplicateName(OsString::from("roxyd-cert.pem")),
+            GenerationError::InvalidName(OsString::from("..")),
+            GenerationError::Reload {
+                unit: "clumit-security-roxyd.service".to_string(),
+                reason: "exited with 1".to_string(),
+            },
+        ];
+        for fault in faults {
+            let rendered = fault.to_string();
+            let mapped = TrustError::from(fault);
+            match mapped {
+                // Both variants predate the generalization, and neither has changed
+                // the situation it is produced in.
+                TrustError::Io { .. } | TrustError::Reload(_) => {}
+                other => panic!("{rendered} mapped onto a new variant: {other:?}"),
+            }
+            assert!(
+                !mapped.to_string().contains("roxyd trust"),
+                "the i/o rendering no longer claims to be roxyd's alone: {mapped}",
+            );
+        }
     }
 }

@@ -33,7 +33,10 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   create directories, run root commands, load images, extract bundles).
 - **bootroot_cmd** — the wrapper around the on-host PKI command.
 - **registration** — service registration against the on-host PKI.
-- **roxyd_trust** — trust-material activation for the on-host agent.
+- **roxyd_trust** — trust-material activation for the on-host agent: the X.509
+  validator for roxyd's staged cert/key/CA triple, over the crate-internal
+  tree-neutral generation engine (stage, validate the copy, swap `active`,
+  prune) that every root-owned trust tree under **layout** shares.
 
 It carries no product concept — no component catalog, no per-component
 renderers — so both the installer and the per-machine root daemon depend

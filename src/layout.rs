@@ -4,9 +4,9 @@
 //! `clumit-insight`, …) under the fixed `/opt`, `/etc`, `/var/lib` prefixes.
 //! [`Layout`] derives every managed path from that namespace alone — the
 //! software, config, and variable-data directories, the module store, and the
-//! bootroot-state and roxyd-trust subtrees. It carries **no** product concept
-//! (no component catalog, no ports), so an external consumer such as the
-//! on-host agent can resolve the same paths without the installer's
+//! bootroot-state, roxyd-trust and release-trust subtrees. It carries **no**
+//! product concept (no component catalog, no ports), so an external consumer
+//! such as the on-host agent can resolve the same paths without the installer's
 //! `ProductManifest`.
 //!
 //! The installer's `ProductManifest` embeds a `Layout` and delegates its path
@@ -40,10 +40,19 @@ const BOOTROOT_CA_CERTS_SUBDIR: &str = "certs";
 const BOOTROOT_CA_ROOT_FILE: &str = "root_ca.crt";
 /// The config subdirectory holding roxyd's root-owned validated trust root.
 const ROXYD_TLS_SUBDIR: &str = "roxyd-tls";
-/// The fixed `active` symlink inside `roxyd-tls/` roxyd reads its material through.
-pub(crate) const ROXYD_ACTIVE_LINK: &str = "active";
-/// The `gen-<n>/` generation-directory prefix inside `roxyd-tls/`.
-pub(crate) const ROXYD_GENERATION_PREFIX: &str = "gen-";
+/// The config subdirectory holding the root-owned release-signing trust root — a
+/// **sibling** of `roxyd-tls/`, never inside it, since the two carry different trust
+/// (release provenance rather than PKI) and share no generation index or `active`
+/// link.
+const RELEASE_TRUST_SUBDIR: &str = "release-trust";
+/// The fixed `active` symlink at the root of a trust tree, which its readers resolve
+/// their material through. Tree-neutral: every root-owned trust tree the generation
+/// engine drives uses this one name, so no two trees can drift apart on it.
+pub(crate) const ACTIVE_LINK: &str = "active";
+/// The `gen-<n>/` generation-directory prefix inside a trust tree. Tree-neutral for
+/// the same reason as [`ACTIVE_LINK`]: it is a name the engine parses, and only this
+/// crate parses it.
+pub(crate) const GENERATION_PREFIX: &str = "gen-";
 /// roxyd's client-identity trust-anchor snapshot basename.
 const ROXYD_CLIENT_ANCHOR_FILE: &str = "client-anchor.pem";
 /// roxyd's client certificate basename inside a trust directory.
@@ -52,6 +61,16 @@ const ROXYD_CERT_BASENAME: &str = "roxyd-cert.pem";
 const ROXYD_KEY_BASENAME: &str = "roxyd-key.pem";
 /// The internal CA bundle basename a bootroot agent writes beside a cert.
 pub const CA_BUNDLE_FILE: &str = "ca-bundle.pem";
+/// The basename of the host-side marker whose presence demands an out-of-band
+/// fingerprint pin before a host may be re-bootstrapped past the retention floor.
+///
+/// The installer that creates the marker and the runtime that gates on it live in
+/// different repositories, and two sides that each join their own path do not fail
+/// loudly when they drift — they leave the gate off on a host that asked for it. So
+/// the name is declared **once**, here, and both sides resolve the file through
+/// [`Layout::require_pin_marker`]. Nothing in this crate reads, writes or interprets
+/// it; its meaning is entirely the reader's.
+pub const REQUIRE_TRUST_PIN_MARKER: &str = "require-trust-pin";
 
 /// The on-host directory layout for one namespaced install tree.
 ///
@@ -143,7 +162,7 @@ impl<'a> Layout<'a> {
     /// [`roxyd_generation_dir`]: Layout::roxyd_generation_dir
     #[must_use]
     pub fn roxyd_active_dir(&self) -> PathBuf {
-        self.roxyd_tls_dir().join(ROXYD_ACTIVE_LINK)
+        self.roxyd_tls_dir().join(ACTIVE_LINK)
     }
 
     /// Returns the generation directory `roxyd-tls/gen-<generation>/` a validated
@@ -153,7 +172,61 @@ impl<'a> Layout<'a> {
     #[must_use]
     pub fn roxyd_generation_dir(&self, generation: u64) -> PathBuf {
         self.roxyd_tls_dir()
-            .join(format!("{ROXYD_GENERATION_PREFIX}{generation}"))
+            .join(format!("{GENERATION_PREFIX}{generation}"))
+    }
+
+    /// Returns the root-owned release-signing trust root, `<etc>/release-trust/`
+    /// (root:root 0700) — a **sibling** of [`roxyd_tls_dir`], never inside it. It
+    /// carries release-provenance trust rather than PKI, and shares no directory, no
+    /// generation index and no `active` link with the mTLS tree, so the two can
+    /// never be conflated.
+    ///
+    /// [`roxyd_tls_dir`]: Layout::roxyd_tls_dir
+    #[must_use]
+    pub fn release_trust_dir(&self) -> PathBuf {
+        self.etc_dir().join(RELEASE_TRUST_SUBDIR)
+    }
+
+    /// Returns the fixed `active` symlink inside [`release_trust_dir`], which a
+    /// reader resolves the current release-signing trust set through; the activation
+    /// helper repoints it atomically at the current
+    /// [`release_trust_generation_dir`].
+    ///
+    /// [`release_trust_dir`]: Layout::release_trust_dir
+    /// [`release_trust_generation_dir`]: Layout::release_trust_generation_dir
+    #[must_use]
+    pub fn release_trust_active_dir(&self) -> PathBuf {
+        self.release_trust_dir().join(ACTIVE_LINK)
+    }
+
+    /// Returns the generation directory `release-trust/gen-<generation>/` a validated
+    /// release-signing trust set is installed into before
+    /// [`release_trust_active_dir`] is repointed at it. Its generation index is the
+    /// release-trust tree's own and is unrelated to the mTLS tree's.
+    ///
+    /// [`release_trust_active_dir`]: Layout::release_trust_active_dir
+    #[must_use]
+    pub fn release_trust_generation_dir(&self, generation: u64) -> PathBuf {
+        self.release_trust_dir()
+            .join(format!("{GENERATION_PREFIX}{generation}"))
+    }
+
+    /// Returns the host-side re-bootstrap pin marker — [`REQUIRE_TRUST_PIN_MARKER`]
+    /// inside [`release_trust_dir`], and the single location the installer that
+    /// creates it and the runtime that gates on it both resolve through. The name
+    /// itself is spelled once, in that constant.
+    ///
+    /// It sits at the **root** of the release-trust tree, beside `active` and the
+    /// generation directories and never inside a generation: the generation engine
+    /// enumerates only `active` and `gen-<n>` there, so an activation leaves the
+    /// marker byte-identical and a prune never removes it. The root-owned tree
+    /// directory is also exactly what makes the marker unclearable by the control
+    /// plane the gate defends against.
+    ///
+    /// [`release_trust_dir`]: Layout::release_trust_dir
+    #[must_use]
+    pub fn require_pin_marker(&self) -> PathBuf {
+        self.release_trust_dir().join(REQUIRE_TRUST_PIN_MARKER)
     }
 
     /// Returns roxyd's client-identity trust-anchor snapshot,
@@ -197,4 +270,57 @@ pub struct RoxydMaterialPaths {
     pub key: PathBuf,
     /// The internal CA bundle roxyd hands to `.root_certs()` to verify the Manager.
     pub ca_bundle: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Layout, RELEASE_TRUST_SUBDIR, REQUIRE_TRUST_PIN_MARKER};
+
+    #[test]
+    fn the_release_trust_tree_is_a_sibling_of_the_mtls_tree() {
+        let layout = Layout::new("clumit-security");
+        let release = layout.release_trust_dir();
+        assert_eq!(release, layout.etc_dir().join(RELEASE_TRUST_SUBDIR));
+        assert_eq!(release, layout.etc_dir().join("release-trust"));
+
+        let mtls = layout.roxyd_tls_dir();
+        for path in [
+            release.clone(),
+            layout.release_trust_active_dir(),
+            layout.release_trust_generation_dir(7),
+            layout.require_pin_marker(),
+        ] {
+            assert!(
+                path.starts_with(&release),
+                "{} must resolve under the release-trust tree",
+                path.display(),
+            );
+            assert!(
+                !path.starts_with(&mtls),
+                "{} must not resolve inside the mTLS tree",
+                path.display(),
+            );
+        }
+
+        // Each tree carries its own `active` and its own generation index, under its
+        // own root.
+        assert_ne!(layout.release_trust_active_dir(), layout.roxyd_active_dir());
+        assert_ne!(
+            layout.release_trust_generation_dir(1),
+            layout.roxyd_generation_dir(1),
+        );
+        assert_eq!(
+            layout.release_trust_generation_dir(3),
+            release.join("gen-3"),
+        );
+    }
+
+    #[test]
+    fn the_pin_marker_resolves_through_the_shared_constant() {
+        let layout = Layout::new("clumit-security");
+        assert_eq!(
+            layout.require_pin_marker(),
+            layout.release_trust_dir().join(REQUIRE_TRUST_PIN_MARKER),
+        );
+    }
 }
