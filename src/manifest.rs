@@ -439,6 +439,27 @@ fn read_format_version(document: &serde_json::Value) -> Result<Option<u32>, Mani
     }
 }
 
+/// Reads the `format_version` a manifest block declares, running **stage one**
+/// of [`PayloadManifest::parse`] and nothing else.
+///
+/// A verifier has to decide the version question before the body is decoded and
+/// before it applies a floor of its own, which is a decision the two-stage parse
+/// makes internally and reports only as a rejection. This exposes the same
+/// stage-one reading rather than letting a second caller decode the document its
+/// own way: an explicit `null` reads as absent here exactly as it does there, so
+/// the two cannot disagree about which manifests are unversioned.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::Decode`] when the block is not decodable JSON, and
+/// [`ManifestError::MalformedFormatVersion`] when the key is present but is not
+/// a `u32`.
+pub(crate) fn parse_format_version(manifest_bytes: &[u8]) -> Result<Option<u32>, ManifestError> {
+    let document: serde_json::Value =
+        serde_json::from_slice(manifest_bytes).map_err(ManifestError::Decode)?;
+    read_format_version(&document)
+}
+
 /// Returns the `archive_path` of the first artifact in the stage-1 document
 /// carrying `key`, or its index when that entry has no string `archive_path`.
 ///

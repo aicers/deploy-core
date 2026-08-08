@@ -1151,6 +1151,316 @@ where
     Ok(())
 }
 
+/// A located container whose manifest block has been read but **not** parsed,
+/// together with the state one more step finishes opening it into a
+/// [`Payload`].
+///
+/// [`open`] parses the manifest as it reads it, which is the right order for a
+/// caller that already trusts the bytes it is opening. A verifier does not:
+/// the signature is over the raw manifest bytes, so it needs those bytes, and
+/// it has to answer for them **before** attacker-supplied JSON reaches a
+/// parser. This carries exactly what that decision takes — the raw block, the
+/// footer's container version, and the two envelope blocks — and hands the
+/// rest back through [`UnparsedContainer::into_payload`] once the manifest has
+/// been authenticated and parsed.
+///
+/// It is an added path, not a replacement: [`open`] reads the container
+/// through the same [`read_container_head`] this is built from, so the two
+/// cannot come to disagree about where a block is.
+pub(crate) struct UnparsedContainer<R: Read + Seek> {
+    src: R,
+    footer_version: u8,
+    manifest_bytes: Vec<u8>,
+    signature: EnvelopeBlock,
+    key_id: EnvelopeBlock,
+    archive_offset: u64,
+    archive_len: u64,
+}
+
+impl<R: Read + Seek> UnparsedContainer<R> {
+    /// Returns the container format version the selected footer recorded.
+    ///
+    /// The manifest parse takes it, because only a reader that knows it can
+    /// evaluate the pre-versioned baseline conjunction.
+    pub(crate) fn footer_version(&self) -> u8 {
+        self.footer_version
+    }
+
+    /// Returns the manifest block exactly as it sits in the container.
+    ///
+    /// These are the bytes a signature is computed over, so they are handed
+    /// out unparsed and never re-serialized from a parsed manifest.
+    pub(crate) fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
+    }
+
+    /// Returns the detached signature block as the bounded read left it:
+    /// absent, present at the bounded length, or present at some other length
+    /// and therefore never read.
+    pub(crate) fn signature(&self) -> &EnvelopeBlock {
+        &self.signature
+    }
+
+    /// Returns the `key_id` block as the bounded read left it, under the same
+    /// three states [`UnparsedContainer::signature`] reports.
+    pub(crate) fn key_id(&self) -> &EnvelopeBlock {
+        &self.key_id
+    }
+
+    /// Finishes opening the container with the `manifest` its own bytes parsed
+    /// to.
+    ///
+    /// Taking the manifest rather than parsing it here is the whole point of
+    /// the split: the caller decides when — and whether — those bytes are
+    /// trusted enough to parse.
+    pub(crate) fn into_payload(self, manifest: PayloadManifest) -> Payload<R> {
+        Payload {
+            src: self.src,
+            manifest,
+            archive_offset: self.archive_offset,
+            archive_len: self.archive_len,
+            // A block the bounded read declined to allocate has no bytes to
+            // hand on, so it arrives here as absent. Nothing observes the
+            // difference: a signature at any other length verifies under no
+            // key, so a container carrying one never reaches this point, and a
+            // `key_id` at any other length is not a usable hint — a value the
+            // verified package exposes to nobody.
+            signature: self.signature.into_bytes(),
+            key_id: self.key_id.into_bytes(),
+        }
+    }
+}
+
+/// One envelope block as a bounded read leaves it.
+///
+/// The container layer reads an envelope block into memory, and a footer's
+/// lengths are attacker-controlled: [`validate_footer`] proves only that a
+/// block fits inside the input, which a sparse file — or a hostile
+/// `Read + Seek` source — can make arbitrarily large for almost nothing. A
+/// reader that states the length it can use therefore has a third answer
+/// besides the block's bytes and its absence, and this is it.
+#[derive(Debug)]
+pub(crate) enum EnvelopeBlock {
+    /// The container records no such block: the all-zero absent encoding.
+    Absent,
+    /// The block is present at the bounded length, and these are its bytes.
+    Present(Vec<u8>),
+    /// The block is present at some other length, so its contents were never
+    /// read and never allocated.
+    ///
+    /// This is deliberately not merged into [`EnvelopeBlock::Absent`]: the
+    /// verifier answers an absent signature and an unusable one differently.
+    WrongLength,
+}
+
+impl EnvelopeBlock {
+    /// Returns the block's bytes, or `None` when there are none to return.
+    fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            EnvelopeBlock::Present(bytes) => Some(bytes),
+            EnvelopeBlock::Absent | EnvelopeBlock::WrongLength => None,
+        }
+    }
+}
+
+/// The exact lengths at which a caller of [`read_package_container`] is willing
+/// to read the two envelope blocks.
+///
+/// Both blocks have exactly one useful length, and both are read before
+/// anything has been authenticated, so the caller states those lengths rather
+/// than trusting the footer's. A block of any other length is answered from its
+/// length alone — which is the answer its contents would have produced anyway —
+/// so nothing is lost by refusing to allocate it.
+///
+/// [`open`] takes no bounds and reads whatever the footer describes, as it
+/// always has: its callers are opening a payload they already trust, and
+/// changing what they see is not this reader's to do.
+pub(crate) struct EnvelopeBounds {
+    /// The one length at which the signature block is read.
+    pub(crate) signature_len: u64,
+    /// The one length at which the `key_id` block is read.
+    pub(crate) key_id_len: u64,
+}
+
+/// A located container's source, selected footer and unparsed manifest block:
+/// everything both readers need before they diverge over when the envelope
+/// blocks are read.
+struct ContainerHead<R: Read + Seek> {
+    src: R,
+    footer: Footer,
+    manifest_bytes: Vec<u8>,
+}
+
+/// The two envelope blocks as the container carries them, each `None` when the
+/// container carries none.
+struct Envelope {
+    signature: Option<Vec<u8>>,
+    key_id: Option<Vec<u8>>,
+}
+
+/// The two envelope blocks as a bounded read leaves them.
+struct BoundedEnvelope {
+    signature: EnvelopeBlock,
+    key_id: EnvelopeBlock,
+}
+
+/// Locates a container in `src` and reads its manifest block without parsing
+/// it, reporting `Ok(None)` for a file that carries no trailer.
+///
+/// Every decision the container layer makes before the manifest is in memory —
+/// the footer probe, the offsets check, the block-layout walk — is made here,
+/// so [`open`] and [`read_package_container`] cannot locate a block
+/// differently. It stops short of the envelope blocks precisely because the
+/// two disagree about when those are read: [`open`] must not touch them until
+/// its parse has succeeded, and a verifier must have them before any parse
+/// happens at all.
+///
+/// # Errors
+///
+/// Returns [`PayloadError`] on the container-layer conditions [`open`]
+/// reports, minus the envelope and manifest ones it does not reach.
+fn read_container_head<R: Read + Seek>(
+    mut src: R,
+) -> Result<Option<ContainerHead<R>>, PayloadError> {
+    let file_len = src.seek(SeekFrom::End(0))?;
+    let Located::Found {
+        footer,
+        footer_start,
+    } = locate_footer(&mut src, file_len)?
+    else {
+        return Ok(None);
+    };
+
+    validate_footer(&footer, footer_start)?;
+
+    let manifest_len =
+        usize::try_from(footer.manifest_len).map_err(|_| PayloadError::TruncatedTrailer)?;
+    src.seek(SeekFrom::Start(footer.manifest_offset))?;
+    let mut manifest_bytes = vec![0u8; manifest_len];
+    src.read_exact(&mut manifest_bytes)?;
+
+    Ok(Some(ContainerHead {
+        src,
+        footer,
+        manifest_bytes,
+    }))
+}
+
+/// Reads the signature and `key_id` blocks `footer` locates.
+///
+/// Both readers come through here, so where an envelope block sits is known in
+/// one place even though the two read it at different points.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::TruncatedTrailer`] for a length no `usize` can hold
+/// and [`PayloadError::Io`] when the read itself fails.
+fn read_envelope<R: Read + Seek>(src: &mut R, footer: &Footer) -> Result<Envelope, PayloadError> {
+    let signature = read_block(src, footer.signature_offset, footer.signature_len)?;
+    let key_id = read_block(src, footer.key_id_offset, footer.key_id_len)?;
+    Ok(Envelope { signature, key_id })
+}
+
+/// Reads one envelope block, but only when the footer's length for it is
+/// `bound`.
+///
+/// The length decides before the seek does, so a block the caller cannot use is
+/// never allocated. That matters because this runs ahead of any authentication:
+/// the length comes from a footer an attacker wrote, and
+/// [`validate_footer`] confines it only to the input's own size, which costs
+/// nothing to inflate in a sparse file.
+fn read_bounded_block<R: Read + Seek>(
+    src: &mut R,
+    offset: u64,
+    len: u64,
+    bound: u64,
+) -> Result<EnvelopeBlock, PayloadError> {
+    if is_absent_pair(offset, len) {
+        return Ok(EnvelopeBlock::Absent);
+    }
+    // Compared as `u64`, the type the footer records it in: narrowing the
+    // length to `usize` first would turn a block too large for the platform's
+    // `usize` into an error rather than the wrong length it is, and an error is
+    // a rejection an attacker could drive.
+    if len != bound {
+        return Ok(EnvelopeBlock::WrongLength);
+    }
+    match read_block(src, offset, len)? {
+        Some(bytes) => Ok(EnvelopeBlock::Present(bytes)),
+        None => Ok(EnvelopeBlock::Absent),
+    }
+}
+
+/// Reads the signature and `key_id` blocks `footer` locates, each only at the
+/// length `bounds` states for it.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::Io`] when a read itself fails. A block whose length
+/// is not the one `bounds` states is reported rather than read, so no length a
+/// footer can carry reaches an allocation here.
+fn read_bounded_envelope<R: Read + Seek>(
+    src: &mut R,
+    footer: &Footer,
+    bounds: &EnvelopeBounds,
+) -> Result<BoundedEnvelope, PayloadError> {
+    let signature = read_bounded_block(
+        src,
+        footer.signature_offset,
+        footer.signature_len,
+        bounds.signature_len,
+    )?;
+    let key_id = read_bounded_block(
+        src,
+        footer.key_id_offset,
+        footer.key_id_len,
+        bounds.key_id_len,
+    )?;
+    Ok(BoundedEnvelope { signature, key_id })
+}
+
+/// Reads a **`.pkg` module package**'s container without parsing its manifest,
+/// under [`open_package`]'s answer to a file with no trailer.
+///
+/// The envelope blocks are read here, before the caller has parsed anything,
+/// because that caller is a verifier: it has to answer for the manifest bytes
+/// against the signature before they reach a parser. [`open`], which parses
+/// first, defers the same read until afterwards.
+///
+/// Reading unauthenticated bytes this early is also why the caller passes
+/// `bounds`: a block whose footer length is not one it can use is reported as
+/// [`EnvelopeBlock::WrongLength`] and never allocated. See [`EnvelopeBounds`].
+///
+/// A package that carries no container is broken, not an ordinary file, so
+/// that condition is [`PayloadError::NoTrailer`] here exactly as it is there.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::NoTrailer`] when `src` carries no trailer, and
+/// otherwise every container-layer error [`read_container_head`] and
+/// [`read_bounded_envelope`] raise.
+pub(crate) fn read_package_container<R: Read + Seek>(
+    src: R,
+    bounds: &EnvelopeBounds,
+) -> Result<UnparsedContainer<R>, PayloadError> {
+    let ContainerHead {
+        mut src,
+        footer,
+        manifest_bytes,
+    } = read_container_head(src)?.ok_or(PayloadError::NoTrailer)?;
+    let envelope = read_bounded_envelope(&mut src, &footer, bounds)?;
+
+    Ok(UnparsedContainer {
+        src,
+        footer_version: footer.version,
+        manifest_bytes,
+        signature: envelope.signature,
+        key_id: envelope.key_id,
+        archive_offset: footer.archive_offset,
+        archive_len: footer.archive_len,
+    })
+}
+
 /// A located and parsed payload trailer, holding the source it was read from so
 /// its artifacts can be extracted and verified.
 #[derive(Debug)]
@@ -1529,23 +1839,15 @@ fn read_block<R: Read + Seek>(
 /// build does not implement (reported as [`PayloadError::InvalidManifest`]
 /// carrying [`ManifestError::UnsupportedManifestFormat`]), or a manifest that
 /// fails to parse or validate.
-pub fn open<R: Read + Seek>(mut src: R) -> Result<Option<Payload<R>>, PayloadError> {
-    let file_len = src.seek(SeekFrom::End(0))?;
-    let Located::Found {
+pub fn open<R: Read + Seek>(src: R) -> Result<Option<Payload<R>>, PayloadError> {
+    let Some(ContainerHead {
+        mut src,
         footer,
-        footer_start,
-    } = locate_footer(&mut src, file_len)?
+        manifest_bytes,
+    }) = read_container_head(src)?
     else {
         return Ok(None);
     };
-
-    validate_footer(&footer, footer_start)?;
-
-    let manifest_len =
-        usize::try_from(footer.manifest_len).map_err(|_| PayloadError::TruncatedTrailer)?;
-    src.seek(SeekFrom::Start(footer.manifest_offset))?;
-    let mut manifest_bytes = vec![0u8; manifest_len];
-    src.read_exact(&mut manifest_bytes)?;
     // The manifest is read through the two-stage parse rather than a direct
     // `serde_json::from_slice`, because only a reader that already knows the
     // container footer version can evaluate the pre-versioned baseline
@@ -1559,16 +1861,20 @@ pub fn open<R: Read + Seek>(mut src: R) -> Result<Option<Payload<R>>, PayloadErr
             other => PayloadError::InvalidManifest(other),
         })?;
 
-    let signature = read_block(&mut src, footer.signature_offset, footer.signature_len)?;
-    let key_id = read_block(&mut src, footer.key_id_offset, footer.key_id_len)?;
+    // Only now, after the parse: this reader answers for the manifest before it
+    // ever seeks to an envelope offset, and that order is observable — a
+    // container with both an unparseable manifest and an unreadable envelope
+    // block reports the manifest fault, as it did before the verifier's
+    // container-read split existed.
+    let envelope = read_envelope(&mut src, &footer)?;
 
     Ok(Some(Payload {
         src,
         manifest,
         archive_offset: footer.archive_offset,
         archive_len: footer.archive_len,
-        signature,
-        key_id,
+        signature: envelope.signature,
+        key_id: envelope.key_id,
     }))
 }
 
@@ -1702,7 +2008,7 @@ pub fn current_exe_base() -> Result<Vec<u8>, PayloadError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Seek, SeekFrom, Write};
     use std::path::Path;
 
     use tar::{Builder, EntryType, Header};
@@ -3177,6 +3483,89 @@ mod tests {
             matches!(error, PayloadError::ManifestParse(_)),
             "got: {error:?}"
         );
+    }
+
+    /// A `Read + Seek` source whose reads fail once the cursor sits inside
+    /// `fail`, and succeed everywhere else.
+    ///
+    /// Reading a container is a sequence of seeks and reads, so *where* a read
+    /// fails is what makes the reader's order of operations observable from
+    /// outside.
+    #[derive(Debug)]
+    struct FailingSource {
+        inner: Cursor<Vec<u8>>,
+        fail: std::ops::Range<u64>,
+    }
+
+    impl FailingSource {
+        fn new(bytes: Vec<u8>, fail: std::ops::Range<u64>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                fail,
+            }
+        }
+    }
+
+    impl Read for FailingSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail.contains(&self.inner.position()) {
+                return Err(std::io::Error::other("read inside the failing region"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for FailingSource {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// The byte range the envelope blocks occupy in `binary`: everything
+    /// between the end of the archive and the start of the footer.
+    fn envelope_range(binary: &[u8]) -> std::ops::Range<u64> {
+        let (footer, footer_start) = probe_footer(binary);
+        let footer_start = u64::try_from(footer_start).expect("fixture offsets fit in u64");
+        footer.archive_offset + footer.archive_len..footer_start
+    }
+
+    /// Builds `BASE ‖ manifest ‖ archive ‖ signature ‖ key_id ‖ footer` around
+    /// `manifest_json`, whatever that block happens to contain.
+    fn signed_fixture(manifest_json: &[u8], archive: &[u8]) -> Vec<u8> {
+        let footer = valid_footer(BASE.len(), manifest_json, archive);
+        let unsigned = assemble(BASE, manifest_json, archive, &footer);
+        with_envelope(&unsigned, Some(SIGNATURE), Some(KEY_ID), 0)
+    }
+
+    #[test]
+    fn open_reports_the_manifest_fault_before_it_reads_an_envelope_block() {
+        // `open` parses the manifest as it reads it and only then reads the
+        // envelope blocks. The verifier's container-read split must not move
+        // that boundary: a container that is broken in both places has to keep
+        // reporting the manifest fault, not the I/O one.
+        let bytes = b"payload bytes";
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes,
+        }]);
+
+        let broken = signed_fixture(b"{ this is not valid json", &archive);
+        let range = envelope_range(&broken);
+        assert!(!range.is_empty(), "the fixture must carry envelope blocks");
+        let error =
+            open(FailingSource::new(broken, range)).expect_err("manifest parse failure expected");
+        assert!(
+            matches!(error, PayloadError::ManifestParse(_)),
+            "got: {error:?}"
+        );
+
+        // The failure really is on `open`'s path rather than never reached: the
+        // same injection over a manifest that parses surfaces as `Io`.
+        let sound = signed_fixture(&manifest_json(&[("bin/roxyd", bytes)]), &archive);
+        let range = envelope_range(&sound);
+        let error =
+            open(FailingSource::new(sound, range)).expect_err("the envelope read must fail");
+        assert!(matches!(error, PayloadError::Io(_)), "got: {error:?}");
     }
 
     #[test]
