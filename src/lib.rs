@@ -25,6 +25,10 @@ pub mod bootroot_cmd;
 pub mod engine;
 pub mod exec;
 pub mod executor;
+// The tree-neutral trust-generation engine. Crate-private: every caller — the roxyd
+// mTLS adapter and the release-trust tree's — is in this crate, and each exports its
+// own entry point, so nothing outside needs to name the engine or its types.
+pub(crate) mod generation;
 pub mod layout;
 pub mod manifest;
 pub mod module_spec;
