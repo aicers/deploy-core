@@ -489,29 +489,31 @@ pub(crate) fn read_version_gate(
 pub(crate) fn check_unknown_fields(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), TrustSetDocumentError> {
-    check_keys(object, &TOP_LEVEL_FIELDS, DOCUMENT_LOCATION)?;
+    if let Some(field) = unknown_key(object, &TOP_LEVEL_FIELDS) {
+        return Err(TrustSetDocumentError::UnknownField {
+            location: DOCUMENT_LOCATION.to_string(),
+            field,
+        });
+    }
     check_entry_keys(object, ANCHORS_FIELD, &ANCHOR_FIELDS)?;
     check_entry_keys(object, WITHDRAWN_BUILDS_FIELD, &WITHDRAWN_BUILD_FIELDS)
 }
 
-/// Refuses any key of `object` that is not in `known`, naming `location`.
-fn check_keys(
+/// Returns the first key of `object` that is not in `known`.
+///
+/// The name alone, so a caller names the location it found it in and nothing is
+/// rendered on the path where every key is known.
+fn unknown_key(
     object: &serde_json::Map<String, serde_json::Value>,
     known: &[&str],
-    location: &str,
-) -> Result<(), TrustSetDocumentError> {
-    for field in object.keys() {
-        if !known.contains(&field.as_str()) {
-            return Err(TrustSetDocumentError::UnknownField {
-                location: location.to_string(),
-                field: field.clone(),
-            });
-        }
-    }
-    Ok(())
+) -> Option<String> {
+    object
+        .keys()
+        .find(|field| !known.contains(&field.as_str()))
+        .cloned()
 }
 
-/// Applies [`check_keys`] to each object entry of `object`'s `array_field`.
+/// Applies [`unknown_key`] to each object entry of `object`'s `array_field`.
 fn check_entry_keys(
     object: &serde_json::Map<String, serde_json::Value>,
     array_field: &str,
@@ -524,7 +526,12 @@ fn check_entry_keys(
         let Some(entry) = entry.as_object() else {
             continue;
         };
-        check_keys(entry, known, &format!("`{array_field}` entry {index}"))?;
+        if let Some(field) = unknown_key(entry, known) {
+            return Err(TrustSetDocumentError::UnknownField {
+                location: format!("`{array_field}` entry {index}"),
+                field,
+            });
+        }
     }
     Ok(())
 }
@@ -1217,6 +1224,24 @@ mod tests {
             refusal(&fields.render()),
             TrustSetDocumentError::Decode(_)
         ));
+    }
+
+    #[test]
+    fn an_array_field_that_is_not_an_array_of_objects_is_a_decode_refusal() {
+        // The unknown-field check leaves both shapes alone on purpose: there is
+        // no key set to compare, they are structural faults, and the decode is
+        // what names them.
+        let pair = keypair();
+        for anchors in ["{}", "[3]"] {
+            let fields = Fields {
+                anchors: Some(anchors.to_string()),
+                ..Fields::new(&pair)
+            };
+            assert!(
+                matches!(refusal(&fields.render()), TrustSetDocumentError::Decode(_)),
+                "anchors {anchors} should be a decode refusal"
+            );
+        }
     }
 
     #[test]
