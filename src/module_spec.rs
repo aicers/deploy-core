@@ -490,7 +490,11 @@ fn is_environment_key(key: &str) -> bool {
 /// Reports whether `value` is a non-empty DNS label: at most
 /// [`MAX_DNS_LABEL_LEN`] octets of lowercase alphanumerics and hyphens, with no
 /// leading or trailing hyphen.
-fn is_dns_label(value: &str) -> bool {
+///
+/// Visible to the crate because [`crate::render`] holds each component of a
+/// unit file name to this same rule, and a second predicate would be free to
+/// drift from this one.
+pub(crate) fn is_dns_label(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_DNS_LABEL_LEN {
         return false;
     }
@@ -531,131 +535,9 @@ mod tests {
         RenderVar, RestartPolicy, SystemdTarget, UnitTemplate, validate,
     };
     use crate::manifest::ArtifactKind;
-    use crate::systemd::{UnitValue, render};
 
-    /// `RestartSec=` value both shipped anchors carry.
+    /// `RestartSec=` value the shipped anchors carry.
     const RESTART_SEC: u32 = 5;
-
-    /// Bound to every [`RenderVar`] an anchor does not use, so a test can
-    /// assert the unused bindings reach no output byte.
-    const UNUSED: &str = "UNUSED-BINDING";
-
-    /// Renders `unit` the way the production renderer will have to, walking the
-    /// record and emitting through the shared serialization helper.
-    ///
-    /// This is an **expressiveness proof**, not a renderer: it resolves nothing
-    /// from product state, derives no file name, writes no file, and is not
-    /// exported. `user` and the variable bindings are test literals.
-    fn render_unit(
-        unit: &UnitTemplate,
-        user: Option<&str>,
-        bind: &dyn Fn(RenderVar) -> &'static str,
-    ) -> String {
-        let mut lines = vec![
-            "[Unit]".to_string(),
-            format!(
-                "Description={}",
-                render(UnitValue::Description(&unit.description))
-            ),
-        ];
-        for target in &unit.after {
-            lines.push(format!("After={}", target.as_unit_str()));
-        }
-        for target in &unit.wants {
-            lines.push(format!("Wants={}", target.as_unit_str()));
-        }
-
-        lines.push(String::new());
-        lines.push("[Service]".to_string());
-        if let Some(user) = user {
-            lines.push(format!("User={user}"));
-        }
-        lines.push(format!("ExecStart={}", render_args(&unit.exec_start, bind)));
-        if let Some(exec_reload) = &unit.exec_reload {
-            lines.push(format!("ExecReload={}", render_args(exec_reload, bind)));
-        }
-        if let Some(working_directory) = &unit.working_directory {
-            lines.push(format!(
-                "WorkingDirectory={}",
-                render_arg(working_directory, bind)
-            ));
-        }
-        for (key, value) in &unit.environment {
-            lines.push(format!(
-                "Environment={}",
-                render(UnitValue::Environment {
-                    key,
-                    value: &render_value(value, bind),
-                })
-            ));
-        }
-        lines.push(format!("Restart={}", unit.restart.as_unit_str()));
-        lines.push(format!("RestartSec={}", unit.restart_sec));
-        if unit.protect_home {
-            lines.push("ProtectHome=yes".to_string());
-        }
-        if unit.private_tmp {
-            lines.push("PrivateTmp=yes".to_string());
-        }
-        if unit.no_new_privileges {
-            lines.push("NoNewPrivileges=yes".to_string());
-        }
-
-        lines.push(String::new());
-        lines.push("[Install]".to_string());
-        for target in &unit.wanted_by {
-            lines.push(format!("WantedBy={}", target.as_unit_str()));
-        }
-
-        let mut out = lines.join("\n");
-        out.push('\n');
-        out
-    }
-
-    fn render_args(args: &[Arg], bind: &dyn Fn(RenderVar) -> &'static str) -> String {
-        args.iter()
-            .map(|arg| render_arg(arg, bind))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn render_arg(arg: &Arg, bind: &dyn Fn(RenderVar) -> &'static str) -> String {
-        match arg {
-            Arg::Literal(text) => render(UnitValue::Argument(text)),
-            Arg::Var(RenderVar::MainPid) => render(UnitValue::MainPid),
-            Arg::Var(var) => render(UnitValue::Argument(bind(*var))),
-        }
-    }
-
-    /// Resolves an argument to its raw text, for the one position — an
-    /// environment value — whose escaping happens on the whole `KEY=VALUE`.
-    fn render_value(arg: &Arg, bind: &dyn Fn(RenderVar) -> &'static str) -> String {
-        match arg {
-            Arg::Literal(text) => text.clone(),
-            Arg::Var(RenderVar::MainPid) => render(UnitValue::MainPid),
-            Arg::Var(var) => bind(*var).to_string(),
-        }
-    }
-
-    fn review_binding(var: RenderVar) -> &'static str {
-        match var {
-            RenderVar::ArtifactPath => "/opt/clumit-security/bin/review",
-            RenderVar::ConfigPath => "/etc/clumit-security/review.toml",
-            RenderVar::DataDir => "/var/lib/clumit-security/review/data",
-            _ => UNUSED,
-        }
-    }
-
-    fn roxyd_binding(var: RenderVar) -> &'static str {
-        match var {
-            RenderVar::ArtifactPath => "/opt/clumit-security/bin/roxyd",
-            RenderVar::ConfigPath => "/etc/clumit-security/roxyd.toml",
-            RenderVar::CertPath => "/var/lib/clumit-security/agent/roxyd/roxyd-cert.pem",
-            RenderVar::KeyPath => "/var/lib/clumit-security/agent/roxyd/roxyd-key.pem",
-            RenderVar::CaBundlePath => "/var/lib/clumit-security/agent/roxyd/ca-bundle.pem",
-            _ => UNUSED,
-        }
-    }
 
     fn review_unit() -> UnitTemplate {
         UnitTemplate {
@@ -678,39 +560,6 @@ mod tests {
         }
     }
 
-    fn roxyd_unit() -> UnitTemplate {
-        UnitTemplate {
-            description: "Roxyd host agent".to_string(),
-            after: vec![SystemdTarget::NetworkOnline],
-            wants: vec![SystemdTarget::NetworkOnline],
-            wanted_by: vec![SystemdTarget::MultiUser],
-            exec_start: vec![
-                Arg::Var(RenderVar::ArtifactPath),
-                Arg::Literal("-c".to_string()),
-                Arg::Var(RenderVar::ConfigPath),
-                Arg::Literal("--cert".to_string()),
-                Arg::Var(RenderVar::CertPath),
-                Arg::Literal("--key".to_string()),
-                Arg::Var(RenderVar::KeyPath),
-                Arg::Literal("--ca-certs".to_string()),
-                Arg::Var(RenderVar::CaBundlePath),
-                Arg::Literal("review.clumit.internal:38390".to_string()),
-            ],
-            exec_reload: Some(vec![
-                Arg::Literal("/bin/kill".to_string()),
-                Arg::Literal("-HUP".to_string()),
-                Arg::Var(RenderVar::MainPid),
-            ]),
-            working_directory: None,
-            environment: Vec::new(),
-            restart: RestartPolicy::Always,
-            restart_sec: RESTART_SEC,
-            protect_home: true,
-            private_tmp: true,
-            no_new_privileges: true,
-        }
-    }
-
     fn registration(package_id: &str) -> RegistrationTemplate {
         RegistrationTemplate {
             package_id: package_id.to_string(),
@@ -728,105 +577,6 @@ mod tests {
             registration: registration("example"),
             placement: PlacementClass::CoreHosts,
         }
-    }
-
-    #[test]
-    fn the_harness_reproduces_the_review_anchor_byte_for_byte() {
-        let expected = "\
-[Unit]
-Description=Clumit Security review
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=clumit-security
-ExecStart=/opt/clumit-security/bin/review /etc/clumit-security/review.toml
-WorkingDirectory=/var/lib/clumit-security/review/data
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-";
-        let rendered = render_unit(&review_unit(), Some("clumit-security"), &review_binding);
-        assert_eq!(rendered, expected);
-        // The unused bindings are supplied — the harness binds every variable —
-        // and reach no output byte.
-        assert!(!rendered.contains(UNUSED), "got: {rendered}");
-    }
-
-    #[test]
-    fn the_harness_reproduces_the_roxyd_anchor_byte_for_byte() {
-        let expected = "\
-[Unit]
-Description=Roxyd host agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/opt/clumit-security/bin/roxyd -c /etc/clumit-security/roxyd.toml --cert /var/lib/clumit-security/agent/roxyd/roxyd-cert.pem --key /var/lib/clumit-security/agent/roxyd/roxyd-key.pem --ca-certs /var/lib/clumit-security/agent/roxyd/ca-bundle.pem review.clumit.internal:38390
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=always
-RestartSec=5
-ProtectHome=yes
-PrivateTmp=yes
-NoNewPrivileges=yes
-
-[Install]
-WantedBy=multi-user.target
-";
-        let rendered = render_unit(&roxyd_unit(), None, &roxyd_binding);
-        assert_eq!(rendered, expected);
-        assert!(!rendered.contains(UNUSED), "got: {rendered}");
-        // `$MAINPID` is a variant rather than a literal precisely so it is not
-        // doubled.
-        assert!(!rendered.contains("$$MAINPID"), "got: {rendered}");
-    }
-
-    #[test]
-    fn the_canonical_directive_order_holds_for_a_record_using_every_optional_field() {
-        let mut unit = review_unit();
-        unit.exec_reload = Some(vec![
-            Arg::Literal("/bin/kill".to_string()),
-            Arg::Var(RenderVar::MainPid),
-        ]);
-        unit.environment = vec![
-            ("RUST_LOG".to_string(), Arg::Literal("info".to_string())),
-            ("HOST".to_string(), Arg::Var(RenderVar::Hostname)),
-        ];
-        unit.protect_home = true;
-        unit.private_tmp = true;
-        unit.no_new_privileges = true;
-
-        let bind = |var: RenderVar| -> &'static str {
-            match var {
-                RenderVar::Hostname => "host-a",
-                other => review_binding(other),
-            }
-        };
-        let expected = "\
-[Unit]
-Description=Clumit Security review
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=clumit-security
-ExecStart=/opt/clumit-security/bin/review /etc/clumit-security/review.toml
-ExecReload=/bin/kill $MAINPID
-WorkingDirectory=/var/lib/clumit-security/review/data
-Environment=\"RUST_LOG=info\"
-Environment=\"HOST=host-a\"
-Restart=always
-RestartSec=5
-ProtectHome=yes
-PrivateTmp=yes
-NoNewPrivileges=yes
-
-[Install]
-WantedBy=multi-user.target
-";
-        assert_eq!(render_unit(&unit, Some("clumit-security"), &bind), expected);
     }
 
     #[test]

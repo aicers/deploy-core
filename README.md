@@ -16,6 +16,9 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **systemd** — the one systemd serialization and rejection rule, which decides
   whether a package-declared string is representable in a unit file at all and
   turns a host-resolved value into directive text.
+- **render** — the generic, catalogue-free renderer that turns a declared spec
+  plus a host-resolved render context into unit text and a unit file name, and
+  the placement check that says whether the artifact belongs on this host.
 - **engine** — the install/update diff engine (compute what changed).
 - **apply** — the apply primitives that actuate a diff on a host (place files,
   create directories, run root commands, load images, extract bundles).
