@@ -702,6 +702,65 @@ mod tests {
         assert_eq!(entries(&t.root), vec!["active", "gen-1"]);
     }
 
+    /// The no-op needs *every* named file to match. One file whose bytes changed, or
+    /// one name the active generation does not hold at all, is a new generation —
+    /// otherwise a partially rotated material set would silently keep serving the old
+    /// bytes for the files that happened to match.
+    #[test]
+    fn one_changed_or_absent_file_defeats_the_idempotent_no_op() {
+        let t = tree();
+        activate(&t.root, &material(&[("one", b"first"), ("two", b"second")])).expect("seed");
+
+        let partial = material(&[("one", b"first"), ("two", b"changed")]);
+        let rotated = activate(&t.root, &partial).expect("rotate");
+        assert_eq!(rotated.generation, 2);
+        assert!(rotated.changed, "one changed file is not a no-op");
+
+        // A name the active generation does not hold at all reads as a mismatch
+        // rather than as an absent-file error.
+        let widened = material(&[
+            ("one", b"first"),
+            ("two", b"changed"),
+            ("three", b"a name active does not hold"),
+        ]);
+        let grown = activate(&t.root, &widened).expect("widen");
+        assert_eq!(grown.generation, 3);
+        assert!(grown.changed);
+        assert_eq!(read_link_target(&t.root), "gen-3");
+        assert_eq!(
+            std::fs::read(t.root.join("gen-3/three")).expect("read"),
+            b"a name active does not hold",
+        );
+    }
+
+    /// Staging removes a leftover `gen-<n>.tmp` before creating its own. Without that
+    /// step an aborted earlier run would wedge the tree at that index for good:
+    /// `make_dir_0700` refuses an existing directory, so every later activation would
+    /// fail on the same debris.
+    #[test]
+    fn a_leftover_staging_directory_from_an_aborted_run_is_replaced() {
+        let t = tree();
+        activate(&t.root, &material(&[("one", b"first")])).expect("seed");
+
+        // Debris at exactly the index the next activation allocates, holding a file
+        // whose name the new material also carries.
+        let stale = t.root.join("gen-2.tmp");
+        std::fs::create_dir(&stale).expect("stale tmp");
+        std::fs::write(stale.join("one"), b"debris").expect("stale file");
+
+        let rotated = activate(&t.root, &material(&[("one", b"second")])).expect("rotate");
+        assert_eq!(
+            rotated.generation, 2,
+            "a `gen-<n>.tmp` is not itself a generation, so the index is unaffected",
+        );
+        assert_eq!(
+            std::fs::read(t.root.join("gen-2/one")).expect("read"),
+            b"second",
+            "the debris was discarded rather than reused",
+        );
+        assert_eq!(entries(&t.root), vec!["active", "gen-2"]);
+    }
+
     #[test]
     fn successive_generations_allocate_and_prune() {
         let t = tree();
