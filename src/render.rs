@@ -757,6 +757,35 @@ WantedBy=multi-user.target
     }
 
     #[test]
+    fn a_kind_that_requires_a_unit_still_refuses_a_spec_declaring_none() {
+        // `Ok(None)` answers a kind whose unit is legitimately absent; it is
+        // not a blanket escape from the kind rule. The two kinds that require
+        // a unit refuse a spec carrying none, and render the one that carries
+        // it — so the whole rule stays with its one owner, the validator.
+        for kind in [ArtifactKind::NativeBinary, ArtifactKind::ComposeBundle] {
+            let mut context = review_context();
+            context.kind = kind;
+
+            let error = render_unit(&spec(None), &context)
+                .expect_err("a kind requiring a unit must reject a spec declaring none");
+            assert!(
+                matches!(
+                    error,
+                    RenderError::InvalidSpec(ModuleSpecError::MissingUnit(refused))
+                        if refused == kind
+                ),
+                "{kind:?} got: {error:?}"
+            );
+
+            assert_eq!(
+                rendered(&spec(Some(review_unit())), &context).file_name,
+                "clumit-security-review.service",
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_instance_discriminator_alone_decides_the_file_name_suffix() {
         let declared = spec(Some(review_unit()));
         let singleton = review_context();
@@ -1067,6 +1096,7 @@ WantedBy=multi-user.target
     #[test]
     fn the_shared_escaping_rule_decides_quoting_and_doubling_in_each_position() {
         let mut unit = review_unit();
+        unit.description = "50% done".to_string();
         unit.exec_start = vec![
             Arg::Var(RenderVar::ArtifactPath),
             Arg::Literal("--flag".to_string()),
@@ -1083,6 +1113,9 @@ WantedBy=multi-user.target
         // systemd expands nothing in `Environment=`, so the same value keeps
         // its single `$` there.
         assert!(text.contains("Environment=\"Q=a$b\"\n"), "got: {text}");
+        // A `Description=` is a whole unquoted line and reaches the same
+        // helper, so its `%` is doubled rather than emitted raw.
+        assert!(text.contains("Description=50%% done\n"), "got: {text}");
     }
 
     #[test]
