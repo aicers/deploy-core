@@ -9,7 +9,9 @@
 //! unit, the one package verifier both the control plane and the root daemon reach
 //! a verdict through, the trust-set generation document that verifier's material
 //! is delivered as together with the reader that refuses a malformed one, the
-//! install/update diff engine, the apply primitives, the
+//! on-host release-trust tree that document is installed into and the constructor
+//! that turns its active generation back into the verifier's injected trust set,
+//! the install/update diff engine, the apply primitives, the
 //! bootroot command wrapper, service registration, and the on-host trust-material
 //! activation. It carries **no** product concept — no component catalog, no
 //! per-component renderers — so both the installer and the per-machine root daemon
@@ -34,9 +36,15 @@ pub mod manifest;
 pub mod module_spec;
 pub mod payload;
 pub mod registration;
+pub mod release_trust;
 pub mod render;
 pub mod roxyd_trust;
 pub mod systemd;
 pub mod transport;
+// The signed single-member trust-container fixture, shared by every test module
+// that mints one. Test-only, so minting a generation stays impossible in a
+// release build.
+#[cfg(test)]
+pub(crate) mod trust_fixture;
 pub mod trust_set;
 pub mod verify;
