@@ -32,9 +32,12 @@
 //! # The tree root holds more than generations
 //!
 //! Allocation and pruning both iterate the tree root and parse root-level entry
-//! names, so an entry that is neither `active` nor `gen-<n>` — a trust anchor
-//! snapshot, a marker file — is enumerated and ignored, never removed. That is what
-//! makes the root a safe home for such a file. Material files, by contrast, live
+//! names, so an entry that is none of the three the engine itself creates — `active`,
+//! `gen-<n>` and `gen-<n>.tmp` — is enumerated and ignored, never removed. A staging
+//! name is parsed in both halves rather than prefix-matched, so a root entry that
+//! merely resembles one, such as `gen-retention.tmp`, survives a prune along with a
+//! trust anchor snapshot or a marker file. That is what makes the root a safe home
+//! for such a file. Material files, by contrast, live
 //! *inside* a generation directory, so a material file named `active` or `gen-2` is
 //! inert: nothing at the root ever sees it.
 
@@ -334,8 +337,7 @@ fn prune_generations(root: &Path, keep: u64) -> Result<(), GenerationError> {
     for entry in read_dir(root)? {
         let entry = entry.map_err(|e| GenerationError::io(root, e))?;
         let name = PathBuf::from(entry.file_name());
-        let is_stale_tmp = name.to_string_lossy().starts_with(GENERATION_PREFIX)
-            && name.extension().is_some_and(|ext| ext == TMP_EXTENSION);
+        let is_stale_tmp = parse_tmp_generation(&name).is_some();
         let is_old_gen = parse_generation(&name).is_some_and(|n| n != keep);
         if is_stale_tmp || is_old_gen {
             remove_dir_all_if_present(&root.join(name))?;
@@ -350,6 +352,23 @@ pub(crate) fn parse_generation(name: &Path) -> Option<u64> {
     let name = name.file_name()?.to_str()?;
     let digits = name.strip_prefix(GENERATION_PREFIX)?;
     digits.parse::<u64>().ok()
+}
+
+/// Parses a `gen-<n>.tmp` staging directory's name into its generation number, and
+/// nothing else.
+///
+/// Both halves are parsed — the extension must be exactly `tmp` and the stem exactly
+/// `gen-<n>` — rather than the name being prefix-matched, because pruning removes what
+/// this accepts. Only the engine creates a staging directory, and only ever under this
+/// name, so anything else the tree root holds is somebody else's file and survives:
+/// `gen-retention.tmp` is not a generation. Parsing also needs no lossy UTF-8 view of
+/// the name, since a name that is not valid UTF-8 is by construction not this one.
+fn parse_tmp_generation(name: &Path) -> Option<u64> {
+    let name = Path::new(name.file_name()?);
+    if name.extension()? != TMP_EXTENSION {
+        return None;
+    }
+    parse_generation(Path::new(name.file_stem()?))
 }
 
 /// The temporary directory a generation is assembled and validated in before it is
@@ -819,6 +838,38 @@ mod tests {
             std::fs::read(&marker).expect("read marker"),
             b"pinned",
             "the engine never treats the marker as a generation",
+        );
+    }
+
+    /// The tree root holds more than generations, and a name that merely resembles a
+    /// staging directory is not one. Pruning parses both halves of `gen-<n>.tmp`, so it
+    /// removes only what the engine itself could have left behind.
+    #[test]
+    fn a_root_entry_that_only_looks_like_a_staging_directory_survives_a_prune() {
+        let t = tree();
+        activate(&t.root, &material(&[("one", b"first")])).expect("seed");
+
+        // Root-owned state whose name shares the generation prefix and the extension
+        // without being a generation, beside real debris from an aborted run.
+        let retention = t.root.join("gen-retention.tmp");
+        std::fs::write(&retention, b"root-owned state").expect("write retention");
+        let debris = t.root.join("gen-9.tmp");
+        std::fs::create_dir(&debris).expect("stale tmp");
+
+        let rotated = activate(&t.root, &material(&[("one", b"second")])).expect("rotate");
+        assert_eq!(
+            rotated.generation, 2,
+            "neither entry parses as a generation, so neither moves the index",
+        );
+        assert_eq!(
+            std::fs::read(&retention).expect("read retention"),
+            b"root-owned state",
+            "`gen-retention.tmp` is not a staging directory the engine ever created",
+        );
+        assert!(!debris.exists(), "a real `gen-<n>.tmp` leftover is pruned");
+        assert_eq!(
+            entries(&t.root),
+            vec!["active", "gen-2", "gen-retention.tmp"],
         );
     }
 
