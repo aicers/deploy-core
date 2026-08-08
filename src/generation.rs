@@ -185,13 +185,25 @@ pub(crate) struct GenerationTree<'a> {
 /// Returns the validator's error as-is, or the engine's own [`GenerationError`]
 /// converted into `E`, on a refused material set or any I/O or reload failure.
 ///
-/// Which side of the step 5 swap the failure falls on decides what the tree looks
-/// like afterwards, and the two are not the same contract:
+/// Where in the sequence the failure falls decides what the tree looks like
+/// afterwards, and the three cases are not the same contract:
 ///
-/// - **Before the swap** — a refused material set, any I/O fault in steps 2 to 4, or
-///   a validator rejection. Fail-closed: `active` resolves to exactly what it
-///   resolved to before the call, no generation directory was published, and a
-///   rejected `gen-<n>.tmp` is removed.
+/// - **Before `gen-<n>` is finalised** — a refused material set, any I/O fault in
+///   steps 2 to 4, or a validator rejection. Fail-closed and nothing published:
+///   `active` resolves to exactly what it resolved to before the call, and no
+///   generation directory exists that did not exist before it. A copy the validator
+///   rejected is removed; one an I/O fault abandoned part-way through staging stays
+///   behind as `gen-<n>.tmp`, which the next activation removes before it reuses the
+///   name, and which any prune removes in any case.
+/// - **Finalised but not yet live** — the `rename` of step 5 succeeded and the
+///   `active` swap right after it failed. `active` still resolves to the previous
+///   generation, so this too is fail-closed for every reader of the tree, but
+///   `gen-<n>` is now on disk as a complete generation nothing points at. That
+///   leftover is inert rather than live material: allocation only ever counts upward
+///   from it, so the next activation stages `gen-<n+1>`, and the prune at the end of
+///   that activation removes it. A caller must not read this `Err` as "no generation
+///   directory was written" — only as "the previous material is still what readers
+///   resolve".
 /// - **After the swap** — a [`GenerationError::Reload`], or an I/O fault while
 ///   pruning. `active` already points at `gen-<n>` and the new material is live; what
 ///   failed is notifying the tree's readers or clearing the superseded generations,
