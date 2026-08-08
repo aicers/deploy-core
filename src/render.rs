@@ -901,6 +901,46 @@ WantedBy=multi-user.target
     }
 
     #[test]
+    fn the_representability_rule_holds_in_every_position_a_variable_may_appear() {
+        // `Environment=` resolves to raw text rather than a rendered argument,
+        // and `WorkingDirectory=` renders a lone element rather than a list, so
+        // each reaches the check by its own path. All three are pinned so a
+        // later shortcut in one cannot drop it silently.
+        let mut unit = review_unit();
+        unit.exec_reload = Some(vec![
+            Arg::Literal("/bin/kill".to_string()),
+            Arg::Var(RenderVar::Hostname),
+        ]);
+        unit.environment = vec![("HOST".to_string(), Arg::Var(RenderVar::Domain))];
+
+        for (var, bad) in [
+            // `exec_start`, through the argument list.
+            (RenderVar::ConfigPath, ""),
+            // `exec_reload`, likewise.
+            (RenderVar::Hostname, "a\nb"),
+            // `working_directory`, a lone element.
+            (RenderVar::DataDir, ""),
+            // `environment`, resolved raw.
+            (RenderVar::Domain, "a\nb"),
+        ] {
+            let mut context = review_context();
+            bind(&mut context, var, bad);
+            let error = render_unit(&spec(Some(unit.clone())), &context)
+                .expect_err("an unrepresentable resolved value must be rejected");
+            assert!(
+                matches!(
+                    error,
+                    RenderError::UnrepresentableValue {
+                        var: rejected,
+                        ref value,
+                    } if rejected == var && value == bad
+                ),
+                "{var:?} {bad:?} got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_file_name_component_outside_the_dns_label_rule_is_refused() {
         for bad in [
             "a/b",
