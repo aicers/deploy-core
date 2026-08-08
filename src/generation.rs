@@ -43,11 +43,16 @@
 //! is what makes the root a safe home for such a file.
 //!
 //! `active.tmp` is the one name that carries no such tolerance, and it is reserved
-//! rather than merely parsed: [`swap_active_symlink`] clears whatever sits there
-//! before every swap, because a leftover from an aborted swap would otherwise wedge
-//! the tree for good. Root-owned state must not use that name — a file placed there
-//! is removed by the next activation. It is the swap protocol's scratch entry, not
-//! part of any generation, and nothing else at the root is treated this way.
+//! rather than merely parsed: [`swap_active_symlink`] clears what sits there before
+//! every swap, because a leftover from an aborted swap would otherwise wedge the tree
+//! for good. The clearing is a `remove_file`, so it covers what an aborted swap can
+//! actually leave — a symlink, or a plain file — and only that. A *directory* at that
+//! name is not removed and is not stepped around either: `remove_file` fails on it,
+//! and the swap returns that error with `gen-<n>` already finalised and `active` still
+//! on the previous generation, which is the finalised-but-not-live failure
+//! [`activate_generation`] documents. Either way, root-owned state must not use that
+//! name. It is the swap protocol's scratch entry, not part of any generation, and
+//! nothing else at the root is treated this way.
 //!
 //! Material files, by contrast, live *inside* a generation directory, so a material
 //! file named `active` or `gen-2` is inert: nothing at the root ever sees it.
@@ -206,7 +211,9 @@ pub(crate) struct GenerationTree<'a> {
 ///   behind as `gen-<n>.tmp`, which the next activation removes before it reuses the
 ///   name, and which any prune removes in any case.
 /// - **Finalised but not yet live** — the `rename` of step 5 succeeded and the
-///   `active` swap right after it failed. `active` still resolves to the previous
+///   `active` swap right after it failed; a directory left at the reserved
+///   `active.tmp` scratch name is one way to reach it, since clearing that name is a
+///   `remove_file`. `active` still resolves to the previous
 ///   generation, so this too is fail-closed for every reader of the tree, but
 ///   `gen-<n>` is now on disk as a complete generation nothing points at. That
 ///   leftover is inert rather than live material: allocation only ever counts upward
@@ -953,7 +960,7 @@ mod tests {
     }
 
     /// `active.tmp` is the swap protocol's scratch entry and the one root name the
-    /// engine reserves: whatever sits there is removed before the link is created,
+    /// engine reserves: a file or symlink there is removed before the link is created,
     /// since `symlink` refuses an existing path and a leftover from an aborted swap
     /// would otherwise fail every later activation at that step. The boundary is
     /// exact — the reservation is the literal name, so a neighbour that merely starts
@@ -984,6 +991,56 @@ mod tests {
             "only the exact name is reserved",
         );
         assert_eq!(entries(&t.root), vec!["active", "active.tmp.bak", "gen-2"]);
+    }
+
+    /// The clearing of the reserved scratch name is a `remove_file`, which covers what
+    /// an aborted swap can leave — a symlink or a plain file — and fails on a
+    /// directory. So a directory there is neither removed nor stepped around: the
+    /// swap returns that error, and the tree lands in the documented
+    /// finalised-but-not-live state, with `gen-<n>` complete on disk and `active`
+    /// still on the previous generation. This is the boundary the module
+    /// documentation qualifies; asserting it keeps the two from drifting.
+    #[test]
+    fn a_directory_at_the_swap_scratch_name_fails_the_swap_after_finalising() {
+        let t = tree();
+        activate(&t.root, &material(&[("one", b"first")])).expect("seed");
+
+        let scratch = t.root.join("active.tmp");
+        std::fs::create_dir(&scratch).expect("create scratch directory");
+        std::fs::write(scratch.join("occupant"), b"not the engine's").expect("write occupant");
+
+        let err = activate(&t.root, &material(&[("one", b"second")])).expect_err("swap fails");
+        assert!(
+            matches!(err, TestError::Engine(GenerationError::Io { ref path, .. })
+                if Path::new(path) == scratch),
+            "the swap reports the scratch name it could not clear, got {err:?}",
+        );
+
+        assert_eq!(
+            read_link_target(&t.root),
+            "gen-1",
+            "`active` still resolves to the previous generation",
+        );
+        assert!(
+            t.root.join("gen-2").is_dir(),
+            "`gen-2` was finalised before the swap and stays on disk, unreferenced",
+        );
+        assert_eq!(
+            std::fs::read(scratch.join("occupant")).expect("read occupant"),
+            b"not the engine's",
+            "a directory at the scratch name is left exactly as it was",
+        );
+        assert_eq!(
+            entries(&t.root),
+            vec!["active", "active.tmp", "gen-1", "gen-2"],
+        );
+
+        // The leftover is inert: once the obstruction is gone, the next activation
+        // counts past it and prunes it.
+        std::fs::remove_dir_all(&scratch).expect("remove scratch directory");
+        let rotated = activate(&t.root, &material(&[("one", b"third")])).expect("rotate");
+        assert_eq!(rotated.generation, 3);
+        assert_eq!(entries(&t.root), vec!["active", "gen-3"]);
     }
 
     /// Both predicates decide a removal, so each accepts only the canonical spelling
