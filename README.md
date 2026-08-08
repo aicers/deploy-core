@@ -19,6 +19,10 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **render** — the generic, catalogue-free renderer that turns a declared spec
   plus a host-resolved render context into unit text and a unit file name, and
   the placement check that says whether the artifact belongs on this host.
+- **verify** — the one package verifier the control plane and the root daemon
+  both reach a verdict through: the Ed25519 signature over the raw manifest
+  bytes, the trust anchors and withdrawn builds a caller injects, and the error
+  taxonomy downstream repositories match on.
 - **engine** — the install/update diff engine (compute what changed).
 - **apply** — the apply primitives that actuate a diff on a host (place files,
   create directories, run root commands, load images, extract bundles).
