@@ -1035,6 +1035,42 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_carrying_withdrawn_builds_round_trips_them_in_order() {
+        // The accepted path, not a refusal: a well-formed entry must reach the
+        // caller with its three identity fields on the fields they were written
+        // as, in the order the document listed them, since the verifier
+        // compares the triples as exact strings.
+        let pair = keypair();
+        let member = Fields {
+            withdrawn_builds: Some(array(&[
+                withdrawn_json("example", "1.0.0", "abc"),
+                withdrawn_json("other", "2.0.0+build", "def"),
+            ])),
+            ..Fields::new(&pair)
+        }
+        .render();
+        let package = generation_pkg(&pair, &member, EPOCH);
+        self_admit(&package, &member).expect("the generation should verify");
+
+        let document = accepted(&member);
+        assert_eq!(
+            document.withdrawn_builds,
+            vec![
+                WithdrawnBuild {
+                    package_id: "example".to_string(),
+                    version: "1.0.0".to_string(),
+                    commit: "abc".to_string(),
+                },
+                WithdrawnBuild {
+                    package_id: "other".to_string(),
+                    version: "2.0.0+build".to_string(),
+                    commit: "def".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn bytes_that_are_not_a_json_object_are_malformed_json() {
         for bytes in [
             b"not json at all".as_slice(),
@@ -1186,16 +1222,26 @@ mod tests {
     #[test]
     fn numeric_fields_are_refused_rather_than_coerced() {
         let pair = keypair();
-        // A negative `epoch`, an over-wide one, a fractional and an over-wide
-        // manifest floor, and a floor written as a string: serde's own integer
-        // deserialization refuses every one of them.
+        // A negative `epoch`, a fractional one and an over-wide one; a
+        // negative, fractional and over-wide manifest floor, and a floor
+        // written as a string or as `null`: serde's own integer
+        // deserialization refuses every one of them, and none of them reaches
+        // the semantic checks as a coerced value.
         for fields in [
             Fields {
                 epoch: Some("-1".to_string()),
                 ..Fields::new(&pair)
             },
             Fields {
+                epoch: Some("7.5".to_string()),
+                ..Fields::new(&pair)
+            },
+            Fields {
                 epoch: Some("18446744073709551616".to_string()),
+                ..Fields::new(&pair)
+            },
+            Fields {
+                min_manifest_format_version: Some("-1".to_string()),
                 ..Fields::new(&pair)
             },
             Fields {
