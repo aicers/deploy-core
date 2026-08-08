@@ -7,7 +7,9 @@
 //! spec a package carries in its manifest with the systemd serialization rule its
 //! strings are held to, the generic renderer that turns such a spec into a systemd
 //! unit, the one package verifier both the control plane and the root daemon reach
-//! a verdict through, the install/update diff engine, the apply primitives, the
+//! a verdict through, the trust-set generation document that verifier's material
+//! is delivered as together with the reader that refuses a malformed one, the
+//! install/update diff engine, the apply primitives, the
 //! bootroot command wrapper, service registration, and the on-host trust-material
 //! activation. It carries **no** product concept — no component catalog, no
 //! per-component renderers — so both the installer and the per-machine root daemon
@@ -32,4 +34,5 @@ pub mod render;
 pub mod roxyd_trust;
 pub mod systemd;
 pub mod transport;
+pub mod trust_set;
 pub mod verify;

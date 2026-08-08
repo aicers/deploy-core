@@ -23,6 +23,11 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   both reach a verdict through: the Ed25519 signature over the raw manifest
   bytes, the trust anchors and withdrawn builds a caller injects, and the error
   taxonomy downstream repositories match on.
+- **trust_set** — the generation document that verifier's injected material is
+  delivered as, and the reader that refuses a malformed one rather than
+  repairing it: a version gate, a structural decode that admits no unknown
+  field, and the semantic checks over the anchors and withdrawn builds. It
+  opens no file and performs no I/O.
 - **engine** — the install/update diff engine (compute what changed).
 - **apply** — the apply primitives that actuate a diff on a host (place files,
   create directories, run root commands, load images, extract bundles).

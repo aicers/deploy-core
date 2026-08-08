@@ -364,10 +364,13 @@ impl TrustSet {
 
 /// The build a caller is asking for, as a plain injected value.
 ///
-/// Built through one of two constructors, and that is what makes an `epoch` on
-/// a non-[`TRUST_TARGET`] target **unrepresentable** rather than refused at
-/// runtime: there is no state in which one accompanies another target, because
-/// the pairing is decided by which constructor was called.
+/// Every constructor either names the reserved [`TRUST_TARGET`] itself or
+/// refuses it, and only one of them carries an `epoch` — the two exported forms
+/// are [`VerifyRequest::for_package`] and [`VerifyRequest::for_trust`], and the
+/// crate-internal `for_trust_self_admission` joins them. That is what makes an
+/// `epoch` on a non-[`TRUST_TARGET`] target **unrepresentable** rather than
+/// refused at runtime: there is no state in which one accompanies another
+/// target, because the pairing is decided by which constructor was called.
 #[derive(Debug, Clone)]
 pub struct VerifyRequest {
     target: String,
@@ -414,6 +417,114 @@ impl VerifyRequest {
             version: version.to_string(),
             commit: commit.to_string(),
             epoch: Some(epoch),
+        })
+    }
+
+    /// Creates a request for the **self-admission** of a trust generation: the
+    /// reserved [`TRUST_TARGET`], and deliberately **no** delivered `epoch`, so
+    /// [`check_epoch`] returns before it compares anything.
+    ///
+    /// A generation is admitted by verifying it under the anchors carried
+    /// *inside the very document being admitted* — there is no other key
+    /// material available for the first one, and the document must in any case
+    /// be checked against what it itself claims. The candidate trust set is
+    /// therefore built from the delivered document, so its epoch and the
+    /// delivered epoch are the same number, and the strictly-greater comparison
+    /// [`VerifyRequest::for_trust`] arms would answer
+    /// [`VerifyError::StaleTrustSet`] for every well-formed input. Here the
+    /// epoch branch is not taken at all: there is no epoch floor, and that is a
+    /// property of the call rather than of a caller's arithmetic. **A caller
+    /// with an active generation to compare a delivered one against wants
+    /// [`VerifyRequest::for_trust`] instead** — this form applies no
+    /// anti-rollback check whatsoever.
+    ///
+    /// Everything else the request enforces is unchanged: [`check_target`]
+    /// still requires the manifest's single artifact entry to match the target,
+    /// the decimal `version` and the member-digest `commit` exactly.
+    ///
+    /// # The decode that precedes this call
+    ///
+    /// [`verify_package`] takes a [`TrustSet`] by value, so a caller must
+    /// already hold one, which for a first generation means decoding the
+    /// delivered document before anything has authenticated it. That decode is
+    /// permitted and it is bounded:
+    ///
+    /// - it is **permissive**, and it reads `anchors` (each entry's `key_id`,
+    ///   `public_key` and `revoked`) and `epoch` and **no other field** —
+    ///   those two because they are the only ones this call consumes: `anchors`
+    ///   supplies the candidate anchors and `epoch` in decimal is this
+    ///   request's `version`. The request's other two parts need no parse at
+    ///   all: `target` is [`TRUST_TARGET`] and `commit` is the document
+    ///   member's digest over the bytes just read;
+    /// - it is **not** the refusing reader in
+    ///   [`crate::trust_set`]. Running that here would be a defect: it would
+    ///   report a parse refusal where a signature failure belongs, and would
+    ///   decide things about bytes no anchor has vouched for;
+    /// - it is **not admission**. Nothing it produces is stored, returned or
+    ///   becomes the generation. Admission is [`verify_package`] returning
+    ///   `Ok`, after which the refusing reader parses the member bytes again,
+    ///   from scratch, and the generation is built from *that* parse;
+    /// - the digest ties the two halves together: the bytes the provisional
+    ///   decode read are the bytes whose digest [`check_target`] compares
+    ///   against the signed manifest's `commit`, so a caller that verified over
+    ///   one byte range and parsed another cannot pass.
+    ///
+    /// A failure of that decode is a refusal of the admission *attempt*, named
+    /// by the admission path's own error type, and never a refusal of a
+    /// document.
+    ///
+    /// # The candidate trust set
+    ///
+    /// [`TrustSet::new`] takes four arguments and the provisional decode reads
+    /// two fields, so the other two are stated here rather than improvised.
+    /// Each is the identity value for a check this call deliberately does not
+    /// make:
+    ///
+    /// - `anchors` — **every** anchor the decode produced, each carrying its
+    ///   `revoked` flag, revoked ones included, so a generation signed by a key
+    ///   its own document marks revoked is refused as [`VerifyError::RevokedKey`]
+    ///   rather than as [`VerifyError::UnknownKeyId`] by a pruned list. The
+    ///   decode is all-or-nothing: every entry must yield a [`TrustAnchor`], or
+    ///   the attempt fails;
+    /// - `withdrawn_builds` — **empty**, the identity of [`check_withdrawal`].
+    ///   This container carries exactly one triple — the reserved target, this
+    ///   document's own epoch, this document's own member digest — so the only
+    ///   entry that could ever match is one in which the document withdraws
+    ///   *itself*, which is not a control anyone exercises. The list a document
+    ///   really carries governs every *later* package and takes effect once the
+    ///   verified document is installed;
+    /// - `min_manifest_format_version` — **`0`**, the identity of
+    ///   [`check_format_version`], which is exactly this build's own range since
+    ///   [`PayloadManifest::parse`] already refuses anything outside it. A
+    ///   document declaring a floor above its own envelope's `format_version`
+    ///   would otherwise brick itself, and admission would turn on an integer
+    ///   read from unauthenticated bytes;
+    /// - `epoch` — the provisional `epoch`, passed through unchanged. Under
+    ///   this request form it is **read by nothing**, since [`check_epoch`]
+    ///   returns early; it is passed through rather than zeroed so that no
+    ///   number appears in the call that did not come from the document.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today, and `Result` all the same: it is the matched shape of
+    /// the two constructors beside it, one of which is not. It never panics.
+    // The in-crate install-time admission sequence that calls this is a later
+    // issue; this `allow` goes when that work supplies the caller.
+    #[allow(dead_code)]
+    // `Result` is the point rather than an oversight: this is the third of three
+    // constructors a caller writes one shape for, and `for_package` is genuinely
+    // fallible. The lint sees only this one because, unlike its two siblings, it
+    // is not exported.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn for_trust_self_admission(
+        version: &str,
+        commit: &str,
+    ) -> Result<Self, InputError> {
+        Ok(Self {
+            target: TRUST_TARGET.to_string(),
+            version: version.to_string(),
+            commit: commit.to_string(),
+            epoch: None,
         })
     }
 
