@@ -82,9 +82,17 @@ const LABEL_CERTIFICATE: &str = "CERTIFICATE";
 /// The PEM label of a PKCS#8 private key (what rcgen's `serialize_pem` emits).
 const LABEL_PRIVATE_KEY: &str = "PRIVATE KEY";
 
-/// A failure to validate or activate roxyd's trust material. Every variant is
-/// fail-closed: on any of them the caller leaves `active/` untouched, so roxyd keeps
-/// serving the last material a root helper vouched for (RFC 0003 §8.3).
+/// A failure to validate or activate roxyd's trust material.
+///
+/// Every variant that can arise before the `active` swap is fail-closed: the caller
+/// leaves `active/` as it found it, so roxyd keeps serving the last material a root
+/// helper vouched for (RFC 0003 §8.3). That is every validation variant, and [`Io`]
+/// raised while reading or staging. The two faults the activation sequence can raise
+/// *after* the swap — [`Reload`], and [`Io`] from pruning superseded generations —
+/// report a material set that is already live; see [`activate_with_paths`].
+///
+/// [`Io`]: TrustError::Io
+/// [`Reload`]: TrustError::Reload
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
     /// A file could not be read or written, or a directory operation failed.
@@ -560,8 +568,7 @@ pub struct Activation {
 /// staged bytes already match `active`, return an idempotent no-op; otherwise copy
 /// the staged bytes into a fresh root-only `gen-<n>.tmp`, **validate that copy**
 /// against the anchor, finalise it to `gen-<n>`, atomically repoint `active` at it,
-/// reload roxyd if it is running, and prune superseded generations. A failure before
-/// the `active` swap leaves the live material untouched.
+/// reload roxyd if it is running, and prune superseded generations.
 ///
 /// The generation's files carry the staged basenames, in the staged order, so a
 /// generation is a like-named copy of `agent/roxyd/` — including a basename that is
@@ -569,8 +576,13 @@ pub struct Activation {
 ///
 /// # Errors
 ///
-/// Returns [`TrustError`] on any I/O, validation, or reload failure. On error the
-/// `active` tree is left exactly as it was (fail-closed).
+/// Returns [`TrustError`] on any I/O, validation, or reload failure. An error before
+/// the `active` swap — every I/O fault up to that point, and every validation
+/// failure — is fail-closed: roxyd keeps resolving the material it resolved before
+/// the call. An error after it is not: [`TrustError::Reload`], and an I/O fault while
+/// pruning superseded generations, both return `Err` with the new generation already
+/// active and roxyd's material already replaced. Treat those as "installed, but the
+/// unit may not have been told" rather than as a failed activation.
 pub fn activate_with_paths(paths: &RoxydTrustPaths) -> Result<Activation, TrustError> {
     // roxyd's material set: the staged triple, read in the order this module has
     // always read it, under the basenames the bootroot agent wrote it as.

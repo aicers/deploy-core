@@ -173,7 +173,9 @@ pub(crate) struct GenerationTree<'a> {
 ///    error with `active` untouched.
 /// 5. `rename` the temporary directory to `gen-<n>`, swap `active` onto it
 ///    atomically, reload `tree.reload_unit` when it is `Some` and the unit is
-///    running, then prune every generation other than the one now active.
+///    running, then prune every generation other than the one now active. The swap
+///    is the point of no return: the two steps after it run with the new material
+///    already live.
 ///
 /// The files handed to `validate` carry the same names, in the same order, as
 /// `material`.
@@ -181,8 +183,22 @@ pub(crate) struct GenerationTree<'a> {
 /// # Errors
 ///
 /// Returns the validator's error as-is, or the engine's own [`GenerationError`]
-/// converted into `E`, on a refused material set or any I/O or reload failure. On
-/// every error the `active` tree is left exactly as it was (fail-closed).
+/// converted into `E`, on a refused material set or any I/O or reload failure.
+///
+/// Which side of the step 5 swap the failure falls on decides what the tree looks
+/// like afterwards, and the two are not the same contract:
+///
+/// - **Before the swap** — a refused material set, any I/O fault in steps 2 to 4, or
+///   a validator rejection. Fail-closed: `active` resolves to exactly what it
+///   resolved to before the call, no generation directory was published, and a
+///   rejected `gen-<n>.tmp` is removed.
+/// - **After the swap** — a [`GenerationError::Reload`], or an I/O fault while
+///   pruning. `active` already points at `gen-<n>` and the new material is live; what
+///   failed is notifying the tree's readers or clearing the superseded generations,
+///   not the installation. A caller must not read this `Err` as "the previous
+///   material is still in place". Recovery is another activation: a call over the
+///   same bytes is the step 2 no-op, which neither retries the reload nor prunes, so
+///   the leftovers go when the next activation that changes something reaches step 5.
 pub(crate) fn activate_generation<E>(
     tree: &GenerationTree<'_>,
     material: &[GenerationFile],
