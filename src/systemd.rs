@@ -14,7 +14,7 @@
 //!   [`crate::module_spec::ReloadSpec`]).
 //! - [`render`] is the **serialization** half. It turns an already
 //!   host-resolved value into the directive text a unit file carries. Its only
-//!   production caller is the renderer, which is not in this crate yet.
+//!   production caller is [`crate::render`].
 //!
 //! Exactly one copy of these rules exists, because two repositories render
 //! bytes from the same record and any second copy is a silent divergence.
