@@ -1053,7 +1053,17 @@ mod tests {
     #[test]
     fn an_absent_or_ill_typed_trust_set_version_is_malformed_version() {
         let pair = keypair();
-        for version in [None, Some("null"), Some(r#""1""#), Some("-1"), Some("1.0")] {
+        // The last of these is the narrowing the gate performs by hand rather
+        // than through serde: a JSON integer that is a `u64` and not a `u32` is
+        // no more a version than a string is.
+        for version in [
+            None,
+            Some("null"),
+            Some(r#""1""#),
+            Some("-1"),
+            Some("1.0"),
+            Some("4294967296"),
+        ] {
             let fields = Fields {
                 trust_set_version: version.map(str::to_string),
                 ..Fields::new(&pair)
@@ -1369,6 +1379,74 @@ mod tests {
             refusal(&fields.render()),
             TrustSetDocumentError::DuplicateWithdrawnBuild { package_id, .. }
                 if package_id == "example"
+        ));
+    }
+
+    #[test]
+    fn two_semantic_faults_are_refused_for_the_earlier_one() {
+        // The stage C order is the contract, not an artefact of how the checks
+        // happen to be written, so each pair below carries two faults and is
+        // asserted against the earlier one.
+        let pair = keypair();
+        let public_key = public_key_of(&pair);
+        let hex = hex_of(&public_key);
+        let derived = key_id(&public_key);
+
+        // The `epoch` precedes the anchor list.
+        let fields = Fields {
+            epoch: Some("0".to_string()),
+            ..Fields::anchored(&[])
+        };
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::AbsentEpoch
+        ));
+
+        // A wholly revoked list precedes the per-anchor checks.
+        let fields = Fields::anchored(&[anchor_json("not hex", "not hex either", true)]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::AllAnchorsRevoked
+        ));
+
+        // Within an anchor: the `key_id` shape, then the `public_key` shape,
+        // then the derivation, then duplication.
+        let fields = Fields::anchored(&[anchor_json(&derived.to_uppercase(), "not hex", false)]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::MalformedKeyId { .. }
+        ));
+        let fields = Fields::anchored(&[anchor_json(STRANGER_KEY_ID, "not hex", false)]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::MalformedPublicKey { .. }
+        ));
+        let entry = anchor_json(STRANGER_KEY_ID, &hex, false);
+        let fields = Fields::anchored(&[entry.clone(), entry]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::KeyIdMismatch { .. }
+        ));
+
+        // The anchors precede the withdrawn builds, and within a withdrawn
+        // entry the identifier predicate precedes duplication.
+        let withdrawn = withdrawn_json("example", "1.0.0", "abc");
+        let fields = Fields {
+            withdrawn_builds: Some(array(&[withdrawn.clone(), withdrawn])),
+            ..Fields::anchored(&[anchor_json("not hex", &hex, false)])
+        };
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::MalformedKeyId { .. }
+        ));
+        let unsafe_entry = withdrawn_json("example", "-1.0.0", "abc");
+        let fields = Fields {
+            withdrawn_builds: Some(array(&[unsafe_entry.clone(), unsafe_entry])),
+            ..Fields::new(&pair)
+        };
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::UnsafeBuildIdentifier { .. }
         ));
     }
 
