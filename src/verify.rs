@@ -508,9 +508,6 @@ impl VerifyRequest {
     ///
     /// Infallible today, and `Result` all the same: it is the matched shape of
     /// the two constructors beside it, one of which is not. It never panics.
-    // The in-crate install-time admission sequence that calls this is a later
-    // issue; this `allow` goes when that work supplies the caller.
-    #[allow(dead_code)]
     // `Result` is the point rather than an oversight: this is the third of three
     // constructors a caller writes one shape for, and `for_package` is genuinely
     // fallible. The lint sees only this one because, unlike its two siblings, it
