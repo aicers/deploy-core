@@ -1932,6 +1932,21 @@ mod tests {
             entries(scratch.path()).is_empty(),
             "a refusal mid-walk leaves nothing behind either",
         );
+
+        // And a refusal *after* the walk succeeded, which is the case a
+        // temporary directory hoisted out of `extract_member` would leak: the
+        // member is extracted whole and the sequence refuses it two steps later.
+        let undecodable = generation_pkg(&pair, b"not a document", SEED_EPOCH);
+        let err = admit(&t.root, &undecodable, Some(scratch.path()))
+            .expect_err("no candidate set can be built from these bytes");
+        assert!(
+            matches!(err, ReleaseTrustError::ProvisionalDecode),
+            "got {err:?}",
+        );
+        assert!(
+            entries(scratch.path()).is_empty(),
+            "a refusal past the walk leaves nothing behind either",
+        );
     }
 
     /// The container walks whole and is internally consistent; what it does not
