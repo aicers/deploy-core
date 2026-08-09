@@ -77,10 +77,31 @@
 //! state, and the fact that the replace door is a separately named symbol reached
 //! only from an operator-mediated installer.
 //!
-//! The runtime delivery channel — the one that *does* apply the epoch floor, the
-//! chain rules and the `require-trust-pin` re-bootstrap gate — is neither of
-//! these. It exports its own, separately named runtime entry point, and reaches
-//! this tree through this same installer rather than around it.
+//! The runtime delivery channel — the one that *does* apply the epoch floor and
+//! the chain rules — is neither of these. It exports its own, separately named
+//! entry points, and reaches this tree through this same installer rather than
+//! around it: [`accept_generation`] for one delivered generation,
+//! [`accept_generation_chain`] for the ordered replay that catches a lagging host
+//! up, and [`read_generation_state`] for the question a caller asks before it
+//! pushes. The `require-trust-pin` re-bootstrap gate is not among them yet; it
+//! admits a generation under its own anchors rather than against the active
+//! generation's, and belongs to a later entry point on this tree.
+//!
+//! # Two notions of "the active generation", kept apart on purpose
+//!
+//! [`read_active_epoch`] and the reader behind [`active_trust_set`] ask only "is
+//! anything resolvable at `active`", through one `metadata` call that **follows**
+//! the link. An absent link and a dangling one are alike no generation; a real
+//! directory at `active`, or a symlink to a non-canonical name, over well-formed
+//! files is a success. That is the right question for "may I seed".
+//!
+//! The runtime paths additionally ask the generation engine's question — a
+//! `read_link` on `active` with its target through the engine's own canonical
+//! `gen-<n>` predicate — because "which generation am I on" is what a delivered
+//! generation is compared against and what an unchanged result has to report.
+//! The two disagree on exactly the trees whose `active` is not a canonical
+//! symlink, and neither is wrong. They are separate functions so they cannot
+//! drift back together.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -93,7 +114,7 @@ use crate::payload;
 use crate::roxyd_trust::Activation;
 use crate::trust_set::{
     TRUST_SET_MEMBER, TrustSetDocument, TrustSetDocumentError, document_anchors, member_digest,
-    read_trust_set_document, self_admission_candidate,
+    provisional_anchors_and_epoch, read_trust_set_document, self_admission_candidate,
 };
 use crate::verify::{InputError, TrustSet, VerifyError, VerifyRequest, verify_package};
 
@@ -266,6 +287,45 @@ pub enum ReleaseTrustError {
         record: u64,
         /// The epoch the document names.
         document: u64,
+    },
+
+    /// `active` is a link this crate did not write: its target is not a
+    /// canonical `gen-<n>`.
+    ///
+    /// Raised by the runtime paths alone, which resolve the index with the
+    /// generation engine's own pair — a `read_link` and
+    /// `generation::parse_generation` — so they and the engine cannot disagree
+    /// about which trees they own. It is a refusal and never the empty-tree
+    /// state: a tree holding something this crate did not put there is not a
+    /// tree a control-plane push may install over. Putting it right is an
+    /// operator's job through the install-time paths.
+    #[error(
+        "the release-trust tree's `active` names `{target}`, which is not a canonical generation"
+    )]
+    ActiveNotCanonical {
+        /// The link target, as it reads on disk.
+        target: String,
+    },
+
+    /// The delivered generation states its epoch twice under the signature and
+    /// the two carriers disagree.
+    ///
+    /// The document's own `epoch` field is authoritative; the manifest artifact
+    /// entry's `version` is the second carrier, kept as the decimal string it
+    /// is so a non-numeric one is reportable. Both are covered by the
+    /// signature, so a disagreement is a producer bug or a crafted container.
+    ///
+    /// Distinct from [`ReleaseTrustError::EpochDisagreement`], which is about
+    /// the *tree*: that one compares a generation already on disk against its
+    /// own `epoch` record.
+    #[error(
+        "the delivered trust generation's document names epoch {document} and its manifest names `{manifest}`"
+    )]
+    DeliveredEpochDisagreement {
+        /// The epoch the document's `epoch` field names.
+        document: u64,
+        /// The epoch the manifest artifact entry's `version` names, verbatim.
+        manifest: String,
     },
 }
 
@@ -483,6 +543,11 @@ fn active_document(root: &Path) -> PathBuf {
     active_link(root).join(TRUST_SET_MEMBER)
 }
 
+/// The delivered container of the generation `active` resolves to.
+fn active_package(root: &Path) -> PathBuf {
+    active_link(root).join(GENERATION_PACKAGE_FILE)
+}
+
 /// Returns the epoch the release-trust tree at `root` currently has active, or
 /// `None` when no generation has been installed yet.
 ///
@@ -612,6 +677,47 @@ fn parse_epoch_record(bytes: &[u8]) -> Result<u64, ReleaseTrustError> {
 /// malformed record, and [`ReleaseTrustError::Io`] when either file cannot be
 /// read.
 pub fn active_trust_set(root: &Path) -> Result<TrustSet, ReleaseTrustError> {
+    Ok(read_active_generation(root)?.trust)
+}
+
+/// Everything the active generation's two material reads yield, held together
+/// so nothing re-reads them.
+///
+/// [`active_trust_set`] wants the [`TrustSet`] alone; the runtime accept path
+/// wants the document and the epoch as well, to answer a byte-identical
+/// redelivery from the copy that was verified when it was admitted rather than
+/// from the delivered bytes.
+struct ActiveGenerationMaterial {
+    /// The active generation's document, as the refusing reader parsed it.
+    document: TrustSetDocument,
+    /// The epoch the `epoch` record names, which the document agrees with.
+    epoch: u64,
+    /// The verifier's injected trust set, assembled from the two.
+    trust: TrustSet,
+}
+
+/// Reads the active generation's `trust-set.json` and `epoch` **once** and
+/// yields the verified document, the epoch and the assembled [`TrustSet`].
+///
+/// This is the **following-stat** reader: it asks only "is anything resolvable
+/// at `active`" — through [`read_active_epoch`], whose one `metadata` call
+/// follows the link — and it calls no `read_link`. So an absent `active` and a
+/// dangling one are alike [`ReleaseTrustError::NoActiveGeneration`], while a
+/// real directory at `active`, or a symlink to a target that is not a canonical
+/// `gen-<n>`, is a *success* over well-formed files. That is deliberately not
+/// the generation engine's question, and tightening it here would change what
+/// the seed and install-time paths accept; the runtime paths ask the engine's
+/// question separately, through [`active_generation_index`].
+///
+/// # Errors
+///
+/// Returns exactly what [`active_trust_set`] documents, which is this reader's
+/// own surface: [`ReleaseTrustError::NoActiveGeneration`],
+/// [`ReleaseTrustError::Document`], [`ReleaseTrustError::EpochDisagreement`],
+/// whichever grammar refusal [`read_active_epoch`] raises for a malformed
+/// record, [`ReleaseTrustError::MalformedAnchorKey`],
+/// [`ReleaseTrustError::Input`] and [`ReleaseTrustError::Io`].
+fn read_active_generation(root: &Path) -> Result<ActiveGenerationMaterial, ReleaseTrustError> {
     let epoch = read_active_epoch(root)?.ok_or(ReleaseTrustError::NoActiveGeneration)?;
 
     let path = active_document(root);
@@ -631,12 +737,61 @@ pub fn active_trust_set(root: &Path) -> Result<TrustSet, ReleaseTrustError> {
             )
         })
         .collect();
-    Ok(TrustSet::new(
+    let trust = TrustSet::new(
         anchors,
         withdrawn,
         document.min_manifest_format_version,
         epoch,
-    )?)
+    )?;
+    Ok(ActiveGenerationMaterial {
+        document,
+        epoch,
+        trust,
+    })
+}
+
+/// Resolves the canonical generation index `active` names, with the generation
+/// engine's own pair: a `read_link` on `active`, its target through
+/// [`parse_generation`].
+///
+/// A **runtime-only** probe, called by [`accept_generation`],
+/// [`read_generation_state`] and each step of [`accept_generation_chain`] and by
+/// nothing else. It is spelled the engine's way rather than a second way so the
+/// runtime paths and the engine cannot disagree about which trees they own, and
+/// it is a separate function from [`read_active_generation`] because the two
+/// answer different questions and disagree on real trees.
+///
+/// Its four outcomes, two of them successful:
+///
+/// - the target parses as a canonical `gen-<n>` — `Ok(Some(n))`;
+/// - `read_link` fails with `NotFound` — `Ok(None)`, the absent link, kept as an
+///   outcome rather than raised as a refusal because the callers answer
+///   differently about an empty tree: the accept path converts it into
+///   [`ReleaseTrustError::NoActiveGeneration`] and the state query reports it;
+/// - the target does not parse — [`ReleaseTrustError::ActiveNotCanonical`];
+/// - `read_link` fails any other way, which is what a **real directory** at
+///   `active` produces (`EINVAL`, not `NotFound`) —
+///   [`ReleaseTrustError::Io`] naming `active`, fail-closed.
+///
+/// `None` therefore means `read_link` returned `NotFound` and nothing else:
+/// neither refusal is folded into it.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::ActiveNotCanonical`] and
+/// [`ReleaseTrustError::Io`] as stated above.
+fn active_generation_index(root: &Path) -> Result<Option<u64>, ReleaseTrustError> {
+    let active = active_link(root);
+    match std::fs::read_link(&active) {
+        Ok(target) => match parse_generation(&target) {
+            Some(generation) => Ok(Some(generation)),
+            None => Err(ReleaseTrustError::ActiveNotCanonical {
+                target: target.to_string_lossy().into_owned(),
+            }),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ReleaseTrustError::io(&active, e)),
+    }
 }
 
 /// What an install-time admission produced.
@@ -941,7 +1096,404 @@ pub fn replace_generation(
     root: &Path,
     package: &[u8],
 ) -> Result<AdmittedGeneration, ReleaseTrustError> {
+    #[cfg(test)]
+    REPLACE_GENERATION_CALLS.with_borrow_mut(|calls| calls.push(root.to_path_buf()));
+
     admit(root, package, None)
+}
+
+// Every call this install-time door receives in a test build, so a test can
+// assert that the runtime entry points reach it neither directly nor through a
+// helper. Instrumenting the *callee* is what makes the assertion cover a
+// transitive call without anyone having enumerated the helpers.
+//
+// Thread-local, in the shape of the engine's `SYSTEMCTL_CALLS` recorder, because
+// this module's own `replace_generation` tests run in parallel in the same
+// binary and a process-global recorder would see their calls. The paths under
+// test do no threading of their own, so every call a drive provokes lands on the
+// test's own thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REPLACE_GENERATION_CALLS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Which generation a release-trust tree currently has active, as
+/// [`read_generation_state`] reports it.
+///
+/// A read result with no invariant to protect, so its two values are public
+/// fields, exactly as [`Activation`] and [`AdmittedGeneration`] carry theirs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ActiveGeneration {
+    /// The canonical index `active` names.
+    pub generation: u64,
+    /// The epoch that generation records.
+    pub epoch: u64,
+}
+
+/// Reports which generation the release-trust tree at `root` has active, or that
+/// it carries none.
+///
+/// `root` is the tree
+/// [`Layout::release_trust_dir`](crate::layout::Layout::release_trust_dir)
+/// resolves.
+///
+/// A caller pushing a generation over the runtime channel needs to know which
+/// situation it is in before it pushes, and this answers with the index and the
+/// epoch [`accept_generation`] would compare against — the same probe and the
+/// same reader that path runs, in the same order, so this can never report "you
+/// are on generation *n*" for a tree the accept path would refuse.
+///
+/// `Ok(None)` **is** the tree state and is never a synthesized zero. It covers
+/// exactly two inputs: an absent `active`, and one that dangles — the trees
+/// [`read_active_epoch`] already calls empty. Every other verdict is an `Err`,
+/// including a tree carrying a generation whose document or `epoch` record is
+/// damaged: that tree is broken rather than empty, and the two are not the same
+/// answer.
+///
+/// This reports no install-time door. [`replace_generation`] applies no epoch
+/// floor and is not a runtime accept path, so it is not one of the situations
+/// this describes and nothing here reaches it.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::ActiveNotCanonical`] when `active` names
+/// something that is not a canonical `gen-<n>`, [`ReleaseTrustError::Io`] naming
+/// `active` when the link cannot be read for any reason other than its absence —
+/// a real directory there is the concrete case — and every refusal the common
+/// reader raises about a generation that does resolve:
+/// [`ReleaseTrustError::Document`], [`ReleaseTrustError::EpochDisagreement`],
+/// whichever grammar refusal [`read_active_epoch`] raises for a malformed
+/// `epoch` record, [`ReleaseTrustError::MalformedAnchorKey`],
+/// [`ReleaseTrustError::Input`] and [`ReleaseTrustError::Io`].
+pub fn read_generation_state(root: &Path) -> Result<Option<ActiveGeneration>, ReleaseTrustError> {
+    // The probe first, exactly as the accept path runs it. Its absent link is
+    // this caller's `Ok(None)`; both its refusals propagate.
+    let Some(generation) = active_generation_index(root)? else {
+        return Ok(None);
+    };
+
+    match read_active_generation(root) {
+        Ok(active) => Ok(Some(ActiveGeneration {
+            generation,
+            epoch: active.epoch,
+        })),
+        // The one refusal of the common reader this maps, and only this one: a
+        // dangling `active` passes the probe — `read_link` succeeds and the
+        // target parses — and the following stat then sees nothing. Reporting it
+        // as `None` is what keeps this reader and `read_active_epoch` agreeing
+        // about which trees are empty.
+        Err(ReleaseTrustError::NoActiveGeneration) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Accepts the delivered release-trust generation `package` at runtime, over the
+/// control-plane channel, applying the `epoch` floor.
+///
+/// `root` is the tree
+/// [`Layout::release_trust_dir`](crate::layout::Layout::release_trust_dir)
+/// resolves, and `package` is the delivered `.pkg` bytes verbatim — a byte slice
+/// because it genuinely arrived over the wire.
+///
+/// # The sequence
+///
+/// 1. **Establish the active generation.** The canonical-link probe, then the
+///    common reader, yielding the index, the verified document, the epoch and
+///    the trust set. Every refusal of either lands here, before verification and
+///    before any write. There is no accept onto an empty tree: an absent
+///    `active` and a dangling one are alike
+///    [`ReleaseTrustError::NoActiveGeneration`].
+/// 2. **Compare the delivered bytes against `active/generation.pkg`.** Equal
+///    bytes return an unchanged result immediately — without verifying, without
+///    comparing epochs, without touching the tree.
+/// 3. **Read both carriers of the delivered `epoch` and refuse a disagreement**,
+///    before anything is injected into the verifier.
+/// 4. **Verify** through [`verify_package`], which applies the floor and the
+///    rest of the taxonomy.
+/// 5. **Install** through the crate's one funnel onto the tree.
+///
+/// No signature check, taxonomy variant or epoch comparison is written here: the
+/// shared verifier already implements all of it against the injected trust set
+/// and the delivered epoch this path supplies. A generation that fails
+/// verification is never staged.
+///
+/// # Byte-identical redelivery is an idempotent no-op
+///
+/// A control plane with bounded retry redelivers the current generation
+/// routinely, and identical bytes can restore no revocation, so the answer is
+/// "unchanged" rather than a refusal. Step 2 is **this path's own** comparison
+/// and it runs **before** the verifier, because for such a redelivery the
+/// delivered epoch equals the active one and the strictly-greater test would
+/// refuse it as [`VerifyError::StaleTrustSet`] first. The generation engine's own
+/// downstream no-op therefore cannot serve here, and this path never reaches it
+/// on that input.
+///
+/// The unchanged result is the same [`AdmittedGeneration`] every other outcome
+/// returns, carrying `changed: false`, the index the probe yielded, and the
+/// **active** generation's epoch and document — the copy on disk that was
+/// verified when it was admitted, never a parse of the delivered bytes. A caller
+/// reads whether anything moved from `activation.changed` rather than from the
+/// result's type. A *different* document at an equal epoch does not match those
+/// bytes, so it falls through to the verifier and is
+/// [`VerifyError::StaleTrustSet`].
+///
+/// # The `epoch` floor
+///
+/// A valid signature proves a generation is authentic, not *current*, so an
+/// older but validly signed generation could otherwise be replayed to restore a
+/// revoked `key_id` or drop a withdrawn build. Activation therefore requires the
+/// delivered signed `epoch` to be strictly greater than the active generation's;
+/// equal or lower is [`VerifyError::StaleTrustSet`]. The activated epoch is
+/// written to the new generation's `epoch` record, so the floor survives a
+/// restart.
+///
+/// # The manifest-format floor is the ACTIVE generation's
+///
+/// The injected trust set is built from the active generation, so its
+/// `min_manifest_format_version` is what governs the delivered generation's own
+/// manifest — a trust generation is a package like any other here, and this
+/// special-cases nothing. The consequence is worth knowing at mint time: **a
+/// generation that raises the floor must itself be minted at or above the floor
+/// it raises to**, and so must every generation after it. One minted at an older
+/// manifest format than the floor its predecessor published is refused with
+/// [`VerifyError::UnsupportedManifestFormat`] and cannot be superseded except by
+/// re-provisioning the host.
+///
+/// # Not the install-time doors
+///
+/// [`admit_seed_generation`] refuses a tree that already carries a generation
+/// and [`replace_generation`] applies no floor in either direction; neither is a
+/// runtime accept path, and nothing here calls either of them.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::NoActiveGeneration`] for a tree whose `active` is
+/// absent or dangling, [`ReleaseTrustError::ActiveNotCanonical`] when `active`
+/// names something that is not a canonical `gen-<n>`,
+/// [`ReleaseTrustError::Io`] naming `active` for any other link failure — a real
+/// directory there is the concrete case — and every refusal the common reader
+/// raises about a generation that does resolve. Past step 1,
+/// [`ReleaseTrustError::Io`] naming `<root>/active/generation.pkg` when the
+/// active container cannot be read, [`ReleaseTrustError::Verify`] for a
+/// container-layer fault or a verification verdict,
+/// [`ReleaseTrustError::MissingTrustSetMember`] when the delivered container
+/// carries no `trust-set.json`, [`ReleaseTrustError::ProvisionalDecode`] when the
+/// delivered document does not survive the pre-verification decode,
+/// [`ReleaseTrustError::DeliveredEpochDisagreement`] when its two epoch carriers
+/// disagree, [`ReleaseTrustError::Document`] carrying the refusing reader's own
+/// refusal, and the installer's own I/O and validator refusals.
+pub fn accept_generation(
+    root: &Path,
+    package: &[u8],
+) -> Result<AdmittedGeneration, ReleaseTrustError> {
+    // 1. The active generation, the engine's question first and the following
+    //    stat second. The order matters on one input: a dangling `active`
+    //    naming a canonical `gen-<n>` passes the probe and is then refused by
+    //    the reader, which is the intended answer — the probe running first must
+    //    not turn a dangling link into that generation.
+    let generation = active_generation_index(root)?.ok_or(ReleaseTrustError::NoActiveGeneration)?;
+    let active = read_active_generation(root)?;
+
+    // 2. This path's own byte-identity comparison, ahead of the verifier. Step 1
+    //    has established that a canonical generation is active, so a container
+    //    that cannot be read is a damaged tree rather than an empty one: there
+    //    is deliberately no `NotFound` exemption here.
+    let path = active_package(root);
+    let stored = std::fs::read(&path).map_err(|e| ReleaseTrustError::io(&path, e))?;
+    if stored == package {
+        return Ok(AdmittedGeneration {
+            activation: Activation {
+                generation,
+                changed: false,
+            },
+            epoch: active.epoch,
+            document: active.document,
+        });
+    }
+
+    // 3. The delivered member, out of the container's one walk, and its epoch
+    //    from the crate's one pre-verification decode. Both carriers are read
+    //    and compared before anything is injected into the verifier. The
+    //    anchors that decode also yields are dropped on purpose: a runtime
+    //    accept is judged against the **active** generation's trust set, never
+    //    against one carried by the bytes being judged.
+    let member = extract_member(package, None)?;
+    let (_anchors, delivered_epoch) =
+        provisional_anchors_and_epoch(&member).ok_or(ReleaseTrustError::ProvisionalDecode)?;
+    check_delivered_epoch_carriers(package, delivered_epoch)?;
+
+    // 4. The verdict, against the **active** generation's trust set: its anchors,
+    //    its withdrawn list, its manifest-format floor, and its epoch as the
+    //    floor the verifier's strictly-greater test applies.
+    let request = VerifyRequest::for_trust(
+        &delivered_epoch.to_string(),
+        &member_digest(&member),
+        delivered_epoch,
+    )?;
+    verify_package(Cursor::new(package), &active.trust, &request)?;
+
+    // 5. Only now is the delivered document parsed for real, and only now does
+    //    anything reach the tree.
+    let document = read_trust_set_document(&member)?;
+    let activation = install_generation(root, package, &member, document.epoch)?;
+    Ok(AdmittedGeneration {
+        activation,
+        epoch: document.epoch,
+        document,
+    })
+}
+
+/// Refuses a delivered generation whose two epoch carriers disagree.
+///
+/// A generation states its epoch twice under the signature: the `epoch` field
+/// inside the document, which is authoritative and arrives here as `document`,
+/// and the manifest artifact entry's `version` in decimal. Reading the manifest
+/// costs one footer parse and no archive walk, and refusing a disagreement costs
+/// nothing, because both carriers are signed: a disagreement is a producer bug or
+/// a crafted container.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::DeliveredEpochDisagreement`] when an artifact
+/// entry's `version` is not `document` in decimal, and
+/// [`ReleaseTrustError::Verify`] carrying the container layer's own fault when
+/// the container cannot be opened at all.
+fn check_delivered_epoch_carriers(package: &[u8], document: u64) -> Result<(), ReleaseTrustError> {
+    let payload = payload::open_package(Cursor::new(package)).map_err(VerifyError::from)?;
+    let declared = document.to_string();
+    for artifact in payload.manifest().artifacts() {
+        if artifact.version != declared {
+            return Err(ReleaseTrustError::DeliveredEpochDisagreement {
+                document,
+                manifest: artifact.version.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// How far a chain replay got, on the arm where it got all the way.
+///
+/// Carries the same two progress fields as [`ChainReplayError`], so a caller
+/// reads its position off whichever value it holds without first branching on
+/// which arm it got.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChainReplay {
+    /// How many entries of `packages` were accepted — a position in that slice,
+    /// not a count of activations.
+    pub completed: usize,
+    /// The record the last accepted step returned, or `None` when `packages` was
+    /// empty.
+    pub last: Option<AdmittedGeneration>,
+}
+
+/// A chain replay that stopped, and how far it got before it did.
+///
+/// A struct error of its own rather than a [`ReleaseTrustError`] variant: a
+/// variant wrapping a boxed `ReleaseTrustError` would make that enum recursive,
+/// and would put an arm in front of every existing caller of
+/// [`admit_seed_generation`] and [`replace_generation`] that their calls can
+/// never produce.
+///
+/// It derives only `Debug`, because a `ReleaseTrustError` reaches an
+/// [`std::io::Error`], which is not `Eq`.
+#[derive(Debug, thiserror::Error)]
+#[error("the trust generation chain stopped after {completed} step(s)")]
+pub struct ChainReplayError {
+    /// How many entries of `packages` were accepted before the failure, so
+    /// `packages[completed]` is the step that raised `source`.
+    pub completed: usize,
+    /// The record the last accepted step returned, or `None` when the first step
+    /// failed.
+    pub last: Option<AdmittedGeneration>,
+    /// The refusal that stopped the replay.
+    #[source]
+    pub source: ReleaseTrustError,
+}
+
+/// Replays the missing trust-generation chain onto the tree at `root`, epoch by
+/// epoch, as an ordered sequence of ordinary accepts.
+///
+/// `root` is the tree
+/// [`Layout::release_trust_dir`](crate::layout::Layout::release_trust_dir)
+/// resolves. `packages` is a slice of slices so a caller replaying out of one
+/// contiguous buffer copies nothing, and a caller holding owned buffers maps
+/// once at the call.
+///
+/// # Why a chain rather than the latest generation alone
+///
+/// Each generation is verified against the *current* active key set, so a host
+/// that skipped the generation which **introduced** a key cannot verify a later
+/// one signed by that key. Rotation preserves the matching invariant — a
+/// generation is only ever signed by a key present in the immediately preceding
+/// one — so a lagging host is caught up by replaying what it missed, in order.
+///
+/// Every step is [`accept_generation`] verbatim, its byte-identity fast path
+/// included, and each is subject to the `epoch` floor wherever it reaches the
+/// epoch comparison at all. There is deliberately **no numeric contiguity
+/// test**: epochs are allocated by hand and are not contiguous, so arithmetic
+/// would refuse legitimate sequences. A gap shows up instead as the next
+/// generation being signed by a key the host's active set does not carry, which
+/// the verifier returns as [`VerifyError::UnknownKeyId`], and out-of-order
+/// delivery shows up as [`VerifyError::StaleTrustSet`] on the step that goes
+/// backwards.
+///
+/// # Progress is counted in input steps and is never unwound
+///
+/// `completed` is the number of entries of `packages` consumed without refusal,
+/// so `packages[..completed]` all succeeded and, on the error arm,
+/// `packages[completed]` is the step that raised the failure — the resume
+/// position. A step that succeeded as the byte-identical no-op is **accepted**:
+/// it increments `completed` and supplies `last` exactly as a step that
+/// activated does, which is routine rather than exceptional, since a control
+/// plane sending "generations *N* through *M*" to a host it believes is on *N*
+/// produces one on the first step. Whether anything actually moved is read from
+/// `last`'s `activation.changed`, never inferred from the count. An empty
+/// `packages` is `Ok(ChainReplay { completed: 0, last: None })` and touches
+/// nothing.
+///
+/// A failed step leaves the tree exactly as the preceding accepted steps left
+/// it: activations stand, and a chain whose accepted steps were all no-ops is
+/// left on the generation it started on. That is sound under both kinds of
+/// accepted step — every step that activated was individually verified against
+/// its own predecessor, and every step that succeeded as a no-op installed
+/// nothing — and the floor moved backward in neither case. Keeping the progress
+/// is strictly better than unwinding a host's only route out of being behind.
+///
+/// # Errors
+///
+/// Returns [`ChainReplayError`] carrying the refusal the stopping step raised as
+/// its `#[source]`, which is any refusal [`accept_generation`] documents,
+/// together with `completed` and the last accepted step's record.
+// The `Err` arm is large because carrying the progress is the whole reason this
+// pair exists: `last` is an `AdmittedGeneration`, holding the document the last
+// accepted step returned. Boxing the error would put a caller's resume position
+// behind an allocation and change the exported signature; the two arms carry the
+// same two progress fields so a caller need not branch on which one it got.
+#[allow(clippy::result_large_err)]
+pub fn accept_generation_chain(
+    root: &Path,
+    packages: &[&[u8]],
+) -> Result<ChainReplay, ChainReplayError> {
+    let mut completed = 0;
+    let mut last = None;
+    for package in packages {
+        match accept_generation(root, package) {
+            Ok(admitted) => {
+                completed += 1;
+                last = Some(admitted);
+            }
+            Err(source) => {
+                return Err(ChainReplayError {
+                    completed,
+                    last,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(ChainReplay { completed, last })
 }
 
 #[cfg(test)]
@@ -956,18 +1508,22 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        EPOCH_RECORD_FILE, GENERATION_PACKAGE_FILE, MATERIAL_SET_TARGET, ReleaseTrustError,
-        active_trust_set, admit, admit_seed_generation, install_generation, material,
-        read_active_epoch, replace_generation,
+        ActiveGeneration, EPOCH_RECORD_FILE, GENERATION_PACKAGE_FILE, MATERIAL_SET_TARGET,
+        REPLACE_GENERATION_CALLS, ReleaseTrustError, accept_generation, accept_generation_chain,
+        active_package, active_trust_set, admit, admit_seed_generation, install_generation,
+        material, read_active_epoch, read_generation_state, replace_generation,
     };
     use crate::generation::{GenerationError, SYSTEMCTL_CALLS, active_link, generation_dir};
     use crate::layout::{ACTIVE_LINK, Layout, REQUIRE_TRUST_PIN_MARKER};
     use crate::manifest::MAX_MANIFEST_FORMAT_VERSION;
+    use crate::roxyd_trust::Activation;
     use crate::trust_fixture::{
         Fields, anchor_json, anchor_of, array, default_document, generation_pkg,
         generation_pkg_member_named, hex_of, keypair, pkg_naming, public_key_of, withdrawn_json,
     };
-    use crate::trust_set::{TRUST_SET_MEMBER, TrustSetDocumentError, member_digest};
+    use crate::trust_set::{
+        TRUST_SET_MEMBER, TrustSetDocumentError, member_digest, read_trust_set_document,
+    };
     use crate::verify::{TRUST_TARGET, VerifyError, VerifyRequest, key_id, verify_package};
 
     /// A release epoch far from any generation index, so a test asserting
@@ -2518,5 +3074,896 @@ mod tests {
             &t.root,
             &[OsString::from(ACTIVE_LINK), generation_name(&t.root, 1)],
         );
+    }
+
+    // The runtime accept path: the state query, a single accept and chain
+    // replay. Every generation below is minted in-test from ephemeral keys, and
+    // every epoch is far from any generation index so an assertion about `gen-1`
+    // cannot pass by conflating the two.
+
+    /// The three chain epochs, deliberately **non-contiguous**: epochs are
+    /// allocated by hand, so a replay that required arithmetic between them
+    /// would refuse a legitimate sequence.
+    const CHAIN_EPOCHS: [u64; 3] = [5000, 6001, 9999];
+
+    /// The name a non-canonical `active` points at in the tests that build one.
+    const ELSEWHERE: &str = "elsewhere";
+
+    /// Every path under `root` with what it holds — a directory as an empty
+    /// entry, a symlink as its target, a file as its bytes — so a test can
+    /// assert a tree is byte-identical before and after a call.
+    ///
+    /// `symlink_metadata` throughout: a snapshot that followed `active` would
+    /// report the generation twice and would say nothing about where the link
+    /// points.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("every entry is under the root")
+                    .to_path_buf();
+                let meta = std::fs::symlink_metadata(&path).expect("symlink metadata");
+                if meta.is_symlink() {
+                    let target = std::fs::read_link(&path).expect("read_link");
+                    out.push((relative, target.into_os_string().into_encoded_bytes()));
+                } else if meta.is_dir() {
+                    out.push((relative, Vec::new()));
+                    pending.push(path);
+                } else {
+                    out.push((relative, std::fs::read(&path).expect("read")));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A tree carrying `generation` as its only generation, admitted through the
+    /// install-time seed exactly as a real host is provisioned.
+    fn seeded_tree(generation: &Generation) -> Tree {
+        let t = tree();
+        admit_seed_generation(&t.root, &generation.package).expect("seed");
+        t
+    }
+
+    /// A tree seeded with `generation` whose `active` is then a symlink to a
+    /// well-formed generation directory under a name the engine never writes.
+    fn tree_with_non_canonical_active(generation: &Generation) -> Tree {
+        let t = seeded_tree(generation);
+        std::fs::remove_file(active_link(&t.root)).expect("remove the link");
+        std::fs::rename(generation_dir(&t.root, 1), t.root.join(ELSEWHERE)).expect("rename");
+        std::os::unix::fs::symlink(ELSEWHERE, active_link(&t.root)).expect("link");
+        t
+    }
+
+    /// A tree seeded with `generation` whose `active` is a **real directory**
+    /// holding that generation's three files rather than a symlink, which is
+    /// what makes `read_link` fail with `EINVAL` rather than `NotFound`.
+    fn tree_with_real_directory_active(generation: &Generation) -> Tree {
+        let t = seeded_tree(generation);
+        std::fs::remove_file(active_link(&t.root)).expect("remove the link");
+        std::fs::rename(generation_dir(&t.root, 1), active_link(&t.root)).expect("rename");
+        t
+    }
+
+    /// A tree whose `active` dangles onto a canonical `gen-<n>` that is not
+    /// there.
+    fn tree_with_dangling_active() -> Tree {
+        let t = tree();
+        std::os::unix::fs::symlink(generation_name(&t.root, 9), active_link(&t.root))
+            .expect("dangling link");
+        t
+    }
+
+    /// A generation at `epoch` that is not the one [`Generation::new`] mints for
+    /// it: same key, same epoch, one unrelated withdrawn build.
+    fn other_document_at(pair: &Ed25519KeyPair, epoch: u64) -> Generation {
+        Generation::from_fields(
+            pair,
+            &Fields {
+                epoch: Some(epoch.to_string()),
+                withdrawn_builds: Some(array(&[withdrawn_json("example", "1.0.0", "abc")])),
+                ..Fields::new(pair)
+            },
+            epoch,
+        )
+    }
+
+    /// The `VerifyError` a refusal carries, or a panic naming what arrived
+    /// instead.
+    fn verdict(err: &ReleaseTrustError) -> &VerifyError {
+        match err {
+            ReleaseTrustError::Verify(verdict) => verdict,
+            other => panic!("expected a verification verdict, got {other:?}"),
+        }
+    }
+
+    /// A generation one epoch above the active one is accepted and activated.
+    #[test]
+    fn accept_activates_a_strictly_newer_generation() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+
+        let admitted = accept_generation(&t.root, &delivered.package).expect("a newer generation");
+        assert_eq!(
+            admitted.activation,
+            Activation {
+                generation: 2,
+                changed: true,
+            },
+        );
+        assert_eq!(admitted.epoch, NEXT_EPOCH);
+        assert_eq!(admitted.document.epoch, NEXT_EPOCH);
+
+        assert_active_is(&t.root, 2);
+        assert_eq!(
+            std::fs::read(active_package(&t.root)).expect("read"),
+            delivered.package,
+            "the delivered container is stored verbatim",
+        );
+        assert_eq!(
+            read_active_epoch(&t.root).expect("read"),
+            Some(NEXT_EPOCH),
+            "the floor survives a restart",
+        );
+    }
+
+    /// Equal and lower are alike stale, and the equal case carries a document
+    /// that is *not* the active one — which is what makes it reach the floor at
+    /// all rather than the byte-identity fast path.
+    #[test]
+    fn accept_refuses_an_equal_or_lower_epoch_as_stale() {
+        let pair = keypair();
+        let cases = [
+            (other_document_at(&pair, SEED_EPOCH), SEED_EPOCH),
+            (Generation::new(&pair, SEED_EPOCH - 1), SEED_EPOCH - 1),
+        ];
+        for (delivered, epoch) in cases {
+            let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+            let before = snapshot(&t.root);
+            let err = accept_generation(&t.root, &delivered.package)
+                .expect_err("the floor is strictly greater");
+            assert!(
+                matches!(
+                    verdict(&err),
+                    VerifyError::StaleTrustSet { delivered, active }
+                        if *delivered == epoch && *active == SEED_EPOCH
+                ),
+                "got {err:?}",
+            );
+            assert_eq!(snapshot(&t.root), before, "a refusal writes nothing");
+        }
+    }
+
+    /// The redelivery a control plane with bounded retry produces routinely.
+    ///
+    /// This is the test that would fail if the byte comparison ran after
+    /// verification: the delivered epoch equals the active one, so the verifier
+    /// would refuse these very bytes as stale.
+    #[test]
+    fn redelivering_the_active_generations_bytes_is_an_unchanged_no_op() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        let t = seeded_tree(&seed);
+        let before = snapshot(&t.root);
+
+        let admitted =
+            accept_generation(&t.root, &seed.package).expect("a byte-identical redelivery");
+        assert_eq!(
+            admitted.activation,
+            Activation {
+                generation: 1,
+                changed: false,
+            },
+            "the index `active` names, and nothing moved",
+        );
+        assert_eq!(admitted.epoch, SEED_EPOCH);
+        assert_eq!(
+            admitted.document,
+            read_trust_set_document(&seed.member).expect("the seeded document"),
+            "the active generation's own document, not a parse of the delivered bytes",
+        );
+        assert_eq!(snapshot(&t.root), before, "the tree was not touched");
+    }
+
+    /// A different document at the same epoch does not match those bytes, so it
+    /// falls through to the verifier — which is what makes the comparison
+    /// byte-exact rather than an epoch shortcut.
+    #[test]
+    fn a_different_document_at_the_active_epoch_is_stale_rather_than_unchanged() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        let t = seeded_tree(&seed);
+        let delivered = other_document_at(&pair, SEED_EPOCH);
+        assert_ne!(delivered.package, seed.package);
+
+        let err = accept_generation(&t.root, &delivered.package).expect_err("not these bytes");
+        assert!(
+            matches!(
+                verdict(&err),
+                VerifyError::StaleTrustSet { delivered, active }
+                    if *delivered == SEED_EPOCH && *active == SEED_EPOCH
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// The canonical-link precondition covers the whole path rather than only
+    /// the fast path, so each tree is driven with a byte-identical redelivery
+    /// **and** with a genuinely newer generation.
+    #[test]
+    fn accept_refuses_a_tree_whose_active_is_not_a_canonical_symlink() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        let newer = Generation::new(&pair, NEXT_EPOCH);
+
+        for delivered in [&seed, &newer] {
+            let linked = tree_with_non_canonical_active(&seed);
+            let before = snapshot(&linked.root);
+            let err = accept_generation(&linked.root, &delivered.package)
+                .expect_err("`active` names no canonical generation");
+            assert!(
+                matches!(
+                    err,
+                    ReleaseTrustError::ActiveNotCanonical { ref target } if target == ELSEWHERE
+                ),
+                "got {err:?}",
+            );
+            assert_eq!(snapshot(&linked.root), before);
+
+            let real = tree_with_real_directory_active(&seed);
+            let before = snapshot(&real.root);
+            let err = accept_generation(&real.root, &delivered.package)
+                .expect_err("`active` cannot be read as a link at all");
+            assert!(
+                matches!(
+                    err,
+                    ReleaseTrustError::Io { ref path, .. }
+                        if Path::new(path) == active_link(&real.root)
+                ),
+                "got {err:?}",
+            );
+            assert_eq!(snapshot(&real.root), before);
+        }
+    }
+
+    /// The two readers differ deliberately rather than accidentally: the
+    /// following stat resolves a generation on both of the trees the runtime
+    /// probe refuses, exactly as it did before the factoring.
+    #[test]
+    fn the_common_reader_still_accepts_the_two_trees_the_probe_refuses() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        for t in [
+            tree_with_non_canonical_active(&seed),
+            tree_with_real_directory_active(&seed),
+        ] {
+            let trust =
+                active_trust_set(&t.root).expect("the following stat resolves a generation");
+            assert_eq!(trust.anchors().len(), 1);
+            assert_eq!(read_active_epoch(&t.root).expect("read"), Some(SEED_EPOCH));
+        }
+    }
+
+    /// The state query never reports a generation the accept path would refuse,
+    /// and never calls a tree empty that the accept path calls broken.
+    #[test]
+    fn the_state_query_reports_the_probes_two_refusals_rather_than_no_generation() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+
+        let linked = tree_with_non_canonical_active(&seed);
+        let err = read_generation_state(&linked.root).expect_err("not a canonical generation");
+        assert!(
+            matches!(
+                err,
+                ReleaseTrustError::ActiveNotCanonical { ref target } if target == ELSEWHERE
+            ),
+            "got {err:?}",
+        );
+
+        let real = tree_with_real_directory_active(&seed);
+        let err = read_generation_state(&real.root).expect_err("`active` is no link");
+        assert!(
+            matches!(
+                err,
+                ReleaseTrustError::Io { ref path, .. }
+                    if Path::new(path) == active_link(&real.root)
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// The probe runs first and a dangling `active` passes it, so the common
+    /// reader's refusal is what decides — and each caller disposes of it the way
+    /// it disposed of the absent link.
+    #[test]
+    fn a_dangling_active_is_no_generation_to_every_reader() {
+        let t = tree_with_dangling_active();
+        let pair = keypair();
+        let delivered = Generation::new(&pair, SEED_EPOCH);
+
+        let err = accept_generation(&t.root, &delivered.package)
+            .expect_err("there is nothing to accept onto");
+        assert!(
+            matches!(err, ReleaseTrustError::NoActiveGeneration),
+            "a dangling link is never generation 9, got {err:?}",
+        );
+        assert_eq!(read_generation_state(&t.root).expect("read"), None);
+        assert_eq!(
+            read_active_epoch(&t.root).expect("read"),
+            None,
+            "the two readers still agree about which trees are empty",
+        );
+    }
+
+    #[test]
+    fn accept_refuses_an_empty_tree_where_the_state_query_reports_it() {
+        let t = tree();
+        let pair = keypair();
+        let delivered = Generation::new(&pair, SEED_EPOCH);
+
+        let err = accept_generation(&t.root, &delivered.package)
+            .expect_err("there is no accept onto an empty tree");
+        assert!(
+            matches!(err, ReleaseTrustError::NoActiveGeneration),
+            "got {err:?}",
+        );
+        assert_eq!(read_generation_state(&t.root).expect("read"), None);
+    }
+
+    /// Step 1 has established that a canonical generation is active, so a
+    /// container that cannot be read is a damaged tree rather than an empty one:
+    /// there is no `NotFound` exemption and no fall-through to verification.
+    #[test]
+    fn accept_refuses_a_tree_whose_active_container_cannot_be_read() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        std::fs::remove_file(active_package(&t.root)).expect("remove the container");
+
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+        let err = accept_generation(&t.root, &delivered.package)
+            .expect_err("the active container is gone");
+        assert!(
+            matches!(
+                err,
+                ReleaseTrustError::Io { ref path, .. }
+                    if Path::new(path) == active_package(&t.root)
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// Both carriers are covered by the signature, so a disagreement is refused
+    /// with this path's own error before anything is injected into the verifier
+    /// — never as a verifier verdict, and never as the tree's
+    /// `EpochDisagreement`.
+    #[test]
+    fn a_delivered_generation_whose_two_epoch_carriers_disagree_is_refused_before_verification() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let before = snapshot(&t.root);
+
+        let member = document_at(&pair, NEXT_EPOCH);
+        let package = pkg_naming(
+            &pair,
+            &member,
+            TRUST_TARGET,
+            &(NEXT_EPOCH + 1).to_string(),
+            &member_digest(&member),
+        );
+        let err = accept_generation(&t.root, &package).expect_err("the two carriers disagree");
+        assert!(
+            matches!(
+                err,
+                ReleaseTrustError::DeliveredEpochDisagreement { document, ref manifest }
+                    if document == NEXT_EPOCH && *manifest == (NEXT_EPOCH + 1).to_string()
+            ),
+            "the document field is authoritative, got {err:?}",
+        );
+        assert_eq!(snapshot(&t.root), before);
+    }
+
+    /// The delivered generation is judged against the **active** generation's
+    /// manifest-format floor, with no special-casing. A generation that raises
+    /// the floor past what release tooling mints therefore locks the host out of
+    /// every later generation — intended behaviour, cheap to avoid at mint time,
+    /// and escapable only by re-provisioning.
+    #[test]
+    fn a_delivered_generation_below_the_active_floor_is_refused_for_its_manifest_format() {
+        let pair = keypair();
+        let raised = Generation::from_fields(
+            &pair,
+            &Fields {
+                epoch: Some(SEED_EPOCH.to_string()),
+                min_manifest_format_version: Some((MAX_MANIFEST_FORMAT_VERSION + 1).to_string()),
+                ..Fields::new(&pair)
+            },
+            SEED_EPOCH,
+        );
+        let t = seeded_tree(&raised);
+
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+        let err = accept_generation(&t.root, &delivered.package)
+            .expect_err("the active generation published a floor above it");
+        assert!(
+            matches!(
+                verdict(&err),
+                VerifyError::UnsupportedManifestFormat { min, .. }
+                    if *min == MAX_MANIFEST_FORMAT_VERSION + 1
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// Every refusal this path raises falls before `install_generation` is
+    /// called, so the tree is byte-identical afterwards. A failure *inside* the
+    /// engine is deliberately not asserted against: two of its three documented
+    /// outcomes legitimately leave debris behind.
+    #[test]
+    fn every_refusal_before_the_installer_leaves_the_tree_byte_identical() {
+        let pair = keypair();
+        let stranger = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let before = snapshot(&t.root);
+
+        let carriers = document_at(&pair, NEXT_EPOCH);
+        let refusals = [
+            // Stale, at a lower and at an equal epoch.
+            Generation::new(&pair, SEED_EPOCH - 1).package,
+            other_document_at(&pair, SEED_EPOCH).package,
+            // Signed by a key the active generation does not carry.
+            Generation::new(&stranger, NEXT_EPOCH).package,
+            // The two delivered epoch carriers disagreeing.
+            pkg_naming(
+                &pair,
+                &carriers,
+                TRUST_TARGET,
+                &SEED_EPOCH.to_string(),
+                &member_digest(&carriers),
+            ),
+            // No container at all, and a container carrying no document.
+            b"not a container".to_vec(),
+            generation_pkg(&pair, b"not a document", NEXT_EPOCH),
+        ];
+        for package in refusals {
+            let err = accept_generation(&t.root, &package).expect_err("refused");
+            assert_eq!(snapshot(&t.root), before, "{err:?} left the tree changed");
+        }
+    }
+
+    /// The whole of the state query's two successful answers, and the refusals
+    /// that are deliberately not folded into either of them.
+    #[test]
+    fn the_state_query_reports_the_index_and_the_epoch_or_that_there_is_none() {
+        assert_eq!(
+            read_generation_state(&tree().root).expect("read"),
+            None,
+            "an empty tree carries no generation",
+        );
+
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        assert_eq!(
+            read_generation_state(&t.root).expect("read"),
+            Some(ActiveGeneration {
+                generation: 1,
+                epoch: SEED_EPOCH,
+            }),
+        );
+
+        // The index is the tree's own and moves with an activation; the epoch is
+        // the generation's and is unrelated to it.
+        accept_generation(&t.root, &Generation::new(&pair, NEXT_EPOCH).package).expect("rotate");
+        assert_eq!(
+            read_generation_state(&t.root).expect("read"),
+            Some(ActiveGeneration {
+                generation: 2,
+                epoch: NEXT_EPOCH,
+            }),
+        );
+
+        // A tree that carries a generation and is damaged is an `Err`, never
+        // `Ok(None)` and never `Ok(Some(..))`.
+        let malformed = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        overwrite_active(&malformed.root, EPOCH_RECORD_FILE, b"4711");
+        assert!(
+            matches!(
+                read_generation_state(&malformed.root).expect_err("a malformed record"),
+                ReleaseTrustError::UnterminatedEpochRecord
+            ),
+            "a malformed `epoch` record is not an empty tree",
+        );
+
+        let disagreeing = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        overwrite_active(&disagreeing.root, EPOCH_RECORD_FILE, b"4712\n");
+        assert!(
+            matches!(
+                read_generation_state(&disagreeing.root).expect_err("the two disagree"),
+                ReleaseTrustError::EpochDisagreement { record, document }
+                    if record == NEXT_EPOCH && document == SEED_EPOCH
+            ),
+            "a generation whose record and document disagree is not an empty tree",
+        );
+    }
+
+    /// The state query writes nothing, over every tree shape it can be handed.
+    ///
+    /// On its own this does not pin *which* functions it called — a
+    /// byte-identical re-admission through the install door would leave the same
+    /// snapshot, since the engine's own no-op returns without writing on exactly
+    /// that input. The recorder test below is what pins the callee.
+    #[test]
+    fn the_state_query_writes_nothing_whatever_the_tree() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        let trees = [
+            tree(),
+            tree_with_dangling_active(),
+            tree_with_non_canonical_active(&seed),
+            tree_with_real_directory_active(&seed),
+            seeded_tree(&seed),
+        ];
+        for t in &trees {
+            let before = snapshot(&t.root);
+            let _ = read_generation_state(&t.root);
+            assert_eq!(snapshot(&t.root), before, "the state query is read-only");
+        }
+    }
+
+    /// Non-contiguous epochs, replayed in order, all three activated. Nothing
+    /// here tests arithmetic between the epochs, because there is none to test.
+    #[test]
+    fn a_three_step_chain_replays_in_order_with_no_contiguity_test() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let chain: Vec<Generation> = CHAIN_EPOCHS
+            .iter()
+            .map(|epoch| Generation::new(&pair, *epoch))
+            .collect();
+        let packages: Vec<&[u8]> = chain.iter().map(|g| g.package.as_slice()).collect();
+
+        let replay = accept_generation_chain(&t.root, &packages).expect("the chain replays");
+        assert_eq!(replay.completed, 3);
+        let last = replay.last.expect("three steps were accepted");
+        assert_eq!(
+            last.activation,
+            Activation {
+                generation: 4,
+                changed: true,
+            },
+            "the seeded generation plus three activations",
+        );
+        assert_eq!(last.epoch, CHAIN_EPOCHS[2]);
+        assert_active_is(&t.root, 4);
+        assert_eq!(
+            read_active_epoch(&t.root).expect("read"),
+            Some(CHAIN_EPOCHS[2]),
+        );
+    }
+
+    /// A gap in the chain is detected by the signature check: the step the host
+    /// skipped is the one that would have introduced the key, so the next step
+    /// is signed by a key its active set does not carry.
+    #[test]
+    fn a_chain_stops_at_a_step_signed_by_a_key_the_active_generation_does_not_carry() {
+        let pair = keypair();
+        let successor = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+
+        let first = Generation::new(&pair, CHAIN_EPOCHS[0]);
+        // Signed by, and trusting, a key the preceding generation never named.
+        let orphan = Generation::new(&successor, CHAIN_EPOCHS[1]);
+        let third = Generation::new(&successor, CHAIN_EPOCHS[2]);
+        let packages: Vec<&[u8]> = vec![&first.package, &orphan.package, &third.package];
+
+        let err = accept_generation_chain(&t.root, &packages).expect_err("the chain has a gap");
+        assert_eq!(err.completed, 1, "`packages[1]` is the step that refused");
+        let last = err.last.as_ref().expect("the first step was accepted");
+        assert_eq!(
+            last.activation,
+            Activation {
+                generation: 2,
+                changed: true,
+            },
+        );
+        assert!(
+            matches!(
+                verdict(&err.source),
+                VerifyError::UnknownKeyId { key_id: id }
+                    if *id == key_id(&public_key_of(&successor))
+            ),
+            "got {:?}",
+            err.source,
+        );
+
+        assert_active_is(&t.root, 2);
+        assert_eq!(
+            read_active_epoch(&t.root).expect("read"),
+            Some(CHAIN_EPOCHS[0]),
+            "the accepted step stands and nothing is unwound",
+        );
+    }
+
+    /// Out-of-order delivery shows up as a stale step, and the byte comparison
+    /// is against the *currently* active container rather than against anything
+    /// the chain passed through.
+    #[test]
+    fn a_chain_delivered_out_of_order_is_refused_at_the_step_that_goes_backwards() {
+        let pair = keypair();
+        let earlier = Generation::new(&pair, CHAIN_EPOCHS[0]);
+        let later = Generation::new(&pair, CHAIN_EPOCHS[1]);
+
+        let reversed = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let packages: Vec<&[u8]> = vec![&later.package, &earlier.package];
+        let err = accept_generation_chain(&reversed.root, &packages)
+            .expect_err("the second step goes backwards");
+        assert_eq!(err.completed, 1);
+        assert!(
+            matches!(
+                verdict(&err.source),
+                VerifyError::StaleTrustSet { delivered, active }
+                    if *delivered == CHAIN_EPOCHS[0] && *active == CHAIN_EPOCHS[1]
+            ),
+            "got {:?}",
+            err.source,
+        );
+        assert_active_is(&reversed.root, 2);
+
+        // And a chain that ends by redelivering a generation two steps back: by
+        // then it is not the active container, so it falls through to the floor
+        // rather than short-circuiting as a no-op.
+        let looped = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let packages: Vec<&[u8]> = vec![&earlier.package, &later.package, &earlier.package];
+        let err = accept_generation_chain(&looped.root, &packages)
+            .expect_err("the third step goes backwards");
+        assert_eq!(err.completed, 2);
+        assert!(
+            matches!(
+                verdict(&err.source),
+                VerifyError::StaleTrustSet { delivered, active }
+                    if *delivered == CHAIN_EPOCHS[0] && *active == CHAIN_EPOCHS[1]
+            ),
+            "got {:?}",
+            err.source,
+        );
+    }
+
+    /// The other half of the rule the out-of-order test pins: a duplicate
+    /// **adjacent** to the step that activated it is a no-op, because by then it
+    /// *is* the active container. Only a duplicate further back falls through to
+    /// the floor.
+    ///
+    /// The activating step is the chain's own, not the seed's, so the bytes the
+    /// second step short-circuits against are ones this call installed rather
+    /// than ones it found.
+    #[test]
+    fn a_duplicate_adjacent_to_the_step_that_activated_it_is_a_no_op() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let newer = Generation::new(&pair, NEXT_EPOCH);
+        let packages: Vec<&[u8]> = vec![&newer.package, &newer.package];
+
+        let replay = accept_generation_chain(&t.root, &packages).expect("the chain replays");
+        assert_eq!(replay.completed, 2);
+        let last = replay.last.expect("both steps were accepted");
+        assert_eq!(
+            last.activation,
+            Activation {
+                generation: 2,
+                changed: false,
+            },
+            "the second step found its own bytes already active",
+        );
+        assert_eq!(last.epoch, NEXT_EPOCH);
+        assert_active_is(&t.root, 2);
+        assert_eq!(
+            entries(&t.root),
+            vec![OsString::from(ACTIVE_LINK), generation_name(&t.root, 2)],
+            "the redelivery allocated no generation directory of its own",
+        );
+    }
+
+    /// The routine shape: a control plane sends "generations *N* through *M*" to
+    /// a host it believes is on *N*, so the first step is a redelivery.
+    ///
+    /// `completed: 2` is what pins the no-op as an **accepted** step: the
+    /// redelivery sits at an equal epoch, so any path through it other than the
+    /// byte-identical short-circuit would have been refused as stale and stopped
+    /// the chain at `completed: 0`. The resulting index being exactly one past
+    /// the seeded generation is what shows the no-op consumed no generation
+    /// directory.
+    ///
+    /// The first step's own `changed: false` is deliberately not asserted here —
+    /// `ChainReplay` carries only the last accepted record, and that field's
+    /// semantics are pinned by the single-accept redelivery test above.
+    #[test]
+    fn a_chain_whose_first_step_is_a_redelivery_counts_it_as_an_accepted_step() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        let t = seeded_tree(&seed);
+        let newer = Generation::new(&pair, NEXT_EPOCH);
+        let packages: Vec<&[u8]> = vec![&seed.package, &newer.package];
+
+        let replay = accept_generation_chain(&t.root, &packages).expect("the chain replays");
+        assert_eq!(replay.completed, 2);
+        let last = replay.last.expect("two steps were accepted");
+        assert_eq!(
+            last.activation,
+            Activation {
+                generation: 2,
+                changed: true,
+            },
+        );
+        assert_eq!(last.epoch, NEXT_EPOCH);
+        assert_active_is(&t.root, 2);
+    }
+
+    /// The same first step, followed by one that fails: `packages[completed]`
+    /// names the failing step and the caller can resume from it.
+    #[test]
+    fn a_chain_that_fails_after_a_redelivery_reports_the_redelivery_as_its_last_record() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        let t = seeded_tree(&seed);
+        let stale = Generation::new(&pair, SEED_EPOCH - 1);
+        let packages: Vec<&[u8]> = vec![&seed.package, &stale.package];
+
+        let err =
+            accept_generation_chain(&t.root, &packages).expect_err("the second step is stale");
+        assert_eq!(err.completed, 1);
+        let last = err.last.as_ref().expect("the redelivery was accepted");
+        assert_eq!(
+            last.activation,
+            Activation {
+                generation: 1,
+                changed: false,
+            },
+        );
+        assert_eq!(last.epoch, SEED_EPOCH);
+        assert!(
+            matches!(verdict(&err.source), VerifyError::StaleTrustSet { .. }),
+            "got {:?}",
+            err.source,
+        );
+    }
+
+    /// A chain of nothing but redeliveries is accepted end to end and moves
+    /// nothing. Whether anything moved is read from `last`, never from the
+    /// count.
+    #[test]
+    fn a_chain_of_nothing_but_the_active_generations_bytes_moves_nothing() {
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        let t = seeded_tree(&seed);
+        let before = snapshot(&t.root);
+        let packages: Vec<&[u8]> = vec![&seed.package, &seed.package, &seed.package];
+
+        let replay = accept_generation_chain(&t.root, &packages).expect("every step is a no-op");
+        assert_eq!(replay.completed, packages.len());
+        let last = replay.last.expect("three steps were accepted");
+        assert!(!last.activation.changed);
+        assert_eq!(last.activation.generation, 1);
+        assert_eq!(snapshot(&t.root), before, "the tree is byte-identical");
+
+        // An empty chain touches nothing at all.
+        let replay = accept_generation_chain(&t.root, &[]).expect("an empty chain");
+        assert_eq!(replay.completed, 0);
+        assert!(replay.last.is_none());
+        assert_eq!(snapshot(&t.root), before);
+    }
+
+    /// The floor is enforced on **both** accepting entry points, and neither
+    /// behaves like the no-floor door.
+    ///
+    /// This is deliberately **not** the pin for the no-call rule: an
+    /// implementation that refused here and then installed its *valid*
+    /// deliveries through the replace door would pass it unchanged. The recorder
+    /// test below is that pin. The state query is not driven this way at all —
+    /// it takes no delivered package, so it has no delivered epoch to refuse.
+    #[test]
+    fn both_accepting_entry_points_refuse_a_lower_epoch() {
+        let pair = keypair();
+        let stale = Generation::new(&pair, SEED_EPOCH - 1);
+
+        let single = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let err =
+            accept_generation(&single.root, &stale.package).expect_err("a single accept refuses");
+        assert!(
+            matches!(verdict(&err), VerifyError::StaleTrustSet { .. }),
+            "got {err:?}",
+        );
+
+        let chained = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let err = accept_generation_chain(&chained.root, &[&stale.package])
+            .expect_err("a one-step chain refuses too");
+        assert_eq!(err.completed, 0);
+        assert!(err.last.is_none());
+        assert!(
+            matches!(verdict(&err.source), VerifyError::StaleTrustSet { .. }),
+            "got {:?}",
+            err.source,
+        );
+    }
+
+    /// The no-call rule, pinned by observing the **callee**: a helper that
+    /// reached the install-time replace door would be recorded exactly as an
+    /// entry point reaching it directly, so the assertion does not depend on
+    /// anyone having enumerated the helpers.
+    #[test]
+    fn no_runtime_entry_point_reaches_the_install_time_replace_door() {
+        REPLACE_GENERATION_CALLS.with_borrow_mut(Vec::clear);
+
+        let pair = keypair();
+        let stranger = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+
+        // A successful accept.
+        let accepted = seeded_tree(&seed);
+        accept_generation(&accepted.root, &Generation::new(&pair, NEXT_EPOCH).package)
+            .expect("a newer generation");
+
+        // A successful three-step chain replay.
+        let replayed = seeded_tree(&seed);
+        let chain: Vec<Generation> = CHAIN_EPOCHS
+            .iter()
+            .map(|epoch| Generation::new(&pair, *epoch))
+            .collect();
+        let packages: Vec<&[u8]> = chain.iter().map(|g| g.package.as_slice()).collect();
+        accept_generation_chain(&replayed.root, &packages).expect("the chain replays");
+
+        // A refusal of every shape, through both accepting entry points.
+        let refused = seeded_tree(&seed);
+        let refusals = [
+            Generation::new(&pair, SEED_EPOCH - 1).package,
+            other_document_at(&pair, SEED_EPOCH).package,
+            Generation::new(&stranger, NEXT_EPOCH).package,
+            b"not a container".to_vec(),
+            generation_pkg(&pair, b"not a document", NEXT_EPOCH),
+        ];
+        for package in &refusals {
+            accept_generation(&refused.root, package).expect_err("refused");
+            accept_generation_chain(&refused.root, &[package]).expect_err("refused");
+        }
+        for root in [
+            tree().root.clone(),
+            tree_with_dangling_active().root.clone(),
+            tree_with_non_canonical_active(&seed).root.clone(),
+            tree_with_real_directory_active(&seed).root.clone(),
+        ] {
+            accept_generation(&root, &seed.package).expect_err("refused");
+        }
+
+        // And the state query over every tree shape.
+        let dangling = tree_with_dangling_active();
+        let linked = tree_with_non_canonical_active(&seed);
+        let real = tree_with_real_directory_active(&seed);
+        let well_formed = seeded_tree(&seed);
+        for t in [&dangling, &linked, &real, &well_formed] {
+            let _ = read_generation_state(&t.root);
+        }
+        let _ = read_generation_state(&tree().root);
+
+        assert!(
+            REPLACE_GENERATION_CALLS.with_borrow(Vec::is_empty),
+            "a runtime path reached the no-floor install-time door: {:?}",
+            REPLACE_GENERATION_CALLS.with_borrow(Vec::clone),
+        );
+
+        // The recorder does fire, so an assertion that could only ever pass is
+        // not mistaken for coverage.
+        let direct = seeded_tree(&seed);
+        replace_generation(&direct.root, &Generation::new(&pair, NEXT_EPOCH).package)
+            .expect("the install-time door");
+        assert_eq!(
+            REPLACE_GENERATION_CALLS.with_borrow(Vec::clone),
+            vec![direct.root.clone()],
+        );
+        REPLACE_GENERATION_CALLS.with_borrow_mut(Vec::clear);
     }
 }
