@@ -83,9 +83,24 @@
 //! around it: [`accept_generation`] for one delivered generation,
 //! [`accept_generation_chain`] for the ordered replay that catches a lagging host
 //! up, and [`read_generation_state`] for the question a caller asks before it
-//! pushes. The `require-trust-pin` re-bootstrap gate is not among them yet; it
-//! admits a generation under its own anchors rather than against the active
-//! generation's, and belongs to a later entry point on this tree.
+//! pushes.
+//!
+//! # The two self-admitting doors the chain cannot serve
+//!
+//! An accept judges a delivered generation against the **active** one's key set,
+//! and two situations have no such key set to judge against: a host offline
+//! across more rotations than the control plane retains, whose intermediate keys
+//! have been pruned, and a host the installer never touched. Both are admitted
+//! under the anchors the delivered document itself carries — the same
+//! cryptographic act the installer's seed performs, reached over a different
+//! channel — through [`rebootstrap_generation`] and
+//! [`bootstrap_from_join_material`]. Each relaxes the signature-chain check and
+//! **only** that: re-bootstrap still applies a monotonic floor against the
+//! verified epoch and reads the `require-trust-pin` marker, and the bootstrap
+//! still runs the seed's tree-state gate over a generation it reads from the
+//! operator-mediated join-material location rather than from its caller. Every
+//! tree state is served by exactly one of the two, so neither is reachable from
+//! the ordinary route by a flag.
 //!
 //! # Two notions of "the active generation", kept apart on purpose
 //!
@@ -103,6 +118,7 @@
 //! symlink, and neither is wrong. They are separate functions so they cannot
 //! drift back together.
 
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -110,6 +126,7 @@ use crate::generation::{
     GenerationError, GenerationFile, GenerationTree, activate_generation, active_link,
     parse_generation,
 };
+use crate::layout::{JOIN_GENERATION_FILE, REQUIRE_TRUST_PIN_MARKER};
 use crate::payload;
 use crate::roxyd_trust::Activation;
 use crate::trust_set::{
@@ -326,6 +343,66 @@ pub enum ReleaseTrustError {
         document: u64,
         /// The epoch the manifest artifact entry's `version` names, verbatim.
         manifest: String,
+    },
+
+    /// A re-bootstrap asserted a last-confirmed epoch the tree does not record.
+    ///
+    /// The caller named the host it believed it was re-bootstrapping and named it
+    /// wrongly: a mis-targeted call, or one from a batch prepared before the host
+    /// moved on. Refused rather than resolved in either direction — this path
+    /// supersedes a host's whole trust history, and a caller that cannot say where
+    /// that history stands is not a caller to do it on behalf of.
+    #[error(
+        "the re-bootstrap asserts last-confirmed epoch {asserted} and the tree records {recorded}"
+    )]
+    RebootstrapEpochMismatch {
+        /// The epoch [`RebootstrapAuthorization`] carries.
+        asserted: u64,
+        /// The epoch the tree's active generation records.
+        recorded: u64,
+    },
+
+    /// The host demands an out-of-band fingerprint pin and the re-bootstrap
+    /// carried none.
+    ///
+    /// The host-side [`REQUIRE_TRUST_PIN_MARKER`] is present, which is the
+    /// deployment saying that a path relaxing the signature chain must be pinned
+    /// out of band. Deliberately distinct from
+    /// [`ReleaseTrustError::FingerprintPinMismatch`]: "this host requires a pin
+    /// and you supplied none" and "the pin you supplied does not match" send an
+    /// operator to different places.
+    #[error("the host requires an out-of-band fingerprint pin and none was supplied")]
+    FingerprintPinRequired,
+
+    /// The supplied fingerprint pin is not the delivered document's digest.
+    ///
+    /// Both values are public digests the signed manifest already carries as its
+    /// `commit`, never key material, so naming them is what makes the refusal
+    /// actionable.
+    #[error("the supplied fingerprint pin `{pin}` is not the delivered document's digest {digest}")]
+    FingerprintPinMismatch {
+        /// The pin the caller supplied, verbatim.
+        pin: String,
+        /// The lowercase-hex SHA-256 of the delivered document member.
+        digest: String,
+    },
+
+    /// A re-bootstrap delivered a generation that is not strictly newer than the
+    /// one the tree records.
+    ///
+    /// This path's **own** floor, and the reason it has a variant rather than
+    /// reusing [`VerifyError::StaleTrustSet`]: the self-admission request form
+    /// carries no delivered epoch, so the verifier's strictly-greater comparison
+    /// returns before it compares anything, and the epoch this names is the
+    /// verified document's rather than a provisionally-decoded one.
+    #[error(
+        "the re-bootstrap delivers epoch {delivered}, which is not above the recorded {recorded}"
+    )]
+    StaleRebootstrap {
+        /// The verified epoch the delivered document carries.
+        delivered: u64,
+        /// The epoch the tree's active generation records.
+        recorded: u64,
     },
 }
 
@@ -546,6 +623,26 @@ fn active_document(root: &Path) -> PathBuf {
 /// The delivered container of the generation `active` resolves to.
 fn active_package(root: &Path) -> PathBuf {
     active_link(root).join(GENERATION_PACKAGE_FILE)
+}
+
+/// The host-side pin marker at the root of the tree.
+///
+/// The root-based resolution of [`REQUIRE_TRUST_PIN_MARKER`], for the entry
+/// points here, which are handed the already-resolved tree root and so cannot
+/// call the namespace-based
+/// [`Layout::require_pin_marker`](crate::layout::Layout::require_pin_marker). The
+/// basename is spelled in that constant alone; this joins it, exactly as
+/// [`active_document`] joins its own.
+fn require_pin_marker(root: &Path) -> PathBuf {
+    root.join(REQUIRE_TRUST_PIN_MARKER)
+}
+
+/// The operator-delivered join generation at the root of the tree.
+///
+/// The root-based resolution of [`JOIN_GENERATION_FILE`], on the same terms as
+/// [`require_pin_marker`].
+fn join_generation_file(root: &Path) -> PathBuf {
+    root.join(JOIN_GENERATION_FILE)
 }
 
 /// Returns the epoch the release-trust tree at `root` currently has active, or
@@ -877,7 +974,30 @@ fn extract_member(package: &[u8], scratch: Option<&Path>) -> Result<Vec<u8>, Rel
     }
 }
 
-/// The whole install-time admission sequence, shared verbatim by both doors.
+/// What the verification-only core of the self-admission sequence yields: a
+/// generation that has verified under its own anchors and has not been installed.
+///
+/// The member bytes travel with the document and the epoch because they are what
+/// the installer stores and what a fingerprint pin is compared against. Nothing
+/// downstream re-extracts or re-reads them, which is what keeps "the bytes that
+/// were verified" and "the bytes that are stored" the same slice.
+struct VerifiedGeneration {
+    /// The admitted document, as the refusing reader parsed it.
+    document: TrustSetDocument,
+    /// The verified document's own epoch — the number that will be recorded.
+    epoch: u64,
+    /// The container's `trust-set.json` member, verbatim.
+    member: Vec<u8>,
+}
+
+/// The verification-only core of the self-admission sequence: steps 1 to 4, and
+/// **no** write of any kind.
+///
+/// Nothing here creates, touches or prunes a directory in the tree — it does not
+/// take the tree root at all. `extract_member`'s scratch is no exception: it is a
+/// `tempfile::TempDir` removed when it drops, on every path out, and with
+/// `scratch` `None` it is created under `std::env::temp_dir()`, outside the tree
+/// altogether.
 ///
 /// One `member` binding carries every step: the slice read out of the container
 /// is the slice the pre-verification decode reads, the slice whose digest becomes
@@ -894,6 +1014,11 @@ fn extract_member(package: &[u8], scratch: Option<&Path>) -> Result<Vec<u8>, Rel
 /// `install_generation`'s validator independently re-runs this entire sequence
 /// over the bytes read back from `gen-<n>.tmp` before `active` moves.
 ///
+/// Splitting the verification from the installation is what lets the re-bootstrap
+/// path put its epoch floor **between** them: an activating form would install
+/// first and let the floor refuse second, which is the inversion that path exists
+/// to avoid.
+///
 /// # Errors
 ///
 /// Returns whichever [`ReleaseTrustError`] the step that refused raises: the
@@ -901,13 +1026,12 @@ fn extract_member(package: &[u8], scratch: Option<&Path>) -> Result<Vec<u8>, Rel
 /// [`ReleaseTrustError::MissingTrustSetMember`],
 /// [`ReleaseTrustError::ProvisionalDecode`] for every pre-verification decode
 /// fault, [`ReleaseTrustError::Verify`] again for the verdict on the container,
-/// [`ReleaseTrustError::Document`] for the refusing reader's own named refusal,
-/// and the installer's on any I/O or validator fault.
-fn admit(
-    root: &Path,
+/// and [`ReleaseTrustError::Document`] for the refusing reader's own named
+/// refusal.
+fn verify_self_admitted(
     package: &[u8],
     scratch: Option<&Path>,
-) -> Result<AdmittedGeneration, ReleaseTrustError> {
+) -> Result<VerifiedGeneration, ReleaseTrustError> {
     // 1. The member, out of the container's one walk.
     let member = extract_member(package, scratch)?;
 
@@ -929,15 +1053,143 @@ fn admit(
     // 4. Only now is the document parsed for real. The generation is built from
     //    this parse; step 2's output reaches neither the tree nor the caller.
     let document = read_trust_set_document(&member)?;
-
-    // 5. The one funnel onto the tree, so the record is finalised by the same
-    //    atomic swap that makes the generation active.
-    let activation = install_generation(root, package, &member, document.epoch)?;
-    Ok(AdmittedGeneration {
-        activation,
+    Ok(VerifiedGeneration {
         epoch: document.epoch,
         document,
+        member,
     })
+}
+
+/// Compares an optional out-of-band fingerprint pin against the delivered
+/// document member, installing nothing either way.
+///
+/// `None` is "no pin was supplied" and is `Ok(())`: the pin is optional by
+/// default on every path that takes one, and enforced whenever supplied. A
+/// supplied pin is the lowercase-hex SHA-256 of `member` — the same digest the
+/// generation's signed manifest carries as its `commit` — compared as a plain
+/// string, exactly as the verifier's own target check compares that value. Both
+/// sides are public digests rather than key material, so there is no secret here
+/// for a comparison to leak the shape of.
+///
+/// This writes nothing and activates nothing, which is precisely what lets the
+/// re-bootstrap path run its epoch floor *after* it while the ordinary admission
+/// order runs the installer straight after it. One contract, written once, two
+/// orders.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::FingerprintPinMismatch`] naming both digests when
+/// a supplied pin is not the member's.
+fn check_fingerprint_pin(pin: Option<&str>, member: &[u8]) -> Result<(), ReleaseTrustError> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+    let digest = member_digest(member);
+    if pin == digest {
+        return Ok(());
+    }
+    Err(ReleaseTrustError::FingerprintPinMismatch {
+        pin: pin.to_string(),
+        digest,
+    })
+}
+
+/// The ordinary admission order: the verification-only core, the pin comparison,
+/// then the one funnel onto the tree.
+///
+/// Nothing sits between the pin and the install here. A path that needs a further
+/// refusal in that slot — the re-bootstrap's epoch floor — composes the same three
+/// pieces in its own order rather than calling this, because calling it would
+/// activate the generation before that refusal ever ran.
+///
+/// # Errors
+///
+/// Returns whichever refusal [`verify_self_admitted`] raises,
+/// [`ReleaseTrustError::FingerprintPinMismatch`] when a supplied pin is not the
+/// delivered document's digest, and the installer's own I/O and validator
+/// refusals.
+fn admit_with_pin(
+    root: &Path,
+    package: &[u8],
+    scratch: Option<&Path>,
+    pin: Option<&str>,
+) -> Result<AdmittedGeneration, ReleaseTrustError> {
+    let verified = verify_self_admitted(package, scratch)?;
+    check_fingerprint_pin(pin, &verified.member)?;
+
+    // The one funnel onto the tree, so the record is finalised by the same
+    // atomic swap that makes the generation active.
+    let activation = install_generation(root, package, &verified.member, verified.epoch)?;
+    Ok(AdmittedGeneration {
+        activation,
+        epoch: verified.epoch,
+        document: verified.document,
+    })
+}
+
+/// The whole install-time admission sequence, shared verbatim by both doors:
+/// [`admit_with_pin`] with no pin.
+///
+/// # Errors
+///
+/// Returns exactly what [`admit_with_pin`] does, less the pin refusal it cannot
+/// raise.
+fn admit(
+    root: &Path,
+    package: &[u8],
+    scratch: Option<&Path>,
+) -> Result<AdmittedGeneration, ReleaseTrustError> {
+    admit_with_pin(root, package, scratch, None)
+}
+
+/// The empty-tree admission both doors onto an unseeded tree run: the tree-state
+/// gate, **then** the package source, then [`admit_with_pin`].
+///
+/// `package` is deferred rather than taken as a slice because the two callers
+/// obtain their bytes differently and the gate must run first on both.
+/// [`admit_seed_generation`] hands over the slice its own caller passed, as a
+/// `Cow::Borrowed`, so no package is copied to gain the deferral;
+/// [`bootstrap_from_join_material`] reads the join-material file, which must not
+/// happen on a tree this gate is going to refuse. The source is not consulted
+/// until the gate has passed, and there is exactly one stat of `active` on either
+/// path.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::ActiveGenerationPresent`] when `active` resolves
+/// and [`ReleaseTrustError::Io`] naming `active` when its state cannot be read at
+/// all, whatever `package` raises, and then whatever [`admit_with_pin`] raises.
+fn admit_onto_empty_tree<'a>(
+    root: &Path,
+    pin: Option<&str>,
+    package: impl FnOnce() -> Result<Cow<'a, [u8]>, ReleaseTrustError>,
+) -> Result<AdmittedGeneration, ReleaseTrustError> {
+    let active = active_link(root);
+    // One following stat, exactly as `read_active_epoch` makes it, so the two
+    // agree on where the line is: an absent `active` and a dangling one are alike
+    // `NotFound` and alike the empty-tree seed. This deliberately does not copy
+    // the generation engine's own `current_generation`, which reads the link's
+    // *name* and would call a dangling link a generation.
+    match std::fs::metadata(&active) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Fail closed: a tree whose state cannot be read is not a tree that may
+        // be seeded.
+        Err(e) => return Err(ReleaseTrustError::io(&active, e)),
+        Ok(_) => {
+            // Naming the index is a courtesy and never a condition of refusing:
+            // a link this crate did not write, or an `active` that is a real
+            // directory and so cannot be read as a link at all, is refused just
+            // the same with `None`.
+            return Err(ReleaseTrustError::ActiveGenerationPresent {
+                generation: std::fs::read_link(&active)
+                    .ok()
+                    .as_deref()
+                    .and_then(parse_generation),
+            });
+        }
+    }
+
+    admit_with_pin(root, &package()?, None, pin)
 }
 
 /// Admits the delivered release-trust generation `package` onto a tree that has
@@ -984,6 +1236,12 @@ fn admit(
 /// refuse the delivered package. Re-provisioning a tree that *does* carry a
 /// generation is [`replace_generation`].
 ///
+/// The gate and the sequence behind it are shared with
+/// [`bootstrap_from_join_material`], the other door onto an empty tree, so the two
+/// cannot come to disagree about what an empty tree is. What differs there is the
+/// byte source — the operator-mediated join-material location rather than a
+/// caller's slice — and nothing else.
+///
 /// # Errors
 ///
 /// Returns [`ReleaseTrustError::ActiveGenerationPresent`] when `active` resolves,
@@ -1000,32 +1258,10 @@ pub fn admit_seed_generation(
     root: &Path,
     package: &[u8],
 ) -> Result<AdmittedGeneration, ReleaseTrustError> {
-    let active = active_link(root);
-    // One following stat, exactly as `read_active_epoch` makes it, so the two
-    // agree on where the line is: an absent `active` and a dangling one are alike
-    // `NotFound` and alike the empty-tree seed. This deliberately does not copy
-    // the generation engine's own `current_generation`, which reads the link's
-    // *name* and would call a dangling link a generation.
-    match std::fs::metadata(&active) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // Fail closed: a tree whose state cannot be read is not a tree that may
-        // be seeded.
-        Err(e) => return Err(ReleaseTrustError::io(&active, e)),
-        Ok(_) => {
-            // Naming the index is a courtesy and never a condition of refusing:
-            // a link this crate did not write, or an `active` that is a real
-            // directory and so cannot be read as a link at all, is refused just
-            // the same with `None`.
-            return Err(ReleaseTrustError::ActiveGenerationPresent {
-                generation: std::fs::read_link(&active)
-                    .ok()
-                    .as_deref()
-                    .and_then(parse_generation),
-            });
-        }
-    }
-
-    admit(root, package, None)
+    // The source borrows the caller's slice rather than copying it: the deferral
+    // exists so the gate runs before the *other* door's file read, and it must
+    // cost this one nothing.
+    admit_onto_empty_tree(root, None, || Ok(Cow::Borrowed(package)))
 }
 
 /// Admits the delivered release-trust generation `package` onto a tree that may
@@ -1058,11 +1294,10 @@ pub fn admit_seed_generation(
 ///   an inverted gate would only force a caller to branch between two functions
 ///   with identical behaviour. This is the seed *minus* a gate, not the seed with
 ///   a different one.
-/// - **No fingerprint pin, and no reading of
-///   [`REQUIRE_TRUST_PIN_MARKER`](crate::layout::REQUIRE_TRUST_PIN_MARKER).**
-///   That marker governs the *runtime* re-bootstrap, whose threat is a compromised
-///   control plane pushing a forged higher-epoch generation to a host that has
-///   fallen past the retention floor. An install-time replace is the operator
+/// - **No fingerprint pin, and no reading of [`REQUIRE_TRUST_PIN_MARKER`].**
+///   That marker governs [`rebootstrap_generation`], whose threat is a
+///   compromised control plane pushing a forged higher-epoch generation to a
+///   host that has fallen past the retention floor. An install-time replace is the operator
 ///   standing in that channel's place, so consulting the marker here would demand
 ///   an out-of-band pin from the very party the marker exists to trust, and would
 ///   leave the wedged host wedged. Its presence changes nothing about this call,
@@ -1496,6 +1731,341 @@ pub fn accept_generation_chain(
     Ok(ChainReplay { completed, last })
 }
 
+/// A caller's assertion that a host has fallen past the control plane's retention
+/// floor and may be re-bootstrapped, carrying the last-confirmed `epoch` it
+/// believes that host records.
+///
+/// Whether a host is past the retained window is a **control-plane
+/// determination**, so [`rebootstrap_generation`] is necessarily entered on the
+/// caller's assertion — which is exactly why it must not be reachable by accident.
+/// This type is how that is arranged: it is not a `bool`, it has no `Default`, it
+/// is built only through [`RebootstrapAuthorization::asserting_last_confirmed_epoch`],
+/// and it carries no `Deserialize` and no conversion from any wire or request
+/// type, so no value of it can *arrive* already filled in.
+///
+/// # What that buys, exactly
+///
+/// The constructor is public and takes a `u64`, so a handler **can** write
+/// `RebootstrapAuthorization::asserting_last_confirmed_epoch(request.epoch)`. That
+/// is by design. This type establishes no provenance and is **not an
+/// authorization capability**: what it forces is that the assertion be an explicit
+/// line of source someone wrote — greppable by the constructor's name and visible
+/// in review — rather than a field a deserializer filled in. Reaching the
+/// re-bootstrap path stays a deliberate act; it does not become an unforgeable
+/// one.
+#[derive(Debug, Clone, Copy)]
+pub struct RebootstrapAuthorization {
+    /// The last-confirmed epoch the caller asserts the host records. Private, and
+    /// read only by this module, so it cannot be built by struct literal or
+    /// altered after construction.
+    asserted_epoch: u64,
+}
+
+impl RebootstrapAuthorization {
+    /// Creates the authorization value asserting `epoch` as the host's
+    /// last-confirmed one.
+    ///
+    /// The only constructor. [`rebootstrap_generation`] compares `epoch` for
+    /// equality against the epoch the tree actually records and refuses a
+    /// disagreement with [`ReleaseTrustError::RebootstrapEpochMismatch`], which is
+    /// what catches a mis-targeted or stale-batch re-bootstrap aimed at a host
+    /// that has moved on.
+    #[must_use]
+    pub fn asserting_last_confirmed_epoch(epoch: u64) -> Self {
+        Self {
+            asserted_epoch: epoch,
+        }
+    }
+}
+
+/// Whether the host-side pin marker is present, without following symlinks and
+/// without reading a byte of it.
+///
+/// The marker's **existence is the entire state**: there is no format, so no
+/// malformed state, no parser, no encoding and no version, and an empty file is a
+/// valid marker. `symlink_metadata` rather than `metadata`, so an entry of any
+/// kind at that path — a dangling symlink included — reads as set; otherwise
+/// deleting a symlink's target would silently clear the gate.
+///
+/// The classification of the stat's outcome is [`classify_pin_marker`]'s and this
+/// function does not repeat it.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::Io`] naming the marker path for every stat failure
+/// that is not `NotFound`.
+fn require_pin_marker_set(root: &Path) -> Result<bool, ReleaseTrustError> {
+    let path = require_pin_marker(root);
+    classify_pin_marker(std::fs::symlink_metadata(&path).map(|_| ()), &path)
+}
+
+/// Classifies the pin marker's stat: set, unset, or a fail-closed refusal.
+///
+/// Pure, and the **only** place the stat result is interpreted. `Ok` is set,
+/// `NotFound` — and only `NotFound` — is unset, and every other I/O failure is
+/// refused through [`ReleaseTrustError::Io`] naming `path` rather than coerced
+/// into "unset": whatever can make the marker unreadable is the kind of
+/// interference the gate exists to survive.
+///
+/// It is a separate function because that last branch is what no test can reach
+/// through a real filesystem. The marker is a direct child of the tree root, and
+/// the re-bootstrap's earlier `read_active_epoch` already stats inside that root,
+/// so stripping the root's search permission — the only ordinary way to make a
+/// stat of a direct child fail with something other than `NotFound` — fails that
+/// read first and the marker is never reached. A unit test feeds this a
+/// synthesized [`std::io::Error`] of each kind instead. The runtime behaviour is
+/// unchanged by the split: the same three outcomes at the same point in the order.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::Io`] naming `path` for every non-`NotFound` stat
+/// failure.
+fn classify_pin_marker(
+    stat: Result<(), std::io::Error>,
+    path: &Path,
+) -> Result<bool, ReleaseTrustError> {
+    match stat {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ReleaseTrustError::io(path, e)),
+    }
+}
+
+/// Re-bootstraps a host that has fallen past the control plane's retention floor,
+/// admitting `package` under the anchors it itself carries and superseding the
+/// stale generation the tree holds.
+///
+/// `root` is the tree
+/// [`Layout::release_trust_dir`](crate::layout::Layout::release_trust_dir)
+/// resolves, `package` is the delivered `.pkg` bytes verbatim, `authorization` is
+/// the caller's assertion of the host's last-confirmed epoch, and `pin` is the
+/// optional out-of-band fingerprint — the lowercase-hex SHA-256 of the delivered
+/// document member, which is the digest the generation's signed manifest carries
+/// as its `commit`.
+///
+/// # Why this exists
+///
+/// [`accept_generation`] judges a delivered generation against the **active**
+/// generation's key set, and a control plane prunes old generations. A host
+/// offline across more rotations than the retained window cannot be chained
+/// forward at all: the intermediate keys that would carry it there are gone.
+/// Re-running the accept path against the stale generation fails by construction,
+/// so this path admits the delivered document under its own anchors instead — the
+/// same cryptographic act the installer's seed performs, reached over the runtime
+/// channel.
+///
+/// # What this admission proves, and what stands in for the rest
+///
+/// Under self-admission the delivered document vouches for itself, so — exactly as
+/// at install-time seeding — this proves **internal consistency and transit
+/// integrity, not authenticity**. A forged generation carrying its own anchors and
+/// signed by a key those anchors name passes the verification step.
+///
+/// What stands in for authenticity is a set of weaker things, and they are not
+/// equal. Against a **compromised control plane** exactly two bite:
+///
+/// - the **epoch floor** against the *verified* epoch, which denies a rollback to
+///   an older, pre-revocation generation; and
+/// - the **out-of-band fingerprint pin**, which the host-side
+///   [`REQUIRE_TRUST_PIN_MARKER`] can make mandatory.
+///
+/// The `authorization` value and the asserted-epoch equality check do **not**: a
+/// handler that passes a wire-supplied epoch into
+/// [`RebootstrapAuthorization::asserting_last_confirmed_epoch`] satisfies both.
+/// What those two buy is that this path is not reachable by accident, and that a
+/// mis-targeted or stale-batch re-bootstrap aimed at a host that has moved on is
+/// caught. Neither establishes provenance and neither is a capability.
+///
+/// # The order, and where the single write is
+///
+/// 1. **The authorization value is required**, by the signature.
+/// 2. **An empty tree is refused** as [`ReleaseTrustError::NoActiveGeneration`],
+///    read through [`read_active_epoch`] — before the marker is consulted, before
+///    the container is opened and before anything is written. This path exists to
+///    supersede a **stale** generation; an unseeded host is
+///    [`bootstrap_from_join_material`]'s, which takes no caller-supplied bytes.
+/// 3. **The recorded epoch must equal the asserted one.**
+/// 4. **The host-side pin marker is read**, and a call carrying no pin while it is
+///    present is refused with [`ReleaseTrustError::FingerprintPinRequired`]. This
+///    sits ahead of the container work deliberately: the refusal depends on
+///    nothing the delivered bytes carry, so a host that demands a pin rejects an
+///    unpinned call without paying for a package verification.
+/// 5. **The verification-only self-admission core** runs — the container's one
+///    walk, the pre-verification decode, the signature verdict under the delivered
+///    document's own anchors, and the refusing reader. Nothing has been written at
+///    this point.
+/// 6. **A supplied pin is compared** against the digest of the member that core
+///    returned, through the same helper the ordinary admission order calls.
+/// 7. **The floor is enforced against the VERIFIED epoch** — strictly greater than
+///    the recorded one, or [`ReleaseTrustError::StaleRebootstrap`]. This is **this
+///    path's own** comparison, not the verifier's: the self-admission request form
+///    carries no delivered epoch, so `verify_package`'s strictly-greater test
+///    returns before it compares anything. The binding comparison is the verified
+///    one, available precisely because step 5 verified without activating, so a
+///    compromised control plane cannot declare a healthy host "too far behind" and
+///    push an older generation on a provisionally-decoded epoch.
+/// 8. **The generation is activated and recorded**, through the crate's one funnel
+///    onto the tree.
+///
+/// Steps 1 to 7 all refuse **before** the installer is entered, so every refusal
+/// this path adds leaves the host exactly as it was: the stale generation is
+/// superseded by activation and pruning and is never removed up front. What the
+/// tree looks like when step 8 itself fails is the generation engine's own
+/// three-outcome contract, inherited unchanged.
+///
+/// # What is relaxed
+///
+/// The **chain check only**. The monotonic epoch floor stands, the package is
+/// still verified rather than waved through, and this is a distinct entry point
+/// from [`accept_generation`] rather than a flag on it, so the relaxation is never
+/// reachable by the ordinary route.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::NoActiveGeneration`] for a tree whose `active` is
+/// absent or dangling, whichever grammar refusal [`read_active_epoch`] raises for
+/// a malformed `epoch` record, [`ReleaseTrustError::RebootstrapEpochMismatch`]
+/// when the asserted epoch is not the recorded one,
+/// [`ReleaseTrustError::FingerprintPinRequired`] when the host demands an
+/// out-of-band pin and none was supplied, [`ReleaseTrustError::Io`] naming the
+/// marker path when its state cannot be read at all,
+/// [`ReleaseTrustError::Verify`] for a container-layer fault or a verification
+/// verdict, [`ReleaseTrustError::MissingTrustSetMember`] when the delivered
+/// container carries no `trust-set.json`,
+/// [`ReleaseTrustError::ProvisionalDecode`] when the delivered document does not
+/// survive the pre-verification decode, [`ReleaseTrustError::Document`] carrying
+/// the refusing reader's own refusal,
+/// [`ReleaseTrustError::FingerprintPinMismatch`] when a supplied pin is not the
+/// delivered document's digest, [`ReleaseTrustError::StaleRebootstrap`] when the
+/// verified epoch is not strictly greater than the recorded one, and the
+/// installer's own I/O and validator refusals.
+pub fn rebootstrap_generation(
+    root: &Path,
+    package: &[u8],
+    authorization: RebootstrapAuthorization,
+    pin: Option<&str>,
+) -> Result<AdmittedGeneration, ReleaseTrustError> {
+    // 2. The tree state, first: this path supersedes a stale generation and has
+    //    nothing to do on a tree that carries none.
+    let recorded = read_active_epoch(root)?.ok_or(ReleaseTrustError::NoActiveGeneration)?;
+
+    // 3. The assertion against the record.
+    if authorization.asserted_epoch != recorded {
+        return Err(ReleaseTrustError::RebootstrapEpochMismatch {
+            asserted: authorization.asserted_epoch,
+            recorded,
+        });
+    }
+
+    // 4. Host state, ahead of the container work. The marker is read whatever the
+    //    call carries, so an unreadable marker is fail-closed rather than
+    //    conditional on the pin.
+    if require_pin_marker_set(root)? && pin.is_none() {
+        return Err(ReleaseTrustError::FingerprintPinRequired);
+    }
+
+    // 5. The verification-only core: everything the ordinary admission verifies,
+    //    and no write.
+    let verified = verify_self_admitted(package, None)?;
+
+    // 6. The pin, through the shared non-activating helper.
+    check_fingerprint_pin(pin, &verified.member)?;
+
+    // 7. The floor, against the **verified** epoch and against nothing weaker.
+    if verified.epoch <= recorded {
+        return Err(ReleaseTrustError::StaleRebootstrap {
+            delivered: verified.epoch,
+            recorded,
+        });
+    }
+
+    // 8. The first and only write.
+    let activation = install_generation(root, package, &verified.member, verified.epoch)?;
+    Ok(AdmittedGeneration {
+        activation,
+        epoch: verified.epoch,
+        document: verified.document,
+    })
+}
+
+/// Bootstraps a host with **no** prior release-trust generation from the
+/// operator-delivered join material at the root of the tree.
+///
+/// `root` is the tree
+/// [`Layout::release_trust_dir`](crate::layout::Layout::release_trust_dir)
+/// resolves, and `pin` is the optional out-of-band fingerprint pin on the same
+/// terms as [`rebootstrap_generation`]'s. There is deliberately **no package
+/// parameter**: the generation is read from [`JOIN_GENERATION_FILE`] inside
+/// `root`, which the operator-mediated join channel writes — the same
+/// out-of-band delivery that carries the mTLS CA anchor. **The location is the
+/// enforcement**, not who asks, so this accepts no caller-supplied bytes at all.
+/// It is named for that
+/// byte source rather than for the tree state it requires, so it cannot be
+/// mistaken at a call site for [`admit_seed_generation`], which serves the same
+/// tree state from a caller's slice.
+///
+/// # The sequence is the seed's
+///
+/// This invents no bootstrap of its own: it hands the join-material location and
+/// the pin to the shared empty-tree admission, so the tree-state gate and the
+/// verification sequence are [`admit_seed_generation`]'s, byte for byte. What this
+/// path contributes is the byte source and the pin, and nothing else.
+///
+/// **The gate precedes the read.** `active` is stat'd and a non-empty tree refused
+/// with [`ReleaseTrustError::ActiveGenerationPresent`] *before* the join material
+/// is opened, so that refusal is what **every** non-empty tree gets whatever the
+/// join-material location does or does not hold, and an
+/// [`ReleaseTrustError::Io`] from that location is only ever reachable on a tree
+/// the gate accepted. The refusal that depends only on tree state runs before the
+/// one that depends on bytes — the same discipline the re-bootstrap follows.
+///
+/// The pin, when supplied, is compared inside the sequence against the member the
+/// verification core returned, because that digest does not exist until the
+/// container has been walked; a mismatch refuses with nothing written.
+///
+/// # What it does not consult
+///
+/// - **The pin marker.** That gate guards the path which supersedes an existing
+///   trust history; this path has none to supersede.
+/// - **Any epoch floor.** An empty tree records no epoch, so nothing is compared
+///   and no stale refusal runs. The floor is **vacuous** here rather than relaxed,
+///   and no active epoch is synthesized to have something to compare against —
+///   inventing one would make the very first generation refusable.
+///
+/// The join material is **left in place** after a successful bootstrap: reading it
+/// is idempotent, the tree-state gate refuses a second call anyway, and removing
+/// operator-delivered material is not this path's business.
+///
+/// # What this admission proves
+///
+/// Exactly what [`admit_seed_generation`] proves, over a different channel:
+/// internal consistency and transit integrity, never authenticity. Authenticity
+/// rests on the operator-mediated channel that wrote the file.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::ActiveGenerationPresent`] when `active` resolves
+/// and [`ReleaseTrustError::Io`] naming `active` when its state cannot be read at
+/// all. Past the gate, [`ReleaseTrustError::Io`] naming the join-material path
+/// when nothing is there or it cannot be read, and then whichever refusal the
+/// admission sequence raises: [`ReleaseTrustError::Verify`],
+/// [`ReleaseTrustError::MissingTrustSetMember`],
+/// [`ReleaseTrustError::ProvisionalDecode`], [`ReleaseTrustError::Document`],
+/// [`ReleaseTrustError::FingerprintPinMismatch`] when a supplied pin is not the
+/// delivered document's digest, and the installer's own I/O and validator
+/// refusals.
+pub fn bootstrap_from_join_material(
+    root: &Path,
+    pin: Option<&str>,
+) -> Result<AdmittedGeneration, ReleaseTrustError> {
+    admit_onto_empty_tree(root, pin, || {
+        let path = join_generation_file(root);
+        std::fs::read(&path)
+            .map(Cow::Owned)
+            .map_err(|e| ReleaseTrustError::io(&path, e))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1509,12 +2079,14 @@ mod tests {
 
     use super::{
         ActiveGeneration, EPOCH_RECORD_FILE, GENERATION_PACKAGE_FILE, MATERIAL_SET_TARGET,
-        REPLACE_GENERATION_CALLS, ReleaseTrustError, accept_generation, accept_generation_chain,
-        active_package, active_trust_set, admit, admit_seed_generation, install_generation,
-        material, read_active_epoch, read_generation_state, replace_generation,
+        REPLACE_GENERATION_CALLS, RebootstrapAuthorization, ReleaseTrustError, accept_generation,
+        accept_generation_chain, active_package, active_trust_set, admit, admit_seed_generation,
+        bootstrap_from_join_material, classify_pin_marker, install_generation,
+        join_generation_file, material, read_active_epoch, read_generation_state,
+        rebootstrap_generation, replace_generation, require_pin_marker, verify_self_admitted,
     };
     use crate::generation::{GenerationError, SYSTEMCTL_CALLS, active_link, generation_dir};
-    use crate::layout::{ACTIVE_LINK, Layout, REQUIRE_TRUST_PIN_MARKER};
+    use crate::layout::{ACTIVE_LINK, JOIN_GENERATION_FILE, Layout, REQUIRE_TRUST_PIN_MARKER};
     use crate::manifest::MAX_MANIFEST_FORMAT_VERSION;
     use crate::roxyd_trust::Activation;
     use crate::trust_fixture::{
@@ -3939,6 +4511,38 @@ mod tests {
             accept_generation(&root, &seed.package).expect_err("refused");
         }
 
+        // The two self-admitting doors, succeeding and refusing alike.
+        let rebootstrapped = seeded_tree(&seed);
+        rebootstrap_generation(
+            &rebootstrapped.root,
+            &Generation::new(&stranger, NEXT_EPOCH).package,
+            RebootstrapAuthorization::asserting_last_confirmed_epoch(SEED_EPOCH),
+            None,
+        )
+        .expect("a re-bootstrap past the retention floor");
+        // Its own refusal set: the stranger-signed generation above is exactly
+        // what a re-bootstrap *admits*, so it cannot stand in for one here.
+        let rebootstrap_refusals = [
+            Generation::new(&pair, SEED_EPOCH - 1).package,
+            other_document_at(&pair, SEED_EPOCH).package,
+            b"not a container".to_vec(),
+            generation_pkg(&pair, b"not a document", NEXT_EPOCH),
+        ];
+        for package in &rebootstrap_refusals {
+            rebootstrap_generation(
+                &refused.root,
+                package,
+                RebootstrapAuthorization::asserting_last_confirmed_epoch(SEED_EPOCH),
+                None,
+            )
+            .expect_err("refused");
+        }
+        let bootstrapped = tree();
+        std::fs::write(join_generation_file(&bootstrapped.root), &seed.package).expect("join");
+        bootstrap_from_join_material(&bootstrapped.root, None).expect("the join channel");
+        bootstrap_from_join_material(&bootstrapped.root, None).expect_err("refused");
+        bootstrap_from_join_material(&tree().root, None).expect_err("no join material");
+
         // And the state query over every tree shape.
         let dangling = tree_with_dangling_active();
         let linked = tree_with_non_canonical_active(&seed);
@@ -3965,5 +4569,760 @@ mod tests {
             vec![direct.root.clone()],
         );
         REPLACE_GENERATION_CALLS.with_borrow_mut(Vec::clear);
+    }
+
+    // The two self-admitting doors: the re-bootstrap for a host past the
+    // retention floor, and the bootstrap for one the installer never touched.
+    // Every generation below is minted in-test from ephemeral keys, every tree is
+    // `tempfile`-backed, and no test requires or detects root.
+
+    /// The authorization value asserting `epoch`, written out at every call site
+    /// exactly as a real caller has to write it.
+    fn authorizing(epoch: u64) -> RebootstrapAuthorization {
+        RebootstrapAuthorization::asserting_last_confirmed_epoch(epoch)
+    }
+
+    /// Writes the host-side pin marker with `contents`, at the path the root-based
+    /// helper resolves.
+    fn set_pin_marker(root: &Path, contents: &[u8]) {
+        std::fs::write(require_pin_marker(root), contents).expect("marker");
+    }
+
+    /// Writes `package` to the join-material location the bootstrap reads.
+    fn set_join_material(root: &Path, package: &[u8]) {
+        std::fs::write(join_generation_file(root), package).expect("join material");
+    }
+
+    /// The two files this issue reads resolve to the same paths a caller holding a
+    /// namespace resolves them to. The root-based helpers cannot call the
+    /// namespace-based accessors — they are handed the tree root, which a `Layout`
+    /// cannot be reconstructed from — so a drift between the two resolutions would
+    /// silently read a file nobody writes.
+    #[test]
+    fn the_root_based_helpers_resolve_what_the_layouts_accessors_do() {
+        let layout = Layout::new("clumit-security");
+        let root = layout.release_trust_dir();
+        assert_eq!(require_pin_marker(&root), layout.require_pin_marker());
+        assert_eq!(join_generation_file(&root), layout.join_generation_path());
+        assert_eq!(
+            require_pin_marker(&root),
+            root.join(REQUIRE_TRUST_PIN_MARKER)
+        );
+        assert_eq!(join_generation_file(&root), root.join(JOIN_GENERATION_FILE));
+    }
+
+    /// The core verifies and returns; the tree is the tree it was never given.
+    #[test]
+    fn the_verification_core_returns_a_verified_document_and_writes_nothing() {
+        let t = tree();
+        let pair = keypair();
+        let seed = Generation::new(&pair, SEED_EPOCH);
+        admit_seed_generation(&t.root, &seed.package).expect("seed");
+        let before = snapshot(&t.root);
+
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+        let verified = verify_self_admitted(&delivered.package, None).expect("self-admission");
+        assert_eq!(verified.epoch, NEXT_EPOCH);
+        assert_eq!(verified.document.epoch, NEXT_EPOCH);
+        assert_eq!(
+            verified.member, delivered.member,
+            "the member is the container's own bytes",
+        );
+        assert_eq!(
+            snapshot(&t.root),
+            before,
+            "verification creates, touches and prunes nothing",
+        );
+    }
+
+    /// A stale host takes the current generation, and the stale generation is
+    /// superseded by the activation rather than removed ahead of it.
+    #[test]
+    fn a_rebootstrap_admits_a_strictly_newer_generation_onto_a_stale_tree() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+
+        let admitted =
+            rebootstrap_generation(&t.root, &delivered.package, authorizing(SEED_EPOCH), None)
+                .expect("a re-bootstrap past the retention floor");
+        assert_eq!(
+            admitted.activation,
+            Activation {
+                generation: 2,
+                changed: true,
+            },
+        );
+        assert_eq!(admitted.epoch, NEXT_EPOCH);
+        assert_eq!(admitted.document.epoch, NEXT_EPOCH);
+        assert_active_is(&t.root, 2);
+        assert_eq!(read_active_epoch(&t.root).expect("read"), Some(NEXT_EPOCH));
+        assert_eq!(
+            entries(&t.root),
+            vec![OsString::from(ACTIVE_LINK), generation_name(&t.root, 2)],
+            "the stale generation is superseded and pruned, never removed up front",
+        );
+    }
+
+    /// The floor stands: only strictly greater activates, and the refusal is this
+    /// path's own variant rather than the verifier's, which never runs on a
+    /// request carrying no delivered epoch.
+    #[test]
+    fn a_rebootstrap_at_or_below_the_recorded_epoch_is_refused_as_stale() {
+        let pair = keypair();
+        for delivered in [
+            Generation::new(&pair, SEED_EPOCH),
+            Generation::new(&pair, SEED_EPOCH - 1),
+        ] {
+            let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+            let before = snapshot(&t.root);
+
+            let err =
+                rebootstrap_generation(&t.root, &delivered.package, authorizing(SEED_EPOCH), None)
+                    .expect_err("the floor refuses");
+            assert!(
+                matches!(
+                    err,
+                    ReleaseTrustError::StaleRebootstrap {
+                        delivered: at,
+                        recorded: SEED_EPOCH,
+                    } if at == delivered.epoch,
+                ),
+                "got {err:?}",
+            );
+
+            assert_eq!(
+                snapshot(&t.root),
+                before,
+                "a floor refusal precedes the installer, so the tree is untouched",
+            );
+            assert_eq!(
+                entries(&t.root),
+                vec![OsString::from(ACTIVE_LINK), generation_name(&t.root, 1)],
+                "no generation directory was allocated",
+            );
+            assert_eq!(read_active_epoch(&t.root).expect("read"), Some(SEED_EPOCH));
+        }
+    }
+
+    /// The empty tree is the bootstrap's, never this path's: it has no recorded
+    /// epoch to assert against or raise, and admitting one here would open a
+    /// second empty-tree door taking arbitrary caller bytes.
+    ///
+    /// Asserted with the marker present and with bytes that are not a container at
+    /// all, so the test fails if either the marker read or the container open runs
+    /// before the empty-tree gate.
+    #[test]
+    fn a_rebootstrap_onto_an_empty_tree_is_refused_before_the_marker_and_the_container() {
+        let t = tree();
+        set_pin_marker(&t.root, b"");
+        let before = snapshot(&t.root);
+
+        let err =
+            rebootstrap_generation(&t.root, b"not a container", authorizing(SEED_EPOCH), None)
+                .expect_err("an empty tree has nothing to supersede");
+        assert!(
+            matches!(err, ReleaseTrustError::NoActiveGeneration),
+            "got {err:?}",
+        );
+        assert_eq!(snapshot(&t.root), before, "and nothing was written");
+    }
+
+    /// A mis-targeted or stale-batch re-bootstrap, caught before anything is
+    /// opened.
+    #[test]
+    fn a_rebootstrap_asserting_an_epoch_the_tree_does_not_record_is_refused() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let before = snapshot(&t.root);
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+
+        let err = rebootstrap_generation(
+            &t.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH - 1),
+            None,
+        )
+        .expect_err("the assertion names a host that has moved on");
+        assert!(
+            matches!(
+                err,
+                ReleaseTrustError::RebootstrapEpochMismatch {
+                    asserted,
+                    recorded: SEED_EPOCH,
+                } if asserted == SEED_EPOCH - 1,
+            ),
+            "got {err:?}",
+        );
+        assert_eq!(snapshot(&t.root), before, "and nothing was written");
+    }
+
+    /// The central assertion: on inputs the ordinary accept path cannot serve —
+    /// a generation signed by a key the stale active set does not carry, which is
+    /// exactly what a pruned retention window leaves behind — the re-bootstrap
+    /// succeeds. The chain check is what was relaxed, and nothing else.
+    #[test]
+    fn a_rebootstrap_succeeds_where_an_accept_fails_on_the_same_inputs() {
+        let pair = keypair();
+        let rotated = keypair();
+        let delivered = Generation::new(&rotated, NEXT_EPOCH);
+
+        let accepting = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let err = accept_generation(&accepting.root, &delivered.package)
+            .expect_err("the chain is broken");
+        assert!(
+            matches!(verdict(&err), VerifyError::UnknownKeyId { .. }),
+            "the key that would chain this forward has been pruned, got {err:?}",
+        );
+
+        let rebootstrapping = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let admitted = rebootstrap_generation(
+            &rebootstrapping.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            None,
+        )
+        .expect("the same bytes, admitted under their own anchors");
+        assert_eq!(admitted.epoch, NEXT_EPOCH);
+        assert_eq!(
+            read_active_epoch(&rebootstrapping.root).expect("read"),
+            Some(NEXT_EPOCH),
+        );
+    }
+
+    /// "The chain check is relaxed" is never "nothing is checked": the package is
+    /// still self-admitted, so a signature that does not verify under a
+    /// non-revoked anchor the document itself carries is refused.
+    #[test]
+    fn a_rebootstrap_whose_package_does_not_self_admit_is_refused() {
+        let pair = keypair();
+        let revoked = keypair();
+        let stranger = keypair();
+
+        let by_revoked_member = Fields {
+            epoch: Some(NEXT_EPOCH.to_string()),
+            anchors: Some(array(&[anchor_of(&pair, false), anchor_of(&revoked, true)])),
+            ..Fields::new(&pair)
+        }
+        .render();
+        let by_revoked = generation_pkg(&revoked, &by_revoked_member, NEXT_EPOCH);
+        let by_a_key_it_does_not_name =
+            generation_pkg(&stranger, &document_at(&pair, NEXT_EPOCH), NEXT_EPOCH);
+        let mutated = corrupt_archive(&Generation::new(&pair, NEXT_EPOCH).package);
+
+        let cases: [(&[u8], Refusal, &str); 3] = [
+            (
+                &by_revoked,
+                |err| {
+                    matches!(
+                        err,
+                        ReleaseTrustError::Verify(VerifyError::RevokedKey { .. })
+                    )
+                },
+                "a signer its own document revokes",
+            ),
+            (
+                &by_a_key_it_does_not_name,
+                |err| {
+                    matches!(
+                        err,
+                        ReleaseTrustError::Verify(VerifyError::UnknownKeyId { .. })
+                    )
+                },
+                "a signer its own document does not name",
+            ),
+            (
+                &mutated,
+                |err| matches!(err, ReleaseTrustError::Verify(_)),
+                "a container mutated after signing",
+            ),
+        ];
+        for (package, is_expected, expected) in cases {
+            let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+            let before = snapshot(&t.root);
+            let err = rebootstrap_generation(&t.root, package, authorizing(SEED_EPOCH), None)
+                .expect_err("the package is still self-admitted");
+            assert!(
+                is_expected(&err),
+                "a re-bootstrap should refuse {expected}, got {err:?}",
+            );
+            assert_eq!(snapshot(&t.root), before, "and nothing was written");
+        }
+    }
+
+    /// The two carriers of the delivered epoch are compared by the verifier's own
+    /// target check, against the *signed* manifest. This path adds no
+    /// epoch-agreement comparison of its own and needs none.
+    #[test]
+    fn a_rebootstrap_whose_epoch_carriers_disagree_is_refused_by_the_target_check() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let before = snapshot(&t.root);
+
+        let member = document_at(&pair, NEXT_EPOCH);
+        let package = pkg_naming(
+            &pair,
+            &member,
+            TRUST_TARGET,
+            &(NEXT_EPOCH + 1).to_string(),
+            &member_digest(&member),
+        );
+
+        let err = rebootstrap_generation(&t.root, &package, authorizing(SEED_EPOCH), None)
+            .expect_err("the document and the manifest disagree");
+        assert!(
+            matches!(
+                err,
+                ReleaseTrustError::Verify(VerifyError::TargetMismatch { .. })
+            ),
+            "got {err:?}",
+        );
+        assert_eq!(snapshot(&t.root), before, "and nothing was written");
+    }
+
+    /// A supplied pin is enforced on this path, compared against the digest of the
+    /// member the core returned; a matching one changes nothing else.
+    #[test]
+    fn a_rebootstrap_pin_is_compared_against_the_delivered_document() {
+        let pair = keypair();
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+        let digest = member_digest(&delivered.member);
+
+        let mismatched = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let before = snapshot(&mismatched.root);
+        let err = rebootstrap_generation(
+            &mismatched.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(STRANGER_COMMIT),
+        )
+        .expect_err("the pin is not this document's digest");
+        assert!(
+            matches!(
+                &err,
+                ReleaseTrustError::FingerprintPinMismatch { pin, digest: got }
+                    if pin == STRANGER_COMMIT && *got == digest,
+            ),
+            "got {err:?}",
+        );
+        assert_eq!(
+            snapshot(&mismatched.root),
+            before,
+            "a pin mismatch installs nothing",
+        );
+
+        let matched = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let admitted = rebootstrap_generation(
+            &matched.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(&digest),
+        )
+        .expect("the pin is the delivered document's digest");
+        assert_eq!(admitted.epoch, NEXT_EPOCH);
+    }
+
+    /// The marker is the only difference between the two calls: identical inputs,
+    /// one refused and one admitted.
+    #[test]
+    fn the_pin_marker_is_what_refuses_an_unpinned_rebootstrap() {
+        let pair = keypair();
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+
+        let pinned = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&pinned.root, b"");
+        let before = snapshot(&pinned.root);
+        let err = rebootstrap_generation(
+            &pinned.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            None,
+        )
+        .expect_err("the host demands an out-of-band pin");
+        assert!(
+            matches!(err, ReleaseTrustError::FingerprintPinRequired),
+            "got {err:?}",
+        );
+        assert_eq!(snapshot(&pinned.root), before, "and nothing was written");
+
+        let unpinned = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        rebootstrap_generation(
+            &unpinned.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            None,
+        )
+        .expect("the same call on a host that set no marker");
+    }
+
+    /// The no-pin refusal and the pin-mismatch refusal are different variants, so
+    /// an operator can tell "this host requires a pin and you supplied none" from
+    /// "the pin you supplied does not match". Matched on the value, never on a
+    /// message.
+    #[test]
+    fn the_two_pin_refusals_are_distinct_variants() {
+        let pair = keypair();
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+
+        let required = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&required.root, b"");
+        let missing = rebootstrap_generation(
+            &required.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            None,
+        )
+        .expect_err("no pin");
+
+        let wrong = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let mismatch = rebootstrap_generation(
+            &wrong.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(STRANGER_COMMIT),
+        )
+        .expect_err("the wrong pin");
+
+        assert_ne!(
+            discriminant(&missing),
+            discriminant(&mismatch),
+            "{missing:?} and {mismatch:?} must not be the same refusal",
+        );
+    }
+
+    /// The marker gate runs before the container is opened, so a host that demands
+    /// a pin rejects an unpinned call without paying for a package verification.
+    /// Bytes that are not a container at all are what makes that observable.
+    #[test]
+    fn the_pin_marker_gate_runs_before_the_container_is_opened() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&t.root, b"");
+
+        let err =
+            rebootstrap_generation(&t.root, b"not a container", authorizing(SEED_EPOCH), None)
+                .expect_err("refused");
+        assert!(
+            matches!(err, ReleaseTrustError::FingerprintPinRequired),
+            "the container fault should never be reached, got {err:?}",
+        );
+    }
+
+    /// The gate is additive: it relaxes nothing, so a pinned call whose epoch is
+    /// not strictly greater is still refused by the floor.
+    #[test]
+    fn the_pin_marker_gate_relaxes_no_floor() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&t.root, b"");
+        let delivered = Generation::new(&pair, SEED_EPOCH - 1);
+
+        let err = rebootstrap_generation(
+            &t.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(&member_digest(&delivered.member)),
+        )
+        .expect_err("the floor still refuses");
+        assert!(
+            matches!(err, ReleaseTrustError::StaleRebootstrap { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// The configuration the marker exists for: a host that demands an
+    /// out-of-band pin admits the call that carries the right one, and the marker
+    /// asks only that a pin was supplied — a wrong one is still the mismatch
+    /// refusal rather than the no-pin one.
+    #[test]
+    fn a_pinned_rebootstrap_onto_a_marked_host_turns_on_the_pin_alone() {
+        let pair = keypair();
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+        let digest = member_digest(&delivered.member);
+
+        let wrong = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&wrong.root, b"");
+        let before = snapshot(&wrong.root);
+        let err = rebootstrap_generation(
+            &wrong.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(STRANGER_COMMIT),
+        )
+        .expect_err("a pin was supplied, and it is not this document's");
+        assert!(
+            matches!(err, ReleaseTrustError::FingerprintPinMismatch { .. }),
+            "the marker gate tests presence, not correctness, got {err:?}",
+        );
+        assert_eq!(snapshot(&wrong.root), before, "and nothing was written");
+
+        let right = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&right.root, b"");
+        let admitted = rebootstrap_generation(
+            &right.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(&digest),
+        )
+        .expect("the host demanded a pin and the call carried the right one");
+        assert_eq!(admitted.epoch, NEXT_EPOCH);
+        assert_eq!(
+            read_active_epoch(&right.root).expect("read"),
+            Some(NEXT_EPOCH)
+        );
+    }
+
+    /// The marker's presence is its entire state: there is no format, so no
+    /// parser, and its contents are never read.
+    #[test]
+    fn the_pin_markers_contents_are_never_read() {
+        let pair = keypair();
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+
+        for contents in [b"".as_slice(), b"anything at all\0\xff".as_slice()] {
+            let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+            set_pin_marker(&t.root, contents);
+            let err =
+                rebootstrap_generation(&t.root, &delivered.package, authorizing(SEED_EPOCH), None)
+                    .expect_err("an empty marker and a full one are the same state");
+            assert!(
+                matches!(err, ReleaseTrustError::FingerprintPinRequired),
+                "got {err:?}",
+            );
+        }
+    }
+
+    /// Presence is tested without following symlinks, so a dangling symlink at the
+    /// marker path reads as set. Otherwise deleting a symlink's target would
+    /// silently clear the gate.
+    #[test]
+    fn a_dangling_symlink_at_the_marker_path_reads_as_set() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        std::os::unix::fs::symlink("nothing-is-here", require_pin_marker(&t.root))
+            .expect("dangling marker");
+
+        let err = rebootstrap_generation(
+            &t.root,
+            &Generation::new(&pair, NEXT_EPOCH).package,
+            authorizing(SEED_EPOCH),
+            None,
+        )
+        .expect_err("an entry of any kind is the marker");
+        assert!(
+            matches!(err, ReleaseTrustError::FingerprintPinRequired),
+            "got {err:?}",
+        );
+    }
+
+    /// The classification is unit-tested directly, because no filesystem
+    /// arrangement can make the entry point's own stat of a direct child of the
+    /// tree root fail with a non-`NotFound` error while leaving the earlier
+    /// `read_active_epoch` intact. These run unprivileged everywhere and are
+    /// deterministic.
+    #[test]
+    fn the_marker_classification_maps_each_stat_outcome() {
+        let path = Path::new("/etc/clumit-security/release-trust").join(REQUIRE_TRUST_PIN_MARKER);
+        let target = path.to_string_lossy().into_owned();
+
+        assert!(
+            classify_pin_marker(Ok(()), &path).expect("a stat that succeeded"),
+            "an entry of any kind is the marker",
+        );
+        assert!(
+            !classify_pin_marker(Err(std::io::ErrorKind::NotFound.into()), &path)
+                .expect("the absent marker"),
+            "`NotFound` is the only unset",
+        );
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotADirectory,
+            std::io::ErrorKind::Other,
+        ] {
+            let err = classify_pin_marker(Err(kind.into()), &path)
+                .expect_err("every other failure is fail-closed");
+            match err {
+                ReleaseTrustError::Io { path, source } => {
+                    assert_eq!(path, target, "the refusal names the marker");
+                    assert_eq!(source.kind(), kind, "and carries the fault verbatim");
+                }
+                other => panic!("{kind:?} should refuse through the i/o variant, got {other:?}"),
+            }
+        }
+    }
+
+    /// The join channel is the byte source, the seed's gate and sequence are the
+    /// admission, and the operator's material is left where it was.
+    #[test]
+    fn the_bootstrap_admits_the_join_material_onto_an_empty_tree() {
+        let t = tree();
+        let pair = keypair();
+        let generation = Generation::new(&pair, SEED_EPOCH);
+        set_join_material(&t.root, &generation.package);
+
+        let admitted = bootstrap_from_join_material(&t.root, None).expect("the join channel");
+        assert_eq!(
+            admitted.activation,
+            Activation {
+                generation: 1,
+                changed: true,
+            },
+        );
+        assert_eq!(admitted.epoch, SEED_EPOCH);
+        assert_active_is(&t.root, 1);
+        assert_eq!(
+            std::fs::read(active_link(&t.root).join(TRUST_SET_MEMBER)).expect("read"),
+            generation.member,
+        );
+        assert_eq!(
+            std::fs::read(join_generation_file(&t.root)).expect("read"),
+            generation.package,
+            "operator-delivered material is left in place",
+        );
+    }
+
+    /// A supplied pin is enforced here too, and a mismatch leaves the tree as
+    /// empty as it found it — no generation directory, no `active`, no record.
+    #[test]
+    fn a_bootstrap_pin_mismatch_leaves_the_tree_empty() {
+        let t = tree();
+        let pair = keypair();
+        let generation = Generation::new(&pair, SEED_EPOCH);
+        set_join_material(&t.root, &generation.package);
+
+        let err = bootstrap_from_join_material(&t.root, Some(STRANGER_COMMIT))
+            .expect_err("the pin is not this document's digest");
+        assert!(
+            matches!(err, ReleaseTrustError::FingerprintPinMismatch { .. }),
+            "got {err:?}",
+        );
+        assert_eq!(
+            entries(&t.root),
+            vec![OsString::from(JOIN_GENERATION_FILE)],
+            "nothing was installed",
+        );
+        assert_eq!(read_active_epoch(&t.root).expect("read"), None);
+
+        let admitted =
+            bootstrap_from_join_material(&t.root, Some(&member_digest(&generation.member)))
+                .expect("the matching pin");
+        assert_eq!(admitted.epoch, SEED_EPOCH);
+    }
+
+    /// The marker guards the path that supersedes an existing trust history, and
+    /// this path has none to supersede.
+    #[test]
+    fn the_bootstrap_consults_no_pin_marker() {
+        let t = tree();
+        let pair = keypair();
+        set_pin_marker(&t.root, b"");
+        set_join_material(&t.root, &Generation::new(&pair, SEED_EPOCH).package);
+
+        let admitted =
+            bootstrap_from_join_material(&t.root, None).expect("the marker decides nothing here");
+        assert_eq!(admitted.epoch, SEED_EPOCH);
+        assert!(
+            require_pin_marker(&t.root).is_file(),
+            "and the bootstrap leaves it where it was",
+        );
+    }
+
+    /// Nothing at the join-material location is an `Io` refusal naming that path —
+    /// reachable only on a tree the gate already accepted.
+    #[test]
+    fn the_bootstrap_refuses_an_absent_join_material_by_name() {
+        let t = tree();
+        let err = bootstrap_from_join_material(&t.root, None)
+            .expect_err("the operator delivered nothing");
+        match err {
+            ReleaseTrustError::Io { path, source } => {
+                assert_eq!(path, join_generation_file(&t.root).to_string_lossy());
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected the i/o refusal naming the join material, got {other:?}"),
+        }
+        assert_eq!(entries(&t.root), Vec::<OsString>::new());
+    }
+
+    /// The gate runs before the read, so a provisioned host reports the condition
+    /// that actually decided the call rather than a missing file. Paired with the
+    /// test above, the two show which refusal each input gets.
+    #[test]
+    fn a_non_empty_tree_is_refused_before_the_join_material_is_read() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let before = snapshot(&t.root);
+
+        let err = bootstrap_from_join_material(&t.root, None)
+            .expect_err("the tree already carries a generation");
+        assert!(
+            matches!(
+                err,
+                ReleaseTrustError::ActiveGenerationPresent {
+                    generation: Some(1),
+                },
+            ),
+            "got {err:?}",
+        );
+        assert_eq!(snapshot(&t.root), before, "and nothing was written");
+
+        // And the same refusal with the join material present, so the two inputs
+        // are not being told apart by what the location holds.
+        set_join_material(&t.root, &Generation::new(&pair, NEXT_EPOCH).package);
+        let err = bootstrap_from_join_material(&t.root, None).expect_err("still refused");
+        assert!(
+            matches!(err, ReleaseTrustError::ActiveGenerationPresent { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// The path is delegated rather than re-implemented: a package that does not
+    /// self-admit is refused with the seed's own error, on the seed's own
+    /// sequence.
+    #[test]
+    fn the_bootstrap_refuses_with_the_seeds_own_error() {
+        let pair = keypair();
+        let stranger = keypair();
+        let package = generation_pkg(&stranger, &document_at(&pair, SEED_EPOCH), SEED_EPOCH);
+
+        let bootstrapped = tree();
+        set_join_material(&bootstrapped.root, &package);
+        let by_bootstrap = bootstrap_from_join_material(&bootstrapped.root, None)
+            .expect_err("the signer is not an anchor the document carries");
+
+        let seeded = tree();
+        let by_seed = admit_seed_generation(&seeded.root, &package)
+            .expect_err("the same refusal, the same sequence");
+
+        assert_eq!(
+            discriminant(&by_bootstrap),
+            discriminant(&by_seed),
+            "{by_bootstrap:?} and {by_seed:?} are one sequence's refusal",
+        );
+        assert!(
+            matches!(
+                by_bootstrap,
+                ReleaseTrustError::Verify(VerifyError::UnknownKeyId { .. })
+            ),
+            "got {by_bootstrap:?}",
+        );
+        assert_eq!(
+            entries(&bootstrapped.root),
+            vec![OsString::from(JOIN_GENERATION_FILE)]
+        );
+    }
+
+    /// The floor is vacuous where no prior epoch exists, and none is synthesized:
+    /// an arbitrarily low epoch bootstraps onto an empty tree.
+    #[test]
+    fn the_bootstrap_applies_no_floor() {
+        let t = tree();
+        let pair = keypair();
+        set_join_material(&t.root, &Generation::new(&pair, 1).package);
+
+        let admitted = bootstrap_from_join_material(&t.root, None).expect("the first generation");
+        assert_eq!(admitted.epoch, 1);
+        assert_eq!(read_active_epoch(&t.root).expect("read"), Some(1));
     }
 }
