@@ -31,9 +31,13 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **release_trust** — the on-host release-trust tree that document is installed
   into: a sibling of the mTLS tree holding `active` and `gen-<n>/`, where one
   generation is the delivered container, the verified member and a one-integer
-  `epoch` record finalised together. It exports the epoch reader and the one
+  `epoch` record finalised together. It exports the epoch reader, the one
   constructor that turns the active generation back into **verify**'s injected
-  trust set, and no way for a dependent crate to write the tree.
+  trust set, and the two install-time admission doors — a seed that refuses a
+  tree already carrying a generation and an operator-mediated replace that does
+  not — which verify a delivered container against the trust set it carries
+  before the tree's one crate-internal installer stages it. There is no other
+  way for a dependent crate to write the tree.
 - **engine** — the install/update diff engine (compute what changed).
 - **apply** — the apply primitives that actuate a diff on a host (place files,
   create directories, run root commands, load images, extract bundles).

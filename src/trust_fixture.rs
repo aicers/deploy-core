@@ -156,13 +156,15 @@ pub(crate) fn default_document(pair: &Ed25519KeyPair) -> Vec<u8> {
 }
 
 /// Builds the archive block: one zstd-compressed tar holding the document as its
-/// only member, which is what the envelope contract states.
-fn archive_of(member: &[u8]) -> Vec<u8> {
+/// only member, under `member_name` — [`TRUST_SET_MEMBER`] for a container built
+/// to the envelope contract, anything else for a fixture that deliberately is
+/// not.
+fn archive_of(member_name: &str, member: &[u8]) -> Vec<u8> {
     let encoder = Encoder::new(Vec::new(), FIXTURE_ZSTD_LEVEL).expect("encoder should be created");
     let mut builder = Builder::new(encoder);
     let mut header = Header::new_gnu();
     header
-        .set_path(TRUST_SET_MEMBER)
+        .set_path(member_name)
         .expect("a fixture path fits the field");
     header.set_size(len_u64(member));
     header.set_mode(0o644);
@@ -177,12 +179,18 @@ fn archive_of(member: &[u8]) -> Vec<u8> {
 }
 
 /// Renders the manifest block of a generation container: one artifact entry,
-/// `StaticAssets`, binding the one member.
-fn manifest_json(component: &str, version: &str, commit: &str, member: &[u8]) -> Vec<u8> {
+/// `StaticAssets`, binding the one member under `member_name`.
+fn manifest_json(
+    member_name: &str,
+    component: &str,
+    version: &str,
+    commit: &str,
+    member: &[u8],
+) -> Vec<u8> {
     let manifest = PayloadManifest::new(
         None,
         vec![ArchiveMember {
-            name: TRUST_SET_MEMBER.to_string(),
+            name: member_name.to_string(),
             length: len_u64(member),
         }],
         vec![PayloadArtifact {
@@ -192,7 +200,7 @@ fn manifest_json(component: &str, version: &str, commit: &str, member: &[u8]) ->
             target_arch: TargetArch::X86_64,
             kind: ArtifactKind::StaticAssets,
             dispositions: [Disposition::Install].into_iter().collect(),
-            archive_path: TRUST_SET_MEMBER.to_string(),
+            archive_path: member_name.to_string(),
             // The same digest the entry's `commit` is, over the same bytes: the
             // container layer checks this one on extraction.
             sha256: member_digest(member),
@@ -241,6 +249,24 @@ fn signed_pkg(pair: &Ed25519KeyPair, manifest: &[u8], archive: &[u8]) -> Vec<u8>
     out
 }
 
+/// The one assembler every container fixture goes through: `member` under
+/// `member_name`, bound by a manifest naming `component`, `version` and
+/// `commit`, signed by `pair`.
+fn pkg_carrying(
+    pair: &Ed25519KeyPair,
+    member_name: &str,
+    member: &[u8],
+    component: &str,
+    version: &str,
+    commit: &str,
+) -> Vec<u8> {
+    signed_pkg(
+        pair,
+        &manifest_json(member_name, component, version, commit, member),
+        &archive_of(member_name, member),
+    )
+}
+
 /// A generation container whose manifest names `component`, `version` and
 /// `commit`, carrying `member` as the archive's only member.
 pub(crate) fn pkg_naming(
@@ -250,11 +276,7 @@ pub(crate) fn pkg_naming(
     version: &str,
     commit: &str,
 ) -> Vec<u8> {
-    signed_pkg(
-        pair,
-        &manifest_json(component, version, commit, member),
-        &archive_of(member),
-    )
+    pkg_carrying(pair, TRUST_SET_MEMBER, member, component, version, commit)
 }
 
 /// A generation container built to the envelope contract: the reserved target,
@@ -262,6 +284,29 @@ pub(crate) fn pkg_naming(
 pub(crate) fn generation_pkg(pair: &Ed25519KeyPair, member: &[u8], epoch: u64) -> Vec<u8> {
     pkg_naming(
         pair,
+        member,
+        TRUST_TARGET,
+        &epoch.to_string(),
+        &member_digest(member),
+    )
+}
+
+/// A generation container built to the envelope contract in every respect but
+/// the archive member's name, which is `member_name` rather than
+/// [`TRUST_SET_MEMBER`].
+///
+/// The manifest binds that same name, so the container is internally consistent
+/// and its walk succeeds; what it does not carry is a trust-set document to
+/// admit.
+pub(crate) fn generation_pkg_member_named(
+    pair: &Ed25519KeyPair,
+    member: &[u8],
+    epoch: u64,
+    member_name: &str,
+) -> Vec<u8> {
+    pkg_carrying(
+        pair,
+        member_name,
         member,
         TRUST_TARGET,
         &epoch.to_string(),
