@@ -67,10 +67,28 @@ pub const CA_BUNDLE_FILE: &str = "ca-bundle.pem";
 /// The installer that creates the marker and the runtime that gates on it live in
 /// different repositories, and two sides that each join their own path do not fail
 /// loudly when they drift — they leave the gate off on a host that asked for it. So
-/// the name is declared **once**, here, and both sides resolve the file through
-/// [`Layout::require_pin_marker`]. Nothing in this crate reads, writes or interprets
-/// it; its meaning is entirely the reader's.
+/// this constant is the **single declaration** of the name, and every side resolves
+/// the file by joining it rather than by spelling it: a caller holding a namespace
+/// through [`Layout::require_pin_marker`], and
+/// [`crate::release_trust::rebootstrap_generation`], which is handed the
+/// already-resolved tree root, through that module's own root-based helper. Two
+/// resolutions of one name, never two names.
 pub const REQUIRE_TRUST_PIN_MARKER: &str = "require-trust-pin";
+
+/// The basename of the operator-delivered generation a host with no prior
+/// release-trust generation is bootstrapped from.
+///
+/// Written at the root of the release-trust tree by the operator-mediated join
+/// channel — the same out-of-band delivery that carries the mTLS CA anchor — and
+/// read by [`crate::release_trust::bootstrap_from_join_material`], for which **the
+/// location is the enforcement**: that entry point accepts no caller-supplied
+/// generation bytes at all.
+///
+/// Declared and resolved exactly as [`REQUIRE_TRUST_PIN_MARKER`] is: this constant
+/// is the single declaration, [`Layout::join_generation_path`] resolves it for a
+/// caller holding a namespace, and the release-trust module's own root-based helper
+/// resolves it for the reader holding a tree root.
+pub const JOIN_GENERATION_FILE: &str = "join-generation.pkg";
 
 /// The on-host directory layout for one namespaced install tree.
 ///
@@ -212,9 +230,15 @@ impl<'a> Layout<'a> {
     }
 
     /// Returns the host-side re-bootstrap pin marker — [`REQUIRE_TRUST_PIN_MARKER`]
-    /// inside [`release_trust_dir`], and the single location the installer that
-    /// creates it and the runtime that gates on it both resolve through. The name
-    /// itself is spelled once, in that constant.
+    /// inside [`release_trust_dir`] — for a caller that holds a namespace, such as
+    /// the installer that creates it.
+    ///
+    /// The name is declared once, in that constant, and this is one of its two
+    /// resolutions. The other is the release-trust module's root-based helper,
+    /// which is what the runtime gate reads the marker through: that path is handed
+    /// the already-resolved tree root and cannot reconstruct a namespace to call
+    /// this accessor with. Both join the same constant onto the same directory, so
+    /// they cannot drift.
     ///
     /// It sits at the **root** of the release-trust tree, beside `active` and the
     /// generation directories and never inside a generation: the generation engine
@@ -227,6 +251,26 @@ impl<'a> Layout<'a> {
     #[must_use]
     pub fn require_pin_marker(&self) -> PathBuf {
         self.release_trust_dir().join(REQUIRE_TRUST_PIN_MARKER)
+    }
+
+    /// Returns the operator-delivered join generation — [`JOIN_GENERATION_FILE`]
+    /// inside [`release_trust_dir`] — for a caller that holds a namespace, such as
+    /// the provisioning side that writes the file.
+    ///
+    /// The name is declared once, in that constant, and this is one of its two
+    /// resolutions; the release-trust module's root-based helper is the other, for
+    /// [`crate::release_trust::bootstrap_from_join_material`], which is handed the
+    /// tree root alone.
+    ///
+    /// It sits at the **root** of the release-trust tree for the same reason the pin
+    /// marker does: the generation engine enumerates only `active` and `gen-<n>`
+    /// there, so a file at this path is never staged, activated or pruned, and the
+    /// root-owned directory is what makes the location itself the enforcement.
+    ///
+    /// [`release_trust_dir`]: Layout::release_trust_dir
+    #[must_use]
+    pub fn join_generation_path(&self) -> PathBuf {
+        self.release_trust_dir().join(JOIN_GENERATION_FILE)
     }
 
     /// Returns roxyd's client-identity trust-anchor snapshot,
@@ -274,7 +318,7 @@ pub struct RoxydMaterialPaths {
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, RELEASE_TRUST_SUBDIR, REQUIRE_TRUST_PIN_MARKER};
+    use super::{JOIN_GENERATION_FILE, Layout, RELEASE_TRUST_SUBDIR, REQUIRE_TRUST_PIN_MARKER};
 
     #[test]
     fn the_release_trust_tree_is_a_sibling_of_the_mtls_tree() {
@@ -289,6 +333,7 @@ mod tests {
             layout.release_trust_active_dir(),
             layout.release_trust_generation_dir(7),
             layout.require_pin_marker(),
+            layout.join_generation_path(),
         ] {
             assert!(
                 path.starts_with(&release),
@@ -321,6 +366,15 @@ mod tests {
         assert_eq!(
             layout.require_pin_marker(),
             layout.release_trust_dir().join(REQUIRE_TRUST_PIN_MARKER),
+        );
+    }
+
+    #[test]
+    fn the_join_generation_resolves_through_the_shared_constant() {
+        let layout = Layout::new("clumit-security");
+        assert_eq!(
+            layout.join_generation_path(),
+            layout.release_trust_dir().join(JOIN_GENERATION_FILE),
         );
     }
 }

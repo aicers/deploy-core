@@ -16,5 +16,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   caller asks before it pushes. A byte-identical redelivery of the active
   generation is an unchanged no-op rather than a refusal; anything else must be
   strictly newer than the active generation to activate.
+- The two release-trust entry points for the hosts the accept path cannot serve,
+  each admitting a generation under the anchors the delivered document itself
+  carries: `release_trust::rebootstrap_generation` for a host offline past the
+  control plane's retention window, and
+  `release_trust::bootstrap_from_join_material` for a host with no prior
+  generation. Both relax the signature-chain check and only that. The
+  re-bootstrap demands a `release_trust::RebootstrapAuthorization` carrying the
+  caller's assertion of the host's last-confirmed epoch, still applies the
+  `epoch` floor against the verified epoch, and refuses an unpinned call on a
+  host that carries the `require-trust-pin` marker; the bootstrap takes no
+  caller-supplied bytes at all and reads its generation from
+  `layout::JOIN_GENERATION_FILE` inside the release-trust tree, which
+  `Layout::join_generation_path` resolves. Both take an optional out-of-band
+  fingerprint pin, enforced whenever supplied.
 
 [Unreleased]: https://github.com/aicers/deploy-core/commits/main
