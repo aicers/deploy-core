@@ -76,7 +76,7 @@
 //! # The one decode permitted before verification
 //!
 //! [`verify_package`](crate::verify::verify_package) takes a
-//! [`TrustSet`](crate::verify::TrustSet) by value, so a caller admitting a
+//! [`TrustSet`] by value, so a caller admitting a
 //! generation must already hold one when it calls — and for a first generation
 //! the only anchors in existence are inside the delivered document. So the
 //! admission path reads the member's bytes out of the container and decodes
@@ -84,7 +84,14 @@
 //! is bounded; see
 //! `VerifyRequest::for_trust_self_admission`,
 //! whose documentation states the decode, the candidate trust set built from it
-//! and the order of the call. It reads `anchors` and `epoch` and no other field,
+//! and the order of the call. This module is where the two live —
+//! `provisional_anchors_and_epoch` and `self_admission_candidate`, one copy
+//! each, so the installer's validator and every admission path built on it run
+//! the same decode and verify against the same candidate set. (Both are
+//! crate-private, so they are code spans rather than intra-doc links: this
+//! module is public, and a public doc linking to a private item is
+//! `rustdoc::private_intra_doc_links`.) It reads `anchors` and `epoch` and no
+//! other field,
 //! it is **not** this module's refusing reader, and it admits nothing: nothing
 //! it produces is stored, returned or becomes the generation. Admission is
 //! `verify_package` returning `Ok`, after which `read_trust_set_document`
@@ -103,7 +110,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use crate::payload;
-use crate::verify::{BuildIdentifier, is_safe_build_identifier, key_id};
+use crate::verify::{BuildIdentifier, TrustAnchor, TrustSet, is_safe_build_identifier, key_id};
 
 /// The one `trust_set_version` this reader implements.
 ///
@@ -111,16 +118,17 @@ use crate::verify::{BuildIdentifier, is_safe_build_identifier, key_id};
 /// `format_version` floor a document carries: the two version numbers move
 /// independently, and conflating them would tie a schema addition here to a
 /// manifest schema addition there.
-const TRUST_SET_VERSION: u32 = 1;
+pub(crate) const TRUST_SET_VERSION: u32 = 1;
 
 /// Archive member the generation document is carried in.
 ///
 /// Crate-internal because no caller outside this crate names it: a consumer
 /// receives an already-verified [`TrustSetDocument`] from an entry point this
 /// crate exports rather than reaching into a container itself.
-// The install-time admission path that extracts this member is a later issue;
-// this `allow` goes when that work supplies the caller.
-#[allow(dead_code)]
+///
+/// It is also the basename the verified member is copied out under inside a
+/// release-trust generation directory (see [`crate::release_trust`]), so the
+/// member's name on the wire and its name on disk cannot drift apart.
 pub(crate) const TRUST_SET_MEMBER: &str = "trust-set.json";
 
 /// Number of ASCII characters 32 bytes rendered as lowercase hex is.
@@ -131,14 +139,25 @@ pub(crate) const TRUST_SET_MEMBER: &str = "trust-set.json";
 const HEX_32_LEN: usize = 64;
 
 /// Name of the field the version gate reads, and the only field it types.
-const TRUST_SET_VERSION_FIELD: &str = "trust_set_version";
+pub(crate) const TRUST_SET_VERSION_FIELD: &str = "trust_set_version";
+
+/// Name of the epoch field, which the pre-verification decode reads too.
+pub(crate) const EPOCH_FIELD: &str = "epoch";
 
 /// Name of the anchor array, as both a decoded field and an unknown-field
 /// location.
-const ANCHORS_FIELD: &str = "anchors";
+pub(crate) const ANCHORS_FIELD: &str = "anchors";
+
+/// Name of an anchor entry's raw key field, which the pre-verification decode
+/// reads too.
+const PUBLIC_KEY_FIELD: &str = "public_key";
+
+/// Name of an anchor entry's revocation flag, which the pre-verification decode
+/// reads too.
+const REVOKED_FIELD: &str = "revoked";
 
 /// Name of the withdrawn-build array, on the same terms as [`ANCHORS_FIELD`].
-const WITHDRAWN_BUILDS_FIELD: &str = "withdrawn_builds";
+pub(crate) const WITHDRAWN_BUILDS_FIELD: &str = "withdrawn_builds";
 
 /// How [`TrustSetDocumentError::UnknownField`] names the top-level object.
 const DOCUMENT_LOCATION: &str = "the document";
@@ -152,14 +171,14 @@ const DOCUMENT_LOCATION: &str = "the document";
 /// cannot slip through in either direction.
 const TOP_LEVEL_FIELDS: [&str; 5] = [
     TRUST_SET_VERSION_FIELD,
-    "epoch",
+    EPOCH_FIELD,
     "min_manifest_format_version",
     ANCHORS_FIELD,
     WITHDRAWN_BUILDS_FIELD,
 ];
 
 /// Every field an anchor entry may carry.
-const ANCHOR_FIELDS: [&str; 3] = ["key_id", "public_key", "revoked"];
+const ANCHOR_FIELDS: [&str; 3] = ["key_id", PUBLIC_KEY_FIELD, REVOKED_FIELD];
 
 /// Every field a withdrawn-build entry may carry.
 const WITHDRAWN_BUILD_FIELDS: [&str; 3] = ["package_id", "version", "commit"];
@@ -405,13 +424,110 @@ pub enum TrustSetDocumentError {
 /// of it. It exists so no caller re-derives the rule that *this* digest is over
 /// *these* bytes — the same value the entry's `sha256` carries, which the
 /// container layer checks on extraction.
-// The install-time admission path that compares this against a verified
-// manifest is a later issue; this `allow` goes when that work supplies the
-// caller.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn member_digest(bytes: &[u8]) -> String {
     payload::sha256_hex(bytes)
+}
+
+/// Decodes the two fields a self-admission consumes out of document bytes
+/// **nothing has vouched for yet**: every anchor's raw key and revocation flag,
+/// and the `epoch`.
+///
+/// This is the one decode permitted before verification, and the crate has
+/// exactly one copy of it — this one. Both the release-trust installer's
+/// validator ([`crate::release_trust`]) and the install-time admission paths
+/// built on top of it run *this* function rather than each writing the same
+/// permissive parse, because two copies of it could disagree about which bytes
+/// a candidate trust set was built from.
+///
+/// It is deliberately **not** [`read_trust_set_document`]: running the refusing
+/// reader here would report a parse refusal where a signature failure belongs,
+/// and would decide something about bytes no anchor has vouched for. An entry's
+/// own `key_id` is not read at all — [`TrustAnchor::new`] derives the index from
+/// the key, so there is no second derivation site to disagree with. Nothing it
+/// produces is stored or becomes the generation; see
+/// `VerifyRequest::for_trust_self_admission`.
+///
+/// Returns `None` — never a [`TrustSetDocumentError`], whose contract is "this
+/// is what a *verified* document said" — when the bytes are not a JSON object,
+/// when `epoch` is absent or is not an unsigned integer, when `anchors` is
+/// absent or is not an array, or when any entry fails to yield 32 key bytes and
+/// a boolean flag. The decode is all-or-nothing: a caller names that failure
+/// with its own error type.
+pub(crate) fn provisional_anchors_and_epoch(bytes: &[u8]) -> Option<(Vec<TrustAnchor>, u64)> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let epoch = document
+        .get(EPOCH_FIELD)
+        .and_then(serde_json::Value::as_u64)?;
+    let entries = document
+        .get(ANCHORS_FIELD)
+        .and_then(serde_json::Value::as_array)?;
+    let mut anchors = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let public_key = entry
+            .get(PUBLIC_KEY_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(decode_lowercase_hex_32)?;
+        let revoked = entry
+            .get(REVOKED_FIELD)
+            .and_then(serde_json::Value::as_bool)?;
+        anchors.push(TrustAnchor::new(public_key, revoked));
+    }
+    Some((anchors, epoch))
+}
+
+/// Builds the candidate [`TrustSet`] a generation is self-admitted against, and
+/// returns it beside the `epoch` the decode read.
+///
+/// The crate's only assembly of that value, so the installer's validator and the
+/// admission paths cannot end up verifying against two different candidate sets.
+/// All four [`TrustSet::new`] arguments are fixed here exactly as
+/// `VerifyRequest::for_trust_self_admission` states them, and none is left to a
+/// caller's discretion:
+///
+/// - `anchors` — **every** anchor [`provisional_anchors_and_epoch`] produced,
+///   each carrying its own `revoked` flag, so a container signed by a key its
+///   own document marks revoked is refused as
+///   [`VerifyError::RevokedKey`](crate::verify::VerifyError::RevokedKey) rather
+///   than by a pruned list as an unknown key;
+/// - `withdrawn_builds` — **empty**, the identity of the withdrawal check. The
+///   container carries exactly one triple, its own, so the delivered list could
+///   only ever match a document withdrawing itself; that list governs every
+///   *later* package instead;
+/// - `min_manifest_format_version` — **`0`**, the identity of the manifest-floor
+///   check, so a document declaring a floor above its own envelope's
+///   `format_version` does not brick itself and admission turns on no integer
+///   read from unauthenticated bytes;
+/// - `epoch` — the decoded epoch, passed through unchanged. Under the
+///   self-admission request form it is read by nothing, since the epoch
+///   comparison returns early; it is passed through rather than zeroed so that
+///   no number appears in the call that did not come from the document.
+///
+/// Returns `None` on the same terms as [`provisional_anchors_and_epoch`], plus
+/// two anchors sharing a public key, which [`TrustSet::new`] refuses.
+pub(crate) fn self_admission_candidate(bytes: &[u8]) -> Option<(TrustSet, u64)> {
+    let (anchors, epoch) = provisional_anchors_and_epoch(bytes)?;
+    let trust = TrustSet::new(anchors, Vec::new(), 0, epoch).ok()?;
+    Some((trust, epoch))
+}
+
+/// Returns a **verified** document's anchors as the verifier's own values.
+///
+/// Unlike [`provisional_anchors_and_epoch`] this runs over a
+/// [`TrustSetDocument`] that already passed [`read_trust_set_document`], so it
+/// exists to convert rather than to parse. It returns `Option` all the same
+/// because `public_key` is carried as text: `check_document` has already proved
+/// every entry decodes, which makes `None` unreachable through the reader, and
+/// an unreachable arm is answered by the caller rather than by a panic.
+pub(crate) fn document_anchors(document: &TrustSetDocument) -> Option<Vec<TrustAnchor>> {
+    document
+        .anchors
+        .iter()
+        .map(|anchor| {
+            decode_lowercase_hex_32(&anchor.public_key)
+                .map(|public_key| TrustAnchor::new(public_key, anchor.revoked))
+        })
+        .collect()
 }
 
 /// Reads a trust-set generation document out of `bytes`, refusing anything it
@@ -430,9 +546,6 @@ pub(crate) fn member_digest(bytes: &[u8]) -> String {
 /// [`TrustSetDocumentError::UnknownField`] or [`TrustSetDocumentError::Decode`]
 /// from the structural decode; and one of the semantic refusals
 /// `check_document` lists.
-// The install-time admission path that parses a verified member is a later
-// issue; this `allow` goes when that work supplies the caller.
-#[allow(dead_code)]
 pub(crate) fn read_trust_set_document(
     bytes: &[u8],
 ) -> Result<TrustSetDocument, TrustSetDocumentError> {
@@ -671,149 +784,25 @@ fn decode_lowercase_hex_32(value: &str) -> Option<[u8; 32]> {
 mod tests {
     use std::io::Cursor;
 
-    use ring::rand::SystemRandom;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
-    use tar::{Builder, EntryType, Header};
-    use zstd::Encoder;
-
     use super::*;
-    use crate::manifest::{
-        ArchiveMember, ArtifactKind, Disposition, MAX_MANIFEST_FORMAT_VERSION,
-        MIN_MANIFEST_FORMAT_VERSION, PayloadArtifact, PayloadManifest, TargetArch,
+    use crate::manifest::{MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION};
+    // The signed single-member container fixture lives beside this module rather
+    // than inside it: `crate::release_trust`'s tests mint exactly the same
+    // container, and the install-time admission paths built on them will too.
+    use crate::trust_fixture::{
+        EPOCH, Fields, anchor_json, anchor_of, array, default_document, generation_pkg, hex_of,
+        keypair, pkg_naming, public_key_of, withdrawn_json,
     };
-    use crate::payload::{FORMAT_VERSION, MAGIC};
     use crate::verify::{
-        TRUST_TARGET, TrustAnchor, TrustSet, VerifiedPackage, VerifyError, VerifyRequest,
-        verify_package,
+        TRUST_TARGET, VerifiedPackage, VerifyError, VerifyRequest, verify_package,
     };
 
-    /// Epoch every well-formed fixture generation carries.
-    const EPOCH: u64 = 7;
     /// A `key_id`-shaped value no fixture key derives.
     const STRANGER_KEY_ID: &str =
         "abababababababababababababababababababababababababababababababab";
     /// A `commit`-shaped value that is not any fixture member's digest.
     const STRANGER_COMMIT: &str =
         "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-    /// zstd level the fixture archive writer uses; it only has to round-trip.
-    const FIXTURE_ZSTD_LEVEL: i32 = 3;
-
-    /// Mints an ephemeral Ed25519 key pair. No key material is committed to the
-    /// repository and none is read from a fixed path.
-    fn keypair() -> Ed25519KeyPair {
-        let rng = SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("key generation should succeed");
-        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("a freshly minted key pair parses")
-    }
-
-    /// Returns a key pair's raw 32-byte public key.
-    fn public_key_of(pair: &Ed25519KeyPair) -> [u8; 32] {
-        pair.public_key()
-            .as_ref()
-            .try_into()
-            .expect("an ed25519 public key is 32 bytes")
-    }
-
-    /// Renders bytes as the lowercase hex a document writes them as.
-    fn hex_of(bytes: &[u8]) -> String {
-        use std::fmt::Write as _;
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
-    }
-
-    fn len_u64(bytes: &[u8]) -> u64 {
-        u64::try_from(bytes.len()).expect("a fixture is far smaller than u64::MAX")
-    }
-
-    /// Renders a JSON array out of already-rendered members.
-    fn array(items: &[String]) -> String {
-        format!("[{}]", items.join(","))
-    }
-
-    /// Renders one anchor entry verbatim, so a fixture can state a `key_id` or
-    /// a `public_key` no derivation would produce.
-    fn anchor_json(key_id: &str, public_key: &str, revoked: bool) -> String {
-        format!(r#"{{"key_id":"{key_id}","public_key":"{public_key}","revoked":{revoked}}}"#)
-    }
-
-    /// The anchor entry `pair` really writes: its `key_id` derived from its own
-    /// `public_key`.
-    fn anchor_of(pair: &Ed25519KeyPair, revoked: bool) -> String {
-        let public_key = public_key_of(pair);
-        anchor_json(&key_id(&public_key), &hex_of(&public_key), revoked)
-    }
-
-    /// Renders one withdrawn-build entry verbatim.
-    fn withdrawn_json(package_id: &str, version: &str, commit: &str) -> String {
-        format!(r#"{{"package_id":"{package_id}","version":"{version}","commit":"{commit}"}}"#)
-    }
-
-    /// The five top-level members of a document, each as the JSON text it is
-    /// written as.
-    ///
-    /// `None` omits a member outright and `extra` is appended verbatim, so one
-    /// builder covers an absent field, an ill-typed one, an unknown one and the
-    /// same one written twice — shapes the typed document could not hold.
-    struct Fields {
-        trust_set_version: Option<String>,
-        epoch: Option<String>,
-        min_manifest_format_version: Option<String>,
-        anchors: Option<String>,
-        withdrawn_builds: Option<String>,
-        extra: Vec<String>,
-    }
-
-    impl Fields {
-        /// A well-formed generation trusting `pair` alone.
-        fn new(pair: &Ed25519KeyPair) -> Self {
-            Self {
-                trust_set_version: Some(TRUST_SET_VERSION.to_string()),
-                epoch: Some(EPOCH.to_string()),
-                min_manifest_format_version: Some(MIN_MANIFEST_FORMAT_VERSION.to_string()),
-                anchors: Some(array(&[anchor_of(pair, false)])),
-                withdrawn_builds: Some(array(&[])),
-                extra: Vec::new(),
-            }
-        }
-
-        /// A well-formed generation carrying exactly `anchors`.
-        fn anchored(anchors: &[String]) -> Self {
-            let pair = keypair();
-            Self {
-                anchors: Some(array(anchors)),
-                ..Self::new(&pair)
-            }
-        }
-
-        fn render(&self) -> Vec<u8> {
-            let mut members: Vec<String> = Vec::new();
-            for (name, value) in [
-                (TRUST_SET_VERSION_FIELD, &self.trust_set_version),
-                ("epoch", &self.epoch),
-                (
-                    "min_manifest_format_version",
-                    &self.min_manifest_format_version,
-                ),
-                (ANCHORS_FIELD, &self.anchors),
-                (WITHDRAWN_BUILDS_FIELD, &self.withdrawn_builds),
-            ] {
-                if let Some(value) = value {
-                    members.push(format!(r#""{name}":{value}"#));
-                }
-            }
-            members.extend(self.extra.iter().cloned());
-            format!("{{{}}}", members.join(",")).into_bytes()
-        }
-    }
-
-    /// The document a well-formed fixture carries: one live anchor, nothing
-    /// withdrawn.
-    fn default_document(pair: &Ed25519KeyPair) -> Vec<u8> {
-        Fields::new(pair).render()
-    }
 
     /// Reads `bytes`, asserting they are refused, and returns the refusal.
     fn refusal(bytes: &[u8]) -> TrustSetDocumentError {
@@ -825,192 +814,18 @@ mod tests {
         read_trust_set_document(bytes).expect("the document should be read")
     }
 
-    /// Builds the archive block: one zstd-compressed tar holding the document
-    /// as its only member, which is what the envelope contract states.
-    fn archive_of(member: &[u8]) -> Vec<u8> {
-        let encoder =
-            Encoder::new(Vec::new(), FIXTURE_ZSTD_LEVEL).expect("encoder should be created");
-        let mut builder = Builder::new(encoder);
-        let mut header = Header::new_gnu();
-        header
-            .set_path(TRUST_SET_MEMBER)
-            .expect("a fixture path fits the field");
-        header.set_size(len_u64(member));
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_entry_type(EntryType::Regular);
-        header.set_cksum();
-        builder
-            .append(&header, member)
-            .expect("append should succeed");
-        let encoder = builder.into_inner().expect("archive should finish");
-        encoder.finish().expect("compression should finish")
-    }
-
-    /// Renders the manifest block of a generation container: one artifact
-    /// entry, `StaticAssets`, binding the one member.
-    fn manifest_json(component: &str, version: &str, commit: &str, member: &[u8]) -> Vec<u8> {
-        let manifest = PayloadManifest::new(
-            None,
-            vec![ArchiveMember {
-                name: TRUST_SET_MEMBER.to_string(),
-                length: len_u64(member),
-            }],
-            vec![PayloadArtifact {
-                component: component.to_string(),
-                version: version.to_string(),
-                commit: Some(commit.to_string()),
-                target_arch: TargetArch::X86_64,
-                kind: ArtifactKind::StaticAssets,
-                dispositions: [Disposition::Install].into_iter().collect(),
-                archive_path: TRUST_SET_MEMBER.to_string(),
-                // The same digest the entry's `commit` is, over the same bytes:
-                // the container layer checks this one on extraction.
-                sha256: member_digest(member),
-                spec: None,
-            }],
-        )
-        .expect("the envelope contract builds a manifest");
-        serde_json::to_vec(&manifest).expect("a manifest serializes")
-    }
-
-    /// Encodes a current-version footer by hand: magic, the version byte, then
-    /// the four offset/length pairs it records.
-    fn footer_bytes(fields: [u64; 8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&MAGIC);
-        out.push(FORMAT_VERSION);
-        for field in fields {
-            out.extend_from_slice(&field.to_le_bytes());
-        }
-        out
-    }
-
-    /// Assembles a signed `.pkg`: the manifest at offset `0`, the archive, the
-    /// signature over the manifest's raw bytes, the signer's `key_id` hint,
-    /// then the footer.
-    fn signed_pkg(pair: &Ed25519KeyPair, manifest: &[u8], archive: &[u8]) -> Vec<u8> {
-        let signature = pair.sign(manifest);
-        let hint = key_id(&public_key_of(pair));
-        let mut out = Vec::new();
-        out.extend_from_slice(manifest);
-        out.extend_from_slice(archive);
-        let signature_offset = len_u64(manifest) + len_u64(archive);
-        out.extend_from_slice(signature.as_ref());
-        let hint_offset = signature_offset + len_u64(signature.as_ref());
-        out.extend_from_slice(hint.as_bytes());
-        out.extend_from_slice(&footer_bytes([
-            0,
-            len_u64(manifest),
-            len_u64(manifest),
-            len_u64(archive),
-            signature_offset,
-            len_u64(signature.as_ref()),
-            hint_offset,
-            len_u64(hint.as_bytes()),
-        ]));
-        out
-    }
-
-    /// A generation container whose manifest names `component`, `version` and
-    /// `commit`, carrying `member` as the archive's only member.
-    fn pkg_naming(
-        pair: &Ed25519KeyPair,
-        member: &[u8],
-        component: &str,
-        version: &str,
-        commit: &str,
-    ) -> Vec<u8> {
-        signed_pkg(
-            pair,
-            &manifest_json(component, version, commit, member),
-            &archive_of(member),
-        )
-    }
-
-    /// A generation container built to the envelope contract: the reserved
-    /// target, the epoch in decimal, and the member digest as `commit`.
-    fn generation_pkg(pair: &Ed25519KeyPair, member: &[u8], epoch: u64) -> Vec<u8> {
-        pkg_naming(
-            pair,
-            member,
-            TRUST_TARGET,
-            &epoch.to_string(),
-            &member_digest(member),
-        )
-    }
-
-    /// The provisional decode the admission path is permitted to make before
-    /// anything is verified: `anchors` and `epoch` only, permissively, and
-    /// all-or-nothing.
-    ///
-    /// An entry's own `key_id` is not read at all — [`TrustAnchor::new`]
-    /// derives the index from the key, so there is no second derivation site to
-    /// disagree with. This is deliberately **not** `read_trust_set_document`:
-    /// running that here would report a parse refusal where a signature failure
-    /// belongs.
-    fn provisional(member: &[u8]) -> (Vec<TrustAnchor>, u64) {
-        let document: serde_json::Value =
-            serde_json::from_slice(member).expect("a fixture document is JSON");
-        let epoch = document
-            .get("epoch")
-            .and_then(serde_json::Value::as_u64)
-            .expect("a fixture document carries an epoch");
-        let anchors = document
-            .get(ANCHORS_FIELD)
-            .and_then(serde_json::Value::as_array)
-            .expect("a fixture document carries an anchor array")
-            .iter()
-            .map(|entry| {
-                let public_key = entry
-                    .get("public_key")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(decode_lowercase_hex_32)
-                    .expect("a fixture anchor carries 32 key bytes");
-                let revoked = entry
-                    .get("revoked")
-                    .and_then(serde_json::Value::as_bool)
-                    .expect("a fixture anchor carries a revocation flag");
-                TrustAnchor::new(public_key, revoked)
-            })
-            .collect();
-        (anchors, epoch)
-    }
-
-    /// The candidate trust set a self-admission is verified against, with all
-    /// four [`TrustSet::new`] arguments as the request form states them.
-    fn candidate(member: &[u8]) -> (TrustSet, u64) {
-        let (anchors, epoch) = provisional(member);
-        let trust = TrustSet::new(
-            // Every anchor the decode produced, revoked ones included, so a
-            // generation signed by a key its own document marks revoked is
-            // refused as `RevokedKey` and not as `UnknownKeyId`.
-            anchors,
-            // The identity of `check_withdrawal`: the only entry that could
-            // ever match this container's one triple is a document withdrawing
-            // itself, and the list it really carries governs later packages
-            // once the verified document is installed.
-            Vec::new(),
-            // The identity of `check_format_version`: the parse already refuses
-            // anything outside this build's manifest range, so `0` is exactly
-            // that range and honours no floor read from unauthenticated bytes.
-            0,
-            // Read by nothing under this request form, since `check_epoch`
-            // returns early; passed through so no number appears in the call
-            // that did not come from the document.
-            epoch,
-        )
-        .expect("a fixture document carries distinct anchors");
-        (trust, epoch)
-    }
-
     /// Verifies `package` as a self-admission of the generation `member`
     /// carries, in the order the request form states.
+    ///
+    /// The candidate set is `self_admission_candidate`'s and not one assembled
+    /// here, so this exercises the very value the release-trust installer's
+    /// validator verifies against rather than a second copy of it.
     fn self_admit(
         package: &[u8],
         member: &[u8],
     ) -> Result<VerifiedPackage<Cursor<Vec<u8>>>, VerifyError> {
-        let (trust, epoch) = candidate(member);
+        let (trust, epoch) =
+            self_admission_candidate(member).expect("a fixture document decodes provisionally");
         let request =
             VerifyRequest::for_trust_self_admission(&epoch.to_string(), &member_digest(member))
                 .expect("a self-admission request is infallible");
@@ -1578,7 +1393,8 @@ mod tests {
         // The same input through the epoch-carrying form: the delivered epoch
         // and the candidate set's are one number, so the strictly-greater test
         // refuses every well-formed generation.
-        let (trust, epoch) = candidate(&member);
+        let (trust, epoch) =
+            self_admission_candidate(&member).expect("a fixture document decodes provisionally");
         let request = VerifyRequest::for_trust(&epoch.to_string(), &member_digest(&member), epoch)
             .expect("a trust-target request");
         let refused = verify_package(Cursor::new(package.clone()), &trust, &request)

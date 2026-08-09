@@ -465,7 +465,7 @@ fn swap_active_symlink(root: &Path, active: &Path, generation: u64) -> Result<()
 // running in parallel never observe each other's calls.
 #[cfg(test)]
 thread_local! {
-    static SYSTEMCTL_CALLS: std::cell::RefCell<Vec<String>> =
+    pub(crate) static SYSTEMCTL_CALLS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
