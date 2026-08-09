@@ -2985,14 +2985,28 @@ exec "$@"
             /// permits — on exactly the terms [`current_meta`] uses for the
             /// native path. They are passed numerically so the script needs no
             /// passwd entry for the account CI happens to run as.
+            ///
+            /// A refused destination is refused before `cat > "$tmp"` — a
+            /// directory at the destination in the script's first four lines —
+            /// so on those paths the shell exits without ever reading stdin.
+            /// Whether these bytes reach the pipe buffer before that happens is
+            /// a race, and `BrokenPipe` is the side of it that says the script
+            /// refused early rather than that anything went wrong. The verdict
+            /// is the exit status and the stderr the caller asserts on, so it
+            /// is taken as one outcome of a run; every other write error still
+            /// panics.
             fn run_landing_script(dest: &Path, contents: &[u8], mode: u32) -> std::process::Output {
                 let mut child = spawn_landing_script(dest, mode);
-                child
-                    .stdin
-                    .take()
-                    .expect("stdin is piped")
-                    .write_all(contents)
-                    .expect("write contents");
+                let mut stdin = child.stdin.take().expect("stdin is piped");
+                match stdin.write_all(contents) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(error) => panic!("write contents: {error}"),
+                }
+                // Explicitly, and before the wait: the paths that do read stdin
+                // sit in `cat` until they see EOF, and holding this open past
+                // here would hang them.
+                drop(stdin);
                 child.wait_with_output().expect("the script should finish")
             }
 
