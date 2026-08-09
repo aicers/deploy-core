@@ -5030,6 +5030,48 @@ mod tests {
         );
     }
 
+    /// The configuration the marker exists for: a host that demands an
+    /// out-of-band pin admits the call that carries the right one, and the marker
+    /// asks only that a pin was supplied — a wrong one is still the mismatch
+    /// refusal rather than the no-pin one.
+    #[test]
+    fn a_pinned_rebootstrap_onto_a_marked_host_turns_on_the_pin_alone() {
+        let pair = keypair();
+        let delivered = Generation::new(&pair, NEXT_EPOCH);
+        let digest = member_digest(&delivered.member);
+
+        let wrong = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&wrong.root, b"");
+        let before = snapshot(&wrong.root);
+        let err = rebootstrap_generation(
+            &wrong.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(STRANGER_COMMIT),
+        )
+        .expect_err("a pin was supplied, and it is not this document's");
+        assert!(
+            matches!(err, ReleaseTrustError::FingerprintPinMismatch { .. }),
+            "the marker gate tests presence, not correctness, got {err:?}",
+        );
+        assert_eq!(snapshot(&wrong.root), before, "and nothing was written");
+
+        let right = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        set_pin_marker(&right.root, b"");
+        let admitted = rebootstrap_generation(
+            &right.root,
+            &delivered.package,
+            authorizing(SEED_EPOCH),
+            Some(&digest),
+        )
+        .expect("the host demanded a pin and the call carried the right one");
+        assert_eq!(admitted.epoch, NEXT_EPOCH);
+        assert_eq!(
+            read_active_epoch(&right.root).expect("read"),
+            Some(NEXT_EPOCH)
+        );
+    }
+
     /// The marker's presence is its entire state: there is no format, so no
     /// parser, and its contents are never read.
     #[test]
