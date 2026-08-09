@@ -36,8 +36,12 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   trust set, and the two install-time admission doors — a seed that refuses a
   tree already carrying a generation and an operator-mediated replace that does
   not — which verify a delivered container against the trust set it carries
-  before the tree's one crate-internal installer stages it. There is no other
-  way for a dependent crate to write the tree.
+  before the tree's one crate-internal installer stages it. Separately it
+  exports the runtime accept path the control plane pushes over, which judges a
+  delivered generation against the **active** one's trust set and applies the
+  `epoch` floor: the state query a caller asks before it pushes, the accept for
+  one delivered generation, and the ordered chain replay that catches a lagging
+  host up. There is no other way for a dependent crate to write the tree.
 - **engine** — the install/update diff engine (compute what changed).
 - **apply** — the apply primitives that actuate a diff on a host (place files,
   create directories, run root commands, load images, extract bundles).
