@@ -3734,6 +3734,41 @@ mod tests {
         );
     }
 
+    /// The other half of the rule the out-of-order test pins: a duplicate
+    /// **adjacent** to the step that activated it is a no-op, because by then it
+    /// *is* the active container. Only a duplicate further back falls through to
+    /// the floor.
+    ///
+    /// The activating step is the chain's own, not the seed's, so the bytes the
+    /// second step short-circuits against are ones this call installed rather
+    /// than ones it found.
+    #[test]
+    fn a_duplicate_adjacent_to_the_step_that_activated_it_is_a_no_op() {
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let newer = Generation::new(&pair, NEXT_EPOCH);
+        let packages: Vec<&[u8]> = vec![&newer.package, &newer.package];
+
+        let replay = accept_generation_chain(&t.root, &packages).expect("the chain replays");
+        assert_eq!(replay.completed, 2);
+        let last = replay.last.expect("both steps were accepted");
+        assert_eq!(
+            last.activation,
+            Activation {
+                generation: 2,
+                changed: false,
+            },
+            "the second step found its own bytes already active",
+        );
+        assert_eq!(last.epoch, NEXT_EPOCH);
+        assert_active_is(&t.root, 2);
+        assert_eq!(
+            entries(&t.root),
+            vec![OsString::from(ACTIVE_LINK), generation_name(&t.root, 2)],
+            "the redelivery allocated no generation directory of its own",
+        );
+    }
+
     /// The routine shape: a control plane sends "generations *N* through *M*" to
     /// a host it believes is on *N*, so the first step is a redelivery.
     ///
