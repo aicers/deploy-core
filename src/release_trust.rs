@@ -1970,6 +1970,31 @@ mod tests {
         }
     }
 
+    /// `MissingTrustSetMember` is the *only* container-layer refusal this work
+    /// names. Everything else the container layer decides — bytes that are no
+    /// container at all, and an archive block that cannot be walked to its end —
+    /// arrives through the existing `PayloadError` mapping as the verifier's own
+    /// refusal, with no variant added here to carry it.
+    #[test]
+    fn every_other_container_fault_arrives_through_the_existing_verifier_mapping() {
+        let pair = keypair();
+        let generation = Generation::new(&pair, SEED_EPOCH);
+        let corrupt = corrupt_archive(&generation.package);
+        crate::payload::open_package(Cursor::new(&corrupt))
+            .expect("the container still opens, so the failure falls inside the walk");
+
+        for package in [b"not a container".as_slice(), &corrupt] {
+            let t = tree();
+            let err = admit_seed_generation(&t.root, package)
+                .expect_err("the container layer refuses these bytes");
+            assert!(
+                matches!(err, ReleaseTrustError::Verify(VerifyError::Payload(_))),
+                "got {err:?}",
+            );
+            assert_nothing_installed(&t.root, &[]);
+        }
+    }
+
     /// Material mutated after it was signed is refused by the signature, not by
     /// the reader: the pre-verification decode ran over the delivered document
     /// and decided nothing.
