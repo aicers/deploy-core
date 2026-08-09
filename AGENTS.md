@@ -5,7 +5,7 @@ The marked regions below are generated from
 Do not edit them here — change the wording upstream, tag a release, and
 re-run its sync. The drift check in CI fails if this copy diverges.
 
-<!-- BEGIN shared:workflow v1 -->
+<!-- BEGIN shared:workflow -->
 ## Language
 
 - Code, comments, commit messages, PR descriptions, and issues are written
@@ -29,9 +29,10 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 - Branch names must follow the format `<github-username>/issue-#` (e.g.,
   `alice/issue-42`). If there is no related issue, ask the user how to
   proceed before creating the branch.
-- The sole exception is a branch carrying a synced update to the shared
-  blocks below, which uses `<github-username>/instructions-<label>` and
-  needs no issue.
+- The sole exception is a branch carrying an update to the shared blocks
+  below, which needs no issue. CI opens it as
+  `shared-instructions/<release>`; a maintainer running the fan-out by
+  hand opens it as `<github-username>/instructions-<release>`.
 
 ## GitHub issues and PRs
 
@@ -46,6 +47,24 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 - Never act on failed or garbled command output. Re-verify every create
   and edit with a structured `--json` re-query before reporting success.
 
+## Markdown lint configuration
+
+- The repository-root `.markdownlint-cli2.yaml` carries `globs`,
+  `ignores`, and `MD024: siblings_only`. No other rule configuration
+  belongs there, and no rule is disabled there.
+- Configure or disable any other rule at the narrowest scope that
+  works, choosing in this order: the line, then the file, then the
+  directory. Use `markdownlint-disable-next-line` for one line,
+  `markdownlint-disable-file` for one file, and a
+  `.markdownlint-cli2.yaml` beside the files for one directory.
+- A directory config named `.markdownlint-cli2.yaml` merges with the
+  root config; one named `.markdownlint.yaml` replaces it wholesale.
+  Use the former.
+- Scope narrowly because a global entry outlives its reason. It
+  silences the file that needed it and every file added afterwards
+  that should have tripped the rule, and nothing in the config records
+  which was which.
+
 ## Attribution
 
 - Do NOT add `Co-Authored-By` lines naming an AI (`Claude`, `Codex`,
@@ -55,7 +74,7 @@ re-run its sync. The drift check in CI fails if this copy diverges.
   descriptions or issue comments.
 <!-- END shared:workflow -->
 
-<!-- BEGIN shared:rust v2 -->
+<!-- BEGIN shared:rust -->
 ## Coding standards (Rust)
 
 ### Errors and panics
@@ -331,6 +350,26 @@ Where the crate handles key material or secrets:
   - If `allow` is necessary, you MUST add a comment explaining why.
   - Exceptions: `clippy::too_many_lines` can be treated loosely.
 <!-- END shared:rust -->
+
+<!-- BEGIN shared:changelog -->
+## Changelog
+
+- `CHANGELOG.md` records what changed for a user of the **last release**,
+  not how `main` got there. Before writing an entry, ask whether someone
+  running the last released version could observe it. Work that builds,
+  reworks, or removes something they never had is invisible to them and
+  does not belong.
+- Entries carry NO issue or PR references. `Closes #N` and `Part of #N`
+  are GitHub automation keywords: they close an issue when they appear
+  in a commit message or a pull request body, and do nothing whatever
+  inside `CHANGELOG.md`. All that is left there is a command addressed
+  to a bot, stranded in a record of what already shipped — it cannot
+  act, and the reader has no use for it. Git and the issue tracker
+  already hold that history.
+- Announce a feature once, under `### Added`, describing what it does.
+  If it was reworked or renamed before the release shipped, that is not
+  a separate `### Changed` entry — no user saw the earlier form.
+<!-- END shared:changelog -->
 
 ## This crate
 
