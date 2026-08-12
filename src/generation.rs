@@ -61,6 +61,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::durability::sync_dir;
 use crate::layout::{ACTIVE_LINK, GENERATION_PREFIX};
 use crate::roxyd_trust::Activation;
 
@@ -211,10 +212,10 @@ pub(crate) struct GenerationTree<'a> {
 ///   steps 3 and 4 leaves `gen-<n>.tmp` behind, which the next activation removes
 ///   before it reuses the name, and which any prune removes in any case. A copy the
 ///   validator rejected is removed on the way out.
-/// - **Finalised but not yet live** — the `rename` of step 5 succeeded and the
-///   `active` swap right after it failed; a directory left at the reserved
-///   `active.tmp` scratch name is one way to reach it, since clearing that name is a
-///   `remove_file`. `active` still resolves to the previous
+/// - **Finalised but not yet live** — the `rename` of step 5 succeeded and either the
+///   flush of the tree root after it or the `active` swap failed; a directory left at
+///   the reserved `active.tmp` scratch name is one way to reach it, since clearing
+///   that name is a `remove_file`. `active` still resolves to the previous
 ///   generation, so this too is fail-closed for every reader of the tree, but
 ///   `gen-<n>` is now on disk as a complete generation nothing points at. That
 ///   leftover is inert rather than live material: allocation only ever counts upward
@@ -223,8 +224,9 @@ pub(crate) struct GenerationTree<'a> {
 ///   directory was written" — only as "the previous material is still what readers
 ///   resolve".
 /// - **After the swap** — a [`GenerationError::Reload`], or an I/O fault while
-///   pruning. `active` already points at `gen-<n>` and the new material is live; what
-///   failed is notifying the tree's readers or clearing the superseded generations,
+///   flushing the tree root after the swap or while pruning. `active` already points
+///   at `gen-<n>` and the new material is live; what failed is making that swap
+///   durable, notifying the tree's readers, or clearing the superseded generations,
 ///   not the installation. A caller must not read this `Err` as "the previous
 ///   material is still in place". Recovery is another activation: a call over the
 ///   same bytes is the step 2 no-op, which neither retries the reload nor prunes, so
@@ -274,9 +276,26 @@ where
         return Err(err);
     }
 
-    // Finalise the generation, then swap `active` onto it atomically.
+    // Finalise the generation, then swap `active` onto it atomically. Each step
+    // is flushed as it is taken, because what this sequence publishes is state
+    // the tree's readers resolve at every start: an `active` that survives a
+    // crash naming a generation whose files did not is the failure to prevent.
+    //
+    // The material files are already down, one at a time, but the entries
+    // naming them inside `gen-<n>.tmp` are not until the directory itself is
+    // flushed, and that has to happen before the rename that finalises it.
+    sync_dir(&tmp_dir).map_err(|e| GenerationError::io(&tmp_dir, e))?;
     rename(&tmp_dir, &final_dir)?;
+    // The generation's own entry lives in the tree root, and it has to be on
+    // disk before anything at that root can name it. A single flush after the
+    // swap instead of this one is not equivalent: it would let the filesystem
+    // commit `active` ahead of the generation directory it points at.
+    sync_dir(root).map_err(|e| GenerationError::io(root, e))?;
     swap_active_symlink(root, &active, generation)?;
+    // The swap's durability is this flush and nothing else: a symlink cannot be
+    // flushed itself — `File::open` follows it, and an `O_PATH`/`O_NOFOLLOW`
+    // descriptor cannot be `fsync`ed — so the root's entry is all there is.
+    sync_dir(root).map_err(|e| GenerationError::io(root, e))?;
     if let Some(unit) = tree.reload_unit {
         reload_if_active(unit)?;
     }
@@ -515,6 +534,10 @@ fn read_file(path: &Path) -> Result<Vec<u8>, GenerationError> {
 /// material — a certificate, a CA bundle, a private key. `create_new` also makes a
 /// pre-existing path an error rather than a silent overwrite, which is what staged
 /// trust material wants.
+///
+/// The bytes are on disk when this returns, not merely written: what goes through
+/// here is staged into a generation the tree reads back at every start, so it has to
+/// survive a crash between the staging and the rename that publishes it.
 pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -526,7 +549,11 @@ pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), Generatio
         .open(path)
         .map_err(|e| GenerationError::io(path, e))?;
     file.write_all(bytes)
-        .map_err(|e| GenerationError::io(path, e))
+        .map_err(|e| GenerationError::io(path, e))?;
+    // Protects the material itself: the generation directory holding this file is
+    // renamed into place and pointed at by `active`, and a reader resolving that
+    // link after a crash must not find an empty or truncated file behind it.
+    file.sync_all().map_err(|e| GenerationError::io(path, e))
 }
 
 /// Creates `path` as a directory that is `0700` from the moment it exists.
@@ -567,7 +594,7 @@ mod tests {
 
     use super::{
         GenerationError, GenerationFile, GenerationTree, SYSTEMCTL_CALLS, activate_generation,
-        parse_generation, parse_tmp_generation,
+        parse_generation, parse_tmp_generation, sync_dir,
     };
     use crate::layout::REQUIRE_TRUST_PIN_MARKER;
 
@@ -1102,6 +1129,28 @@ mod tests {
                 !rendered.contains("roxyd"),
                 "the engine reports for every tree: {rendered}",
             );
+        }
+    }
+
+    /// A directory flush that fails is an error the caller sees, carrying the path
+    /// that was flushed — mapped exactly as the three `sync_dir` call sites in
+    /// [`activate_generation`] map it, so what is checked here is the plumbing those
+    /// sites use and not a spelling private to this test.
+    #[test]
+    fn a_failed_directory_flush_names_the_flushed_path() {
+        let tree = tree();
+        let missing = tree.root.join("gen-7.tmp");
+
+        let err = sync_dir(&missing)
+            .map_err(|e| GenerationError::io(&missing, e))
+            .expect_err("flushing a directory that does not exist must not succeed");
+
+        match err {
+            GenerationError::Io { path, source } => {
+                assert_eq!(path, missing.to_string_lossy());
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected a path-carrying i/o error, got: {other:?}"),
         }
     }
 }
