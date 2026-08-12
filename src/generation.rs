@@ -61,6 +61,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::durability::sync_dir;
 use crate::layout::{ACTIVE_LINK, GENERATION_PREFIX};
 use crate::roxyd_trust::Activation;
 
@@ -186,9 +187,11 @@ pub(crate) struct GenerationTree<'a> {
 /// 4. Read every file back from `gen-<n>.tmp` and hand that directory and those
 ///    bytes to `validate`. On a validator error, remove `gen-<n>.tmp` and return the
 ///    error with `active` untouched.
-/// 5. `rename` the temporary directory to `gen-<n>`, swap `active` onto it
+/// 5. Flush `gen-<n>.tmp`, `rename` it to `gen-<n>`, swap `active` onto it
 ///    atomically, reload `tree.reload_unit` when it is `Some` and the unit is
-///    running, then prune every generation other than the one now active. The swap
+///    running, then prune every generation other than the one now active. Each of
+///    the first three is flushed as it is taken, so what a reader resolves after a
+///    crash is never an `active` naming material that did not land. The swap
 ///    is the point of no return: the two steps after it run with the new material
 ///    already live.
 ///
@@ -203,18 +206,19 @@ pub(crate) struct GenerationTree<'a> {
 /// Where in the sequence the failure falls decides what the tree looks like
 /// afterwards, and the three cases are not the same contract:
 ///
-/// - **Before `gen-<n>` is finalised** — a refused material set, any I/O fault in
-///   steps 2 to 4, or a validator rejection. Fail-closed and nothing published:
-///   `active` resolves to exactly what it resolved to before the call, and no final
-///   `gen-<n>` exists that did not exist before it. A half-staged copy may: the
-///   directory is created before the files are written, so an I/O fault anywhere in
-///   steps 3 and 4 leaves `gen-<n>.tmp` behind, which the next activation removes
-///   before it reuses the name, and which any prune removes in any case. A copy the
-///   validator rejected is removed on the way out.
-/// - **Finalised but not yet live** — the `rename` of step 5 succeeded and the
-///   `active` swap right after it failed; a directory left at the reserved
-///   `active.tmp` scratch name is one way to reach it, since clearing that name is a
-///   `remove_file`. `active` still resolves to the previous
+/// - **Before `gen-<n>` is finalised** — a refused material set, any I/O fault from
+///   step 2 through the flush that opens step 5, or a validator rejection.
+///   Fail-closed and nothing published: `active` resolves to exactly what it
+///   resolved to before the call, and no final `gen-<n>` exists that did not exist
+///   before it. A half-staged copy may: the directory is created before the files
+///   are written, so an I/O fault anywhere from step 3 up to and including that
+///   flush leaves `gen-<n>.tmp` behind, which the next activation removes before it
+///   reuses the name, and which any prune removes in any case. A copy the validator
+///   rejected is removed on the way out.
+/// - **Finalised but not yet live** — the `rename` of step 5 succeeded and either the
+///   flush of the tree root after it or the `active` swap failed; a directory left at
+///   the reserved `active.tmp` scratch name is one way to reach it, since clearing
+///   that name is a `remove_file`. `active` still resolves to the previous
 ///   generation, so this too is fail-closed for every reader of the tree, but
 ///   `gen-<n>` is now on disk as a complete generation nothing points at. That
 ///   leftover is inert rather than live material: allocation only ever counts upward
@@ -223,8 +227,9 @@ pub(crate) struct GenerationTree<'a> {
 ///   directory was written" — only as "the previous material is still what readers
 ///   resolve".
 /// - **After the swap** — a [`GenerationError::Reload`], or an I/O fault while
-///   pruning. `active` already points at `gen-<n>` and the new material is live; what
-///   failed is notifying the tree's readers or clearing the superseded generations,
+///   flushing the tree root after the swap or while pruning. `active` already points
+///   at `gen-<n>` and the new material is live; what failed is making that swap
+///   durable, notifying the tree's readers, or clearing the superseded generations,
 ///   not the installation. A caller must not read this `Err` as "the previous
 ///   material is still in place". Recovery is another activation: a call over the
 ///   same bytes is the step 2 no-op, which neither retries the reload nor prunes, so
@@ -274,9 +279,26 @@ where
         return Err(err);
     }
 
-    // Finalise the generation, then swap `active` onto it atomically.
+    // Finalise the generation, then swap `active` onto it atomically. Each step
+    // is flushed as it is taken, because what this sequence publishes is state
+    // the tree's readers resolve at every start: an `active` that survives a
+    // crash naming a generation whose files did not is the failure to prevent.
+    //
+    // The material files are already down, one at a time, but the entries
+    // naming them inside `gen-<n>.tmp` are not until the directory itself is
+    // flushed, and that has to happen before the rename that finalises it.
+    sync_dir(&tmp_dir).map_err(|e| GenerationError::io(&tmp_dir, e))?;
     rename(&tmp_dir, &final_dir)?;
+    // The generation's own entry lives in the tree root, and it has to be on
+    // disk before anything at that root can name it. A single flush after the
+    // swap instead of this one is not equivalent: it would let the filesystem
+    // commit `active` ahead of the generation directory it points at.
+    sync_dir(root).map_err(|e| GenerationError::io(root, e))?;
     swap_active_symlink(root, &active, generation)?;
+    // The swap's durability is this flush and nothing else: a symlink cannot be
+    // flushed itself — `File::open` follows it, and an `O_PATH`/`O_NOFOLLOW`
+    // descriptor cannot be `fsync`ed — so the root's entry is all there is.
+    sync_dir(root).map_err(|e| GenerationError::io(root, e))?;
     if let Some(unit) = tree.reload_unit {
         reload_if_active(unit)?;
     }
@@ -515,6 +537,10 @@ fn read_file(path: &Path) -> Result<Vec<u8>, GenerationError> {
 /// material — a certificate, a CA bundle, a private key. `create_new` also makes a
 /// pre-existing path an error rather than a silent overwrite, which is what staged
 /// trust material wants.
+///
+/// The bytes are on disk when this returns, not merely written: what goes through
+/// here is staged into a generation the tree reads back at every start, so it has to
+/// survive a crash between the staging and the rename that publishes it.
 pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -526,7 +552,11 @@ pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), Generatio
         .open(path)
         .map_err(|e| GenerationError::io(path, e))?;
     file.write_all(bytes)
-        .map_err(|e| GenerationError::io(path, e))
+        .map_err(|e| GenerationError::io(path, e))?;
+    // Protects the material itself: the generation directory holding this file is
+    // renamed into place and pointed at by `active`, and a reader resolving that
+    // link after a crash must not find an empty or truncated file behind it.
+    file.sync_all().map_err(|e| GenerationError::io(path, e))
 }
 
 /// Creates `path` as a directory that is `0700` from the moment it exists.
@@ -1103,5 +1133,52 @@ mod tests {
                 "the engine reports for every tree: {rendered}",
             );
         }
+    }
+
+    /// A failing directory flush is an error the caller sees, carrying the path that
+    /// was flushed — asserted through the real call site rather than a spelling
+    /// private to this test, so the flush cannot be deleted without a failure here.
+    ///
+    /// The validator is the one hook [`activate_generation`] hands the staging
+    /// directory to, and it runs after the material is written and before the flush
+    /// that finalises it, so taking the directory away there is a fault injected
+    /// exactly between those two steps. Which path the resulting error names is what
+    /// says the flush ran *before* the rename: `rename` reports its destination, so
+    /// a sequence missing the flush would name `gen-1` here instead.
+    #[test]
+    fn the_staging_flush_runs_before_the_rename_and_names_what_it_flushed() {
+        let t = tree();
+        let files = material(&[("cert.pem", b"bytes")]);
+        let tree = GenerationTree {
+            root: &t.root,
+            reload_unit: None,
+        };
+
+        let err = activate_generation(&tree, &files, |dir: &Path, _: &[GenerationFile]| {
+            std::fs::remove_dir_all(dir).expect("the staging copy is there to be removed");
+            Ok::<(), TestError>(())
+        })
+        .expect_err("flushing a staging directory that is gone must not succeed");
+
+        match err {
+            TestError::Engine(GenerationError::Io { path, source }) => {
+                assert_eq!(
+                    path,
+                    t.root.join("gen-1.tmp").to_string_lossy(),
+                    "the flush names the staging directory it was given",
+                );
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected a path-carrying i/o error, got: {other:?}"),
+        }
+
+        assert!(
+            !t.root.join("gen-1").exists(),
+            "the sequence stops at the flush, with nothing finalised",
+        );
+        assert!(
+            !t.root.join("active").exists(),
+            "and with `active` untouched",
+        );
     }
 }

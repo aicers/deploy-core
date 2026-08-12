@@ -24,6 +24,10 @@
 
 pub mod apply;
 pub mod bootroot_cmd;
+// The one directory flush every staged write in this crate publishes through.
+// Crate-private: it is an implementation detail of those writes, not vocabulary
+// a dependent has any reason to name.
+pub(crate) mod durability;
 pub mod engine;
 pub mod exec;
 pub mod executor;

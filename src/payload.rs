@@ -85,6 +85,7 @@ use tar::{Archive, Builder, EntryType, Header};
 use tempfile::Builder as TempBuilder;
 use zstd::{Decoder, Encoder};
 
+use crate::durability::sync_dir;
 use crate::manifest::{
     ArchiveMember, ArtifactKind, Disposition, ManifestError, PayloadArtifact, PayloadManifest,
     TargetArch, is_safe_archive_path,
@@ -1543,15 +1544,28 @@ impl<R: Read + Seek> Payload<R> {
     /// and is empty.
     ///
     /// Two cases lie outside that guarantee. It does not survive a process
-    /// crash. And it does not cover the final publish step — the moves that put
-    /// already-verified members at their target paths once every check has
-    /// passed. Publishing several files is not one atomic operation, so **a
-    /// failure during the publish step may leave already-verified members at
-    /// their target paths**; making it otherwise would mean owning `dest`
-    /// rather than writing into it, which is a different function's contract.
-    /// Even there, no staging directory and no temporary file survives, and no
-    /// partially written artifact appears at a target path, because each
-    /// individual move is atomic.
+    /// crash: nothing runs on the way out, so a crash mid-walk can leave the
+    /// staging directory and whatever is under it behind, and a crash mid-
+    /// publish can leave both that and already-published artifacts. And it does
+    /// not cover the final publish step — the moves that put already-verified
+    /// members at their target paths once every check has passed. Publishing
+    /// several files is not one atomic operation, so **a failure during the
+    /// publish step may leave already-verified members at their target paths**;
+    /// making it otherwise would mean owning `dest` rather than writing into
+    /// it, which is a different function's contract. Even there, no staging
+    /// directory and no temporary file survives, and no partially written
+    /// artifact appears at a target path, because each individual move is
+    /// atomic.
+    ///
+    /// # Durability
+    ///
+    /// What a crash cannot undo is a publish that *completed*. On a successful
+    /// return every extracted artifact is on disk — its bytes, and the entry
+    /// naming it, along with every directory between it and `dest` that this
+    /// call may have created — so a power loss immediately after an install
+    /// reports success cannot leave an artifact empty, truncated or missing.
+    /// The one thing left unflushed is the directory holding `dest` itself,
+    /// which belongs to whoever chose `dest`.
     ///
     /// # Errors
     ///
@@ -1563,7 +1577,7 @@ impl<R: Read + Seek> Payload<R> {
     /// when the members walked disagree with the manifest's bound
     /// `archive_members` in name, order, count or per-member length
     /// ([`PayloadError::MemberListMismatch`]); or when the archive cannot be
-    /// read or a staged member cannot be written.
+    /// read, or a staged member cannot be written, flushed or published.
     pub fn extract_to(&mut self, dest: &Path) -> Result<Vec<ExtractedArtifact>, PayloadError> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
@@ -1631,6 +1645,12 @@ impl<R: Read + Seek> Payload<R> {
                     path: artifact.archive_path.clone(),
                 });
             }
+            // Protects the artifact's own bytes, which the publish step below
+            // does no more than rename into place. After the check, so a member
+            // about to be rejected does not buy a disk round trip, and here
+            // rather than at the publish, which holds no descriptor for this
+            // file and would have to reopen it to get one.
+            file.sync_all()?;
             // The length recorded is the count of data bytes this reader
             // consumed while hashing the member, never the size read back out
             // of its `tar` header: the bound length has to be a property of the
@@ -1667,6 +1687,7 @@ impl<R: Read + Seek> Payload<R> {
         // already-verified members behind; each individual move is atomic, so
         // no partial artifact can appear at a target path.
         let mut extracted = Vec::with_capacity(staged.len());
+        let mut published: Vec<PathBuf> = Vec::with_capacity(staged.len());
         for (relative, artifact) in staged {
             let out_path = dest.join(&relative);
             if let Some(parent) = out_path.parent() {
@@ -1677,10 +1698,57 @@ impl<R: Read + Seek> Payload<R> {
                 artifact: artifact.clone(),
                 path: out_path,
             });
+            published.push(relative);
+        }
+
+        // The artifacts' bytes are down, but the names the renames just gave
+        // them are not, and neither are the directories the loop above may have
+        // created to hold them. What this protects is a host that boots: an
+        // install that reported success and lost a binary does not come back
+        // up. Every level is flushed rather than the innermost alone, because a
+        // directory's own entry lives in its parent. The staging directory is
+        // not flushed at all — its `Drop` removes it.
+        for dir in publish_dirs(dest, &published) {
+            sync_dir(&dir)?;
         }
 
         Ok(extracted)
     }
+}
+
+/// The directories a completed [`Payload::extract_to`] flushes: for every
+/// published artifact, the directory holding it and each ancestor between that
+/// and `dest`, with `dest` itself, each returned exactly once.
+///
+/// `relatives` are the artifact paths relative to `dest`, as the publish loop
+/// joins them. Each chain is walked innermost first, since a directory's own
+/// entry lives in its parent, and the walk stops at `dest`: `dest` is created by
+/// the same call, but the directory holding *it* is the caller's to flush.
+///
+/// Split out from the publish loop because the arithmetic — which levels, how
+/// far up, how often — is the part of this worth testing, and none of it is
+/// observable from the flushes themselves.
+fn publish_dirs(dest: &Path, relatives: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut dirs = Vec::new();
+    for relative in relatives {
+        // `Path::parent` of a bare file name is the empty path, whose parent is
+        // `None`, so the walk terminates at `dest` on its own rather than by
+        // comparing paths for ancestry.
+        let mut current = relative.parent();
+        while let Some(rel_dir) = current {
+            let dir = if rel_dir.as_os_str().is_empty() {
+                dest.to_path_buf()
+            } else {
+                dest.join(rel_dir)
+            };
+            if seen.insert(dir.clone()) {
+                dirs.push(dir);
+            }
+            current = rel_dir.parent();
+        }
+    }
+    dirs
 }
 
 /// Compares the sequence the archive walk produced against the ordered member
@@ -2009,7 +2077,7 @@ pub fn current_exe_base() -> Result<Vec<u8>, PayloadError> {
 mod tests {
     use std::collections::BTreeSet;
     use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tar::{Builder, EntryType, Header};
     use zstd::Encoder;
@@ -2018,8 +2086,8 @@ mod tests {
         ArtifactInput, Candidate, FOOTER_SIZE, FOOTER_SIZE_V1, FOOTER_SIZE_V2, FORMAT_VERSION,
         Footer, KNOWN_FOOTER_SIZES, MAGIC, MAGIC_LEN, PayloadError, PayloadManifest,
         TAR_BLOCK_SIZE, TAR_NAME_FIELD_LEN, append_trailer, classify_candidate, open,
-        open_current_exe, open_package, open_package_path, read_base_executable, rewrap_trailer,
-        sha256_hex,
+        open_current_exe, open_package, open_package_path, publish_dirs, read_base_executable,
+        rewrap_trailer, sha256_hex,
     };
     use crate::manifest::{
         ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
@@ -5152,5 +5220,56 @@ mod tests {
                 .expect("current exe read should succeed")
                 .is_none()
         );
+    }
+
+    /// The directory set a publish flushes, over paths alone: what the flushes
+    /// themselves do is not observable, but which directories they are asked
+    /// for is.
+    fn dirs_for(relatives: &[&str]) -> Vec<PathBuf> {
+        let owned: Vec<PathBuf> = relatives.iter().map(PathBuf::from).collect();
+        publish_dirs(Path::new("/install/dest"), &owned)
+    }
+
+    #[test]
+    fn an_artifact_directly_in_dest_flushes_dest_alone() {
+        assert_eq!(dirs_for(&["bootler"]), vec![PathBuf::from("/install/dest")]);
+    }
+
+    #[test]
+    fn a_nested_artifact_flushes_every_level_down_to_dest() {
+        assert_eq!(
+            dirs_for(&["opt/share/lib/libfoo.so"]),
+            vec![
+                PathBuf::from("/install/dest/opt/share/lib"),
+                PathBuf::from("/install/dest/opt/share"),
+                PathBuf::from("/install/dest/opt"),
+                PathBuf::from("/install/dest"),
+            ],
+            "innermost first, since a directory's entry lives in its parent"
+        );
+    }
+
+    #[test]
+    fn two_artifacts_sharing_a_parent_flush_it_once() {
+        assert_eq!(
+            dirs_for(&["bin/one", "bin/two", "bin/nested/three"]),
+            vec![
+                PathBuf::from("/install/dest/bin"),
+                PathBuf::from("/install/dest"),
+                PathBuf::from("/install/dest/bin/nested"),
+            ],
+            "each directory appears once, at the position it was first reached"
+        );
+    }
+
+    #[test]
+    fn the_walk_stops_at_dest() {
+        for dir in dirs_for(&["a/b/c", "top"]) {
+            assert!(
+                dir.starts_with("/install/dest"),
+                "nothing above dest is flushed: {}",
+                dir.display()
+            );
+        }
     }
 }

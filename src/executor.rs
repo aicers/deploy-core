@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::durability::sync_dir;
 use crate::transport::{HostKeyPolicy, Ssh};
 
 /// The `sudo` binary name used unless a test overrides it.
@@ -1070,6 +1071,11 @@ fn make_dir_through_install<E: Executor + ?Sized>(
 /// object already held open, so no path component changing between the write
 /// and the `chown` can redirect them. The shell cannot express that, which is
 /// why the two mechanisms both exist rather than one standing in for the other.
+///
+/// The landing is durable as well as atomic: on return the file's bytes, its
+/// owner and its mode are on disk, and so is the destination directory's entry
+/// naming it, so a crash or a power loss immediately after cannot leave the
+/// destination empty or absent.
 #[cfg(unix)]
 fn put_file_natively<E: Executor + ?Sized>(
     executor: &E,
@@ -1081,6 +1087,13 @@ fn put_file_natively<E: Executor + ?Sized>(
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, fchown};
 
     let stage = staging_dir(dest)?;
+    // The directory the rename's new entry appears in, bound here because the
+    // call above is what makes it infallible: `select_staging_dir` opens with
+    // `dest.parent()?`, and `staging_dir` turns that `None` into a `Transfer`
+    // error, so a parentless destination never reaches this line.
+    let dest_dir = dest
+        .parent()
+        .expect("staging_dir has already refused a destination with no parent");
     let uid = numeric_id(executor, meta.owner, IdKind::User)?;
     let gid = numeric_id(executor, meta.group, IdKind::Group)?;
     let temp = stage.join(format!(
@@ -1099,13 +1112,19 @@ fn put_file_natively<E: Executor + ?Sized>(
             .mode(STAGING_TEMP_MODE)
             .open(&temp)?;
         file.write_all(contents)?;
-        file.flush()?;
         // Metadata goes on before the file is reachable under its final name,
         // and through the descriptor rather than the path, so the destination
         // never resolves to a file with the wrong owner or a wider mode and
         // nothing renaming a path component can redirect either call.
         fchown(&file, Some(uid), Some(gid))?;
         file.set_permissions(Permissions::from_mode(meta.mode))?;
+        // Flushed here rather than straight after the write: `sync_all` covers
+        // metadata as well as data, and the owner and the mode this function
+        // exists to get right are precisely that metadata, so a flush placed
+        // above the two calls would leave what they set unflushed. What it
+        // protects is a destination that survives a crash holding the bytes and
+        // the ownership this call promised.
+        file.sync_all()?;
         // `rename` replaces whatever is at the destination — including a
         // symlink, which it does not follow — atomically.
         std::fs::rename(&temp, dest)
@@ -1117,6 +1136,14 @@ fn put_file_natively<E: Executor + ?Sized>(
     }
     landed.map_err(|source| ExecutorError::Io {
         path: dest.to_path_buf(),
+        source,
+    })?;
+    // The entry the rename created lives in the destination's own directory, so
+    // that is what has to be flushed for the landing to survive a crash — not
+    // the staging directory, which is somewhere else entirely and whose lost
+    // temporary entry would be inert anyway.
+    sync_dir(dest_dir).map_err(|source| ExecutorError::Io {
+        path: dest_dir.to_path_buf(),
         source,
     })
 }
