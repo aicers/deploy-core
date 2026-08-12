@@ -187,9 +187,11 @@ pub(crate) struct GenerationTree<'a> {
 /// 4. Read every file back from `gen-<n>.tmp` and hand that directory and those
 ///    bytes to `validate`. On a validator error, remove `gen-<n>.tmp` and return the
 ///    error with `active` untouched.
-/// 5. `rename` the temporary directory to `gen-<n>`, swap `active` onto it
+/// 5. Flush `gen-<n>.tmp`, `rename` it to `gen-<n>`, swap `active` onto it
 ///    atomically, reload `tree.reload_unit` when it is `Some` and the unit is
-///    running, then prune every generation other than the one now active. The swap
+///    running, then prune every generation other than the one now active. Each of
+///    the first three is flushed as it is taken, so what a reader resolves after a
+///    crash is never an `active` naming material that did not land. The swap
 ///    is the point of no return: the two steps after it run with the new material
 ///    already live.
 ///
@@ -204,14 +206,15 @@ pub(crate) struct GenerationTree<'a> {
 /// Where in the sequence the failure falls decides what the tree looks like
 /// afterwards, and the three cases are not the same contract:
 ///
-/// - **Before `gen-<n>` is finalised** — a refused material set, any I/O fault in
-///   steps 2 to 4, or a validator rejection. Fail-closed and nothing published:
-///   `active` resolves to exactly what it resolved to before the call, and no final
-///   `gen-<n>` exists that did not exist before it. A half-staged copy may: the
-///   directory is created before the files are written, so an I/O fault anywhere in
-///   steps 3 and 4 leaves `gen-<n>.tmp` behind, which the next activation removes
-///   before it reuses the name, and which any prune removes in any case. A copy the
-///   validator rejected is removed on the way out.
+/// - **Before `gen-<n>` is finalised** — a refused material set, any I/O fault from
+///   step 2 through the flush that opens step 5, or a validator rejection.
+///   Fail-closed and nothing published: `active` resolves to exactly what it
+///   resolved to before the call, and no final `gen-<n>` exists that did not exist
+///   before it. A half-staged copy may: the directory is created before the files
+///   are written, so an I/O fault anywhere from step 3 up to and including that
+///   flush leaves `gen-<n>.tmp` behind, which the next activation removes before it
+///   reuses the name, and which any prune removes in any case. A copy the validator
+///   rejected is removed on the way out.
 /// - **Finalised but not yet live** — the `rename` of step 5 succeeded and either the
 ///   flush of the tree root after it or the `active` swap failed; a directory left at
 ///   the reserved `active.tmp` scratch name is one way to reach it, since clearing
