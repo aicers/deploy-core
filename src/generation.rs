@@ -597,7 +597,7 @@ mod tests {
 
     use super::{
         GenerationError, GenerationFile, GenerationTree, SYSTEMCTL_CALLS, activate_generation,
-        parse_generation, parse_tmp_generation, sync_dir,
+        parse_generation, parse_tmp_generation,
     };
     use crate::layout::REQUIRE_TRUST_PIN_MARKER;
 
@@ -1135,25 +1135,50 @@ mod tests {
         }
     }
 
-    /// A directory flush that fails is an error the caller sees, carrying the path
-    /// that was flushed — mapped exactly as the three `sync_dir` call sites in
-    /// [`activate_generation`] map it, so what is checked here is the plumbing those
-    /// sites use and not a spelling private to this test.
+    /// A failing directory flush is an error the caller sees, carrying the path that
+    /// was flushed — asserted through the real call site rather than a spelling
+    /// private to this test, so the flush cannot be deleted without a failure here.
+    ///
+    /// The validator is the one hook [`activate_generation`] hands the staging
+    /// directory to, and it runs after the material is written and before the flush
+    /// that finalises it, so taking the directory away there is a fault injected
+    /// exactly between those two steps. Which path the resulting error names is what
+    /// says the flush ran *before* the rename: `rename` reports its destination, so
+    /// a sequence missing the flush would name `gen-1` here instead.
     #[test]
-    fn a_failed_directory_flush_names_the_flushed_path() {
-        let tree = tree();
-        let missing = tree.root.join("gen-7.tmp");
+    fn the_staging_flush_runs_before_the_rename_and_names_what_it_flushed() {
+        let t = tree();
+        let files = material(&[("cert.pem", b"bytes")]);
+        let tree = GenerationTree {
+            root: &t.root,
+            reload_unit: None,
+        };
 
-        let err = sync_dir(&missing)
-            .map_err(|e| GenerationError::io(&missing, e))
-            .expect_err("flushing a directory that does not exist must not succeed");
+        let err = activate_generation(&tree, &files, |dir: &Path, _: &[GenerationFile]| {
+            std::fs::remove_dir_all(dir).expect("the staging copy is there to be removed");
+            Ok::<(), TestError>(())
+        })
+        .expect_err("flushing a staging directory that is gone must not succeed");
 
         match err {
-            GenerationError::Io { path, source } => {
-                assert_eq!(path, missing.to_string_lossy());
+            TestError::Engine(GenerationError::Io { path, source }) => {
+                assert_eq!(
+                    path,
+                    t.root.join("gen-1.tmp").to_string_lossy(),
+                    "the flush names the staging directory it was given",
+                );
                 assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
             }
             other => panic!("expected a path-carrying i/o error, got: {other:?}"),
         }
+
+        assert!(
+            !t.root.join("gen-1").exists(),
+            "the sequence stops at the flush, with nothing finalised",
+        );
+        assert!(
+            !t.root.join("active").exists(),
+            "and with `active` untouched",
+        );
     }
 }
