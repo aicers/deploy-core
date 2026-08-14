@@ -79,7 +79,8 @@ const STAT: &str = "stat";
 /// `sh -c SCRIPT _ <dest> <owner> <group> <mode>`, so every value arrives
 /// positionally and is never spliced into the script text.
 ///
-/// The sequence is create-in-staging → write → chown/chmod → rename:
+/// The sequence is create-in-staging → write → chown/chmod → flush → rename →
+/// flush:
 ///
 /// - `mktemp` in the staging directory opens with `O_CREAT|O_EXCL` at mode
 ///   `0600`, so the temporary file is never readable by another account and
@@ -133,6 +134,55 @@ const STAT: &str = "stat";
 ///   keeps the landing atomic, since it runs after the `mv` and an inode number
 ///   is only unique within one device. The same-filesystem guarantee is the
 ///   staging-selection rule above, which acts before the move.
+/// - **Both halves of the landing are flushed**, so a destination this script
+///   reported written is durable as well as atomic — the promise
+///   [`put_file_natively`] makes in process, made here too rather than left to
+///   differ by transport for the same file. `flush "$tmp"` sits *after* the
+///   `chown` and the `chmod` and before the `mv`, because what it protects is
+///   the temporary's bytes together with the owner and mode just applied to it;
+///   a flush placed above those two calls would leave what they set unflushed.
+///   `flush "$(dirname "$dest")"` runs after the `mv`, because the entry a
+///   rename creates lives in the destination's own directory and has to be
+///   flushed in its own right, and does not exist yet at the first point — the
+///   ordering rule [`crate::durability`] states for the native paths. Both
+///   halves are reachable through `sync` because GNU coreutils' `sync` takes
+///   operands and `fsync`s each one, and an operand may be a *directory*; it is
+///   the operand that is the extension there, not the directory.
+/// - **Which `sync` runs is settled by what it does, never by probing for the
+///   name.** `sync "$1" 2>/dev/null || sync` is correct against all three
+///   implementations a target can carry, and a `command -v sync` probe would be
+///   worse than useless because the name is present in every one of them:
+///   coreutils flushes the named object; macOS's `sync` and a busybox built
+///   without `FEATURE_SYNC_FANCY` accept the operand, ignore it, flush every
+///   filesystem on the host and exit `0` — which has already done everything
+///   the fallback would; and an implementation that refuses the operand exits
+///   non-zero, so the bare `sync` runs. POSIX `sync` takes no operands, so that
+///   third outcome is the standard-conforming one and not an edge case. The
+///   shells this has to survive `set -e` under — dash, bash and busybox ash —
+///   carry no `sync` builtin, so the resolution is `PATH`'s in each, and the
+///   `||` list is one whose left operands `set -e` exempts. `dd` is not the
+///   alternative: the idiom that reads like a flush,
+///   `dd if="$tmp" of=/dev/null conv=fsync`, flushes the *output* file and so
+///   `fsync`s `/dev/null` while merely reading the temporary into the page
+///   cache, and the form that works — `of="$tmp" conv=notrunc,fsync` — destroys
+///   the file it was called to flush the moment `notrunc` is dropped, all while
+///   still leaving the directory half to the floor.
+/// - **The floor's cost is its breadth, and it is paid on every write that
+///   reaches it.** A bare `sync` flushes every filesystem on the host, so on a
+///   target already running services it can block for seconds on another
+///   workload's dirty pages, and that is what a target without coreutils gets
+///   for both halves of every landing. It is the fallback rather than the first
+///   choice for exactly that reason. POSIX allows `sync` to return before the
+///   writeback it scheduled has completed; Linux is the deployment target and
+///   its `sync` waits for the writeback, so the floor is a real flush where the
+///   guarantee has to hold and only a scheduling hint on a host that takes the
+///   latitude. A target with no working `sync` at all does not fail the install
+///   over it — the write goes through and the missing flush is said on stderr,
+///   because an artifact the caller asked for is worth more than a guarantee it
+///   never had, and silence is the one outcome that would let the write pass
+///   for durable when it is not. What reaches a caller from that line is a
+///   transport question, settled at [`Executor::put_file`], which surfaces this
+///   script's stderr only on a write that failed.
 ///
 /// The `EXIT` trap is the cleanup path: any failure removes the temporary file
 /// rather than leaving one behind for the caller to reason about. In the raced
@@ -149,6 +199,9 @@ fi
 uid=$(id -u)
 fsid() {
   df -P "$1" 2>/dev/null | awk 'NR==2 {mp=$6; for (i=7; i<=NF; i++) mp=mp" "$i; print $1"\t"mp}'
+}
+flush() {
+  sync "$1" 2>/dev/null || sync || echo "warning: $1 was not flushed: no working sync" >&2
 }
 destfs=$(fsid "$(dirname "$dest")")
 if [ -z "$destfs" ]; then
@@ -177,8 +230,10 @@ trap 'rm -f "$tmp"' EXIT INT TERM
 cat > "$tmp"
 chown "$owner:$group" "$tmp"
 chmod "$mode" "$tmp"
+flush "$tmp"
 ino=$(ls -di "$tmp" | awk '{print $1}')
 mv -f "$tmp" "$dest"
+flush "$(dirname "$dest")"
 if [ -z "$(find "$dest" -maxdepth 0 -inum "$ino" -user "$owner" -group "$group" -perm "$mode" 2>/dev/null)" ]; then
   if [ -d "$dest" ]; then rm -f "$dest/${tmp##*/}"; fi
   echo "destination $dest is not the file just written" >&2
@@ -735,6 +790,22 @@ pub trait Executor {
     /// the shell cannot express descriptor-based metadata and the guarantee is
     /// carried instead by the staging directory being unreachable to anyone but
     /// the writer.
+    ///
+    /// The landing is durable as well as atomic on **every** transport, so a
+    /// destination this primitive reported written survives a crash or a power
+    /// loss immediately after: the bytes together with the owner and mode are
+    /// flushed before the rename, and the entry the rename created in the
+    /// destination's directory is flushed after it. [`InDaemonExecutor`] gets
+    /// that from `fsync` on the descriptors it already holds; the shell
+    /// transports get it from the target's `sync`, which is the one place the
+    /// guarantee rests on something the target supplies rather than on this
+    /// crate — a host carrying no working `sync` still lands the file rather
+    /// than failing the install, and the script says on its own stderr that the
+    /// flush did not happen. That stderr is what [`ExecutorError::Transfer`]
+    /// carries, so the line reaches a caller only when the write itself failed
+    /// too: a `put_file` that returned `Ok` on such a host reports nothing about
+    /// the flush it could not perform, and this crate has no logging facade to
+    /// raise it through.
     ///
     /// # Errors
     ///
@@ -3023,7 +3094,24 @@ exec "$@"
             /// is taken as one outcome of a run; every other write error still
             /// panics.
             fn run_landing_script(dest: &Path, contents: &[u8], mode: u32) -> std::process::Output {
-                let mut child = spawn_landing_script(dest, mode);
+                run_landing_script_with_stubs(dest, contents, mode, None)
+            }
+
+            /// [`run_landing_script`] with `stubs`, when given, prepended to the
+            /// script's `PATH`, so a utility written there is what the script
+            /// resolves that name to.
+            ///
+            /// The directory is prepended rather than replacing `PATH`, because
+            /// the script reaches for a dozen other utilities that must keep
+            /// resolving to the host's. Only the child's environment is set;
+            /// this process's is never touched.
+            fn run_landing_script_with_stubs(
+                dest: &Path,
+                contents: &[u8],
+                mode: u32,
+                stubs: Option<&Path>,
+            ) -> std::process::Output {
+                let mut child = spawn_landing_script_with_stubs(dest, mode, stubs);
                 let mut stdin = child.stdin.take().expect("stdin is piped");
                 match stdin.write_all(contents) {
                     Ok(()) => {}
@@ -3042,6 +3130,16 @@ exec "$@"
             /// past the pre-write guard, before the rename — and act on the
             /// destination while it is blocked there.
             fn spawn_landing_script(dest: &Path, mode: u32) -> std::process::Child {
+                spawn_landing_script_with_stubs(dest, mode, None)
+            }
+
+            /// [`spawn_landing_script`] with the `PATH` prefix
+            /// [`run_landing_script_with_stubs`] describes.
+            fn spawn_landing_script_with_stubs(
+                dest: &Path,
+                mode: u32,
+                stubs: Option<&Path>,
+            ) -> std::process::Child {
                 let args = [
                     "-c".to_string(),
                     super::super::super::PUT_FILE_SCRIPT.to_string(),
@@ -3051,8 +3149,15 @@ exec "$@"
                     id_now("-g").to_string(),
                     format!("{mode:04o}"),
                 ];
-                std::process::Command::new("sh")
-                    .args(args)
+                let mut command = std::process::Command::new("sh");
+                command.args(args);
+                if let Some(stubs) = stubs {
+                    let mut path = std::ffi::OsString::from(stubs);
+                    path.push(":");
+                    path.push(std::env::var_os("PATH").unwrap_or_default());
+                    command.env("PATH", path);
+                }
+                command
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -3897,6 +4002,163 @@ find "$1" -maxdepth 0 {predicate}"#
                     "the file `mv` misplaced must be removed when it is still reachable: \
                      {script}"
                 );
+            }
+
+            #[test]
+            fn the_landing_script_flushes_the_temporary_and_the_destinations_directory() {
+                // Two flushes, because they protect different things and neither
+                // placement serves the other: the temporary's bytes with the
+                // owner and mode just applied to them, and the directory entry
+                // the rename created, which does not exist at the first point.
+                // Where each sits *is* the guarantee, so the positions are what
+                // is asserted.
+                let script = super::super::super::PUT_FILE_SCRIPT;
+                let chmod_at = script.find(r#"chmod "$mode""#).expect("chmod");
+                let rename_at = script.find("mv -f").expect("rename");
+                let temp_flush = script
+                    .find(r#"flush "$tmp""#)
+                    .expect("the temporary is flushed");
+                let dir_flush = script
+                    .find(r#"flush "$(dirname "$dest")""#)
+                    .expect("the destination's directory is flushed");
+                assert!(
+                    chmod_at < temp_flush && temp_flush < rename_at,
+                    "the temporary must be flushed after its owner and mode are applied and \
+                     before the rename: {script}"
+                );
+                assert!(
+                    dir_flush > rename_at,
+                    "the directory must be flushed after the rename that created the entry, \
+                     since flushing it earlier protects nothing: {script}"
+                );
+
+                // The floor is reached by what the targeted form *does*, not by
+                // asking whether a name is there: `sync` is present on every one
+                // of the three implementations, so a probe cannot tell the one
+                // that honours the operand from the one that ignores it.
+                assert!(
+                    script.contains(r#"sync "$1" 2>/dev/null || sync"#),
+                    "the targeted flush must fall back to the host-wide one on failure: {script}"
+                );
+                assert!(
+                    !script.contains("command -v"),
+                    "selection must not be a name probe: {script}"
+                );
+                assert!(
+                    !script.split_whitespace().any(|word| word == "dd"),
+                    "`dd` flushes its output file, so the idiom that reads like a flush syncs \
+                     /dev/null, and the form that works destroys the file without `notrunc`: \
+                     {script}"
+                );
+            }
+
+            #[test]
+            fn the_flush_survives_every_sync_a_target_can_carry() {
+                // The three run-time behaviours the fallback is selected against,
+                // plus the absence the floor itself can meet. None of them may
+                // fail the write: an install that cannot land an artifact because
+                // the host's `sync` refuses an operand is worse than one whose
+                // flush was broader than it needed to be.
+                //
+                // Each stub records how it was called, so the assertion is what
+                // the script actually reached for rather than what its text
+                // says — the rejecting case in particular has to be seen to run
+                // the bare `sync` rather than to give up.
+                const HONOURS: &str = r#"#!/bin/sh
+if [ "$#" -eq 0 ]; then echo bare >>"LOG"; else echo "operand $1" >>"LOG"; fi
+exit 0
+"#;
+                const REJECTS: &str = r#"#!/bin/sh
+if [ "$#" -eq 0 ]; then echo bare >>"LOG"; exit 0; fi
+echo "refused $1" >>"LOG"
+echo "sync: extra operand '$1'" >&2
+exit 1
+"#;
+                const IGNORES: &str = r#"#!/bin/sh
+echo "host-wide $*" >>"LOG"
+exit 0
+"#;
+                const ABSENT: &str = r#"#!/bin/sh
+if [ "$#" -eq 0 ]; then echo bare >>"LOG"; else echo "refused $1" >>"LOG"; fi
+echo "sync: not found" >&2
+exit 127
+"#;
+
+                for (what, body, falls_back, warns) in [
+                    (
+                        "coreutils, which flushes the operand",
+                        HONOURS,
+                        false,
+                        false,
+                    ),
+                    (
+                        "an implementation that refuses the operand",
+                        REJECTS,
+                        true,
+                        false,
+                    ),
+                    (
+                        "macOS or busybox, which ignore the operand",
+                        IGNORES,
+                        false,
+                        false,
+                    ),
+                    ("a host with no working sync at all", ABSENT, true, true),
+                ] {
+                    let root = tempfile::tempdir().expect("tempdir");
+                    let stubs = root.path().join("stubs");
+                    std::fs::create_dir(&stubs).expect("stub directory");
+                    let log = root.path().join("sync.log");
+                    write_script(&stubs, "sync", &body.replace("LOG", &log.to_string_lossy()));
+
+                    let dest = dest_under(root.path(), "secrets.json");
+                    let output = run_landing_script_with_stubs(
+                        &dest,
+                        b"secret-bytes",
+                        0o600,
+                        Some(stubs.as_path()),
+                    );
+
+                    assert!(
+                        output.status.success(),
+                        "{what} must not fail the write: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(std::fs::read(&dest).expect("read back"), b"secret-bytes");
+                    assert_eq!(mode_of(&dest), 0o600, "{what}");
+                    assert!(
+                        strays(root.path()).is_empty(),
+                        "{what}: a successful write leaves no temporary behind"
+                    );
+
+                    let calls = std::fs::read_to_string(&log).expect("the stub was called");
+                    let calls: Vec<&str> = calls.lines().collect();
+                    let dest_dir = dest.parent().expect("dest dir").to_string_lossy();
+                    let (first, rest) = calls.split_first().expect("the stub was called");
+                    assert!(
+                        first.contains(".bootler."),
+                        "{what}: the first flush must name the temporary, which is the half the \
+                         owner and mode were just applied to, got {calls:?}"
+                    );
+                    assert!(
+                        rest.iter().any(|call| call.ends_with(dest_dir.as_ref())),
+                        "{what}: the directory holding the destination must be flushed, and only \
+                         after the temporary the rename moved into it, got {calls:?}"
+                    );
+                    assert_eq!(
+                        calls.iter().filter(|call| call.starts_with("bare")).count(),
+                        if falls_back { 2 } else { 0 },
+                        "{what}: the host-wide flush runs for both halves exactly when the \
+                         targeted form failed, got {calls:?}"
+                    );
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert_eq!(
+                        stderr.contains("was not flushed"),
+                        warns,
+                        "{what}: a flush that did not happen must be said rather than passed \
+                         over in silence, and one that did must say nothing: {stderr}"
+                    );
+                }
             }
 
             #[test]
