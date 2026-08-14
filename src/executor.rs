@@ -180,7 +180,9 @@ const STAT: &str = "stat";
 ///   over it — the write goes through and the missing flush is said on stderr,
 ///   because an artifact the caller asked for is worth more than a guarantee it
 ///   never had, and silence is the one outcome that would let the write pass
-///   for durable when it is not.
+///   for durable when it is not. What reaches a caller from that line is a
+///   transport question, settled at [`Executor::put_file`], which surfaces this
+///   script's stderr only on a write that failed.
 ///
 /// The `EXIT` trap is the cleanup path: any failure removes the temporary file
 /// rather than leaving one behind for the caller to reason about. In the raced
@@ -797,8 +799,13 @@ pub trait Executor {
     /// that from `fsync` on the descriptors it already holds; the shell
     /// transports get it from the target's `sync`, which is the one place the
     /// guarantee rests on something the target supplies rather than on this
-    /// crate — a host carrying no working `sync` still lands the file and says
-    /// on stderr that it was not flushed.
+    /// crate — a host carrying no working `sync` still lands the file rather
+    /// than failing the install, and the script says on its own stderr that the
+    /// flush did not happen. That stderr is what [`ExecutorError::Transfer`]
+    /// carries, so the line reaches a caller only when the write itself failed
+    /// too: a `put_file` that returned `Ok` on such a host reports nothing about
+    /// the flush it could not perform, and this crate has no logging facade to
+    /// raise it through.
     ///
     /// # Errors
     ///
