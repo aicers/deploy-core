@@ -789,6 +789,17 @@ pub trait Executor {
     /// carried instead by the staging directory being unreachable to anyone but
     /// the writer.
     ///
+    /// The landing is durable as well as atomic on **every** transport, so a
+    /// destination this primitive reported written survives a crash or a power
+    /// loss immediately after: the bytes together with the owner and mode are
+    /// flushed before the rename, and the entry the rename created in the
+    /// destination's directory is flushed after it. [`InDaemonExecutor`] gets
+    /// that from `fsync` on the descriptors it already holds; the shell
+    /// transports get it from the target's `sync`, which is the one place the
+    /// guarantee rests on something the target supplies rather than on this
+    /// crate — a host carrying no working `sync` still lands the file and says
+    /// on stderr that it was not flushed.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecutorError`] when the write fails, or the elevation errors
@@ -4116,10 +4127,16 @@ exit 127
                     let calls = std::fs::read_to_string(&log).expect("the stub was called");
                     let calls: Vec<&str> = calls.lines().collect();
                     let dest_dir = dest.parent().expect("dest dir").to_string_lossy();
+                    let (first, rest) = calls.split_first().expect("the stub was called");
                     assert!(
-                        calls.iter().any(|call| call.ends_with(dest_dir.as_ref())),
-                        "{what}: the directory holding the destination must be flushed, got \
-                         {calls:?}"
+                        first.contains(".bootler."),
+                        "{what}: the first flush must name the temporary, which is the half the \
+                         owner and mode were just applied to, got {calls:?}"
+                    );
+                    assert!(
+                        rest.iter().any(|call| call.ends_with(dest_dir.as_ref())),
+                        "{what}: the directory holding the destination must be flushed, and only \
+                         after the temporary the rename moved into it, got {calls:?}"
                     );
                     assert_eq!(
                         calls.iter().filter(|call| call.starts_with("bare")).count(),
