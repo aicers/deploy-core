@@ -29,7 +29,11 @@
 //! The decider decides from durable state, never from which activation woke it —
 //! the activation reason is passed only so the journal line and the status record
 //! can name what woke it — and it is safe to run at any time, any number of
-//! times. Three activations reach it:
+//! times, **including concurrently**: the three activations are separately named
+//! units, so systemd will not serialize them and a timer pass can overlap the
+//! boot activation on a host that has just come up. Holding a lock across a
+//! revert is the decider's own job; no directive in this text can do it. Three
+//! activations reach it:
 //!
 //! - the **deadline** activation ([`deadline_activation_unit`], driven by
 //!   [`deadline_timer_unit`]), which fires on a schedule of its own. It is
@@ -62,9 +66,19 @@
 //! The decision subcommand's name, the canonical roxyd binary path whose
 //! `.previous` sibling the units exec, and the arm record's path are contract
 //! constants, frozen because a rename strands every unit already installed on
-//! every host. This text spells the identical values the installer's exported
-//! contract module holds; the checked-in contract document is the tie-breaker if
-//! the two are ever found to differ.
+//! every host. This text is where they are pinned first: the installer's
+//! exported contract module and the checked-in contract document are written
+//! against these values, and that document is the tie-breaker should the two
+//! ever be found to differ.
+//!
+//! One of the three is an obligation rather than a name. The units exec
+//! `/opt/roxyd/bin/roxyd.previous`, so a consumer installs the roxyd binary at
+//! `/opt/roxyd/bin/roxyd` — namespace-free, because a join-onboarded host has no
+//! namespace to resolve and a per-product path could not be byte-identical
+//! across the two populations. Installing the binary anywhere else and these
+//! units alongside it ships a supervisor whose every activation fails to exec,
+//! and nothing here catches that: the `ConditionPathExists=` gate names the arm
+//! record, not the binary.
 
 /// File name of the boot activation service.
 pub const BOOT_ACTIVATION_SERVICE: &str = "roxyd-selfupdate-boot.service";
@@ -390,6 +404,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn units_names_every_supervisor_unit_and_pairs_each_with_its_own_accessor() {
+        // Without this, an entry dropped from `units()` fails no test: every
+        // other test either iterates whatever `units()` happens to return or
+        // reaches an accessor directly. A consumer installing three of the four
+        // leaves a failure mode nothing on the host reaches a decision on.
+        assert_eq!(
+            units().map(|unit| unit.name),
+            [
+                BOOT_ACTIVATION_SERVICE,
+                CRASH_ACTIVATION_SERVICE,
+                DEADLINE_ACTIVATION_SERVICE,
+                DEADLINE_TIMER,
+            ]
+        );
+        assert_eq!(
+            units().map(|unit| unit.text),
+            [
+                boot_activation_unit(),
+                crash_activation_unit(),
+                deadline_activation_unit(),
+                deadline_timer_unit(),
+            ]
+        );
     }
 
     #[test]
