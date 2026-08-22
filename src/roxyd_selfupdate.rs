@@ -286,6 +286,9 @@ mod tests {
                 "{}: every unit opens a [Unit] section",
                 unit.name
             );
+            // systemd reads a unit's type off its file-name extension, not its
+            // body, so a name whose suffix disagrees with the section it carries
+            // is loaded as the wrong type or not at all.
             let body = if unit.name == DEADLINE_TIMER {
                 "Timer"
             } else {
@@ -295,6 +298,12 @@ mod tests {
                 sections.contains(&body),
                 "{}: every unit carries its [{body}] section",
                 unit.name
+            );
+            assert!(
+                unit.name.ends_with(&format!(".{}", body.to_lowercase())),
+                "{}: a [{body}] unit installs under a `.{}` name",
+                unit.name,
+                body.to_lowercase()
             );
         }
     }
