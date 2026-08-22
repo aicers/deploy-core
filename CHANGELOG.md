@@ -8,6 +8,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- The roxyd self-update rollback supervisor units, shipped as data under
+  `roxyd_selfupdate`: the boot, crash and deadline activation services and the
+  timer that drives the deadline one, each exported verbatim with no renderer
+  and nothing for a consumer to substitute. Every activation execs the decision
+  subcommand from the `.previous` sibling of the roxyd binary's canonical path
+  and is gated on the arm record, so one text serves both the hosts an installer
+  provisions and the hosts roxyd onboards itself. This crate owns the text: a
+  consumer embeds these bytes rather than carrying a copy that would drift.
 - The runtime release-trust accept path, which judges a delivered generation
   against the **active** generation's trust set and applies the `epoch` floor:
   `release_trust::accept_generation` for one delivered generation,

@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-check the roxyd self-update rollback deadline
+
+[Timer]
+Unit=roxyd-selfupdate-deadline.service
+OnCalendar=minutely
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -30,7 +30,11 @@ const CP: &str = "cp";
 
 /// The suffix the prior artifact is copied aside to before a swap overwrites it,
 /// so a failed update leaves it recoverable on disk (no automatic rollback).
-const PREVIOUS_ARTIFACT_SUFFIX: &str = ".previous";
+///
+/// Crate-visible because the shipped supervisor units exec exactly this sibling
+/// of the roxyd binary, and [`crate::roxyd_selfupdate`] pins their text against
+/// it so the suffix stays one decision rather than two.
+pub(crate) const PREVIOUS_ARTIFACT_SUFFIX: &str = ".previous";
 
 /// A root-owned directory that existed with different metadata and was
 /// reconciled (RFC 0003 §9.2).
