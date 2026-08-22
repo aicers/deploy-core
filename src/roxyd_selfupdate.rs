@@ -1,9 +1,9 @@
 //! The roxyd self-update rollback supervisor units, shipped as data.
 //!
 //! **This crate is the single owner of this text.** Two consumers install the
-//! same supervisor: the installer, onto the hosts it provisions over SSH, and
-//! roxyd's `join`, onto the hosts it onboards itself — where the installer never
-//! runs and so cannot place anything. The two host populations must roll back
+//! same supervisor: bootler, the installer, onto the hosts it provisions over
+//! SSH, and roxyd's `join`, onto the hosts it onboards itself — where bootler
+//! never runs and so cannot place anything. The two host populations must roll back
 //! under identical rules, so a consumer **embeds these bytes from its pinned
 //! dependency on this crate and never carries a copy of its own**. A copy is not
 //! a copy for long: the moment one side edits its own, the two populations
