@@ -191,11 +191,15 @@ mod tests {
         DEADLINE_TIMER, boot_activation_unit, crash_activation_unit, deadline_activation_unit,
         deadline_timer_unit, units,
     };
+    use crate::apply::PREVIOUS_ARTIFACT_SUFFIX;
 
     /// The arm record gate, verbatim. Its path is a frozen contract constant: the
     /// producer of the record lives in another repository, and a rename strands
     /// every unit already installed.
     const ARM_RECORD_GATE: &str = "ConditionPathExists=/var/lib/roxyd/selfupdate/arm.json";
+    /// The canonical roxyd binary path whose `.previous` sibling every activation
+    /// execs. Frozen for the same reason as the gate above.
+    const ROXYD_BINARY: &str = "/opt/roxyd/bin/roxyd";
     /// The `.previous` invocation each activation execs, verbatim, one per
     /// activation reason. The binary path, the subcommand name and the `--reason`
     /// values are frozen for the same reason as the gate above.
@@ -354,6 +358,25 @@ mod tests {
                 values(&entries, "Service", "Type"),
                 ["oneshot"],
                 "{name}: the decider runs to completion and exits"
+            );
+        }
+    }
+
+    #[test]
+    fn every_activation_execs_the_sibling_this_crate_writes() {
+        // The `.previous` sibling these units exec is the one the apply path
+        // copies aside, so the suffix is one decision and not two. Change it
+        // there alone and every installed unit execs a path that is never
+        // written, with nothing on the host to say why.
+        let previous = format!("{ROXYD_BINARY}{PREVIOUS_ARTIFACT_SUFFIX}");
+        for exec_start in [BOOT_EXEC_START, CRASH_EXEC_START, DEADLINE_EXEC_START] {
+            let binary = exec_start
+                .strip_prefix("ExecStart=")
+                .and_then(|command| command.split(' ').next());
+            assert_eq!(
+                binary,
+                Some(previous.as_str()),
+                "`{exec_start}` execs the backed-up sibling of `{ROXYD_BINARY}`"
             );
         }
     }
