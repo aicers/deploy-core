@@ -1,0 +1,10 @@
+[Unit]
+Description=Decide the roxyd self-update rollback (boot activation)
+ConditionPathExists=/var/lib/roxyd/selfupdate/arm.json
+
+[Service]
+Type=oneshot
+ExecStart=/opt/roxyd/bin/roxyd.previous selfupdate-decide --reason boot
+
+[Install]
+WantedBy=multi-user.target

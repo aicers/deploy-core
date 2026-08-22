@@ -47,6 +47,11 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   create directories, run root commands, load images, extract bundles).
 - **bootroot_cmd** — the wrapper around the on-host PKI command.
 - **registration** — service registration against the on-host PKI.
+- **roxyd_selfupdate** — the roxyd self-update rollback supervisor units as
+  data: the three activation services and the deadline timer, with no renderer
+  and nothing to substitute. This crate is their single owner — the installer
+  and roxyd's own `join` both embed these bytes from their pinned dependency,
+  so the hosts each onboards cannot roll back under different rules.
 - **roxyd_trust** — trust-material activation for the on-host agent: the X.509
   validator for roxyd's staged cert/key/CA triple, over the crate-internal
   tree-neutral generation engine (stage, validate the copy, swap `active`,

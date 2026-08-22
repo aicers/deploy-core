@@ -1,0 +1,7 @@
+[Unit]
+Description=Decide the roxyd self-update rollback (crash activation)
+ConditionPathExists=/var/lib/roxyd/selfupdate/arm.json
+
+[Service]
+Type=oneshot
+ExecStart=/opt/roxyd/bin/roxyd.previous selfupdate-decide --reason crash
