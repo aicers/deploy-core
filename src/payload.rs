@@ -1302,8 +1302,7 @@ where
 }
 
 /// A located container whose manifest block has been read but **not** parsed,
-/// together with the state one more step finishes opening it into a
-/// [`Payload`].
+/// together with the bounded envelope metadata a caller can inspect.
 ///
 /// [`open`] parses the manifest as it reads it, which is the right order for a
 /// caller that already trusts the bytes it is opening. A verifier does not:
@@ -1311,13 +1310,13 @@ where
 /// it has to answer for them **before** attacker-supplied JSON reaches a
 /// parser. This carries exactly what that decision takes — the raw block, the
 /// footer's container version, and the two envelope blocks — and hands the
-/// rest back through [`UnparsedContainer::into_payload`] once the manifest has
-/// been authenticated and parsed.
+/// rest back through an internal conversion once the manifest has been
+/// authenticated and parsed.
 ///
 /// It is an added path, not a replacement: [`open`] reads the container
-/// through the same [`read_container_head`] this is built from, so the two
-/// cannot come to disagree about where a block is.
-pub(crate) struct UnparsedContainer<R: Read + Seek> {
+/// through the same internal head reader this is built from, so the two cannot
+/// come to disagree about where a block is.
+pub struct UnparsedContainer<R: Read + Seek> {
     src: R,
     footer_version: u8,
     manifest_bytes: Vec<u8>,
@@ -1347,13 +1346,15 @@ impl<R: Read + Seek> UnparsedContainer<R> {
     /// Returns the detached signature block as the bounded read left it:
     /// absent, present at the bounded length, or present at some other length
     /// and therefore never read.
-    pub(crate) fn signature(&self) -> &EnvelopeBlock {
+    #[must_use]
+    pub fn signature(&self) -> &EnvelopeBlock {
         &self.signature
     }
 
     /// Returns the `key_id` block as the bounded read left it, under the same
     /// three states [`UnparsedContainer::signature`] reports.
-    pub(crate) fn key_id(&self) -> &EnvelopeBlock {
+    #[must_use]
+    pub fn key_id(&self) -> &EnvelopeBlock {
         &self.key_id
     }
 
@@ -1384,13 +1385,13 @@ impl<R: Read + Seek> UnparsedContainer<R> {
 /// One envelope block as a bounded read leaves it.
 ///
 /// The container layer reads an envelope block into memory, and a footer's
-/// lengths are attacker-controlled: [`validate_footer`] proves only that a
+/// lengths are attacker-controlled: `validate_footer` proves only that a
 /// block fits inside the input, which a sparse file — or a hostile
 /// `Read + Seek` source — can make arbitrarily large for almost nothing. A
 /// reader that states the length it can use therefore has a third answer
 /// besides the block's bytes and its absence, and this is it.
 #[derive(Debug)]
-pub(crate) enum EnvelopeBlock {
+pub enum EnvelopeBlock {
     /// The container records no such block: the all-zero absent encoding.
     Absent,
     /// The block is present at the bounded length, and these are its bytes.
@@ -1413,19 +1414,21 @@ impl EnvelopeBlock {
     }
 }
 
-/// The exact lengths at which a caller of [`read_package_container`] is willing
-/// to read the two envelope blocks.
+/// The exact lengths [`read_package_container`] uses for its two envelope
+/// blocks.
 ///
 /// Both blocks have exactly one useful length, and both are read before
-/// anything has been authenticated, so the caller states those lengths rather
-/// than trusting the footer's. A block of any other length is answered from its
-/// length alone — which is the answer its contents would have produced anyway —
-/// so nothing is lost by refusing to allocate it.
+/// anything has been authenticated, so the release format states those lengths
+/// rather than trusting the footer's. A block of any other length is answered
+/// from its length alone — which is the answer its contents would have produced
+/// anyway — so nothing is lost by refusing to allocate it. The fields stay
+/// crate-private: callers use [`crate::verify::ENVELOPE_BOUNDS`], the only
+/// bounds this release format defines.
 ///
 /// [`open`] takes no bounds and reads whatever the footer describes, as it
 /// always has: its callers are opening a payload they already trust, and
 /// changing what they see is not this reader's to do.
-pub(crate) struct EnvelopeBounds {
+pub struct EnvelopeBounds {
     /// The one length at which the signature block is read.
     pub(crate) signature_len: u64,
     /// The one length at which the `key_id` block is read.
@@ -1578,18 +1581,18 @@ fn read_bounded_envelope<R: Read + Seek>(
 /// first, defers the same read until afterwards.
 ///
 /// Reading unauthenticated bytes this early is also why the caller passes
-/// `bounds`: a block whose footer length is not one it can use is reported as
-/// [`EnvelopeBlock::WrongLength`] and never allocated. See [`EnvelopeBounds`].
+/// [`crate::verify::ENVELOPE_BOUNDS`]: a block whose footer length is not one
+/// the release format can use is reported as [`EnvelopeBlock::WrongLength`] and
+/// never allocated. See [`EnvelopeBounds`].
 ///
 /// A package that carries no container is broken, not an ordinary file, so
 /// that condition is [`PayloadError::NoTrailer`] here exactly as it is there.
 ///
 /// # Errors
 ///
-/// Returns [`PayloadError::NoTrailer`] when `src` carries no trailer, and
-/// otherwise every container-layer error [`read_container_head`] and
-/// [`read_bounded_envelope`] raise.
-pub(crate) fn read_package_container<R: Read + Seek>(
+/// Returns [`PayloadError::NoTrailer`] when `src` carries no trailer, and any
+/// other container-layer error the bounded read encounters.
+pub fn read_package_container<R: Read + Seek>(
     src: R,
     bounds: &EnvelopeBounds,
 ) -> Result<UnparsedContainer<R>, PayloadError> {
@@ -2040,6 +2043,10 @@ fn read_block<R: Read + Seek>(
 
 /// Locates and reads a trailer from `src`.
 ///
+/// This whole-container reader does not bound its envelope blocks. Call
+/// [`read_package_container`] with [`crate::verify::ENVELOPE_BOUNDS`] instead
+/// when reading untrusted metadata alone.
+///
 /// Returns `Ok(None)` for an empty payload — a file in which the size probe
 /// selected no footer, which is the normal state of an ordinary dev or CI
 /// build. Use [`open_package`] for a `.pkg`, where the same condition is a
@@ -2099,6 +2106,10 @@ pub fn open<R: Read + Seek>(src: R) -> Result<Option<Payload<R>>, PayloadError> 
 ///
 /// Returns `Ok(None)` when the binary carries no trailer.
 ///
+/// This whole-container reader does not bound its envelope blocks. Call
+/// [`read_package_container`] with [`crate::verify::ENVELOPE_BOUNDS`] instead
+/// when reading untrusted metadata alone.
+///
 /// # Errors
 ///
 /// Returns [`PayloadError`] when the file cannot be opened or its trailer is
@@ -2125,6 +2136,10 @@ pub fn open_path(path: &Path) -> Result<Option<Payload<std::fs::File>>, PayloadE
 /// There is no `.pkg` counterpart of [`open_current_exe`]: the running
 /// executable is a payload, not a package.
 ///
+/// This whole-container reader does not bound its envelope blocks. Call
+/// [`read_package_container`] with [`crate::verify::ENVELOPE_BOUNDS`] instead
+/// when reading untrusted metadata alone.
+///
 /// # Errors
 ///
 /// Returns [`PayloadError::NoTrailer`] when `src` carries no trailer, and
@@ -2139,6 +2154,10 @@ pub fn open_package<R: Read + Seek>(src: R) -> Result<Payload<R>, PayloadError> 
 ///
 /// Carries no logic of its own: it opens the file and delegates to
 /// [`open_package`], exactly as [`open_path`] delegates to [`open`].
+///
+/// This whole-container reader does not bound its envelope blocks. Call
+/// [`read_package_container`] with [`crate::verify::ENVELOPE_BOUNDS`] instead
+/// when reading untrusted metadata alone.
 ///
 /// # Errors
 ///
