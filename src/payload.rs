@@ -1346,12 +1346,14 @@ impl<R: Read + Seek> UnparsedContainer<R> {
     /// Returns the detached signature block as the bounded read left it:
     /// absent, present at the bounded length, or present at some other length
     /// and therefore never read.
+    #[must_use]
     pub fn signature(&self) -> &EnvelopeBlock {
         &self.signature
     }
 
     /// Returns the `key_id` block as the bounded read left it, under the same
     /// three states [`UnparsedContainer::signature`] reports.
+    #[must_use]
     pub fn key_id(&self) -> &EnvelopeBlock {
         &self.key_id
     }

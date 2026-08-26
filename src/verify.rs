@@ -1180,7 +1180,7 @@ fn check_epoch(request: &VerifyRequest, trust: &TrustSet) -> Result<(), VerifyEr
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -1560,6 +1560,67 @@ mod tests {
         }
     }
 
+    /// Writes a `.pkg` with a hole standing in for one enormous envelope block.
+    ///
+    /// Unlike [`sparse_pkg`], this exercises the filesystem shape an attacker
+    /// can create cheaply with `set_len`, rather than merely modelling it in a
+    /// `Read + Seek` implementation.
+    fn sparse_file_pkg(
+        manifest: &[u8],
+        archive: &[u8],
+        present: &[u8],
+        sparse: SparseBlock,
+    ) -> std::fs::File {
+        let mut file = tempfile::tempfile().expect("a temporary sparse fixture file is available");
+        let head_len = len_u64(manifest) + len_u64(archive);
+        let (signature_len, key_id_len) = match sparse {
+            SparseBlock::Signature => (HOSTILE_BLOCK_LEN, len_u64(present)),
+            SparseBlock::KeyId => (len_u64(present), HOSTILE_BLOCK_LEN),
+        };
+        let signature_offset = head_len;
+        let key_id_offset = signature_offset + signature_len;
+        let present_offset = match sparse {
+            SparseBlock::Signature => key_id_offset,
+            SparseBlock::KeyId => signature_offset,
+        };
+        let footer_start = key_id_offset + key_id_len;
+        let footer = footer_bytes(
+            FORMAT_VERSION,
+            [
+                0,
+                len_u64(manifest),
+                len_u64(manifest),
+                len_u64(archive),
+                signature_offset,
+                signature_len,
+                key_id_offset,
+                key_id_len,
+            ],
+        );
+
+        file.set_len(footer_start + len_u64(&footer))
+            .expect("the fixture file is extended through its footer");
+        file.write_all(manifest)
+            .expect("the fixture manifest is written");
+        file.write_all(archive)
+            .expect("the fixture archive is written");
+        file.seek(SeekFrom::Start(present_offset))
+            .expect("the fixture seeks past its sparse block");
+        file.write_all(present)
+            .expect("the fixture's other envelope block is written");
+        file.seek(SeekFrom::Start(footer_start))
+            .expect("the fixture seeks to its footer");
+        file.write_all(&footer)
+            .expect("the fixture footer is written");
+        file.seek(SeekFrom::Start(0))
+            .expect("the fixture rewinds before its bounded read");
+
+        // Writing the footer at the far side leaves the other envelope block
+        // as a filesystem hole: it is part of the input length but consumes no
+        // fixture bytes.
+        file
+    }
+
     /// Verifies `bytes` against `trust` and `request`, returning the error.
     fn verify_err(bytes: &[u8], trust: &TrustSet, request: &VerifyRequest) -> VerifyError {
         verify_package(Cursor::new(bytes.to_vec()), trust, request)
@@ -1925,7 +1986,7 @@ mod tests {
         let signer = keypair();
         let hint = key_id(&public_key_of(&signer));
         let container = payload::read_package_container(
-            sparse_pkg(
+            sparse_file_pkg(
                 &default_manifest(),
                 &default_archive(),
                 hint.as_bytes(),
