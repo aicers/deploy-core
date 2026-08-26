@@ -1,0 +1,1 @@
+{"format_version":3,"archive_members":[{"name":"bin/app","length":17}],"artifacts":[{"component":"example","version":"1.0.0","commit":"0123456789abcdef0123456789abcdef01234567","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"bin/app","sha256":"bcf23e595c273e3202d8fc0fb47b5d6107a14fbc2d0a08c97ae4dd0262907d81"}]}
