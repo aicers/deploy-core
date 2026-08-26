@@ -99,13 +99,13 @@ pub const TRUST_TARGET: &str = "trust";
 /// NUL, no newline, no `0x` or multibase prefix, no padding — so the block's
 /// length is itself a check, and it is the only length at which the block is
 /// read at all.
-const KEY_ID_HEX_LEN: u64 = 64;
+pub const KEY_ID_HEX_LEN: u64 = 64;
 
 /// Number of bytes an Ed25519 signature is.
 ///
 /// A signature of any other length verifies under no key, so the container read
 /// answers one from its length rather than reading it.
-const ED25519_SIGNATURE_LEN: u64 = 64;
+pub const ED25519_SIGNATURE_LEN: u64 = 64;
 
 /// The lengths at which this verifier reads the container's envelope blocks.
 ///
@@ -117,7 +117,7 @@ const ED25519_SIGNATURE_LEN: u64 = 64;
 /// that was going to reject it. Refusing to read such a block loses nothing:
 /// its verdict follows from its length, exactly as it would have from its
 /// contents.
-const ENVELOPE_BOUNDS: EnvelopeBounds = EnvelopeBounds {
+pub const ENVELOPE_BOUNDS: EnvelopeBounds = EnvelopeBounds {
     signature_len: ED25519_SIGNATURE_LEN,
     key_id_len: KEY_ID_HEX_LEN,
 };
@@ -1188,15 +1188,17 @@ mod tests {
     use zstd::Encoder;
 
     use super::{
-        BuildIdentifier, InputError, MAX_BUILD_IDENTIFIER_BYTES, TRUST_TARGET, TrustAnchor,
-        TrustSet, VerifiedPackage, VerifyError, VerifyRequest, is_safe_build_identifier, key_id,
-        verify_package,
+        BuildIdentifier, ED25519_SIGNATURE_LEN, ENVELOPE_BOUNDS, InputError, KEY_ID_HEX_LEN,
+        MAX_BUILD_IDENTIFIER_BYTES, TRUST_TARGET, TrustAnchor, TrustSet, VerifiedPackage,
+        VerifyError, VerifyRequest, is_safe_build_identifier, key_id, verify_package,
     };
     use crate::manifest::{
         Disposition, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
         MIN_MANIFEST_FORMAT_VERSION, TargetArch,
     };
-    use crate::payload::{self, ArtifactInput, FORMAT_VERSION, MAGIC, PayloadError, Signed};
+    use crate::payload::{
+        self, ArtifactInput, EnvelopeBlock, FORMAT_VERSION, MAGIC, PayloadError, Signed,
+    };
 
     /// Component every fixture artifact belongs to, and the target a fixture
     /// request names.
@@ -1829,6 +1831,120 @@ mod tests {
             verify_package(package, &trust, &request()).is_ok(),
             "an unusable hint must not deny an authentic package"
         );
+    }
+
+    #[test]
+    fn bounded_container_reader_reports_envelope_metadata() {
+        let manifest = default_manifest();
+        let archive = default_archive();
+
+        let unsigned = payload::read_package_container(
+            Cursor::new(assemble(FORMAT_VERSION, &manifest, &archive, None, None)),
+            &ENVELOPE_BOUNDS,
+        )
+        .expect("an unsigned package has bounded metadata");
+        assert!(matches!(unsigned.signature(), EnvelopeBlock::Absent));
+        assert!(matches!(unsigned.key_id(), EnvelopeBlock::Absent));
+
+        let signer = keypair();
+        let signature = signer.sign(&manifest);
+        let hint = key_id(&public_key_of(&signer));
+        let signed_container = payload::read_package_container(
+            Cursor::new(assemble(
+                FORMAT_VERSION,
+                &manifest,
+                &archive,
+                Some(signature.as_ref()),
+                Some(hint.as_bytes()),
+            )),
+            &ENVELOPE_BOUNDS,
+        )
+        .expect("a signed package has bounded metadata");
+        match signed_container.signature() {
+            EnvelopeBlock::Present(bytes) => assert_eq!(bytes, signature.as_ref()),
+            block => panic!("signature should be present, got {block:?}"),
+        }
+        match signed_container.key_id() {
+            EnvelopeBlock::Present(bytes) => assert_eq!(bytes, hint.as_bytes()),
+            block => panic!("key id should be present, got {block:?}"),
+        }
+
+        let wrong_signature = payload::read_package_container(
+            Cursor::new(assemble(
+                FORMAT_VERSION,
+                &manifest,
+                &archive,
+                Some(&[0; 63]),
+                None,
+            )),
+            &ENVELOPE_BOUNDS,
+        )
+        .expect("a wrong signature length remains readable as metadata");
+        assert!(matches!(
+            wrong_signature.signature(),
+            EnvelopeBlock::WrongLength
+        ));
+
+        let wrong_key_id = payload::read_package_container(
+            Cursor::new(assemble(
+                FORMAT_VERSION,
+                &manifest,
+                &archive,
+                Some(signature.as_ref()),
+                Some(&[b'a'; 63]),
+            )),
+            &ENVELOPE_BOUNDS,
+        )
+        .expect("a wrong key-id length remains readable as metadata");
+        assert!(matches!(wrong_key_id.key_id(), EnvelopeBlock::WrongLength));
+
+        let mut half_zero = manifest.clone();
+        half_zero.extend_from_slice(&archive);
+        half_zero.extend_from_slice(&footer_bytes(
+            FORMAT_VERSION,
+            [
+                0,
+                len_u64(&manifest),
+                len_u64(&manifest),
+                len_u64(&archive),
+                1,
+                0,
+                0,
+                0,
+            ],
+        ));
+        let Err(error) = payload::read_package_container(Cursor::new(half_zero), &ENVELOPE_BOUNDS)
+        else {
+            panic!("a half-zero envelope pair must be malformed");
+        };
+        assert!(matches!(error, PayloadError::MalformedFooter { .. }));
+    }
+
+    #[test]
+    fn bounded_container_reader_never_reads_a_sparse_wrong_length_block() {
+        let signer = keypair();
+        let hint = key_id(&public_key_of(&signer));
+        let container = payload::read_package_container(
+            sparse_pkg(
+                &default_manifest(),
+                &default_archive(),
+                hint.as_bytes(),
+                SparseBlock::Signature,
+            ),
+            &ENVELOPE_BOUNDS,
+        )
+        .expect("the hostile block length is reported without reading its bytes");
+
+        assert!(matches!(container.signature(), EnvelopeBlock::WrongLength));
+        assert!(
+            matches!(container.key_id(), EnvelopeBlock::Present(bytes) if bytes == hint.as_bytes())
+        );
+    }
+
+    #[test]
+    fn exported_envelope_lengths_are_the_verifiers_bounds() {
+        assert_eq!(ENVELOPE_BOUNDS.signature_len, ED25519_SIGNATURE_LEN);
+        assert_eq!(ENVELOPE_BOUNDS.key_id_len, KEY_ID_HEX_LEN);
     }
 
     #[test]

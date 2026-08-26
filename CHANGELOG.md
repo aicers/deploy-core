@@ -8,6 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `payload::read_package_container`, which reports a package's signature and
+  `key_id` metadata under the release format's fixed envelope bounds without
+  allocating blocks advertised at another length.
 - `payload::append_trailer_signed`, which gives a caller-supplied signer the
   exact manifest bytes the writer emits and stamps its detached Ed25519
   signature and `key_id` into either a `.pkg` package or an installer payload.
