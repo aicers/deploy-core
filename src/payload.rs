@@ -2248,15 +2248,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use tar::{Builder, EntryType, Header};
-    use zstd::Encoder;
+    use zstd::{Decoder, Encoder};
 
     use super::{
         ArtifactInput, Candidate, ED25519_SIGNATURE_LEN, FOOTER_SIZE, FOOTER_SIZE_V1,
         FOOTER_SIZE_V2, FORMAT_VERSION, Footer, KEY_ID_HEX_LEN, KNOWN_FOOTER_SIZES, MAGIC,
         MAGIC_LEN, PayloadError, PayloadManifest, Signed, SignerError, TAR_BLOCK_SIZE,
-        TAR_NAME_FIELD_LEN, append_trailer, append_trailer_signed, append_trailer_with_signer,
-        classify_candidate, open, open_current_exe, open_package, open_package_path, publish_dirs,
-        read_base_executable, rewrap_trailer, sha256_hex,
+        TAR_NAME_FIELD_LEN, append_trailer, append_trailer_signed, classify_candidate, open,
+        open_current_exe, open_package, open_package_path, publish_dirs, read_base_executable,
+        rewrap_trailer, sha256_hex,
     };
     use crate::manifest::{
         ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
@@ -4830,7 +4830,13 @@ mod tests {
     }
 
     #[test]
-    fn the_unsigned_entry_point_preserves_the_unsigned_writer_output() {
+    fn unsigned_writer_matches_pre_signing_block_fixtures() {
+        const EXPECTED_FOOTER_VERSION: u8 = 2;
+        const EXPECTED_MANIFEST: &[u8] =
+            include_bytes!("../assets/test-fixtures/unsigned-container/manifest.json");
+        const EXPECTED_ARCHIVE: &[u8] =
+            include_bytes!("../assets/test-fixtures/unsigned-container/archive.tar");
+
         let src = tempfile::tempdir().expect("source tempdir");
         let inputs = [input(
             src.path(),
@@ -4839,28 +4845,60 @@ mod tests {
             b"application bytes",
             &[Disposition::Install],
         )];
-        let mut through_public_entry_point = Vec::new();
-        append_trailer(
-            Cursor::new(BASE),
-            &mut through_public_entry_point,
-            None,
-            None,
-            &inputs,
-        )
-        .expect("the unsigned writer should succeed");
+        let mut container = Vec::new();
+        append_trailer(Cursor::new(BASE), &mut container, None, None, &inputs)
+            .expect("the unsigned writer should succeed");
 
-        let mut through_unsigned_path = Vec::new();
-        append_trailer_with_signer(
-            Cursor::new(BASE),
-            &mut through_unsigned_path,
-            None,
-            None,
-            &inputs,
-            |_| Ok(None),
-        )
-        .expect("the unsigned writer path should succeed");
+        let (footer, footer_start) = probe_footer(&container);
+        let manifest_offset = u64::try_from(BASE.len()).expect("base length fits in u64");
+        let manifest_len =
+            u64::try_from(EXPECTED_MANIFEST.len()).expect("fixture manifest length fits in u64");
+        assert_eq!(footer.version, EXPECTED_FOOTER_VERSION);
+        assert_eq!(footer.manifest_offset, manifest_offset);
+        assert_eq!(footer.manifest_len, manifest_len);
+        assert_eq!(footer.archive_offset, manifest_offset + manifest_len);
+        assert_eq!(footer.signature_offset, 0);
+        assert_eq!(footer.signature_len, 0);
+        assert_eq!(footer.key_id_offset, 0);
+        assert_eq!(footer.key_id_len, 0);
+        assert_eq!(
+            footer.archive_offset + footer.archive_len,
+            u64::try_from(footer_start).expect("footer offset fits in u64")
+        );
 
-        assert_eq!(through_public_entry_point, through_unsigned_path);
+        let manifest_start =
+            usize::try_from(footer.manifest_offset).expect("fixture manifest offset fits in usize");
+        let manifest_end = manifest_start
+            + usize::try_from(footer.manifest_len).expect("fixture manifest length fits in usize");
+        let archive_start =
+            usize::try_from(footer.archive_offset).expect("fixture archive offset fits in usize");
+        let archive_end = archive_start
+            + usize::try_from(footer.archive_len).expect("fixture archive length fits in usize");
+        assert_eq!(
+            container.get(..manifest_start).expect("base is in range"),
+            BASE
+        );
+        assert_eq!(
+            container
+                .get(manifest_start..manifest_end)
+                .expect("manifest block is in range"),
+            EXPECTED_MANIFEST,
+            "manifest block differs from the pre-signing fixture"
+        );
+
+        let mut archive = Vec::new();
+        Decoder::new(Cursor::new(
+            container
+                .get(archive_start..archive_end)
+                .expect("archive block is in range"),
+        ))
+        .expect("archive block must decode")
+        .read_to_end(&mut archive)
+        .expect("archive block must read");
+        assert_eq!(
+            archive, EXPECTED_ARCHIVE,
+            "decoded archive block differs from the pre-signing fixture"
+        );
     }
 
     #[test]
