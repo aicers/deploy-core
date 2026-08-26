@@ -8,6 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `payload::append_trailer_signed`, which gives a caller-supplied signer the
+  exact manifest bytes the writer emits and stamps its detached Ed25519
+  signature and `key_id` into either a `.pkg` package or an installer payload.
+  The signing key and its custody remain entirely with the caller.
 - The roxyd self-update rollback supervisor units, shipped as data under
   `roxyd_selfupdate`: the boot, crash and deadline activation services and the
   timer that drives the deadline one, each exported verbatim with no renderer

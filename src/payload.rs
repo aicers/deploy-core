@@ -23,10 +23,12 @@
 //!    one is — is stated by the manifest's `archive_members`, which the reader
 //!    compares the sequence it walked against rather than reconstructing it
 //!    from the per-artifact entries.
-//! 3. **Signature block** — the detached signature over the container, absent
-//!    in everything this build writes (see [`Payload::signature`]).
+//! 3. **Signature block** — the detached signature over the manifest block,
+//!    optionally stamped by [`append_trailer_signed`] (see
+//!    [`Payload::signature`]).
 //! 4. **`key_id` block** — the identifier of the key that signature was made
-//!    with, absent alongside it (see [`Payload::key_id`]).
+//!    with, present alongside it or absent alongside the signature (see
+//!    [`Payload::key_id`]).
 //! 5. **Footer** — a fixed-size record at the very end of the file with an
 //!    exact binary layout: the [`MAGIC`] bytes (8), a `u8` container format
 //!    version, then **eight** `u64` little-endian fields — the manifest,
@@ -214,6 +216,48 @@ const MAX_END_OF_ARCHIVE_BYTES: usize = TAR_BLOCK_SIZE;
 /// the writer can store in the header block a member is named by.
 const TAR_NAME_FIELD_LEN: usize = 100;
 
+/// Number of bytes an Ed25519 detached signature occupies.
+const ED25519_SIGNATURE_LEN: usize = 64;
+
+/// Number of lowercase hexadecimal ASCII characters in a `key_id`.
+const KEY_ID_HEX_LEN: usize = 64;
+
+/// A detached signature and its signer identifier for a payload manifest.
+#[derive(Debug)]
+pub struct Signed {
+    /// The detached signature, exactly 64 bytes.
+    pub signature: Vec<u8>,
+    /// The signer's `key_id`, exactly 64 lowercase-hex ASCII characters, as
+    /// [`crate::verify::key_id`] derives.
+    pub key_id: String,
+}
+
+/// An error returned by a callback passed to [`append_trailer_signed`].
+#[derive(Debug)]
+pub struct SignerError(Box<dyn std::error::Error + Send + Sync + 'static>);
+
+impl SignerError {
+    /// Creates a signer error from its foreign source.
+    pub fn new<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self(Box::new(source))
+    }
+}
+
+impl std::fmt::Display for SignerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SignerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 /// Errors raised while writing, locating, or extracting a payload trailer.
 ///
 /// The empty-payload case is not an error variant; it is reported as `Ok(None)`
@@ -227,6 +271,26 @@ pub enum PayloadError {
     /// The manifest could not be serialized while writing a trailer.
     #[error("failed to serialize payload manifest: {0}")]
     ManifestSerialize(#[source] serde_json::Error),
+
+    /// A callback could not sign the manifest bytes.
+    #[error("failed to sign payload manifest: {0}")]
+    Signer(#[source] SignerError),
+
+    /// A signer returned a detached signature with the wrong length.
+    #[error(
+        "signer returned a signature of {found} bytes; an Ed25519 signature must be {ED25519_SIGNATURE_LEN} bytes"
+    )]
+    InvalidSignatureLength {
+        /// Number of bytes returned by the signer.
+        found: usize,
+    },
+
+    /// A signer returned a `key_id` that cannot occupy the envelope block.
+    #[error("signer returned an invalid key_id: {reason}")]
+    InvalidKeyId {
+        /// Why the `key_id` was rejected.
+        reason: &'static str,
+    },
 
     /// A caller-supplied manifest failed validation while writing a trailer.
     #[error("invalid payload manifest: {0}")]
@@ -926,12 +990,61 @@ impl<W: Write> Write for CountingWriter<W> {
 /// name-overriding extension header the reader refuses), or serialization,
 /// archive construction, or writing to `out` fails.
 pub fn append_trailer<B: Read, W: Write>(
+    base: B,
+    out: W,
+    pinset: Option<&str>,
+    trust_set: Option<&[u8]>,
+    inputs: &[ArtifactInput],
+) -> Result<(), PayloadError> {
+    append_trailer_with_signer(base, out, pinset, trust_set, inputs, |_| Ok(None))
+}
+
+/// Streams a signed payload trailer built from `inputs` onto `base`.
+///
+/// This has the same layout and derives the same manifest and archive as
+/// [`append_trailer`], but writes a signature block and its `key_id` block
+/// after the archive. `sign` receives the manifest member's bytes exactly as
+/// they will be written to the container; it must return a detached Ed25519
+/// signature and the corresponding [`crate::verify::key_id`]. The callback is
+/// invoked and its return value is validated before this function writes any
+/// bytes to `out`.
+///
+/// Passing an empty `base` (for example [`std::io::empty`]) writes a signed
+/// **`.pkg` module package**: the manifest starts at offset `0`, and the
+/// signature covers those exact bytes.
+///
+/// # Errors
+///
+/// Returns [`PayloadError`] for the same conditions as [`append_trailer`], when
+/// `sign` returns a [`SignerError`], or when it returns a signature or `key_id`
+/// whose shape the container verifier cannot accept.
+pub fn append_trailer_signed<B: Read, W: Write, F>(
+    base: B,
+    out: W,
+    pinset: Option<&str>,
+    trust_set: Option<&[u8]>,
+    inputs: &[ArtifactInput],
+    sign: F,
+) -> Result<(), PayloadError>
+where
+    F: FnOnce(&[u8]) -> Result<Signed, SignerError>,
+{
+    append_trailer_with_signer(base, out, pinset, trust_set, inputs, |manifest| {
+        sign(manifest).map(Some)
+    })
+}
+
+fn append_trailer_with_signer<B: Read, W: Write, F>(
     mut base: B,
     mut out: W,
     pinset: Option<&str>,
     trust_set: Option<&[u8]>,
     inputs: &[ArtifactInput],
-) -> Result<(), PayloadError> {
+    sign: F,
+) -> Result<(), PayloadError>
+where
+    F: FnOnce(&[u8]) -> Result<Option<Signed>, SignerError>,
+{
     // The member list is derived here, from the pre-pass that already streams
     // every input: the manifest block is written before the archive block, so
     // it cannot be collected while the `tar` is being built. Each input is
@@ -970,6 +1083,10 @@ pub fn append_trailer<B: Read, W: Write>(
         None => manifest,
     };
     let manifest_json = serde_json::to_vec(&manifest).map_err(PayloadError::ManifestSerialize)?;
+    let signed = sign(&manifest_json).map_err(PayloadError::Signer)?;
+    if let Some(signed) = signed.as_ref() {
+        validate_signed(signed)?;
+    }
 
     let manifest_offset = std::io::copy(&mut base, &mut out)?;
     out.write_all(&manifest_json)?;
@@ -1011,22 +1128,55 @@ pub fn append_trailer<B: Read, W: Write>(
         counter.count()
     };
 
-    // Both envelope pairs are written all-zero: producing a signature is later
-    // work, and the layout's one encoding for a block that does not exist is
-    // offset `0` with length `0`. Nothing here can fill them, and a placeholder
-    // that looked present would be worse than an absent one.
+    let (signature_offset, signature_len, key_id_offset, key_id_len) = match signed {
+        Some(signed) => {
+            let signature_len = u64::try_from(ED25519_SIGNATURE_LEN)
+                .expect("the fixed signature length always fits the u64 footer field");
+            let key_id_len = u64::try_from(KEY_ID_HEX_LEN)
+                .expect("the fixed key_id length always fits the u64 footer field");
+            let signature_offset = archive_offset + archive_len;
+            out.write_all(&signed.signature)?;
+            let key_id_offset = signature_offset + signature_len;
+            out.write_all(signed.key_id.as_bytes())?;
+            (signature_offset, signature_len, key_id_offset, key_id_len)
+        }
+        None => (0, 0, 0, 0),
+    };
     let footer = Footer {
         version: FORMAT_VERSION,
         manifest_offset,
         manifest_len,
         archive_offset,
         archive_len,
-        signature_offset: 0,
-        signature_len: 0,
-        key_id_offset: 0,
-        key_id_len: 0,
+        signature_offset,
+        signature_len,
+        key_id_offset,
+        key_id_len,
     };
     out.write_all(&footer.encode())?;
+    Ok(())
+}
+
+fn validate_signed(signed: &Signed) -> Result<(), PayloadError> {
+    if signed.signature.len() != ED25519_SIGNATURE_LEN {
+        return Err(PayloadError::InvalidSignatureLength {
+            found: signed.signature.len(),
+        });
+    }
+    if signed.key_id.len() != KEY_ID_HEX_LEN {
+        return Err(PayloadError::InvalidKeyId {
+            reason: "must be exactly 64 lowercase-hex ASCII characters",
+        });
+    }
+    if !signed
+        .key_id
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(PayloadError::InvalidKeyId {
+            reason: "must contain only lowercase hexadecimal ASCII characters",
+        });
+    }
     Ok(())
 }
 
@@ -1048,13 +1198,12 @@ pub fn append_trailer<B: Read, W: Write>(
 /// An **absent** signature or `key_id` pair is carried across untouched, still
 /// exactly all-zero. Adding the delta to it would make offset `0` a non-zero
 /// offset beside a zero length — a half-zero pair, which the reader refuses as
-/// [`PayloadError::MalformedFooter`] — so a blind shift would turn every
-/// unsigned container, which is every container this crate writes, into a
-/// malformed one.
+/// [`PayloadError::MalformedFooter`] — so a blind shift would turn an unsigned
+/// container into a malformed one.
 ///
 /// The body is copied **verbatim** and the manifest is never re-serialized, so
-/// the manifest block is byte-identical across the graft: that is what will let
-/// a signature computed over those bytes survive a rewrap once signing lands.
+/// the manifest block is byte-identical across the graft and a signature over
+/// it remains valid.
 /// The source footer's own `version` is written back rather than the current
 /// one, so a version-1 payload stays a version-1 payload — footer size and all.
 ///
@@ -1485,10 +1634,10 @@ impl<R: Read + Seek> Payload<R> {
     /// container carries none.
     ///
     /// An absent block is `None` and never an empty slice, so a caller cannot
-    /// mistake "nothing was signed" for "a zero-byte signature was". Nothing
-    /// writes this block today. Whether an *unsigned* container is acceptable
-    /// is not this layer's call: the container reader reports what is there,
-    /// and a verifier decides what that is worth.
+    /// mistake "nothing was signed" for "a zero-byte signature was". Whether
+    /// an *unsigned* container is acceptable is not this layer's call: the
+    /// container reader reports what is there, and a verifier decides what
+    /// that is worth.
     #[must_use]
     pub fn signature(&self) -> Option<&[u8]> {
         self.signature.as_deref()
@@ -2083,11 +2232,12 @@ mod tests {
     use zstd::Encoder;
 
     use super::{
-        ArtifactInput, Candidate, FOOTER_SIZE, FOOTER_SIZE_V1, FOOTER_SIZE_V2, FORMAT_VERSION,
-        Footer, KNOWN_FOOTER_SIZES, MAGIC, MAGIC_LEN, PayloadError, PayloadManifest,
-        TAR_BLOCK_SIZE, TAR_NAME_FIELD_LEN, append_trailer, classify_candidate, open,
-        open_current_exe, open_package, open_package_path, publish_dirs, read_base_executable,
-        rewrap_trailer, sha256_hex,
+        ArtifactInput, Candidate, ED25519_SIGNATURE_LEN, FOOTER_SIZE, FOOTER_SIZE_V1,
+        FOOTER_SIZE_V2, FORMAT_VERSION, Footer, KEY_ID_HEX_LEN, KNOWN_FOOTER_SIZES, MAGIC,
+        MAGIC_LEN, PayloadError, PayloadManifest, Signed, SignerError, TAR_BLOCK_SIZE,
+        TAR_NAME_FIELD_LEN, append_trailer, append_trailer_signed, append_trailer_with_signer,
+        classify_candidate, open, open_current_exe, open_package, open_package_path, publish_dirs,
+        read_base_executable, rewrap_trailer, sha256_hex,
     };
     use crate::manifest::{
         ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
@@ -4528,6 +4678,9 @@ mod tests {
     /// it.
     type FooterCase = (&'static str, fn(&mut Footer));
 
+    /// One malformed signer return and the error it must produce.
+    type SignedValidationCase = (&'static str, Signed, fn(&PayloadError) -> bool);
+
     /// A stand-in signature block. Opaque at this layer, which reports what is
     /// there and leaves what it is worth to a verifier.
     const SIGNATURE: &[u8] = b"an opaque detached signature, meaningless to this layer";
@@ -4535,9 +4688,9 @@ mod tests {
     /// A stand-in `key_id` block, of another length.
     const KEY_ID: &[u8] = b"key-2026-08";
 
-    /// Rebuilds `binary` with the envelope blocks nothing writes yet:
-    /// `signature` and `key_id` present or absent independently, and `slack`
-    /// bytes before the footer that the footer accounts for nowhere.
+    /// Rebuilds `binary` with independently present or absent envelope blocks
+    /// and `slack` bytes before the footer that the footer accounts for
+    /// nowhere.
     ///
     /// A present block is appended after the archive in the fixed order and
     /// recorded at the offset the previous *present* block ended at; an absent
@@ -4658,6 +4811,304 @@ mod tests {
     }
 
     #[test]
+    fn the_unsigned_entry_point_preserves_the_unsigned_writer_output() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = [input(
+            src.path(),
+            "app.src",
+            "bin/app",
+            b"application bytes",
+            &[Disposition::Install],
+        )];
+        let mut through_public_entry_point = Vec::new();
+        append_trailer(
+            Cursor::new(BASE),
+            &mut through_public_entry_point,
+            None,
+            None,
+            &inputs,
+        )
+        .expect("the unsigned writer should succeed");
+
+        let mut through_unsigned_path = Vec::new();
+        append_trailer_with_signer(
+            Cursor::new(BASE),
+            &mut through_unsigned_path,
+            None,
+            None,
+            &inputs,
+            |_| Ok(None),
+        )
+        .expect("the unsigned writer path should succeed");
+
+        assert_eq!(through_public_entry_point, through_unsigned_path);
+    }
+
+    #[test]
+    fn a_signed_writer_stamps_the_callback_manifest_and_envelope() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = [input(
+            src.path(),
+            "app.src",
+            "bin/app",
+            b"application bytes",
+            &[Disposition::Install],
+        )];
+        let captured = std::cell::RefCell::new(None);
+        let mut package = Vec::new();
+        append_trailer_signed(
+            std::io::empty(),
+            &mut package,
+            None,
+            None,
+            &inputs,
+            |manifest| {
+                *captured.borrow_mut() = Some(manifest.to_vec());
+                Ok(Signed {
+                    signature: vec![0x5a; ED25519_SIGNATURE_LEN],
+                    key_id: "a".repeat(KEY_ID_HEX_LEN),
+                })
+            },
+        )
+        .expect("the signed writer should succeed");
+
+        let (footer, footer_start) = probe_footer(&package);
+        let manifest_end = footer.manifest_offset + footer.manifest_len;
+        let manifest_start =
+            usize::try_from(footer.manifest_offset).expect("a fixture offset fits usize");
+        let manifest_end = usize::try_from(manifest_end).expect("a fixture offset fits usize");
+        let manifest = package
+            .get(manifest_start..manifest_end)
+            .expect("the manifest range is in the package");
+        assert_eq!(captured.into_inner(), Some(manifest.to_vec()));
+        assert_eq!(footer.manifest_offset, 0);
+        assert_eq!(
+            footer.signature_offset,
+            footer.archive_offset + footer.archive_len
+        );
+        assert_eq!(
+            footer.signature_len,
+            u64::try_from(ED25519_SIGNATURE_LEN).expect("fixed signature length fits u64")
+        );
+        assert_eq!(
+            footer.key_id_offset,
+            footer.signature_offset + footer.signature_len
+        );
+        assert_eq!(
+            footer.key_id_len,
+            u64::try_from(KEY_ID_HEX_LEN).expect("fixed key_id length fits u64")
+        );
+        assert_eq!(
+            footer.key_id_offset + footer.key_id_len,
+            footer_start as u64
+        );
+
+        let package = open_package(Cursor::new(package)).expect("the package must open");
+        assert_eq!(
+            package.signature(),
+            Some([0x5a; ED25519_SIGNATURE_LEN].as_slice())
+        );
+        assert_eq!(
+            package.key_id(),
+            Some("a".repeat(KEY_ID_HEX_LEN).as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_signed_writer_rewraps_with_corrected_envelope_offsets() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = [input(
+            src.path(),
+            "app.src",
+            "bin/app",
+            b"application bytes",
+            &[Disposition::Install],
+        )];
+        let mut signed = Vec::new();
+        append_trailer_signed(Cursor::new(BASE), &mut signed, None, None, &inputs, |_| {
+            Ok(Signed {
+                signature: vec![0x5a; ED25519_SIGNATURE_LEN],
+                key_id: "a".repeat(KEY_ID_HEX_LEN),
+            })
+        })
+        .expect("the signed writer should succeed");
+        let (source_footer, _) = probe_footer(&signed);
+
+        let new_base = b"a replacement executable base of a distinct length";
+        assert_ne!(new_base.len(), BASE.len());
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(Cursor::new(signed), Cursor::new(new_base), &mut rewrapped)
+            .expect("the signed container should rewrap");
+
+        let (footer, footer_start) = probe_footer(&rewrapped);
+        let shifted = |offset: u64| {
+            offset - source_footer.manifest_offset
+                + u64::try_from(new_base.len()).expect("fixture base length fits u64")
+        };
+        assert_eq!(
+            footer.manifest_offset,
+            shifted(source_footer.manifest_offset)
+        );
+        assert_eq!(footer.archive_offset, shifted(source_footer.archive_offset));
+        assert_eq!(
+            footer.signature_offset,
+            shifted(source_footer.signature_offset)
+        );
+        assert_eq!(footer.key_id_offset, shifted(source_footer.key_id_offset));
+        assert_eq!(
+            footer.signature_len,
+            u64::try_from(ED25519_SIGNATURE_LEN).expect("fixed signature length fits u64")
+        );
+        assert_eq!(
+            footer.key_id_len,
+            u64::try_from(KEY_ID_HEX_LEN).expect("fixed key_id length fits u64")
+        );
+        assert_eq!(
+            footer.key_id_offset + footer.key_id_len,
+            u64::try_from(footer_start).expect("fixture offset fits u64")
+        );
+
+        let payload = open(Cursor::new(rewrapped))
+            .expect("the rewrapped container must open")
+            .expect("trailer should be present");
+        assert_eq!(
+            payload.signature(),
+            Some([0x5a; ED25519_SIGNATURE_LEN].as_slice())
+        );
+        assert_eq!(
+            payload.key_id(),
+            Some("a".repeat(KEY_ID_HEX_LEN).as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_signed_writer_rejects_invalid_envelope_values_before_writing() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = [input(
+            src.path(),
+            "app.src",
+            "bin/app",
+            b"application bytes",
+            &[Disposition::Install],
+        )];
+        let cases: [SignedValidationCase; 5] = [
+            (
+                "short signature",
+                Signed {
+                    signature: vec![0; ED25519_SIGNATURE_LEN - 1],
+                    key_id: "a".repeat(KEY_ID_HEX_LEN),
+                },
+                |error| {
+                    matches!(
+                        error,
+                        PayloadError::InvalidSignatureLength { found }
+                            if *found == ED25519_SIGNATURE_LEN - 1
+                    )
+                },
+            ),
+            (
+                "short key_id",
+                Signed {
+                    signature: vec![0; ED25519_SIGNATURE_LEN],
+                    key_id: "a".repeat(KEY_ID_HEX_LEN - 1),
+                },
+                |error| {
+                    matches!(
+                        error,
+                        PayloadError::InvalidKeyId { reason }
+                            if *reason == "must be exactly 64 lowercase-hex ASCII characters"
+                    )
+                },
+            ),
+            (
+                "uppercase key_id",
+                Signed {
+                    signature: vec![0; ED25519_SIGNATURE_LEN],
+                    key_id: "A".repeat(KEY_ID_HEX_LEN),
+                },
+                |error| {
+                    matches!(
+                        error,
+                        PayloadError::InvalidKeyId { reason }
+                            if *reason == "must contain only lowercase hexadecimal ASCII characters"
+                    )
+                },
+            ),
+            (
+                "non-hex key_id",
+                Signed {
+                    signature: vec![0; ED25519_SIGNATURE_LEN],
+                    key_id: "g".repeat(KEY_ID_HEX_LEN),
+                },
+                |error| {
+                    matches!(
+                        error,
+                        PayloadError::InvalidKeyId { reason }
+                            if *reason == "must contain only lowercase hexadecimal ASCII characters"
+                    )
+                },
+            ),
+            (
+                "non-ASCII key_id at the required byte length",
+                Signed {
+                    signature: vec![0; ED25519_SIGNATURE_LEN],
+                    key_id: "é".repeat(KEY_ID_HEX_LEN / 2),
+                },
+                |error| {
+                    matches!(
+                        error,
+                        PayloadError::InvalidKeyId { reason }
+                            if *reason == "must contain only lowercase hexadecimal ASCII characters"
+                    )
+                },
+            ),
+        ];
+        for (label, signed, expected_error) in cases {
+            let mut out = Vec::new();
+            let error =
+                append_trailer_signed(std::io::empty(), &mut out, None, None, &inputs, |_| {
+                    Ok(signed)
+                })
+                .expect_err("an invalid envelope must be rejected");
+            assert!(
+                expected_error(&error),
+                "{label} returned the wrong error: {error:?}"
+            );
+            assert!(
+                out.is_empty(),
+                "{label} must fail before the writer's first byte"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signer_failure_keeps_output_empty_and_its_source_reachable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<PayloadError>();
+        let src = tempfile::tempdir().expect("source tempdir");
+        let inputs = [input(
+            src.path(),
+            "app.src",
+            "bin/app",
+            b"application bytes",
+            &[Disposition::Install],
+        )];
+        let mut out = Vec::new();
+        let error = append_trailer_signed(std::io::empty(), &mut out, None, None, &inputs, |_| {
+            Err(SignerError::new(std::io::Error::other(
+                "signer unavailable",
+            )))
+        })
+        .expect_err("the signer error must surface");
+        assert!(matches!(&error, PayloadError::Signer(_)), "got: {error:?}");
+        let source = std::error::Error::source(&error).expect("the signer is a source");
+        let source = source.source().expect("the callback error is reachable");
+        assert_eq!(source.to_string(), "signer unavailable");
+        assert!(out.is_empty(), "the writer must fail before its first byte");
+    }
+
+    #[test]
     fn a_half_zero_envelope_pair_is_malformed() {
         let src = tempfile::tempdir().expect("source tempdir");
         let binary = two_member_binary(src.path());
@@ -4722,9 +5173,9 @@ mod tests {
 
     #[test]
     fn a_present_signature_block_is_accepted_and_still_held_to_adjacency() {
-        // Nothing writes a signature yet, so the container is hand-built from
-        // the writer's own manifest and archive blocks with two extra blocks
-        // between the archive and the footer.
+        // The reader accepts envelope blocks of arbitrary lengths. This
+        // hand-built container exercises that structural property separately
+        // from the signed writer's fixed Ed25519 and `key_id` lengths.
         let src = tempfile::tempdir().expect("source tempdir");
         let written = two_member_binary(src.path());
         // The second argument is `slack`: bytes the footer accounts for
@@ -4939,10 +5390,9 @@ mod tests {
 
     #[test]
     fn a_rewrap_shifts_a_present_envelope_pair_with_the_rest_of_the_body() {
-        // The other half of the same rule: every container this crate writes has
-        // both pairs absent, so nothing it produces distinguishes "shift every
-        // present block's offset" from "shift the manifest and the archive".
-        // Nothing writes a signature yet, so the source is hand-built.
+        // The signed writer uses fixed envelope lengths, so this hand-built
+        // source separately proves that rewrapping carries arbitrary present
+        // envelope blocks along with the manifest and archive.
         let src = tempfile::tempdir().expect("source tempdir");
         let signed = with_envelope(
             &two_member_binary(src.path()),

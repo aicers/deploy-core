@@ -563,11 +563,12 @@ pub enum VerifyError {
     /// No anchor's key verifies the signature over the manifest block — or the
     /// container carries no signature at all.
     ///
-    /// An unsigned package is this and not a variant of its own: everything the
-    /// writer emits today has both envelope pairs absent, so unsigned packages
-    /// exist and must be answered, and one this verifier cannot authenticate is
-    /// not a new failure mode. It is also what an unusable `key_id` hint falls
-    /// back to, since a hint that is not a `key_id` at all names nothing.
+    /// An unsigned package is this and not a variant of its own: the unsigned
+    /// [`crate::payload::append_trailer`] entry point emits both envelope pairs
+    /// absent, so unsigned packages exist and must be answered, and one this
+    /// verifier cannot authenticate is not a new failure mode. It is also what
+    /// an unusable `key_id` hint falls back to, since a hint that is not a
+    /// `key_id` at all names nothing.
     ///
     /// A signature block present at any length other than the 64 bytes an
     /// Ed25519 signature is reaches this the ordinary way rather than directly:
@@ -1195,7 +1196,7 @@ mod tests {
         Disposition, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
         MIN_MANIFEST_FORMAT_VERSION, TargetArch,
     };
-    use crate::payload::{self, ArtifactInput, FORMAT_VERSION, MAGIC, PayloadError};
+    use crate::payload::{self, ArtifactInput, FORMAT_VERSION, MAGIC, PayloadError, Signed};
 
     /// Component every fixture artifact belongs to, and the target a fixture
     /// request names.
@@ -1647,6 +1648,71 @@ mod tests {
             refusal(&package, &trusting(&pair)),
             VerifyError::BadSignature
         ));
+    }
+
+    #[test]
+    fn signed_writer_packages_verify_before_and_after_a_rewrap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("app");
+        std::fs::write(&source, ARTIFACT_BYTES).expect("write source file");
+        let input = ArtifactInput {
+            component: COMPONENT.to_string(),
+            version: VERSION.to_string(),
+            commit: COMMIT.to_string(),
+            target_arch: TargetArch::X86_64,
+            kind: crate::manifest::ArtifactKind::NativeBinary,
+            dispositions: [Disposition::Install].into_iter().collect(),
+            archive_path: MEMBER.to_string(),
+            spec: None,
+            source,
+        };
+        let pair = keypair();
+        let expected_key_id = key_id(&public_key_of(&pair));
+        let mut package = Vec::new();
+        payload::append_trailer_signed(
+            std::io::empty(),
+            &mut package,
+            None,
+            None,
+            std::slice::from_ref(&input),
+            |manifest| {
+                Ok(Signed {
+                    signature: pair.sign(manifest).as_ref().to_vec(),
+                    key_id: expected_key_id.clone(),
+                })
+            },
+        )
+        .expect("the signed package writer should succeed");
+        accepted(&package, &trusting(&pair));
+        let package_payload = payload::open_package(Cursor::new(&package))
+            .expect("the package must open after verification");
+        assert_eq!(package_payload.key_id(), Some(expected_key_id.as_bytes()));
+
+        let mut installer = Vec::new();
+        payload::append_trailer_signed(
+            Cursor::new(b"an executable base"),
+            &mut installer,
+            None,
+            None,
+            &[input],
+            |manifest| {
+                Ok(Signed {
+                    signature: pair.sign(manifest).as_ref().to_vec(),
+                    key_id: expected_key_id.clone(),
+                })
+            },
+        )
+        .expect("the signed installer writer should succeed");
+        accepted(&installer, &trusting(&pair));
+
+        let mut rewrapped = Vec::new();
+        payload::rewrap_trailer(
+            Cursor::new(installer),
+            Cursor::new(b"a replacement executable base"),
+            &mut rewrapped,
+        )
+        .expect("a signed container should rewrap");
+        accepted(&rewrapped, &trusting(&pair));
     }
 
     #[test]
