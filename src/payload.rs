@@ -886,7 +886,7 @@ fn envelope_present(offset: u64, len: u64, reason: &'static str) -> Result<bool,
 ///
 /// Panics when `container` is not a well-formed current-format signed
 /// container, when `advertised_len` does not widen both blocks, or when the
-/// widened `key_id` offset cannot be represented by the container format.
+/// widened envelope cannot be represented by the container format.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn widen_envelope_blocks(container: &[u8], advertised_len: u64) -> Vec<u8> {
@@ -930,6 +930,10 @@ pub fn widen_envelope_blocks(container: &[u8], advertised_len: u64) -> Vec<u8> {
         .checked_add(advertised_len)
         .expect("the widened key_id offset fits the container format");
     footer.key_id_len = advertised_len;
+    footer
+        .key_id_offset
+        .checked_add(footer.key_id_len)
+        .expect("the widened envelope fits the container format");
 
     let prefix_len = usize::try_from(footer.signature_offset)
         .expect("the fixture input is addressable as a slice");
@@ -3939,6 +3943,38 @@ mod tests {
         let error = open_package(SparseEnvelopeSource::new(compact, ADVERTISED_LEN))
             .expect_err("the unbounded reader tries to read the sparse envelope");
         assert!(matches!(error, PayloadError::Io(_)), "got: {error:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "the advertised length widens both envelope blocks")]
+    fn widened_envelope_fixture_refuses_a_non_widening_length() {
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: ROXYD,
+        }]);
+        let package = signed_fixture(&manifest_json(&[("bin/roxyd", ROXYD)]), &archive);
+
+        let _ = widen_envelope_blocks(&package, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "the widened envelope fits the container format")]
+    fn widened_envelope_fixture_refuses_an_unrepresentable_extent() {
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: ROXYD,
+        }]);
+        let package = signed_fixture(&manifest_json(&[("bin/roxyd", ROXYD)]), &archive);
+        let signature_len =
+            u64::try_from(ED25519_SIGNATURE_LEN).expect("the signature length fits u64");
+        let key_id_len = u64::try_from(KEY_ID_HEX_LEN).expect("the key ID length fits u64");
+        let prefix_len = u64::try_from(package.len() - FOOTER_SIZE)
+            .expect("the signed fixture length fits u64")
+            - signature_len
+            - key_id_len;
+        let advertised_len = (u64::MAX - prefix_len) / 2 + 1;
+
+        let _ = widen_envelope_blocks(&package, advertised_len);
     }
 
     #[test]

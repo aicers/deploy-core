@@ -8,6 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `payload::widen_envelope_blocks`, a `test-support` fixture that builds a
+  compact malformed-envelope case for a dependent crate to write sparsely when
+  testing bounded package reads without duplicating deploy-core's private
+  footer layout.
 - `payload::UnparsedContainer::parse_unverified_manifest`, which lets a caller
   decode manifest metadata from `read_package_container` without reopening an
   untrusted package. The returned manifest is intentionally unauthenticated;
