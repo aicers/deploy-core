@@ -1343,6 +1343,28 @@ impl<R: Read + Seek> UnparsedContainer<R> {
         &self.manifest_bytes
     }
 
+    /// Parses this container's unauthenticated manifest for metadata reporting.
+    ///
+    /// The returned manifest is not authenticated. A caller holding a
+    /// [`crate::verify::TrustSet`] follows `verify.rs`' authenticate-then-parse
+    /// order instead, authenticating the raw manifest bytes before decoding
+    /// them. This entry point serves supported metadata reporting when no key
+    /// material is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayloadError::ManifestParse`] when the manifest bytes are not
+    /// decodable JSON, or [`PayloadError::InvalidManifest`] for every other
+    /// manifest validation failure.
+    pub fn parse_unverified_manifest(&self) -> Result<PayloadManifest, PayloadError> {
+        PayloadManifest::parse(self.manifest_bytes(), self.footer_version()).map_err(|error| {
+            match error {
+                ManifestError::Decode(source) => PayloadError::ManifestParse(source),
+                other => PayloadError::InvalidManifest(other),
+            }
+        })
+    }
+
     /// Returns the detached signature block as the bounded read left it:
     /// absent, present at the bounded length, or present at some other length
     /// and therefore never read.
@@ -2243,20 +2265,22 @@ pub fn current_exe_base() -> Result<Vec<u8>, PayloadError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::io::{Cursor, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
     use tar::{Builder, EntryType, Header};
     use zstd::{Decoder, Encoder};
 
     use super::{
-        ArtifactInput, Candidate, ED25519_SIGNATURE_LEN, FOOTER_SIZE, FOOTER_SIZE_V1,
-        FOOTER_SIZE_V2, FORMAT_VERSION, Footer, KEY_ID_HEX_LEN, KNOWN_FOOTER_SIZES, MAGIC,
-        MAGIC_LEN, PayloadError, PayloadManifest, Signed, SignerError, TAR_BLOCK_SIZE,
+        ArtifactInput, Candidate, ED25519_SIGNATURE_LEN, EnvelopeBlock, FOOTER_SIZE,
+        FOOTER_SIZE_V1, FOOTER_SIZE_V2, FORMAT_VERSION, Footer, KEY_ID_HEX_LEN, KNOWN_FOOTER_SIZES,
+        MAGIC, MAGIC_LEN, PayloadError, PayloadManifest, Signed, SignerError, TAR_BLOCK_SIZE,
         TAR_NAME_FIELD_LEN, append_trailer, append_trailer_signed, classify_candidate, open,
         open_current_exe, open_package, open_package_path, publish_dirs, read_base_executable,
-        rewrap_trailer, sha256_hex,
+        read_package_container, rewrap_trailer, sha256_hex,
     };
     use crate::manifest::{
         ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
@@ -2267,6 +2291,7 @@ mod tests {
         Arg, ModuleSpec, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
         RestartPolicy, SystemdTarget, UnitTemplate,
     };
+    use crate::verify::ENVELOPE_BOUNDS;
 
     const BASE: &[u8] = b"#!/bin/false\nnot a real executable, just a base binary\n";
 
@@ -2276,6 +2301,26 @@ mod tests {
 
     /// Opaque stand-in for the signed trust-set generation container.
     const GENERATION: &[u8] = b"a signed generation container, opaque to this crate";
+
+    struct CountingSource {
+        inner: Cursor<Vec<u8>>,
+        read_count: Rc<Cell<usize>>,
+        seek_count: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountingSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_count.set(self.read_count.get() + 1);
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for CountingSource {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.seek_count.set(self.seek_count.get() + 1);
+            self.inner.seek(pos)
+        }
+    }
 
     fn dispositions(values: &[Disposition]) -> BTreeSet<Disposition> {
         values.iter().copied().collect()
@@ -3720,6 +3765,92 @@ mod tests {
             matches!(error, PayloadError::ManifestParse(_)),
             "got: {error:?}"
         );
+    }
+
+    #[test]
+    fn bounded_manifest_parse_matches_open_error_mapping() {
+        let bytes = b"payload bytes";
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes,
+        }]);
+
+        let invalid_json = b"{ this is not valid json";
+        let footer = valid_footer(BASE.len(), invalid_json, &archive);
+        let binary = assemble(BASE, invalid_json, &archive, &footer);
+        let open_error = open(Cursor::new(binary.clone())).expect_err("open must reject JSON");
+        let bounded_error = read_package_container(Cursor::new(binary), &ENVELOPE_BOUNDS)
+            .expect("the bounded reader only locates the manifest")
+            .parse_unverified_manifest()
+            .expect_err("the bounded parser must reject JSON");
+        assert!(matches!(open_error, PayloadError::ManifestParse(_)));
+        assert!(matches!(bounded_error, PayloadError::ManifestParse(_)));
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&manifest_json(&[("bin/roxyd", bytes)]))
+                .expect("the fixture manifest decodes");
+        document["format_version"] =
+            serde_json::Value::from(u64::from(MAX_MANIFEST_FORMAT_VERSION + 1));
+        let unsupported_version =
+            serde_json::to_vec(&document).expect("the fixture manifest serializes");
+        let footer = valid_footer(BASE.len(), &unsupported_version, &archive);
+        let binary = assemble(BASE, &unsupported_version, &archive, &footer);
+        let open_error = open(Cursor::new(binary.clone()))
+            .expect_err("open must reject an unsupported manifest version");
+        let bounded_error = read_package_container(Cursor::new(binary), &ENVELOPE_BOUNDS)
+            .expect("the bounded reader only locates the manifest")
+            .parse_unverified_manifest()
+            .expect_err("the bounded parser must reject an unsupported manifest version");
+        assert!(matches!(open_error, PayloadError::InvalidManifest(_)));
+        assert!(matches!(bounded_error, PayloadError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn bounded_manifest_parse_ignores_refused_envelope_blocks() {
+        let bytes = b"payload bytes";
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes,
+        }]);
+        let binary = signed_fixture(&manifest_json(&[("bin/roxyd", bytes)]), &archive);
+
+        let container = read_package_container(Cursor::new(binary), &ENVELOPE_BOUNDS)
+            .expect("the bounded reader accepts a wrong-length envelope block");
+        assert!(matches!(container.signature(), EnvelopeBlock::WrongLength));
+        assert!(
+            container.parse_unverified_manifest().is_ok(),
+            "a refused envelope block must not affect manifest parsing"
+        );
+    }
+
+    #[test]
+    fn bounded_manifest_parse_does_not_touch_the_source() {
+        let bytes = b"payload bytes";
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes,
+        }]);
+        let binary = signed_fixture(&manifest_json(&[("bin/roxyd", bytes)]), &archive);
+        let read_count = Rc::new(Cell::new(0));
+        let seek_count = Rc::new(Cell::new(0));
+        let container = read_package_container(
+            CountingSource {
+                inner: Cursor::new(binary),
+                read_count: Rc::clone(&read_count),
+                seek_count: Rc::clone(&seek_count),
+            },
+            &ENVELOPE_BOUNDS,
+        )
+        .expect("the bounded reader accepts the fixture");
+        let reads_before_parse = read_count.get();
+        let seeks_before_parse = seek_count.get();
+
+        container
+            .parse_unverified_manifest()
+            .expect("parsing retained manifest bytes succeeds without source I/O");
+
+        assert_eq!(read_count.get(), reads_before_parse);
+        assert_eq!(seek_count.get(), seeks_before_parse);
     }
 
     /// A `Read + Seek` source whose reads fail once the cursor sits inside

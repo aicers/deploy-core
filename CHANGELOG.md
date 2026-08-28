@@ -8,6 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `payload::UnparsedContainer::parse_unverified_manifest`, which lets a caller
+  decode manifest metadata from `read_package_container` without reopening an
+  untrusted package. The returned manifest is intentionally unauthenticated;
+  callers with a `TrustSet` continue to use the verifying path.
 - `payload::read_package_container`, which reports a package's signature and
   `key_id` metadata under the release format's fixed envelope bounds without
   allocating blocks advertised at another length.
