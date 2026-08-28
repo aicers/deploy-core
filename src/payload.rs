@@ -862,6 +862,89 @@ fn envelope_present(offset: u64, len: u64, reason: &'static str) -> Result<bool,
     }
 }
 
+/// Builds a compact sparse-file fixture with widened envelope blocks.
+///
+/// `container` must be a current-format container produced by
+/// [`append_trailer_signed`]. The returned bytes consist of the real prefix
+/// before its signature followed immediately by a rewritten [`FOOTER_SIZE`]
+/// footer. That footer advertises `advertised_len` for both envelope blocks;
+/// its `key_id` starts immediately after the widened signature.
+///
+/// Do **not** write the returned bytes contiguously. To construct the fixture
+/// without materializing the advertised bytes, write every byte except the
+/// final [`FOOTER_SIZE`], seek to `prefix_len + 2 * advertised_len`, then write
+/// those final footer bytes. The unwritten signature and `key_id` ranges stay
+/// sparse, while the footer still describes both as present. A bounded reader
+/// can reject them from their advertised lengths without reading them; an
+/// unbounded reader reaches the sparse ranges and attempts to allocate their
+/// advertised sizes.
+///
+/// This test-support fixture is not compiled into a default-feature build.
+/// Enable `test-support` only under a dependent's `[dev-dependencies]`.
+///
+/// # Panics
+///
+/// Panics when `container` is not a well-formed current-format signed
+/// container, when `advertised_len` does not widen both blocks, or when the
+/// widened envelope cannot be represented by the container format.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn widen_envelope_blocks(container: &[u8], advertised_len: u64) -> Vec<u8> {
+    let Some(ContainerHead { footer, .. }) = read_container_head(std::io::Cursor::new(container))
+        .expect("the fixture input is readable")
+    else {
+        panic!("the fixture input carries a container");
+    };
+
+    assert_eq!(
+        footer.version, FORMAT_VERSION,
+        "the fixture input uses the current container format"
+    );
+    assert!(
+        envelope_present(
+            footer.signature_offset,
+            footer.signature_len,
+            "the fixture input has a signature",
+        )
+        .expect("the fixture input has a well-formed signature pair"),
+        "the fixture input has a signature"
+    );
+    assert!(
+        envelope_present(
+            footer.key_id_offset,
+            footer.key_id_len,
+            "the fixture input has a key_id",
+        )
+        .expect("the fixture input has a well-formed key_id pair"),
+        "the fixture input has a key_id"
+    );
+    assert!(
+        advertised_len > footer.signature_len && advertised_len > footer.key_id_len,
+        "the advertised length widens both envelope blocks"
+    );
+
+    let mut footer = footer;
+    footer.signature_len = advertised_len;
+    footer.key_id_offset = footer
+        .signature_offset
+        .checked_add(advertised_len)
+        .expect("the widened key_id offset fits the container format");
+    footer.key_id_len = advertised_len;
+    footer
+        .key_id_offset
+        .checked_add(footer.key_id_len)
+        .expect("the widened envelope fits the container format");
+
+    let prefix_len = usize::try_from(footer.signature_offset)
+        .expect("the fixture input is addressable as a slice");
+    let mut compact = container
+        .get(..prefix_len)
+        .expect("the signature starts inside the fixture input")
+        .to_vec();
+    compact.extend_from_slice(&footer.encode());
+    compact
+}
+
 /// Computes the lowercase hex SHA-256 of `bytes`.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -2280,7 +2363,7 @@ mod tests {
         MAGIC, MAGIC_LEN, PayloadError, PayloadManifest, Signed, SignerError, TAR_BLOCK_SIZE,
         TAR_NAME_FIELD_LEN, append_trailer, append_trailer_signed, classify_candidate, open,
         open_current_exe, open_package, open_package_path, publish_dirs, read_base_executable,
-        read_package_container, rewrap_trailer, sha256_hex,
+        read_package_container, rewrap_trailer, sha256_hex, widen_envelope_blocks,
     };
     use crate::manifest::{
         ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
@@ -3824,6 +3907,77 @@ mod tests {
     }
 
     #[test]
+    fn widened_envelope_fixture_bounds_metadata_without_reading_holes() {
+        const ADVERTISED_LEN: u64 = 1_024;
+
+        let source = tempfile::tempdir().expect("source tempdir");
+        let inputs = [input(
+            source.path(),
+            "roxyd.src",
+            "bin/roxyd",
+            ROXYD,
+            &[Disposition::Install],
+        )];
+        let mut package = Vec::new();
+        append_trailer_signed(std::io::empty(), &mut package, None, None, &inputs, |_| {
+            Ok(Signed {
+                signature: vec![0x5a; ED25519_SIGNATURE_LEN],
+                key_id: "a".repeat(KEY_ID_HEX_LEN),
+            })
+        })
+        .expect("the signed package is written");
+        let compact = widen_envelope_blocks(&package, ADVERTISED_LEN);
+
+        let container = read_package_container(
+            SparseEnvelopeSource::new(compact.clone(), ADVERTISED_LEN),
+            &ENVELOPE_BOUNDS,
+        )
+        .expect("the bounded reader does not read the widened blocks");
+        assert!(matches!(container.signature(), EnvelopeBlock::WrongLength));
+        assert!(matches!(container.key_id(), EnvelopeBlock::WrongLength));
+        assert!(
+            container.parse_unverified_manifest().is_ok(),
+            "widening the envelope does not affect the manifest"
+        );
+
+        let error = open_package(SparseEnvelopeSource::new(compact, ADVERTISED_LEN))
+            .expect_err("the unbounded reader tries to read the sparse envelope");
+        assert!(matches!(error, PayloadError::Io(_)), "got: {error:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "the advertised length widens both envelope blocks")]
+    fn widened_envelope_fixture_refuses_a_non_widening_length() {
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: ROXYD,
+        }]);
+        let package = signed_fixture(&manifest_json(&[("bin/roxyd", ROXYD)]), &archive);
+
+        let _ = widen_envelope_blocks(&package, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "the widened envelope fits the container format")]
+    fn widened_envelope_fixture_refuses_an_unrepresentable_extent() {
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: ROXYD,
+        }]);
+        let package = signed_fixture(&manifest_json(&[("bin/roxyd", ROXYD)]), &archive);
+        let signature_len =
+            u64::try_from(ED25519_SIGNATURE_LEN).expect("the signature length fits u64");
+        let key_id_len = u64::try_from(KEY_ID_HEX_LEN).expect("the key ID length fits u64");
+        let prefix_len = u64::try_from(package.len() - FOOTER_SIZE)
+            .expect("the signed fixture length fits u64")
+            - signature_len
+            - key_id_len;
+        let advertised_len = (u64::MAX - prefix_len) / 2 + 1;
+
+        let _ = widen_envelope_blocks(&package, advertised_len);
+    }
+
+    #[test]
     fn bounded_manifest_parse_does_not_touch_the_source() {
         let bytes = b"payload bytes";
         let archive = zstd_tar(&[Member::File {
@@ -3886,6 +4040,93 @@ mod tests {
     impl Seek for FailingSource {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
             self.inner.seek(pos)
+        }
+    }
+
+    /// A compact widened fixture presented as a sparse file whose envelope
+    /// holes fail if a reader tries to read them.
+    #[derive(Debug)]
+    struct SparseEnvelopeSource {
+        compact: Vec<u8>,
+        prefix_len: u64,
+        footer_start: u64,
+        position: u64,
+    }
+
+    impl SparseEnvelopeSource {
+        fn new(compact: Vec<u8>, advertised_len: u64) -> Self {
+            let prefix_len =
+                u64::try_from(compact.len() - FOOTER_SIZE).expect("fixture prefix length fits u64");
+            let footer_start = prefix_len
+                .checked_add(advertised_len)
+                .and_then(|offset| offset.checked_add(advertised_len))
+                .expect("fixture footer offset fits u64");
+            Self {
+                compact,
+                prefix_len,
+                footer_start,
+                position: 0,
+            }
+        }
+
+        fn len(&self) -> u64 {
+            self.footer_start + u64::try_from(FOOTER_SIZE).expect("footer size fits u64")
+        }
+    }
+
+    impl Read for SparseEnvelopeSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.position >= self.len() {
+                return Ok(0);
+            }
+            if self.position >= self.prefix_len && self.position < self.footer_start {
+                return Err(std::io::Error::other(
+                    "read inside an unwritten envelope block",
+                ));
+            }
+
+            let (bytes, start) = if self.position < self.prefix_len {
+                (
+                    self.compact
+                        .get(..usize::try_from(self.prefix_len).expect("prefix fits usize"))
+                        .expect("fixture compact prefix is present"),
+                    0,
+                )
+            } else {
+                (
+                    self.compact
+                        .get(usize::try_from(self.prefix_len).expect("prefix fits usize")..)
+                        .expect("fixture footer is present"),
+                    self.footer_start,
+                )
+            };
+            let offset = usize::try_from(self.position - start).expect("fixture offset fits usize");
+            let available = bytes
+                .get(offset..)
+                .expect("fixture read begins inside its available bytes");
+            let count = available.len().min(buf.len());
+            buf.get_mut(..count)
+                .expect("the destination contains the chosen range")
+                .copy_from_slice(
+                    available
+                        .get(..count)
+                        .expect("the fixture source contains the chosen range"),
+                );
+            self.position += u64::try_from(count).expect("read count fits u64");
+            Ok(count)
+        }
+    }
+
+    impl Seek for SparseEnvelopeSource {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let target = match pos {
+                SeekFrom::Start(offset) => Some(offset),
+                SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+                SeekFrom::End(offset) => self.len().checked_add_signed(offset),
+            }
+            .ok_or_else(|| std::io::Error::other("seek lies outside the fixture source"))?;
+            self.position = target;
+            Ok(target)
         }
     }
 

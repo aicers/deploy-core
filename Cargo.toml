@@ -21,11 +21,11 @@ x509-parser = "0.17"
 zstd = "0.13"
 
 [features]
-# Exposes the test-only `Principal::Fixture`/`ServiceAccount::Fixture` account
-# fixtures so a dependent crate's tests can construct them across the crate
-# boundary (`cfg(test)` alone is invisible to dependents). Enable this ONLY as a
-# `[dev-dependencies]` feature — never under normal `[dependencies]` — so the
-# fixtures stay absent from every release build.
+# Exposes test-only account and payload fixtures so a dependent crate's tests
+# can construct them across the crate boundary (`cfg(test)` alone is invisible
+# to dependents). Enable this ONLY as a `[dev-dependencies]` feature — never
+# under normal `[dependencies]` — so the fixtures stay absent from every
+# release build.
 test-support = []
 
 [dev-dependencies]

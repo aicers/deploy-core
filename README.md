@@ -67,11 +67,12 @@ on it and share one implementation.
 cargo test
 ```
 
-The `test-support` feature exposes the test-only account fixtures
-(`Principal::Fixture` / `ServiceAccount::Fixture`) so a **dependent** crate's tests
-can construct them across the crate boundary. Enable it only as a
-`[dev-dependencies]` feature — never under normal `[dependencies]` — so the
-fixtures stay absent from every release build.
+The `test-support` feature exposes test-only account fixtures
+(`Principal::Fixture` / `ServiceAccount::Fixture`) and payload fixtures such as
+`payload::widen_envelope_blocks` so a **dependent** crate's tests can construct
+them across the crate boundary. Enable it only as a `[dev-dependencies]` feature
+— never under normal `[dependencies]` — so the fixtures stay absent from every
+release build.
 
 ## License
 
