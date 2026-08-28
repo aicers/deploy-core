@@ -66,6 +66,21 @@ jobs:
       - name: Clippy (test-support)
         run: cargo clippy --all-targets --features test-support -- -D warnings
 
+      # Once, where clippy runs twice, and the asymmetry is deliberate. Clippy
+      # needs both runs because `--all-targets` covers every target but no
+      # feature. Documentation has no such gap: this crate carries no
+      # `#[cfg(not(feature = ...))]`, so enabling `test-support` only adds
+      # items and one run documents a superset of the default build.
+      #
+      # `--document-private-items` because the private items are where the
+      # reasoning is: `validate_footer`, `envelope_present`, `Footer` and the
+      # `pub(crate)` accessors carry the doc comments two other repositories
+      # are written against, and a default `cargo doc` skips exactly those.
+      - name: Docs
+        run: cargo doc --no-deps --document-private-items --features test-support
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:
