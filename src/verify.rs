@@ -989,10 +989,13 @@ fn verify_signature<R: Read + Seek>(
 /// second copy of the range would leave that mapping dead and give the two
 /// copies somewhere to drift apart.
 ///
-/// Since [`MIN_MANIFEST_FORMAT_VERSION`](crate::manifest::MIN_MANIFEST_FORMAT_VERSION)
-/// and [`MAX_MANIFEST_FORMAT_VERSION`] are equal today, the floor is only
-/// observable *above* the implemented range,
-/// where the accepted set is empty and the reported range says so.
+/// The injected floor is observable wherever it sits above
+/// [`MIN_MANIFEST_FORMAT_VERSION`](crate::manifest::MIN_MANIFEST_FORMAT_VERSION),
+/// which since manifest format version 4 includes values *inside* the
+/// implemented range: release ops can refuse a manifest at the build's floor
+/// while the build still accepts every later version. Above
+/// [`MAX_MANIFEST_FORMAT_VERSION`] the accepted set is empty, and the reported
+/// range says so.
 fn check_format_version(found: u32, floor: u32) -> Result<(), VerifyError> {
     if found < floor {
         return Err(VerifyError::UnsupportedManifestFormat {

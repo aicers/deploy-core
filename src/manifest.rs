@@ -22,7 +22,7 @@ use crate::module_spec::{ModuleSpec, ModuleSpecError};
 /// Stamped unconditionally, never derived from a manifest's contents: a
 /// manifest's version is the producer's, not a function of which optional
 /// variables its templates happen to name.
-pub const MANIFEST_FORMAT_VERSION: u32 = 4;
+pub const MANIFEST_FORMAT_VERSION: u32 = 5;
 
 /// Inclusive floor of the `format_version` range this build accepts.
 ///
@@ -40,7 +40,7 @@ pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 3;
 /// Tracks [`MANIFEST_FORMAT_VERSION`]: this build reads what it writes, and a
 /// manifest naming anything newer is refused for its version alone rather than
 /// failing as an opaque decode error somewhere inside it.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 4;
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 5;
 
 /// Container footer version the pre-versioned baseline payloads were written
 /// at.
@@ -1037,6 +1037,7 @@ mod tests {
                 ],
                 restart: RestartPolicy::Always,
                 restart_sec: 5,
+                limit_nofile: None,
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,
@@ -1249,17 +1250,18 @@ mod tests {
     }
 
     #[test]
-    fn the_producer_writes_the_ceiling_and_the_floor_is_no_higher() {
-        // The range has a floor as well as a ceiling, and both are written by
-        // repointing a constant rather than by searching for a literal. The
-        // ceiling tracks the producer exactly — this build reads what it
-        // writes — while the floor only ever trails it, because an additive
-        // schema bump leaves every manifest already published at the floor
-        // readable.
-        assert_eq!(MAX_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION);
-        // In a `const` block, so a floor raised past the producer is a build
-        // failure rather than a failing test.
-        const { assert!(MIN_MANIFEST_FORMAT_VERSION <= MANIFEST_FORMAT_VERSION) };
+    fn the_accepted_range_is_open_below_the_producer_and_closed_at_it() {
+        // The producer writes at the ceiling — a build never stamps a version
+        // it would then refuse to read — and the floor sits strictly below it,
+        // so the window admits more than one version. Pinned rather than left
+        // implicit because a later bump that moved all three together would
+        // close the window again and silently strand every payload published
+        // at the older version.
+        //
+        // Both hold at compile time, so both are stated that way: a bump that
+        // closed the window fails the build rather than one test run.
+        const _: () = assert!(MAX_MANIFEST_FORMAT_VERSION == MANIFEST_FORMAT_VERSION);
+        const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < MANIFEST_FORMAT_VERSION);
     }
 
     #[test]
@@ -2006,21 +2008,17 @@ mod tests {
     }
 
     #[test]
-    fn the_range_accepts_the_unmoved_floor_as_well_as_the_current_version() {
-        // Every version is written by interpolating a constant, so the next
-        // bump stays a repoint of the three rather than a search for a
-        // literal. A manifest at the floor is what an earlier build published:
-        // it is still accepted, and reports the version it was written at.
-        // Either side of the range is refused for the version alone, which
-        // `a_version_below_the_floor_is_rejected_with_the_same_variant` and
-        // `a_version_above_the_ceiling_is_rejected_for_its_version_alone` each
-        // pin against its own end.
-        for version in [MIN_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION] {
+    fn every_version_in_the_window_is_accepted_including_the_floor() {
+        // The two refusals either side of the window have their own tests; what
+        // this one pins is that the window is not a point. Written by
+        // interpolating the constants, so the next bump stays a repoint of them
+        // rather than a search for a literal.
+        for version in MIN_MANIFEST_FORMAT_VERSION..=MAX_MANIFEST_FORMAT_VERSION {
             let manifest = PayloadManifest::parse(
                 versioned_json(version).as_bytes(),
                 LEGACY_UNVERSIONED_FOOTER_VERSION,
             )
-            .expect("a version inside the accepted range must parse");
+            .expect("a version inside the window must be accepted");
             assert_eq!(manifest.format_version(), Some(version));
         }
     }
@@ -2088,6 +2086,40 @@ mod tests {
             "[Unit]\nDescription=C\n\n[Service]\nExecStart=/opt/c/bin/c\nRestart=always\n\
              RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
         );
+    }
+
+    #[test]
+    fn a_manifest_at_the_floor_version_still_decodes_validates_and_renders_without_a_limit() {
+        // The floor stayed put across the `limit_nofile` bump precisely so an
+        // already-published payload keeps working. That promise is about the
+        // whole read path, so this exercises it to the rendered bytes rather
+        // than stopping at the decode.
+        let entry = entry_json_with_spec(
+            "bin/c",
+            Some(GIT_COMMIT),
+            &spec_json(&unit_json(VALID_EXEC_START)),
+        );
+        let json = format!(
+            r#"{{"format_version":{MIN_MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a manifest at the floor version must still parse");
+        assert_eq!(manifest.format_version(), Some(MIN_MANIFEST_FORMAT_VERSION));
+
+        let spec = manifest
+            .artifacts()
+            .first()
+            .expect("one artifact")
+            .spec
+            .as_ref()
+            .expect("the artifact declares a spec");
+        let unit = spec.unit.as_ref().expect("the spec declares a unit");
+        assert_eq!(unit.limit_nofile, None);
+
+        let rendered = render_unit(spec, &read_path_context(None))
+            .expect("a floor-version spec must render")
+            .expect("the spec declares a unit");
+        assert!(!rendered.text.contains("Limit"), "got: {}", rendered.text);
     }
 
     #[test]

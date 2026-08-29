@@ -72,7 +72,7 @@ pub struct ModuleSpec {
 ///    element in declared order.
 /// 2. `[Service]` — `User=`, `ExecStart=`, `ExecReload=`, `WorkingDirectory=`,
 ///    one `Environment=` line per [`Self::environment`] entry in declared
-///    order, `Restart=`, `RestartSec=`, then `ProtectHome=yes`,
+///    order, `Restart=`, `RestartSec=`, `LimitNOFILE=`, then `ProtectHome=yes`,
 ///    `PrivateTmp=yes` and `NoNewPrivileges=yes`, each emitted only when its
 ///    flag is `true`.
 /// 3. `[Install]` — one `WantedBy=` line per [`Self::wanted_by`] element in
@@ -113,6 +113,15 @@ pub struct UnitTemplate {
     pub restart: RestartPolicy,
     /// `RestartSec=`, in seconds.
     pub restart_sec: u32,
+    /// `LimitNOFILE=`, in descriptors. Non-zero when present.
+    ///
+    /// Absent means the unit inherits the host's soft limit, which is what
+    /// every unit rendered before this field existed does. There is no
+    /// spelling for systemd's `infinity` on purpose: a package that wants no
+    /// limit omits the field, leaving the unbounded case the host's decision
+    /// rather than a package's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_nofile: Option<u64>,
     /// Emits `ProtectHome=yes` when set.
     pub protect_home: bool,
     /// Emits `PrivateTmp=yes` when set.
@@ -339,6 +348,9 @@ pub enum ModuleSpecError {
     /// `exec_reload` was present and empty.
     #[error("unit template `exec_reload` is present and empty")]
     EmptyExecReload,
+    /// `limit_nofile` was present and zero.
+    #[error("unit template `limit_nofile` is present and zero")]
+    ZeroLimitNofile,
     /// `main-pid` appeared outside `exec_reload`.
     #[error("the `main-pid` variable is permitted only inside `exec_reload`")]
     MainPidOutsideExecReload,
@@ -447,6 +459,13 @@ fn validate_unit(unit: &UnitTemplate) -> Result<(), ModuleSpecError> {
             return Err(ModuleSpecError::InvalidEnvironmentKey(key.clone()));
         }
         validate_arg(value, false)?;
+    }
+
+    // Zero is not a limit a package can mean: it would deny the service every
+    // descriptor, including the ones systemd hands it before `ExecStart=` runs.
+    // Absence is how a package declines to set one.
+    if unit.limit_nofile == Some(0) {
+        return Err(ModuleSpecError::ZeroLimitNofile);
     }
 
     Ok(())
@@ -581,6 +600,7 @@ mod tests {
             environment: Vec::new(),
             restart: RestartPolicy::Always,
             restart_sec: RESTART_SEC,
+            limit_nofile: None,
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
@@ -676,6 +696,26 @@ mod tests {
             validate_unit_template(unit).expect_err("empty exec_reload"),
             ModuleSpecError::EmptyExecReload
         ));
+    }
+
+    #[test]
+    fn a_present_limit_nofile_must_be_non_zero() {
+        // Absence is how a package declines to set a limit, so `None` is not a
+        // violation; `Some(0)` is, because it would deny the service every
+        // descriptor rather than raising anything.
+        for limit in [None, Some(1), Some(8000), Some(u64::MAX)] {
+            let mut unit = review_unit();
+            unit.limit_nofile = limit;
+            validate_unit_template(unit).expect("a non-zero or absent limit is valid");
+        }
+
+        let mut unit = review_unit();
+        unit.limit_nofile = Some(0);
+        let error = validate_unit_template(unit).expect_err("a zero limit must be rejected");
+        assert!(
+            matches!(error, ModuleSpecError::ZeroLimitNofile),
+            "got: {error:?}"
+        );
     }
 
     #[test]
@@ -928,6 +968,9 @@ mod tests {
         );
         assert_eq!(unit.restart, RestartPolicy::Always);
         assert_eq!(unit.restart_sec, RESTART_SEC);
+        // The anchor sets no limit, so this is also the assertion that an
+        // unchanged package's bytes did not move when the field was added.
+        assert_eq!(unit.limit_nofile, None);
         assert!(unit.protect_home);
         assert!(!unit.private_tmp);
         assert!(unit.no_new_privileges);
@@ -944,6 +987,70 @@ mod tests {
 
         let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
         assert_eq!(re_encoded, WIRE_SPEC);
+    }
+
+    #[test]
+    fn limit_nofile_round_trips_only_when_it_is_present() {
+        // The absent case is asserted as whole bytes by the wire-form test
+        // above; what this adds is the present one, on the same anchor, so the
+        // two differ by exactly the key under test.
+        const LIMIT: u64 = 8000;
+        let with_limit = WIRE_SPEC.replace(
+            r#""restart_sec":5,"#,
+            &format!(r#""restart_sec":5,"limit_nofile":{LIMIT},"#),
+        );
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_limit).expect("a declared limit must decode");
+        let unit = decoded.unit.as_ref().expect("a unit is declared");
+        assert_eq!(unit.limit_nofile, Some(LIMIT));
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, with_limit);
+
+        // An explicit `null` is not a spelling of absence here: the field is
+        // `Option`, so it decodes, and what it must not do is round-trip back
+        // to a `null` key.
+        let with_null = WIRE_SPEC.replace(
+            r#""restart_sec":5,"#,
+            r#""restart_sec":5,"limit_nofile":null,"#,
+        );
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_null).expect("an explicit null must decode");
+        assert_eq!(
+            decoded
+                .unit
+                .as_ref()
+                .expect("a unit is declared")
+                .limit_nofile,
+            None
+        );
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, WIRE_SPEC);
+
+        // The new field does not open the record: a sibling beside it is still
+        // refused, and so is a value outside the field's own domain.
+        assert!(
+            serde_json::from_str::<ModuleSpec>(
+                &with_limit.replace(r#""limit_nofile""#, r#""limit_nproc":64,"limit_nofile""#)
+            )
+            .is_err(),
+            "a second `Limit*` key must not decode"
+        );
+        assert!(
+            serde_json::from_str::<ModuleSpec>(&WIRE_SPEC.replace(
+                r#""restart_sec":5,"#,
+                r#""restart_sec":5,"limit_nofile":"infinity","#
+            ))
+            .is_err(),
+            "`infinity` must not be expressible"
+        );
+        assert!(
+            serde_json::from_str::<ModuleSpec>(&WIRE_SPEC.replace(
+                r#""restart_sec":5,"#,
+                r#""restart_sec":5,"limit_nofile":-1,"#
+            ))
+            .is_err(),
+            "a negative sentinel must not be expressible"
+        );
     }
 
     #[test]
