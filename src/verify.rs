@@ -2331,6 +2331,56 @@ mod tests {
     }
 
     #[test]
+    fn an_injected_floor_inside_the_implemented_range_refuses_only_below_itself() {
+        // Since the `limit_nofile` bump the build's window spans more than one
+        // version, so a floor can sit *inside* it — the case the injected floor
+        // could not reach while the range was a point. Release ops raising the
+        // floor to the producer's version must refuse a package written at the
+        // build's own floor and still accept one written at the producer's.
+        let pair = keypair();
+        let at_floor = signed_pkg(
+            &pair,
+            &manifest_json_at(
+                MIN_MANIFEST_FORMAT_VERSION,
+                &[(MEMBER, len_u64(ARTIFACT_BYTES))],
+                &[default_artifact()],
+            ),
+            &default_archive(),
+            None,
+        );
+        // Both versions verify under the build's own floor, so the refusal
+        // below is the injected floor and nothing else about the fixture.
+        assert_eq!(
+            accepted(&at_floor, &trusting(&pair))
+                .manifest()
+                .format_version(),
+            Some(MIN_MANIFEST_FORMAT_VERSION)
+        );
+
+        let floor = MANIFEST_FORMAT_VERSION;
+        let trust = TrustSet::new(
+            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            Vec::new(),
+            floor,
+            0,
+        )
+        .expect("a single anchor builds a trust set");
+        assert!(
+            matches!(
+                refusal(&at_floor, &trust),
+                VerifyError::UnsupportedManifestFormat { found, min, max }
+                    if found == MIN_MANIFEST_FORMAT_VERSION
+                        && min == floor
+                        && max == MAX_MANIFEST_FORMAT_VERSION
+            ),
+            "a package below the injected floor must be refused"
+        );
+        // The floor is a floor and not a pin: the producer's own version, at
+        // the top of the same window, still verifies under it.
+        assert!(verify_package(Cursor::new(default_pkg(&pair)), &trust, &request()).is_ok());
+    }
+
+    #[test]
     fn verification_never_reads_the_archive_block() {
         // The completeness checks are decided from the bound member list and
         // the artifact entries alone, so an archive block that is not even a
