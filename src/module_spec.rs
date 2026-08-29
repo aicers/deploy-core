@@ -207,6 +207,33 @@ pub enum RenderVar {
     KeyPath,
     /// Path of the CA bundle the module trusts.
     CaBundlePath,
+    /// The endpoint of the manager this module is pointed at, as **one** argv
+    /// element in the form `<server_name>@<address>:<port>`.
+    ///
+    /// One variant rather than three because [`Arg`] carries one element per
+    /// entry and concatenates nothing, so three would render three arguments
+    /// where the consuming module's parser expects one.
+    ///
+    /// Its parts, which the caller composing the value owns:
+    ///
+    /// - `server_name` is the peer's internal-mTLS server name — a
+    ///   **certificate identity**. The module verifies the peer's presented
+    ///   leaf against it, so it is what distinguishes the intended peer from
+    ///   any other holder of a certificate under the same CA. It is not
+    ///   resolved, and it is not the module's own name.
+    /// - `address` is a **numeric address, never a name**: consumers parse
+    ///   this value into a name plus a numeric socket address, and a name in
+    ///   that position does not parse.
+    /// - `port` is the peer's RPC port.
+    ///
+    /// That contract is documentation, not a check. Nothing in this crate
+    /// splits the value on `@`, validates the port, or rejects a name in the
+    /// address position; the format belongs to the consuming module's own
+    /// argument parser, and a second parser here would be a second definition
+    /// of it, free to drift from the one that actually reads it. The renderer
+    /// holds the resolved value to the same representability rule every other
+    /// host-resolved value passes, and substitutes it.
+    ManagerEndpoint,
     /// systemd's own `$MAINPID` expansion. Permitted **only** inside
     /// [`UnitTemplate::exec_reload`], because that is the one place a real unit
     /// needs it.
@@ -931,6 +958,7 @@ mod tests {
             (RenderVar::CertPath, "cert-path"),
             (RenderVar::KeyPath, "key-path"),
             (RenderVar::CaBundlePath, "ca-bundle-path"),
+            (RenderVar::ManagerEndpoint, "manager-endpoint"),
             (RenderVar::MainPid, "main-pid"),
         ] {
             let encoded = serde_json::to_string(&var).expect("serialization");
@@ -946,10 +974,19 @@ mod tests {
     }
 
     #[test]
+    fn a_template_naming_the_manager_endpoint_decodes_as_one_argv_element() {
+        let decoded: Vec<Arg> =
+            serde_json::from_str(r#"[{"var":"manager-endpoint"}]"#).expect("the element decodes");
+        assert_eq!(decoded, vec![Arg::Var(RenderVar::ManagerEndpoint)]);
+    }
+
+    #[test]
     fn an_unknown_render_var_name_fails_to_deserialize() {
-        let error = serde_json::from_str::<Arg>(r#"{"var":"manager-address"}"#)
+        // A name no variant can be mistaken for: `RenderVar` is closed, so
+        // what this pins is that a name outside it decodes nowhere.
+        let error = serde_json::from_str::<Arg>(r#"{"var":"no-such-variable"}"#)
             .expect_err("an unknown variable must not decode");
-        assert!(error.to_string().contains("manager-address"), "{error}");
+        assert!(error.to_string().contains("no-such-variable"), "{error}");
         // The alternative this schema rejects — free text with a placeholder —
         // is not a decodable `Arg` either.
         assert!(serde_json::from_str::<Arg>(r#""{{config}}""#).is_err());

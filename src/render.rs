@@ -46,9 +46,16 @@ const MODULE_HOSTS_REASON: &str = "this host carries no distributed modules";
 ///
 /// The context is **total**: there is one field per host-resolved
 /// [`RenderVar`] variant, so resolving a variable is a field access that cannot
-/// miss — no map lookup, no per-variable `Option`, no empty-string fallback.
+/// miss — no map lookup and no empty-string fallback.
 /// [`RenderVar::MainPid`] is the one variant with no field, because it is
 /// systemd's own expansion rather than a value anybody resolves.
+///
+/// One of those fields is an `Option`, because its value is genuinely absent
+/// for some modules rather than empty: [`Self::manager_endpoint`], which a
+/// caller with no such peer supplies as `None`. Absence is not a fallback — a
+/// template naming that variable against a `None` field is
+/// [`RenderError::UnresolvedVariable`], never a default, an empty string or a
+/// placeholder.
 #[derive(Debug, Clone, Copy)]
 pub struct RenderContext<'a> {
     /// Installed path of the artifact itself ([`RenderVar::ArtifactPath`]).
@@ -75,6 +82,21 @@ pub struct RenderContext<'a> {
     /// Path of the CA bundle the module trusts
     /// ([`RenderVar::CaBundlePath`]).
     pub ca_bundle_path: &'a str,
+    /// The endpoint of the manager this module is pointed at
+    /// ([`RenderVar::ManagerEndpoint`]), or `None` for a module with no such
+    /// peer.
+    ///
+    /// An `Option` for the same reason [`Self::service_account`] is: the value
+    /// is genuinely absent for a module that takes no manager argument, and a
+    /// caller in that position says so rather than supplying a placeholder
+    /// string that would render. A template that never names the variable
+    /// needs no value.
+    ///
+    /// Composing the value — the peer's certificate identity, its numeric
+    /// address and its port — is the caller's, whose contract
+    /// [`RenderVar::ManagerEndpoint`] states. The renderer substitutes it and
+    /// parses nothing.
+    pub manager_endpoint: Option<&'a str>,
     /// The account the service runs as, or `None` for a root-run unit.
     ///
     /// `Some` emits `User=<account>`; `None` emits no `User=` line at all,
@@ -183,6 +205,16 @@ pub enum RenderError {
         /// The rejected value.
         value: String,
     },
+    /// The template names a variable the context supplies no value for. Only
+    /// an optional context field can reach this, and the refusal is the whole
+    /// answer: the resolved value reaches a root-executed `ExecStart=` and
+    /// decides which peer a module trusts, so there is no default, no empty
+    /// string and no placeholder to fall back to.
+    #[error("the template names `{var:?}`, for which this context supplies no value")]
+    UnresolvedVariable {
+        /// The variable the context left unresolved.
+        var: RenderVar,
+    },
     /// A component of the unit file name is not a DNS label. That name becomes
     /// the path of a root-executed unit file, so the shape is enforced before
     /// anything is produced.
@@ -227,7 +259,10 @@ pub enum RenderError {
 /// [`RenderContext::instance`] is not a DNS label, and
 /// [`RenderError::UnrepresentableValue`] when a resolved variable value cannot
 /// appear in a unit file — which, by [`crate::systemd::is_representable`],
-/// covers the empty string as well as every control character.
+/// covers the empty string as well as every control character. A template
+/// naming a variable whose optional context field is `None` returns
+/// [`RenderError::UnresolvedVariable`] rather than rendering anything in its
+/// place.
 pub fn render_unit(
     spec: &ModuleSpec,
     context: &RenderContext<'_>,
@@ -428,7 +463,11 @@ fn resolve<'a>(arg: &'a Arg, context: &RenderContext<'a>) -> Result<Resolved<'a>
 /// to the crate's single representability rule.
 ///
 /// That one call is the whole check: it already refuses the empty string as
-/// well as every control character, so nothing is layered on top of it.
+/// well as every control character, so nothing is layered on top of it — no
+/// variable gets a second, shape-specific rule of its own.
+///
+/// A variable whose context field is optional is refused outright when the
+/// caller supplied nothing, before that check has anything to run on.
 fn resolve_var<'a>(
     var: RenderVar,
     context: &RenderContext<'a>,
@@ -443,6 +482,9 @@ fn resolve_var<'a>(
         RenderVar::CertPath => context.cert_path,
         RenderVar::KeyPath => context.key_path,
         RenderVar::CaBundlePath => context.ca_bundle_path,
+        RenderVar::ManagerEndpoint => context
+            .manager_endpoint
+            .ok_or(RenderError::UnresolvedVariable { var })?,
         RenderVar::MainPid => return Ok(Resolved::MainPid),
     };
     if is_representable(value) {
@@ -477,7 +519,7 @@ mod tests {
     /// Every [`RenderVar`] the context resolves, which is the closed set minus
     /// [`RenderVar::MainPid`] — systemd's own expansion and the one variant
     /// with no context field.
-    const HOST_RESOLVED_VARS: [RenderVar; 9] = [
+    const HOST_RESOLVED_VARS: [RenderVar; 10] = [
         RenderVar::ArtifactPath,
         RenderVar::ConfigPath,
         RenderVar::DataDir,
@@ -487,7 +529,13 @@ mod tests {
         RenderVar::CertPath,
         RenderVar::KeyPath,
         RenderVar::CaBundlePath,
+        RenderVar::ManagerEndpoint,
     ];
+
+    /// The endpoint the roxyd anchor is pointed at, in the form
+    /// [`RenderVar::ManagerEndpoint`] documents: a certificate identity, a
+    /// numeric address, and a port.
+    const MANAGER_ENDPOINT: &str = "review@192.0.2.10:38390";
 
     fn review_unit() -> UnitTemplate {
         UnitTemplate {
@@ -576,6 +624,7 @@ mod tests {
             cert_path: UNUSED,
             key_path: UNUSED,
             ca_bundle_path: UNUSED,
+            manager_endpoint: Some(UNUSED),
             service_account: Some(ServiceAccount::Security),
             namespace: "clumit-security",
             service_name: "review",
@@ -596,6 +645,10 @@ mod tests {
             cert_path: "/var/lib/clumit-security/agent/roxyd/roxyd-cert.pem",
             key_path: "/var/lib/clumit-security/agent/roxyd/roxyd-key.pem",
             ca_bundle_path: "/var/lib/clumit-security/agent/roxyd/ca-bundle.pem",
+            // Absent, so this anchor is also the case a `None` field has to
+            // render: a template naming no manager endpoint is unaffected by
+            // a caller having none to supply.
+            manager_endpoint: None,
             service_account: None,
             namespace: "clumit-security",
             service_name: "roxyd",
@@ -675,6 +728,127 @@ WantedBy=multi-user.target
         assert!(!unit.text.contains("User="), "got: {}", unit.text);
         assert_eq!(unit.file_name, "clumit-security-roxyd.service");
         assert!(!unit.text.contains(UNUSED), "got: {}", unit.text);
+    }
+
+    /// The roxyd anchor with the one argument that varies per deployment named
+    /// rather than baked in: the same unit, with its manager endpoint moved
+    /// off the package and onto the host.
+    fn roxyd_endpoint_unit() -> UnitTemplate {
+        let mut unit = roxyd_unit();
+        let endpoint = unit
+            .exec_start
+            .last_mut()
+            .expect("the anchor declares arguments");
+        *endpoint = Arg::Var(RenderVar::ManagerEndpoint);
+        unit
+    }
+
+    #[test]
+    fn the_manager_endpoint_renders_verbatim_as_the_one_final_argument() {
+        let expected = "\
+[Unit]
+Description=Roxyd host agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/clumit-security/bin/roxyd -c /etc/clumit-security/roxyd.toml --cert /var/lib/clumit-security/agent/roxyd/roxyd-cert.pem --key /var/lib/clumit-security/agent/roxyd/roxyd-key.pem --ca-certs /var/lib/clumit-security/agent/roxyd/ca-bundle.pem review@192.0.2.10:38390
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+";
+        let mut context = roxyd_context();
+        context.manager_endpoint = Some(MANAGER_ENDPOINT);
+        let unit = rendered(&spec(Some(roxyd_endpoint_unit())), &context);
+        assert_eq!(unit.text, expected);
+        assert_eq!(unit.file_name, "clumit-security-roxyd.service");
+        // One argv element: the value the caller composed reaches the line as
+        // it stands, neither split on `@` nor quoted nor otherwise reshaped.
+        assert!(
+            unit.text.contains(&format!(" {MANAGER_ENDPOINT}\n")),
+            "got: {}",
+            unit.text
+        );
+    }
+
+    /// The variant in each position an [`Arg`] may occupy, so "permitted
+    /// wherever an argument is" is exercised rather than asserted.
+    fn units_naming_the_endpoint_in_every_position() -> [UnitTemplate; 4] {
+        let mut in_exec_reload = roxyd_unit();
+        in_exec_reload.exec_reload = Some(vec![
+            Arg::Literal("/bin/reconnect".to_string()),
+            Arg::Var(RenderVar::ManagerEndpoint),
+        ]);
+
+        let mut in_working_directory = roxyd_unit();
+        in_working_directory.working_directory = Some(Arg::Var(RenderVar::ManagerEndpoint));
+
+        let mut in_environment = roxyd_unit();
+        in_environment.environment =
+            vec![("MANAGER".to_string(), Arg::Var(RenderVar::ManagerEndpoint))];
+
+        [
+            roxyd_endpoint_unit(),
+            in_exec_reload,
+            in_working_directory,
+            in_environment,
+        ]
+    }
+
+    #[test]
+    fn the_manager_endpoint_is_permitted_in_every_position_an_argument_may_appear() {
+        // Nothing confines it to a field the way `main-pid` is confined to
+        // `exec_reload`: there is no systemd rule to read one off.
+        let mut context = roxyd_context();
+        context.manager_endpoint = Some(MANAGER_ENDPOINT);
+        for unit in units_naming_the_endpoint_in_every_position() {
+            let text = rendered(&spec(Some(unit)), &context).text;
+            assert!(text.contains(MANAGER_ENDPOINT), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn a_template_naming_an_endpoint_the_context_does_not_supply_is_refused() {
+        // `roxyd_context` supplies none. The refusal is the whole answer in
+        // every position: no default, no empty string, no placeholder.
+        for unit in units_naming_the_endpoint_in_every_position() {
+            let error = render_unit(&spec(Some(unit)), &roxyd_context())
+                .expect_err("an unresolved variable must be refused");
+            assert!(
+                matches!(
+                    error,
+                    RenderError::UnresolvedVariable {
+                        var: RenderVar::ManagerEndpoint
+                    }
+                ),
+                "got: {error:?}"
+            );
+            // And it names the variable it could not resolve.
+            assert!(
+                error.to_string().contains("ManagerEndpoint"),
+                "got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_endpoint_leaves_a_template_that_does_not_name_it_unchanged() {
+        // The roxyd anchor renders byte-for-byte from a context supplying no
+        // endpoint at all; here the same template renders identically whether
+        // the caller supplies one or not, so the field reaches a byte only
+        // when a template names the variable.
+        let mut without = review_context();
+        without.manager_endpoint = None;
+        assert_eq!(
+            rendered(&spec(Some(review_unit())), &without).text,
+            rendered(&spec(Some(review_unit())), &review_context()).text
+        );
     }
 
     #[test]
@@ -869,6 +1043,7 @@ WantedBy=multi-user.target
             cert_path: "cert-path",
             key_path: "key-path",
             ca_bundle_path: "ca-bundle-path",
+            manager_endpoint: Some("manager-endpoint"),
             ..review_context()
         }
     }
@@ -885,6 +1060,7 @@ WantedBy=multi-user.target
             RenderVar::CertPath => context.cert_path = value,
             RenderVar::KeyPath => context.key_path = value,
             RenderVar::CaBundlePath => context.ca_bundle_path = value,
+            RenderVar::ManagerEndpoint => context.manager_endpoint = Some(value),
             RenderVar::MainPid => panic!("`main-pid` is not a context field"),
         }
     }
@@ -897,7 +1073,7 @@ WantedBy=multi-user.target
         assert!(
             text.contains(
                 "ExecStart=artifact-path config-path data-dir instance-id hostname domain \
-                 cert-path key-path ca-bundle-path\n"
+                 cert-path key-path ca-bundle-path manager-endpoint\n"
             ),
             "got: {text}"
         );
@@ -908,7 +1084,7 @@ WantedBy=multi-user.target
     #[test]
     fn every_host_resolved_value_goes_through_the_representability_rule() {
         // The check is applied to whatever the host resolved, not to one
-        // favoured field: corrupting any of the nine refuses, naming that one.
+        // favoured field: corrupting any of them refuses, naming that one.
         for var in HOST_RESOLVED_VARS {
             for bad in ["", "a\nb"] {
                 let mut context = every_var_context();
