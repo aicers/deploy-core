@@ -394,6 +394,9 @@ fn render_text(unit: &UnitTemplate, context: &RenderContext<'_>) -> Result<Strin
     }
     lines.push(format!("Restart={}", unit.restart.as_unit_str()));
     lines.push(format!("RestartSec={}", unit.restart_sec));
+    if let Some(limit_nofile) = unit.limit_nofile {
+        lines.push(format!("LimitNOFILE={limit_nofile}"));
+    }
     if unit.protect_home {
         lines.push("ProtectHome=yes".to_string());
     }
@@ -552,6 +555,7 @@ mod tests {
             environment: Vec::new(),
             restart: RestartPolicy::Always,
             restart_sec: RESTART_SEC,
+            limit_nofile: None,
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
@@ -585,6 +589,7 @@ mod tests {
             environment: Vec::new(),
             restart: RestartPolicy::Always,
             restart_sec: RESTART_SEC,
+            limit_nofile: None,
             protect_home: true,
             private_tmp: true,
             no_new_privileges: true,
@@ -852,6 +857,65 @@ WantedBy=multi-user.target
     }
 
     #[test]
+    fn the_production_renderer_reproduces_a_limit_setting_anchor_byte_for_byte() {
+        // The same anchor as the review one, with the single field this record
+        // gained set: the whole diff between the two expected strings is one
+        // line, in one place.
+        let mut unit = review_unit();
+        unit.limit_nofile = Some(8000);
+        let expected = "\
+[Unit]
+Description=Clumit Security review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=clumit-security
+ExecStart=/opt/clumit-security/bin/review /etc/clumit-security/review.toml
+WorkingDirectory=/var/lib/clumit-security/review/data
+Restart=always
+RestartSec=5
+LimitNOFILE=8000
+
+[Install]
+WantedBy=multi-user.target
+";
+        let rendered = rendered(&spec(Some(unit)), &review_context());
+        assert_eq!(rendered.text, expected);
+        assert_eq!(rendered.file_name, "clumit-security-review.service");
+    }
+
+    #[test]
+    fn the_limit_sits_between_restart_sec_and_the_first_sandbox_boolean() {
+        // The neighbours are what fix the position, so they are asserted as
+        // adjacent lines rather than as a substring that would still pass if
+        // the directive drifted to the end of the section.
+        let mut unit = review_unit();
+        unit.limit_nofile = Some(8000);
+        unit.protect_home = true;
+        unit.private_tmp = true;
+        unit.no_new_privileges = true;
+        let text = rendered(&spec(Some(unit)), &review_context()).text;
+        assert!(
+            text.contains("RestartSec=5\nLimitNOFILE=8000\nProtectHome=yes\n"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_unit_setting_no_limit_renders_no_limit_directive_at_all() {
+        // `Limit`, not `LimitNOFILE`: an absent field must not put *any*
+        // resource directive into the unit.
+        for unit in [review_unit(), roxyd_unit()] {
+            assert_eq!(unit.limit_nofile, None);
+        }
+        let review = rendered(&spec(Some(review_unit())), &review_context()).text;
+        assert!(!review.contains("Limit"), "got: {review}");
+        let roxyd = rendered(&spec(Some(roxyd_unit())), &roxyd_context()).text;
+        assert!(!roxyd.contains("Limit"), "got: {roxyd}");
+    }
+
+    #[test]
     fn the_canonical_directive_order_holds_for_a_record_using_every_optional_field() {
         let mut unit = review_unit();
         unit.exec_reload = Some(vec![
@@ -862,6 +926,7 @@ WantedBy=multi-user.target
             ("RUST_LOG".to_string(), Arg::Literal("info".to_string())),
             ("HOST".to_string(), Arg::Var(RenderVar::Hostname)),
         ];
+        unit.limit_nofile = Some(8000);
         unit.protect_home = true;
         unit.private_tmp = true;
         unit.no_new_privileges = true;
@@ -883,6 +948,7 @@ Environment=\"RUST_LOG=info\"
 Environment=\"HOST=host-a\"
 Restart=always
 RestartSec=5
+LimitNOFILE=8000
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes

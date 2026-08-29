@@ -989,10 +989,13 @@ fn verify_signature<R: Read + Seek>(
 /// second copy of the range would leave that mapping dead and give the two
 /// copies somewhere to drift apart.
 ///
-/// Since [`MIN_MANIFEST_FORMAT_VERSION`](crate::manifest::MIN_MANIFEST_FORMAT_VERSION)
-/// and [`MAX_MANIFEST_FORMAT_VERSION`] are equal today, the floor is only
-/// observable *above* the implemented range,
-/// where the accepted set is empty and the reported range says so.
+/// The injected floor is observable wherever it sits above
+/// [`MIN_MANIFEST_FORMAT_VERSION`](crate::manifest::MIN_MANIFEST_FORMAT_VERSION),
+/// which since manifest format version 4 includes values *inside* the
+/// implemented range: release ops can refuse a manifest at the build's floor
+/// while the build still accepts every later version. Above
+/// [`MAX_MANIFEST_FORMAT_VERSION`] the accepted set is empty, and the reported
+/// range says so.
 fn check_format_version(found: u32, floor: u32) -> Result<(), VerifyError> {
     if found < floor {
         return Err(VerifyError::UnsupportedManifestFormat {
@@ -2325,6 +2328,56 @@ mod tests {
             VerifyError::UnsupportedManifestFormat { found, min, .. }
                 if found == MANIFEST_FORMAT_VERSION && min == floor
         ));
+    }
+
+    #[test]
+    fn an_injected_floor_inside_the_implemented_range_refuses_only_below_itself() {
+        // Since the `limit_nofile` bump the build's window spans more than one
+        // version, so a floor can sit *inside* it — the case the injected floor
+        // could not reach while the range was a point. Release ops raising the
+        // floor to the producer's version must refuse a package written at the
+        // build's own floor and still accept one written at the producer's.
+        let pair = keypair();
+        let at_floor = signed_pkg(
+            &pair,
+            &manifest_json_at(
+                MIN_MANIFEST_FORMAT_VERSION,
+                &[(MEMBER, len_u64(ARTIFACT_BYTES))],
+                &[default_artifact()],
+            ),
+            &default_archive(),
+            None,
+        );
+        // Both versions verify under the build's own floor, so the refusal
+        // below is the injected floor and nothing else about the fixture.
+        assert_eq!(
+            accepted(&at_floor, &trusting(&pair))
+                .manifest()
+                .format_version(),
+            Some(MIN_MANIFEST_FORMAT_VERSION)
+        );
+
+        let floor = MANIFEST_FORMAT_VERSION;
+        let trust = TrustSet::new(
+            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            Vec::new(),
+            floor,
+            0,
+        )
+        .expect("a single anchor builds a trust set");
+        assert!(
+            matches!(
+                refusal(&at_floor, &trust),
+                VerifyError::UnsupportedManifestFormat { found, min, max }
+                    if found == MIN_MANIFEST_FORMAT_VERSION
+                        && min == floor
+                        && max == MAX_MANIFEST_FORMAT_VERSION
+            ),
+            "a package below the injected floor must be refused"
+        );
+        // The floor is a floor and not a pin: the producer's own version, at
+        // the top of the same window, still verifies under it.
+        assert!(verify_package(Cursor::new(default_pkg(&pair)), &trust, &request()).is_ok());
     }
 
     #[test]
