@@ -899,6 +899,7 @@ mod tests {
         Arg, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
         RestartPolicy, SystemdTarget, UnitTemplate,
     };
+    use crate::render::{RenderContext, RenderError, render_unit};
 
     /// Length every member of a fixture archive is given, where the value under
     /// test is something other than the member list itself.
@@ -2024,10 +2025,36 @@ mod tests {
         }
     }
 
+    /// A manager endpoint in the form [`RenderVar::ManagerEndpoint`]
+    /// documents: a certificate identity, a numeric address, and a port.
+    const MANAGER_ENDPOINT: &str = "review@192.0.2.10:38390";
+
+    /// The context the two read-path render tests resolve the `c` fixture
+    /// against, differing only in whether the caller has a manager endpoint to
+    /// supply.
+    fn read_path_context(manager_endpoint: Option<&str>) -> RenderContext<'_> {
+        RenderContext {
+            artifact_path: "/opt/c/bin/c",
+            config_path: "/etc/c/c.toml",
+            data_dir: "/var/lib/c",
+            instance_id: "1",
+            hostname: "host-a",
+            domain: "c.internal",
+            cert_path: "/var/lib/c/cert.pem",
+            key_path: "/var/lib/c/key.pem",
+            ca_bundle_path: "/var/lib/c/ca-bundle.pem",
+            manager_endpoint,
+            service_account: None,
+            namespace: "c",
+            service_name: "c",
+            instance: None,
+            component: "c",
+            kind: ArtifactKind::NativeBinary,
+        }
+    }
+
     #[test]
     fn a_manifest_at_the_floor_still_carries_a_spec_that_validates_and_renders() {
-        use crate::render::{RenderContext, render_unit};
-
         // The floor stayed put because the schema growth above it is additive,
         // and that claim is only worth as much as this: a manifest written at
         // the floor still decodes, still passes the validator on the read
@@ -2051,36 +2078,77 @@ mod tests {
             .expect("the spec is carried");
         assert_eq!(spec.placement, PlacementClass::CoreHosts);
 
-        let rendered = render_unit(
-            spec,
-            &RenderContext {
-                artifact_path: "/opt/c/bin/c",
-                config_path: "/etc/c/c.toml",
-                data_dir: "/var/lib/c",
-                instance_id: "1",
-                hostname: "host-a",
-                domain: "c.internal",
-                cert_path: "/var/lib/c/cert.pem",
-                key_path: "/var/lib/c/key.pem",
-                ca_bundle_path: "/var/lib/c/ca-bundle.pem",
-                // The variable the bumped version was cut for. A manifest at
-                // the floor names it nowhere, so a caller with nothing to
-                // supply still renders it.
-                manager_endpoint: None,
-                service_account: None,
-                namespace: "c",
-                service_name: "c",
-                instance: None,
-                component: "c",
-                kind: ArtifactKind::NativeBinary,
-            },
-        )
-        .expect("a spec at the floor must render")
-        .expect("the spec declares a unit");
+        // A manifest at the floor names the variable nowhere, so a caller with
+        // nothing to supply still renders it.
+        let rendered = render_unit(spec, &read_path_context(None))
+            .expect("a spec at the floor must render")
+            .expect("the spec declares a unit");
         assert_eq!(
             rendered.text,
             "[Unit]\nDescription=C\n\n[Service]\nExecStart=/opt/c/bin/c\nRestart=always\n\
              RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+        );
+    }
+
+    #[test]
+    fn a_manifest_at_the_current_version_renders_a_spec_naming_the_manager_endpoint() {
+        // The mirror of the test above, and the read path the bump was cut
+        // for: a producer's manifest declares the variable, the validator on
+        // the read path accepts it, and the renderer substitutes the caller's
+        // value as one final argument. The wire form is what a producer
+        // writes, so nothing here is reached only through a hand-built spec.
+        let exec_start = r#""exec_start":[{"var":"artifact-path"},{"var":"manager-endpoint"}]"#;
+        let entry = entry_json_with_spec(
+            "bin/c",
+            Some(GIT_COMMIT),
+            &spec_json(&unit_json(exec_start)),
+        );
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a manifest naming the variable must parse");
+        let spec = manifest
+            .artifacts()
+            .first()
+            .expect("one artifact")
+            .spec
+            .as_ref()
+            .expect("the spec is carried");
+        assert_eq!(
+            spec.unit
+                .as_ref()
+                .expect("the spec declares a unit")
+                .exec_start,
+            vec![
+                Arg::Var(RenderVar::ArtifactPath),
+                Arg::Var(RenderVar::ManagerEndpoint)
+            ]
+        );
+
+        let rendered = render_unit(spec, &read_path_context(Some(MANAGER_ENDPOINT)))
+            .expect("a spec naming a supplied variable must render")
+            .expect("the spec declares a unit");
+        assert_eq!(
+            rendered.text,
+            format!(
+                "[Unit]\nDescription=C\n\n[Service]\nExecStart=/opt/c/bin/c {MANAGER_ENDPOINT}\n\
+                 Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+            )
+        );
+
+        // And the same manifest against a caller with no such peer is refused
+        // rather than rendered with anything in its place.
+        let error = render_unit(spec, &read_path_context(None))
+            .expect_err("an unresolved variable must be refused");
+        assert!(
+            matches!(
+                error,
+                RenderError::UnresolvedVariable {
+                    var: RenderVar::ManagerEndpoint
+                }
+            ),
+            "got: {error:?}"
         );
     }
 
