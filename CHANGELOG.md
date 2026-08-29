@@ -15,10 +15,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `RestartSec=` and the sandbox booleans. Absence, which is what every unit
   rendered until now carries, inherits the host's soft limit; there is no
   spelling for systemd's `infinity`, so leaving a service unbounded stays the
-  host's decision rather than a package's, and a declared zero is refused as
-  `module_spec::ModuleSpecError::ZeroLimitNofile`. A producer now stamps
-  manifest format version 5 and this build still reads 3, so a payload already
-  published stays readable, installable, and byte-identical in what it renders.
+  host's decision rather than a package's: a declared zero is refused as
+  `module_spec::ModuleSpecError::ZeroLimitNofile`, and `u64::MAX` — the
+  numeric value of Linux's `RLIM_INFINITY`, which systemd's own rlimit parser
+  refuses — as `module_spec::ModuleSpecError::InfiniteLimitNofile`. A producer
+  now stamps manifest format version 5 and this build still reads 3, so a
+  payload already published stays readable, installable, and byte-identical in
+  what it renders.
 - `module_spec::RenderVar::ManagerEndpoint`, with which a unit template names
   the manager endpoint its module is pointed at, and the
   `render::RenderContext::manager_endpoint` field the renderer resolves it

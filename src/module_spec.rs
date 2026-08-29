@@ -113,13 +113,16 @@ pub struct UnitTemplate {
     pub restart: RestartPolicy,
     /// `RestartSec=`, in seconds.
     pub restart_sec: u32,
-    /// `LimitNOFILE=`, in descriptors. Non-zero when present.
+    /// `LimitNOFILE=`, in descriptors. When present, neither zero nor
+    /// [`u64::MAX`].
     ///
     /// Absent means the unit inherits the host's soft limit, which is what
     /// every unit rendered before this field existed does. There is no
     /// spelling for systemd's `infinity` on purpose: a package that wants no
     /// limit omits the field, leaving the unbounded case the host's decision
-    /// rather than a package's.
+    /// rather than a package's. [`u64::MAX`] is refused for the same reason —
+    /// it is the numeric value of Linux's `RLIM_INFINITY`, so it is that
+    /// sentinel written out rather than a limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_nofile: Option<u64>,
     /// Emits `ProtectHome=yes` when set.
@@ -351,6 +354,10 @@ pub enum ModuleSpecError {
     /// `limit_nofile` was present and zero.
     #[error("unit template `limit_nofile` is present and zero")]
     ZeroLimitNofile,
+    /// `limit_nofile` was present and `u64::MAX`, which is Linux's
+    /// `RLIM_INFINITY`.
+    #[error("unit template `limit_nofile` is `u64::MAX`, which systemd reads as `infinity`")]
+    InfiniteLimitNofile,
     /// `main-pid` appeared outside `exec_reload`.
     #[error("the `main-pid` variable is permitted only inside `exec_reload`")]
     MainPidOutsideExecReload,
@@ -463,9 +470,15 @@ fn validate_unit(unit: &UnitTemplate) -> Result<(), ModuleSpecError> {
 
     // Zero is not a limit a package can mean: it would deny the service every
     // descriptor, including the ones systemd hands it before `ExecStart=` runs.
-    // Absence is how a package declines to set one.
-    if unit.limit_nofile == Some(0) {
-        return Err(ModuleSpecError::ZeroLimitNofile);
+    // `u64::MAX` is not one either: it is the numeric value of Linux's
+    // `RLIM_INFINITY`, and systemd's rlimit parser refuses any value at or
+    // above that, so the unit would render fine and then fail to load.
+    // Refusing it here keeps absence the only way a package leaves a service
+    // unbounded. Absence is also how a package declines to set one.
+    match unit.limit_nofile {
+        Some(0) => return Err(ModuleSpecError::ZeroLimitNofile),
+        Some(u64::MAX) => return Err(ModuleSpecError::InfiniteLimitNofile),
+        _ => {}
     }
 
     Ok(())
@@ -699,23 +712,31 @@ mod tests {
     }
 
     #[test]
-    fn a_present_limit_nofile_must_be_non_zero() {
+    fn a_present_limit_nofile_must_be_a_limit_systemd_can_load() {
         // Absence is how a package declines to set a limit, so `None` is not a
         // violation; `Some(0)` is, because it would deny the service every
-        // descriptor rather than raising anything.
-        for limit in [None, Some(1), Some(8000), Some(u64::MAX)] {
+        // descriptor rather than raising anything. `Some(u64::MAX)` is too: it
+        // is Linux's `RLIM_INFINITY`, which systemd's rlimit parser refuses,
+        // so it would render a unit that cannot load.
+        for limit in [None, Some(1), Some(8000), Some(u64::MAX - 1)] {
             let mut unit = review_unit();
             unit.limit_nofile = limit;
-            validate_unit_template(unit).expect("a non-zero or absent limit is valid");
+            validate_unit_template(unit).expect("an absent or loadable limit is valid");
         }
 
-        let mut unit = review_unit();
-        unit.limit_nofile = Some(0);
-        let error = validate_unit_template(unit).expect_err("a zero limit must be rejected");
-        assert!(
-            matches!(error, ModuleSpecError::ZeroLimitNofile),
-            "got: {error:?}"
-        );
+        for (limit, expected) in [
+            (0, ModuleSpecError::ZeroLimitNofile),
+            (u64::MAX, ModuleSpecError::InfiniteLimitNofile),
+        ] {
+            let mut unit = review_unit();
+            unit.limit_nofile = Some(limit);
+            let error = validate_unit_template(unit).expect_err("limit must be rejected");
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected),
+                "limit {limit}: got {error:?}"
+            );
+        }
     }
 
     #[test]

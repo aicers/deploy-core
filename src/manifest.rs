@@ -1830,14 +1830,14 @@ mod tests {
         assert_eq!(spec.placement, PlacementClass::ModuleHosts);
     }
 
+    /// Names which spec rule a read-path rejection must report.
+    type RuleCheck = fn(&ModuleSpecError) -> bool;
+
     #[test]
     fn the_read_path_runs_the_spec_validator_rather_than_trusting_the_producer() {
         // Each of these decodes cleanly and is refused by the validator, so a
         // consumer that never links a producer still refuses it. The case is
         // named by the source variant, not by "some error occurred".
-        /// Names which spec rule a read-path rejection must report.
-        type RuleCheck = fn(&ModuleSpecError) -> bool;
-
         let cases: [(&str, RuleCheck); 4] = [
             (
                 r#""exec_start":[{"var":"artifact-path"},{"var":"main-pid"}]"#,
@@ -1875,31 +1875,41 @@ mod tests {
     }
 
     #[test]
-    fn the_read_path_refuses_a_unit_declaring_a_zero_limit() {
-        // The zero rule reaches a consumer the way every other unit rule does,
-        // through the read path, so a consumer that never links a producer
-        // refuses the manifest rather than rendering `LimitNOFILE=0` and
-        // starving the service of every descriptor it was handed.
-        let unit = unit_json(VALID_EXEC_START).replace(
-            r#""restart_sec":5,"#,
-            r#""restart_sec":5,"limit_nofile":0,"#,
-        );
-        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
-        let json = format!(
-            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
-        );
-        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
-            .expect_err("a zero limit must be refused on read");
-        assert!(
-            matches!(
-                error,
-                ManifestError::InvalidSpec {
-                    ref archive_path,
-                    source: ModuleSpecError::ZeroLimitNofile,
-                } if archive_path == "bin/c"
-            ),
-            "got: {error:?}"
-        );
+    fn the_read_path_refuses_a_unit_declaring_an_unloadable_limit() {
+        // Both limit rules reach a consumer the way every other unit rule
+        // does, through the read path, so a consumer that never links a
+        // producer refuses the manifest rather than rendering a directive that
+        // starves the service of every descriptor or one systemd's rlimit
+        // parser refuses outright.
+        let cases: [(&str, RuleCheck); 2] = [
+            ("0", |source| {
+                matches!(source, ModuleSpecError::ZeroLimitNofile)
+            }),
+            ("18446744073709551615", |source| {
+                matches!(source, ModuleSpecError::InfiniteLimitNofile)
+            }),
+        ];
+        for (limit, is_expected) in cases {
+            let unit = unit_json(VALID_EXEC_START).replace(
+                r#""restart_sec":5,"#,
+                &format!(r#""restart_sec":5,"limit_nofile":{limit},"#),
+            );
+            let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
+            let json = format!(
+                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+            );
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("an unloadable limit must be refused on read");
+            let ManifestError::InvalidSpec {
+                ref archive_path,
+                ref source,
+            } = error
+            else {
+                panic!("limit {limit}: expected a spec rejection, got {error:?}");
+            };
+            assert_eq!(archive_path, "bin/c");
+            assert!(is_expected(source), "limit {limit}: got {source:?}");
+        }
     }
 
     #[test]
