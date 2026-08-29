@@ -1037,7 +1037,7 @@ mod tests {
                 ],
                 restart: RestartPolicy::Always,
                 restart_sec: 5,
-                limit_nofile: None,
+                limit_nofile: Some(8000),
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,
@@ -1822,6 +1822,7 @@ mod tests {
         assert_eq!(unit.environment, expected.environment);
         assert_eq!(unit.restart, expected.restart);
         assert_eq!(unit.restart_sec, expected.restart_sec);
+        assert_eq!(unit.limit_nofile, expected.limit_nofile);
         assert_eq!(unit.protect_home, expected.protect_home);
         assert_eq!(unit.private_tmp, expected.private_tmp);
         assert_eq!(unit.no_new_privileges, expected.no_new_privileges);
@@ -1871,6 +1872,34 @@ mod tests {
             assert_eq!(archive_path, "bin/c");
             assert!(is_expected(source), "exec {exec}: got {source:?}");
         }
+    }
+
+    #[test]
+    fn the_read_path_refuses_a_unit_declaring_a_zero_limit() {
+        // The zero rule reaches a consumer the way every other unit rule does,
+        // through the read path, so a consumer that never links a producer
+        // refuses the manifest rather than rendering `LimitNOFILE=0` and
+        // starving the service of every descriptor it was handed.
+        let unit = unit_json(VALID_EXEC_START).replace(
+            r#""restart_sec":5,"#,
+            r#""restart_sec":5,"limit_nofile":0,"#,
+        );
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("a zero limit must be refused on read");
+        assert!(
+            matches!(
+                error,
+                ManifestError::InvalidSpec {
+                    ref archive_path,
+                    source: ModuleSpecError::ZeroLimitNofile,
+                } if archive_path == "bin/c"
+            ),
+            "got: {error:?}"
+        );
     }
 
     #[test]
