@@ -18,13 +18,29 @@ use serde::{Deserialize, Serialize};
 use crate::module_spec::{ModuleSpec, ModuleSpecError};
 
 /// `format_version` a producer stamps into every manifest it writes.
-pub const MANIFEST_FORMAT_VERSION: u32 = 3;
+///
+/// Stamped unconditionally, never derived from a manifest's contents: a
+/// manifest's version is the producer's, not a function of which optional
+/// variables its templates happen to name.
+pub const MANIFEST_FORMAT_VERSION: u32 = 4;
 
 /// Inclusive floor of the `format_version` range this build accepts.
+///
+/// Behind [`MANIFEST_FORMAT_VERSION`] because the schema growth since is
+/// **additive**: a manifest written at this floor is exactly what an earlier
+/// build of this crate produced, and it decodes, validates and renders here
+/// unchanged. Moving the floor to meet the producer would make every already
+/// published payload at it unreadable and force a republish of release assets
+/// that are otherwise correct, so it moves only for a change an older manifest
+/// genuinely cannot express.
 pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Inclusive ceiling of the `format_version` range this build accepts.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 3;
+///
+/// Tracks [`MANIFEST_FORMAT_VERSION`]: this build reads what it writes, and a
+/// manifest naming anything newer is refused for its version alone rather than
+/// failing as an opaque decode error somewhere inside it.
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 4;
 
 /// Container footer version the pre-versioned baseline payloads were written
 /// at.
@@ -1232,12 +1248,17 @@ mod tests {
     }
 
     #[test]
-    fn the_accepted_range_is_degenerate() {
-        // The range has a floor as well as a ceiling, and all three constants
-        // are equal here — which is what makes a schema bump a repoint of each
-        // rather than a search for the literal.
-        assert_eq!(MIN_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION);
+    fn the_producer_writes_the_ceiling_and_the_floor_is_no_higher() {
+        // The range has a floor as well as a ceiling, and both are written by
+        // repointing a constant rather than by searching for a literal. The
+        // ceiling tracks the producer exactly — this build reads what it
+        // writes — while the floor only ever trails it, because an additive
+        // schema bump leaves every manifest already published at the floor
+        // readable.
         assert_eq!(MAX_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION);
+        // In a `const` block, so a floor raised past the producer is a build
+        // failure rather than a failing test.
+        const { assert!(MIN_MANIFEST_FORMAT_VERSION <= MANIFEST_FORMAT_VERSION) };
     }
 
     #[test]
@@ -1934,7 +1955,7 @@ mod tests {
         // The typed argv element is what makes an unknown variable
         // unrepresentable: it never reaches the validator, let alone a
         // rendered `ExecStart=`.
-        let unit = unit_json(r#""exec_start":[{"var":"manager-address"}]"#);
+        let unit = unit_json(r#""exec_start":[{"var":"no-such-variable"}]"#);
         let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
         let json = format!(
             r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
@@ -1984,29 +2005,83 @@ mod tests {
     }
 
     #[test]
-    fn the_bumped_range_refuses_the_previous_format_version_and_accepts_the_current_one() {
-        // Both are written by interpolating the constants, so the next bump
-        // stays a repoint of the three rather than a search for a literal.
-        let previous = MANIFEST_FORMAT_VERSION - 1;
-        let error = PayloadManifest::parse(
-            versioned_json(previous).as_bytes(),
-            LEGACY_UNVERSIONED_FOOTER_VERSION,
-        )
-        .expect_err("the previous format version must be refused");
-        assert!(
-            matches!(
-                error,
-                ManifestError::UnsupportedManifestFormat { found, .. } if found == previous
-            ),
-            "got: {error:?}"
-        );
+    fn the_range_accepts_the_unmoved_floor_as_well_as_the_current_version() {
+        // Every version is written by interpolating a constant, so the next
+        // bump stays a repoint of the three rather than a search for a
+        // literal. A manifest at the floor is what an earlier build published:
+        // it is still accepted, and reports the version it was written at.
+        // Either side of the range is refused for the version alone, which
+        // `a_version_below_the_floor_is_rejected_with_the_same_variant` and
+        // `a_version_above_the_ceiling_is_rejected_for_its_version_alone` each
+        // pin against its own end.
+        for version in [MIN_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION] {
+            let manifest = PayloadManifest::parse(
+                versioned_json(version).as_bytes(),
+                LEGACY_UNVERSIONED_FOOTER_VERSION,
+            )
+            .expect("a version inside the accepted range must parse");
+            assert_eq!(manifest.format_version(), Some(version));
+        }
+    }
 
-        let manifest = PayloadManifest::parse(
-            versioned_json(MANIFEST_FORMAT_VERSION).as_bytes(),
-            LEGACY_UNVERSIONED_FOOTER_VERSION,
+    #[test]
+    fn a_manifest_at_the_floor_still_carries_a_spec_that_validates_and_renders() {
+        use crate::render::{RenderContext, render_unit};
+
+        // The floor stayed put because the schema growth above it is additive,
+        // and that claim is only worth as much as this: a manifest written at
+        // the floor still decodes, still passes the validator on the read
+        // path, and still renders the unit it declares.
+        let entry = entry_json_with_spec(
+            "bin/c",
+            Some(GIT_COMMIT),
+            &spec_json(&unit_json(VALID_EXEC_START)),
+        );
+        let json = format!(
+            r#"{{"format_version":{MIN_MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a manifest at the floor must parse");
+        let spec = manifest
+            .artifacts()
+            .first()
+            .expect("one artifact")
+            .spec
+            .as_ref()
+            .expect("the spec is carried");
+        assert_eq!(spec.placement, PlacementClass::CoreHosts);
+
+        let rendered = render_unit(
+            spec,
+            &RenderContext {
+                artifact_path: "/opt/c/bin/c",
+                config_path: "/etc/c/c.toml",
+                data_dir: "/var/lib/c",
+                instance_id: "1",
+                hostname: "host-a",
+                domain: "c.internal",
+                cert_path: "/var/lib/c/cert.pem",
+                key_path: "/var/lib/c/key.pem",
+                ca_bundle_path: "/var/lib/c/ca-bundle.pem",
+                // The variable the bumped version was cut for. A manifest at
+                // the floor names it nowhere, so a caller with nothing to
+                // supply still renders it.
+                manager_endpoint: None,
+                service_account: None,
+                namespace: "c",
+                service_name: "c",
+                instance: None,
+                component: "c",
+                kind: ArtifactKind::NativeBinary,
+            },
         )
-        .expect("the current format version must be accepted");
-        assert_eq!(manifest.format_version(), Some(MANIFEST_FORMAT_VERSION));
+        .expect("a spec at the floor must render")
+        .expect("the spec declares a unit");
+        assert_eq!(
+            rendered.text,
+            "[Unit]\nDescription=C\n\n[Service]\nExecStart=/opt/c/bin/c\nRestart=always\n\
+             RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+        );
     }
 
     #[test]

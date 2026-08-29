@@ -8,6 +8,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `module_spec::RenderVar::ManagerEndpoint`, with which a unit template names
+  the manager endpoint its module is pointed at, and the
+  `render::RenderContext::manager_endpoint` field the renderer resolves it
+  from. The value is one argv element, `<server_name>@<address>:<port>`, so a
+  module that takes the endpoint as a mandatory positional argument no longer
+  has to bake one deployment's manager into a package as a literal. This crate
+  parses none of it: the format belongs to the consuming module's own argument
+  parser. A caller with no such peer supplies `None`, and a template naming the
+  variable against it is refused with `render::RenderError::UnresolvedVariable`
+  rather than rendering a default, an empty string or a placeholder.
+  `MANIFEST_FORMAT_VERSION` and `MAX_MANIFEST_FORMAT_VERSION` move with it; the
+  accepted floor does not, so every manifest already published at it still
+  decodes, validates and renders unchanged.
 - `payload::widen_envelope_blocks`, a `test-support` fixture that builds a
   compact malformed-envelope case for a dependent crate to write sparsely when
   testing bounded package reads without duplicating deploy-core's private
