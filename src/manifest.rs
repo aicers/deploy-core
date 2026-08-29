@@ -2162,6 +2162,52 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_at_the_current_version_renders_a_declared_descriptor_limit() {
+        // The positive mirror of the floor test above, and the read path this
+        // bump was cut for: a producer's wire form carries the key, the
+        // validator on the read path accepts it, and the renderer puts the
+        // directive in the unit. Driven from the wire form rather than a
+        // hand-built template, so nothing here is reachable only in-process.
+        const LIMIT: u64 = 8000;
+        let unit = unit_json(VALID_EXEC_START).replace(
+            r#""restart_sec":5,"#,
+            &format!(r#""restart_sec":5,"limit_nofile":{LIMIT},"#),
+        );
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a manifest declaring a limit must parse");
+        let spec = manifest
+            .artifacts()
+            .first()
+            .expect("one artifact")
+            .spec
+            .as_ref()
+            .expect("the spec is carried");
+        assert_eq!(
+            spec.unit
+                .as_ref()
+                .expect("the spec declares a unit")
+                .limit_nofile,
+            Some(LIMIT)
+        );
+
+        let rendered = render_unit(spec, &read_path_context(None))
+            .expect("a spec declaring a limit must render")
+            .expect("the spec declares a unit");
+        assert_eq!(
+            rendered.text,
+            format!(
+                "[Unit]\nDescription=C\n\n[Service]\nExecStart=/opt/c/bin/c\n\
+                 Restart=always\nRestartSec=5\nLimitNOFILE={LIMIT}\n\n\
+                 [Install]\nWantedBy=multi-user.target\n"
+            )
+        );
+    }
+
+    #[test]
     fn a_manifest_at_the_current_version_renders_a_spec_naming_the_manager_endpoint() {
         // The mirror of the test above, and the read path the bump was cut
         // for: a producer's manifest declares the variable, the validator on
