@@ -2332,9 +2332,10 @@ mod tests {
 
     #[test]
     fn an_injected_floor_inside_the_implemented_range_refuses_only_below_itself() {
-        // Since the `limit_nofile` bump the build's window spans more than one
-        // version, so a floor can sit *inside* it — the case the injected floor
-        // could not reach while the range was a point. Release ops raising the
+        // The build's window has spanned more than one version since manifest
+        // format version 4, so a floor can sit *inside* it — above the bottom
+        // yet no higher than the top, leaving versions the build still accepts
+        // — rather than only above the whole window. Release ops raising the
         // floor to the producer's version must refuse a package written at the
         // build's own floor and still accept one written at the producer's.
         let pair = keypair();
