@@ -1,13 +1,25 @@
 //! The roxyd self-update rollback supervisor units, shipped as data.
 //!
-//! **This crate is the single owner of this text.** Two consumers install the
-//! same supervisor: bootler, the installer, onto the hosts it provisions over
-//! SSH, and roxyd's `join`, onto the hosts it onboards itself — where bootler
-//! never runs and so cannot place anything. The two host populations must roll back
-//! under identical rules, so a consumer **embeds these bytes from its pinned
-//! dependency on this crate and never carries a copy of its own**. A copy is not
-//! a copy for long: the moment one side edits its own, the two populations
-//! diverge silently, and nothing on either host says which rules it is under.
+//! **This crate is the single owner of this text, and bootler is its only
+//! consumer.** bootler installs the same supervisor onto **both** host
+//! populations: onto the hosts it provisions over SSH, and — through the
+//! join-only installer subcommand `roxyd-supervisor-install`, which `roxyd
+//! join` invokes on a pre-placed payload-free `bootler-security` — onto the
+//! hosts roxyd onboards itself. **roxyd is not a consumer of this module.**
+//! An earlier revision of this doc said roxyd embedded these bytes and
+//! installed the units itself; the join-host installer shipped afterwards and
+//! does the opposite, so that description named the reverse of what runs.
+//! It mattered more than a stale sentence usually would, because it is the
+//! stated reason this text takes no parameters — argued from having to be
+//! byte-identical across two populations that were said to install it by two
+//! different routes.
+//! **That reason survives intact, and so does the decision.** The two
+//! populations must still roll back under identical rules, the text must
+//! still be byte-identical across them, and a consumer still **embeds these
+//! bytes from its pinned dependency on this crate and never carries a copy of
+//! its own** — a copy is not a copy for long, and the moment one side edits
+//! its own the two populations diverge silently with nothing on either host
+//! saying which rules it is under. Only the count of consumers was wrong.
 //!
 //! The text takes no parameters, and there is deliberately no renderer here —
 //! a consumer substitutes nothing. That is possible because the units name no
@@ -23,8 +35,9 @@
 //! from `.previous` — the known-good slot. The binary being judged is the
 //! incoming one; the binary doing the judging is the one that was demonstrably
 //! running until the swap. That is also what lets one unit shape serve both host
-//! populations: a join-onboarded host has no product CLI and never will, but by
-//! definition it has roxyd.
+//! populations: a join-onboarded host carries the payload-free
+//! `bootler-security` only as an install-time precondition and runs no product
+//! CLI thereafter, but by definition it has roxyd.
 //!
 //! The decider decides from durable state, never from which activation woke it —
 //! the activation reason is passed only so the journal line and the status record
@@ -73,8 +86,11 @@
 //!
 //! One of the three is an obligation rather than a name. The units exec
 //! `/opt/roxyd/bin/roxyd.previous`, so a consumer installs the roxyd binary at
-//! `/opt/roxyd/bin/roxyd` — namespace-free, because a join-onboarded host has no
-//! namespace to resolve and a per-product path could not be byte-identical
+//! `/opt/roxyd/bin/roxyd` — the agent's own path, which is namespace-free
+//! because roxyd is one per host and is not a namespaced product component;
+//! the product namespace that every *managed* path derives from does reach a
+//! join host (roxyd RFC 0002 §3/§7) and is simply not part of this path. A
+//! per-product path could not be byte-identical
 //! across the two populations. Installing the binary anywhere else and these
 //! units alongside it ships a supervisor whose every activation fails to exec,
 //! and nothing here catches that: the `ConditionPathExists=` gate names the arm
