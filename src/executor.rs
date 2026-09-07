@@ -285,40 +285,39 @@ trap - EXIT INT TERM"#;
 ///   taken is reported too rather than being retried forever. [`link_aside`]
 ///   chooses the native side's name on the same terms.
 ///
-///   **The link is made by `link`, not by `ln`.** `ln` is the one step here
-///   that does not fail on an occupied name: given a *directory*, or a symlink
-///   to one, it links the source *inside* it and exits `0`, which would both
-///   write through a planted entry and leave the link behind under a path
-///   nobody named. No option suppresses that portably — `-T` is GNU's, `-h`
-///   and `-n` are the BSDs' and cover only the symlink — but `link` is a
-///   different utility rather than another spelling of that one: it passes the
-///   two names it was given to `link(2)` and does nothing else, so an occupied
-///   candidate is `EEXIST` there whatever kind of entry sits at it, and there
-///   is no name to resolve and so no window to race. That is the same refusal
+///   **The link is made by `link`, and by nothing else.** `ln` is the one step
+///   here that does not fail on an occupied name: given a *directory*, or a
+///   symlink to one, it links the source *inside* it and exits `0`, which
+///   would both write through a planted entry and leave the link behind under
+///   a path nobody named. No option suppresses that portably — `-T` is GNU's,
+///   `-h` and `-n` are the BSDs' and cover only the symlink — and no test run
+///   ahead of it closes it either, since an entry appearing between the test
+///   and the `ln` is followed exactly as one that was already there. `link` is
+///   a different utility rather than another spelling of that one: it passes
+///   the two names it was given to `link(2)` and does nothing else, so an
+///   occupied candidate is `EEXIST` there whatever kind of entry sits at it,
+///   with no name resolved and so no window to race. That is the same refusal
 ///   [`link_aside`] gets from the same syscall.
 ///
-///   `link` is not POSIX, so its absence is degraded rather than fatal: a host
-///   without it runs `ln` behind a test of the candidate — `-e` for an entry,
-///   `-h` for a dangling symlink `-e` does not see — which refuses every entry
-///   that is there when the walk looks and leaves only the window between that
-///   test and the `ln`. Exploiting that window means creating an entry in the
-///   destination's own directory, which is root-owned and holds the artifact
-///   this sequence is protecting; anyone who can do it can replace the
-///   artifact outright. The type guard below still runs on both paths anyway:
-///   a link `ln` was diverted into making is removed by the name it was given,
-///   and the planted entry itself is left exactly as it was found.
+///   `link` is not POSIX, so a host could in principle carry none. That is
+///   refused before the walk begins rather than degraded onto `ln`: the
+///   refusal of a planted entry is what this recovery is *for*, and an `ln`
+///   path would give it up on exactly the hosts nobody checked. What such a
+///   host loses is the backup, reported as [`ExecutorError::Transfer`] naming
+///   the destination like every other on-host failure here, which is a
+///   diagnosable stop rather than a link made through somebody else's
+///   directory. The set is close to empty in practice — coreutils, busybox,
+///   toybox and the BSDs all ship `link` — and the check is a `command -v`,
+///   not a probe run against the candidate.
 ///
-///   The trap stays *after* the walk rather than being hoisted above it, even
-///   though that is what closes the window this recovery exists for. `$tmp`
+///   The trap stays *below the walk* rather than being hoisted above it. `$tmp`
 ///   names whichever candidate is in hand, so a trap armed inside the walk
 ///   would fire on a *refused* one and `rm -f` a leftover this sequence is
-///   required to leave standing. Narrowing the window is not worth trading
-///   for that, since the leftover is now harmless. It stays after the type
-///   guard for the same reason and not the same one: what the guard refuses
-///   may be a directory the `ln` was diverted into, and `rm -f` on `$tmp`
-///   there would delete a symlink the operator planted while leaving the
-///   diverted link standing — the exact pair of wrongs the guard's own cleanup
-///   inverts.
+///   required to leave standing. Below it, `$tmp` is the entry `link(2)` just
+///   created and nothing else can be: the walk breaks only on a link this
+///   script made. So it is armed there, before the temporary's own type is
+///   checked, and that guard needs no cleanup of its own — what it refuses is
+///   still this script's own entry, unlinked by the name it was given.
 /// - **Not a bare `link`.** A directory entry is not durable until its
 ///   directory is flushed, and a backup is precisely the thing that must
 ///   survive a power loss. The flush runs after the rename, per the ordering
@@ -373,21 +372,14 @@ flush() {
   }
 }
 dir=$(dirname "$dest")
-if command -v link >/dev/null 2>&1; then
-  claim() { link "$1" "$2"; }
-else
-  claim() {
-    if [ -e "$2" ] || [ -h "$2" ]; then
-      echo "$2 already exists" >&2
-      return 1
-    fi
-    ln "$1" "$2"
-  }
+if ! command -v link >/dev/null 2>&1; then
+  echo "no link utility: a temporary beside $dest cannot be claimed without following it" >&2
+  exit 1
 fi
 attempt=0
 while :; do
   tmp=$dir/.bootler.link.$$.$attempt
-  if err=$(claim "$source" "$tmp" 2>&1); then
+  if err=$(link "$source" "$tmp" 2>&1); then
     break
   elif [ -e "$tmp" ] || [ -h "$tmp" ]; then
     taken=$err
@@ -401,12 +393,11 @@ while :; do
     exit 1
   fi
 done
+trap 'rm -f "$tmp"' EXIT INT TERM
 if [ -h "$tmp" ] || [ ! -f "$tmp" ]; then
-  if [ -d "$tmp" ]; then rm -f "$tmp/${source##*/}"; else rm -f "$tmp"; fi
   echo "$source is not a regular file" >&2
   exit 1
 fi
-trap 'rm -f "$tmp"' EXIT INT TERM
 ino=$(ls -di "$tmp" | awk '{print $1}')
 if [ -z "$(find "$dest" -maxdepth 0 -inum "$ino" 2>/dev/null)" ]; then
   mv -f "$tmp" "$dest"
@@ -1461,8 +1452,8 @@ fn hard_link_over_through_shell<E: Executor + ?Sized>(
 /// sitting at a candidate is `EEXIST` like anything else, where an `ln` handed
 /// the same name would have linked the source *inside* it.
 /// [`LINK_ASIDE_SCRIPT`] walks the same candidates under the same bound, and
-/// reaches this same syscall through `link(1)` for exactly that reason — it
-/// falls back to a tested `ln` only on a host carrying no `link` at all.
+/// reaches this same syscall through `link(1)` for exactly that reason, on a
+/// host carrying no `link` refusing the backup rather than linking with `ln`.
 ///
 /// The candidates are siblings of the destination, because `link(2)` cannot
 /// cross a filesystem and only the destination's own directory is guaranteed to
@@ -4894,15 +4885,17 @@ exit 127
             /// [`LINK_ASIDE_SCRIPT`] reaches for *except* `link`, to be used as
             /// the script's whole `PATH`.
             ///
-            /// `link` is not POSIX, so the script falls back to running `ln`
-            /// behind a test of the candidate on a host without it. Prepending
-            /// a stub cannot express that absence — `command -v` would find the
-            /// stub — so the fallback is reached by handing the script a `PATH`
-            /// on which no `link` exists at all, which is what such a host is.
+            /// `link` is not POSIX, so a host could carry none, and the script
+            /// refuses the backup there rather than reaching for `ln`. That
+            /// host cannot be staged by prepending a stub — `command -v` would
+            /// find the stub, and a stub that exits non-zero is a `link` that
+            /// failed rather than one that is absent — so it is staged by
+            /// handing the script a `PATH` on which no `link` exists at all,
+            /// which is what such a host is. `ln` is deliberately not on it
+            /// either: the script must not be able to reach one.
             fn path_without_link(root: &Path) -> PathBuf {
-                const NEEDED: [&str; 9] = [
-                    "sh", "dirname", "ln", "ls", "awk", "find", "mv", "rm", "sync",
-                ];
+                const NEEDED: [&str; 8] =
+                    ["sh", "dirname", "ls", "awk", "find", "mv", "rm", "sync"];
                 let farm = root.join("no-link");
                 std::fs::create_dir_all(&farm).expect("the stand-in PATH");
                 for name in NEEDED {
@@ -5683,14 +5676,18 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
-            fn a_shell_host_without_link_refuses_a_directory_candidate_before_ln_runs() {
-                // The same staging as above on the other branch of the walk.
-                // `link` is not POSIX, so a host carrying none of it runs `ln`
-                // behind a test of the candidate instead, and that fallback has
-                // to refuse the two entries `ln` would otherwise link *into*
-                // just as the primary path does. Handing the script a `PATH`
-                // with no `link` on it is what makes it such a host; the run
-                // above, on the host's own `PATH`, is the primary path.
+            fn a_shell_host_without_link_refuses_the_backup_rather_than_linking_with_ln() {
+                // The other end of the same requirement. `link` is not POSIX,
+                // so a host may carry none — and the only other way to make a
+                // hard link from a shell is `ln`, which cannot be stopped from
+                // linking the source *into* a directory sitting at the
+                // candidate: no portable option suppresses it, and a test run
+                // ahead of it is a window an entry can be created inside. So
+                // that host is refused before the walk starts, and this pins
+                // the refusal against the same two entries an `ln` would have
+                // been diverted into. Handing the script a `PATH` with neither
+                // `link` nor `ln` on it is what makes it such a host; every
+                // other test here runs on the host's own, where `link` is.
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", RUNNING);
                 let previous = artifact.with_file_name("roxyd.previous");
@@ -5708,13 +5705,21 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     Some(&path),
                 );
 
+                let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(
-                    output.status.success(),
-                    "the backup is taken out of a free sibling: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    !output.status.success(),
+                    "a host that cannot claim a name without following it must not report a \
+                     backup: {stderr}"
                 );
-                assert_eq!(inode(&previous), inode(&artifact));
-                assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
+                assert!(
+                    stderr.contains("no link utility"),
+                    "and it must say which utility it could not find, since the failure is \
+                     reported to an operator as a transfer failure: {stderr}"
+                );
+                assert!(
+                    !previous.exists(),
+                    "no backup was published by a sequence that could not take one"
+                );
                 let planted = candidate(&dir, pid, 0);
                 assert!(
                     planted.is_dir(),
@@ -5741,7 +5746,7 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 assert_eq!(
                     strays(&dir).len(),
                     2,
-                    "what is beside the backup is what was already there: {:?}",
+                    "nor was anything else left beside the artifact: {:?}",
                     strays(&dir)
                 );
             }
@@ -5797,9 +5802,6 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 // report the same failure under "no free temporary name", which
                 // names the wrong problem entirely. So the diagnostic the
                 // linker gave is what the caller is handed, and it runs once.
-                // Both spellings are stubbed into the same log, since which one
-                // the script reaches depends on whether the host carries
-                // `link`, and either way exactly one of them may run.
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", RUNNING);
                 let previous = artifact.with_file_name("roxyd.previous");
@@ -5813,7 +5815,6 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     calls.display()
                 );
                 write_script(&stubs, "link", &body);
-                write_script(&stubs, "ln", &body);
 
                 let error = StubbedPath::new(&stubs)
                     .hard_link_over(&artifact, &previous)
@@ -6095,7 +6096,7 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     "`ln -f` unlinks the destination before linking, and a symbolic link is not \
                      a backup at all: {script}"
                 );
-                let link_at = script.find(r#"claim "$source" "$tmp""#).expect("the link");
+                let link_at = script.find(r#"link "$source" "$tmp""#).expect("the link");
                 let rename_at = script.find("mv -f").expect("the rename");
                 let flush_at = script
                     .find(r#"flush "$dir""#)
@@ -6117,21 +6118,21 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     "what the link produced is checked again, since POSIX leaves it to `ln` \
                      whether a symlink is followed: {script}"
                 );
-                let chooses_at = script
-                    .find("command -v link")
-                    .expect("the linker is chosen");
-                let fallback_at = script.find(r#"ln "$1" "$2""#).expect("the fallback links");
                 assert!(
-                    chooses_at < link_at
-                        && script[chooses_at..fallback_at].contains(r#"link "$1" "$2""#),
+                    !script.split_whitespace().any(|word| word == "ln"),
                     "the link goes through `link`, which hands `link(2)` the name it was given, \
-                     rather than through `ln`, which links the source *into* a directory sitting \
-                     at the name instead of failing on it: {script}"
+                     and through nothing else: `ln` links the source *into* a directory sitting \
+                     at the name instead of failing on it, and a test run ahead of it only \
+                     narrows the window an entry can appear in: {script}"
                 );
+                let requires_at = script
+                    .find("command -v link")
+                    .expect("the linker's presence is established");
                 assert!(
-                    script[chooses_at..fallback_at].contains(r#"[ -e "$2" ] || [ -h "$2" ]"#),
-                    "and the fallback a host without `link` takes refuses an occupied candidate \
-                     itself rather than leaving it to `ln`: {script}"
+                    requires_at < link_at
+                        && script[requires_at..link_at].contains("no link utility"),
+                    "a host carrying no `link` is refused before the walk begins rather than \
+                     degraded onto something that follows a planted entry: {script}"
                 );
                 let trap_at = script
                     .find(r#"trap 'rm -f "$tmp"' EXIT"#)
@@ -6140,10 +6141,11 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     .find(r#"[ -h "$tmp" ] || [ ! -f "$tmp" ]"#)
                     .expect("the temporary's own type is checked");
                 assert!(
-                    temp_guard < trap_at,
-                    "the trap is armed only once the temporary is known to be the link this \
-                     script made, since `rm -f` on a candidate `ln` was diverted into would \
-                     delete a planted entry and leave the diverted link: {script}"
+                    link_at < trap_at && trap_at < temp_guard,
+                    "the trap is armed below the walk, where `$tmp` is the entry `link(2)` just \
+                     made rather than a refused leftover this script must leave standing — and \
+                     above the type guard, whose refusal that same `rm -f` then cleans up: \
+                     {script}"
                 );
                 assert!(
                     script[..flush_at].contains("no working sync")
