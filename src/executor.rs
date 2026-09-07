@@ -4880,6 +4880,16 @@ if [ -n "$victim" ]; then
   ln -s "$victim" "$dir/.bootler.link.$$.$n"
 fi
 exec sh -c "$script" _ "$source" "$dest""#;
+                // The wrapper spells the candidate name a second time, and a
+                // staged collision the script does not actually meet would let
+                // every assertion downstream pass without recovery ever having
+                // happened. So the script's own line is what the wrapper is
+                // held to.
+                assert!(
+                    LINK_ASIDE_SCRIPT.contains("tmp=$dir/.bootler.link.$$.$attempt"),
+                    "the wrapper plants at the name the script draws, or this stages a \
+                     collision with nothing"
+                );
                 let output = std::process::Command::new("sh")
                     .args([
                         "-c".to_string(),
@@ -5154,10 +5164,22 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 let previous = artifact.with_file_name("roxyd.previous");
                 let dir = previous.parent().expect("dir").to_path_buf();
                 let pid = std::process::id();
-                let stranded: Vec<PathBuf> = (0..2).map(|n| candidate(&dir, pid, n)).collect();
-                for path in &stranded {
-                    std::fs::hard_link(&artifact, path).expect("strand a completed link");
-                }
+                // The leftovers are made by step one itself, twice, which is
+                // exactly what two attempts interrupted between the link and
+                // the publish leave — and their names are then pinned against
+                // the spelling the staging below shares. A leftover planted at
+                // a name of the test's own invention would collide with
+                // nothing, and every assertion here would still pass.
+                let stranded: Vec<PathBuf> = (0..2)
+                    .map(|_| {
+                        link_aside(&artifact, &dir, &previous).expect("strand a completed link")
+                    })
+                    .collect();
+                assert_eq!(
+                    stranded,
+                    vec![candidate(&dir, pid, 0), candidate(&dir, pid, 1)],
+                    "the walk starts at the first candidate and steps one at a time"
+                );
                 let planted = candidate(&dir, pid, 2);
                 std::os::unix::fs::symlink(&victim, &planted).expect("plant a symlink");
 
