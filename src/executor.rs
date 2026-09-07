@@ -273,16 +273,19 @@ trap - EXIT INT TERM"#;
 ///   survive a power loss. The flush runs after the rename, per the ordering
 ///   rule [`crate::durability`] states.
 ///
-///   It runs through the same `flush` helper [`PUT_FILE_SCRIPT`] uses, and
-///   degrades the same way: an implementation refusing the operand falls back
-///   to the host-wide `sync`, and a host carrying no working `sync` at all
-///   gets a warning on stderr rather than a failure. That is the one point at
-///   which this diverges from [`hard_link_over_natively`], whose `fsync` is a
-///   syscall on a descriptor and whose failure is a real I/O error worth
-///   reporting. A missing utility is not: refusing to back anything up on such
-///   a host would fail every apply outright, to withhold a durability claim
-///   that is [not made portably](Executor::hard_link_over) in the first place
-///   — the caller's journal is what decides after a power loss.
+///   It selects a `sync` the way [`PUT_FILE_SCRIPT`] does — the targeted form
+///   first, the host-wide one where an implementation refuses the operand,
+///   because which of the two a target carries cannot be told from the name.
+///   Where the two *end* differs, and deliberately: a host on which both fail
+///   carries no working `sync` at all, and this script fails there rather than
+///   warning and standing, so the failure arrives as
+///   [`ExecutorError::Transfer`] exactly as [`hard_link_over_natively`]'s
+///   `fsync` failure does. [`PUT_FILE_SCRIPT`] lets that case stand because
+///   the caller still holds the bytes and can write them again; nothing holds
+///   the artifact's pre-apply inode once the backup is the only other name for
+///   it, and the caller records the backup as taken from this call's success.
+///   A success reported over a flush that never ran would let that record
+///   suppress the retake the un-flushed entry is precisely what needs.
 /// - **The landing is confirmed by inode**, exactly as [`PUT_FILE_SCRIPT`]
 ///   confirms its own: a directory appearing at the destination between the
 ///   guard and the `mv` would otherwise take the temporary *inside* it and exit
@@ -313,7 +316,10 @@ if [ -d "$dest" ]; then
   exit 1
 fi
 flush() {
-  sync "$1" 2>/dev/null || sync || echo "warning: $1 was not flushed: no working sync" >&2
+  sync "$1" 2>/dev/null || sync || {
+    echo "$1 was not flushed: no working sync" >&2
+    return 1
+  }
 }
 dir=$(dirname "$dest")
 tmp=$dir/.bootler.link.$$
@@ -964,19 +970,20 @@ pub trait Executor {
     ///
     /// [`InDaemonExecutor`] runs the sequence as direct syscalls, being root
     /// already; the shell transports run it as a single elevated `sh -c`
-    /// script. Both report every on-host failure of the link, the rename and
-    /// the confirmation as [`ExecutorError::Transfer`] naming `dest`, so a
-    /// caller need not tell the two mechanisms apart.
+    /// script. Both report every on-host failure — of the link, the rename, the
+    /// flush and the confirmation — as [`ExecutorError::Transfer`] naming
+    /// `dest`, so a caller need not tell the two mechanisms apart.
     ///
-    /// The flush is the exception, because the two do not have the same thing
-    /// to fail at. Natively it is `fsync` on an open descriptor, and a failure
-    /// is an I/O error the caller is told about. On the shell transports it is
-    /// the `sync` utility, which some hosts do not accept an operand for and a
-    /// few do not carry at all; the script falls back to the host-wide `sync`
-    /// and, failing that too, warns on stderr and lets the backup stand. A
-    /// missing utility is not an I/O error, and refusing to back anything up on
-    /// such a host would fail every apply to withhold the power-loss claim
-    /// disclaimed just above — the one the caller's own record already answers.
+    /// The flush is the step whose *mechanism* differs most, and it is still
+    /// held to that contract. Natively it is `fsync` on an open descriptor. On
+    /// the shell transports it is the `sync` utility, which some hosts do not
+    /// accept an operand for; the script falls back to the host-wide `sync`,
+    /// and a host on which that fails too — one carrying no working `sync` at
+    /// all — fails the backup rather than reporting one it could not make
+    /// durable. What is disclaimed above is a fault *between* the rename and a
+    /// flush that ran, not a flush that never ran: this call returning `Ok` is
+    /// what a caller writes its backup-taken record from, and a record written
+    /// over a skipped flush would suppress the retake the missing entry needs.
     ///
     /// # Errors
     ///
@@ -4702,8 +4709,8 @@ exit 127
             use std::path::{Path, PathBuf};
 
             use super::super::super::{
-                Executor, ExecutorError, InDaemonExecutor, LINK_ASIDE_SCRIPT, link_aside,
-                publish_link,
+                CommandOutput, Executor, ExecutorError, FileMeta, Identity, InDaemonExecutor,
+                LINK_ASIDE_SCRIPT, link_aside, publish_link,
             };
             use super::{dest_under, write_script};
 
@@ -4775,6 +4782,61 @@ exit 127
                     command.env("PATH", path);
                 }
                 command.output().expect("sh should be runnable")
+            }
+
+            /// An [`Executor`] that reaches [`LINK_ASIDE_SCRIPT`] the way the
+            /// shell transports do — through the default
+            /// [`Executor::hard_link_over`] body — with `stubs` prepended to
+            /// the child's `PATH`.
+            ///
+            /// [`run_link_script`] asserts on the script's exit status; this
+            /// asserts on what a caller actually acts on, which is the
+            /// [`ExecutorError`] the transport turns that status into. `run`
+            /// spawns directly, minus the `sudo` a non-root CI cannot use, and
+            /// sets only the child's environment; this process's is never
+            /// touched.
+            struct StubbedPath {
+                stubs: PathBuf,
+            }
+
+            impl StubbedPath {
+                fn new(stubs: &Path) -> Self {
+                    Self {
+                        stubs: stubs.to_path_buf(),
+                    }
+                }
+            }
+
+            impl Executor for StubbedPath {
+                fn run(
+                    &self,
+                    _identity: Identity,
+                    command: &str,
+                    args: &[&str],
+                ) -> Result<CommandOutput, ExecutorError> {
+                    let mut path = std::ffi::OsString::from(&self.stubs);
+                    path.push(":");
+                    path.push(std::env::var_os("PATH").unwrap_or_default());
+                    let output = std::process::Command::new(command)
+                        .args(args)
+                        .env("PATH", path)
+                        .output()
+                        .expect("the command should be runnable");
+                    Ok(CommandOutput {
+                        code: output.status.code(),
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                    })
+                }
+
+                fn put_file(
+                    &self,
+                    _dest: &Path,
+                    _contents: &[u8],
+                    _meta: FileMeta,
+                ) -> Result<(), ExecutorError> {
+                    unimplemented!("only the link sequence is driven through this executor")
+                }
             }
 
             /// Writes a stub for `name` that kills the shell running the script
@@ -5046,15 +5108,18 @@ exit 127
             }
 
             #[test]
-            fn a_host_with_no_working_sync_publishes_the_backup_and_says_so() {
-                // The flush's one degradation, pinned deliberately rather than
-                // left to be read out of the script: a `sync` that fails both
-                // with the operand and without it is a host that carries no
-                // working one, and the backup stands with a warning instead of
-                // failing. The alternative is an apply that cannot take a
-                // backup at all on such a host, traded for a durability claim
-                // this sequence does not make portably anyway — the caller's
-                // journal is what answers after a power loss.
+            fn a_host_with_no_working_sync_fails_the_backup_rather_than_claiming_one() {
+                // The flush is a required step, not a best effort, and this is
+                // the only way it can fail on the shell transports: a `sync`
+                // that fails both with the operand and without it is a host
+                // carrying no working one. Reporting `Ok` there would be the
+                // whole problem — the caller writes its backup-taken record
+                // from this call's success, and a record standing over an entry
+                // that was never flushed suppresses the retake the missing
+                // entry needs. So it fails, exactly as the native `fsync`
+                // failure does, and it is asserted through the executor-facing
+                // path rather than off the script's exit status, since what the
+                // caller acts on is the `ExecutorError`.
                 //
                 // This is the flush *failing*, distinct from the flush never
                 // running, which the kill-at-`sync` test above covers.
@@ -5069,26 +5134,29 @@ exit 127
                     "#!/bin/sh\necho \"sync: not found\" >&2\nexit 127\n",
                 );
 
-                let output = run_link_script(&artifact, &previous, Some(&stubs));
+                let error = StubbedPath::new(&stubs)
+                    .hard_link_over(&artifact, &previous)
+                    .expect_err("a flush that cannot run must not pass for one that did");
 
-                let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(
-                    output.status.success(),
-                    "a host without `sync` must still be able to take a backup: {stderr}"
+                    matches!(&error, ExecutorError::Transfer { path, reason }
+                        if path == &previous && reason.contains("was not flushed")),
+                    "the failure must name the destination and say which flush did not \
+                     happen, so `backup_previous_artifact` can fold it into the \
+                     subject-labelled `CoreError::Command`: {error:?}"
                 );
-                assert!(
-                    stderr.contains("was not flushed"),
-                    "and the operator must be told which flush did not happen: {stderr}"
-                );
+                // The rename ran before the flush did, so the entry is on the
+                // filesystem — it is simply not *claimed*. The retry the caller
+                // makes re-links the same artifact, which is still live because
+                // the backup runs before the swap.
                 assert_eq!(
                     inode(&previous),
                     inode(&artifact),
-                    "the backup is published whether or not its directory was flushed"
+                    "and what it left behind is a link, never truncated bytes"
                 );
-                assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
                 assert!(
                     strays(artifact.parent().expect("dir")).is_empty(),
-                    "and the sequence still cleans up after itself"
+                    "and the failure still cleans up after itself"
                 );
             }
 
@@ -5318,6 +5386,13 @@ exit 127
                 assert!(
                     script.contains(r#"trap 'rm -f "$tmp"' EXIT"#),
                     "a failure must leave no temporary behind: {script}"
+                );
+                assert!(
+                    script[..flush_at].contains("no working sync")
+                        && script[..flush_at].contains("return 1"),
+                    "a flush neither `sync` form could perform must fail the script rather than \
+                     warn and let the backup stand, since the caller writes its backup-taken \
+                     record from this script's success: {script}"
                 );
                 // `-inum` appears twice: the skip that keeps `mv` from being
                 // handed two names for one inode comes before the rename, and
