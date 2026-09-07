@@ -8,6 +8,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `executor::Executor::hard_link_over`, which preserves a root-owned regular
+  file under another name by hard-linking it to a temporary sibling, renaming
+  that over the destination, and flushing the directory the new entry appeared
+  in. `apply::backup_previous_artifact` takes the `.previous` backup through it,
+  so a backup is a second name for the artifact's own inode rather than a second
+  copy of its bytes: an interrupted backup leaves no `.previous` at all, where an
+  interrupted copy would leave a truncated one that a later revert succeeds onto,
+  and the artifact's mode and timestamps are carried by the shared inode rather
+  than preserved beside it. Replacing an existing backup leaves either the old
+  file or the new one and never a partial or absent one, because the old entry is
+  never unlinked and the rename is atomic. A symlink at the artifact is refused
+  rather than followed, and so is a directory or any other non-regular file.
 - `module_spec::UnitTemplate::limit_nofile`, an optional `LimitNOFILE=` a
   package declares against its own unit, so a service whose store outgrows the
   soft descriptor limit systemd hands a unit says so itself instead of leaving

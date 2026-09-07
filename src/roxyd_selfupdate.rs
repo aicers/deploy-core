@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn every_activation_execs_the_sibling_this_crate_writes() {
         // The `.previous` sibling these units exec is the one the apply path
-        // copies aside, so the suffix is one decision and not two. Change it
+        // links aside, so the suffix is one decision and not two. Change it
         // there alone and every installed unit execs a path that is never
         // written, with nothing on the host to say why.
         let previous = format!("{ROXYD_BINARY}{PREVIOUS_ARTIFACT_SUFFIX}");
