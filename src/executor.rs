@@ -5407,6 +5407,11 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 let previous = artifact.with_file_name("roxyd.previous");
                 let dir = previous.parent().expect("dir").to_path_buf();
                 let taken = usize::try_from(LINK_TEMP_ATTEMPTS).expect("the bound fits a usize");
+                assert!(
+                    LINK_ASIDE_SCRIPT.contains(&format!("-ge {LINK_TEMP_ATTEMPTS} ]")),
+                    "the script walks the number the native side does, or this test stages \
+                     the wrong count and stops saying anything about the bound"
+                );
 
                 let (_, output) = run_link_script_over_stale_candidates(
                     &artifact,
@@ -5430,6 +5435,58 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     taken,
                     "nor was any of the occupied candidates cleared away"
                 );
+            }
+
+            #[test]
+            fn a_link_failure_that_is_not_occupancy_is_reported_as_itself() {
+                // Only an occupied candidate advances the walk. A link that
+                // fails for any other reason — a directory that cannot be
+                // written, a filesystem boundary — leaves nothing at the
+                // candidate, and walking past it would spend the whole bound to
+                // report the same failure under "no free temporary name", which
+                // names the wrong problem entirely. So the diagnostic `ln` gave
+                // is what the caller is handed, and `ln` runs once.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let dir = previous.parent().expect("dir").to_path_buf();
+                let stubs = root.path().join("stubs");
+                std::fs::create_dir_all(&stubs).expect("stub directory");
+                let calls = root.path().join("ln-calls");
+                write_script(
+                    &stubs,
+                    "ln",
+                    &format!(
+                        "#!/bin/sh\necho called >> {}\necho \"ln: a diagnostic only ln could \
+                         give\" >&2\nexit 1\n",
+                        calls.display()
+                    ),
+                );
+
+                let error = StubbedPath::new(&stubs)
+                    .hard_link_over(&artifact, &previous)
+                    .expect_err("a link that could not be made must not pass for one that was");
+
+                assert!(
+                    matches!(&error, ExecutorError::Transfer { path, reason }
+                        if path == &previous
+                            && reason.contains("a diagnostic only ln could give")
+                            && !reason.contains("no free temporary name")),
+                    "the failure carries `ln`'s own words, not the bound's: {error:?}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&calls)
+                        .expect("the stub ran")
+                        .lines()
+                        .count(),
+                    1,
+                    "and it was reported on the first attempt rather than walked over"
+                );
+                assert!(
+                    !previous.exists(),
+                    "no backup was published from a link that never happened"
+                );
+                assert!(strays(&dir).is_empty(), "and nothing was left beside it");
             }
 
             #[test]

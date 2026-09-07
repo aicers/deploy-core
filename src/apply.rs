@@ -639,6 +639,41 @@ mod tests {
     }
 
     #[test]
+    fn a_temporary_stranded_by_an_interrupted_attempt_does_not_block_the_resumed_backup() {
+        // An attempt interrupted between the link and the rename leaves a
+        // completed temporary sibling and no `.previous`, and the caller's
+        // journal correctly holds no backup-taken record — so the resumed apply
+        // calls this function again. It must take the backup rather than fail
+        // on the leftover, which under a reused pid is the very first name it
+        // draws, and it must leave the leftover alone: clearing it away is what
+        // the refusal of a planted entry exists to prevent.
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = artifact(&root, b"installed-bytes");
+        let previous = previous_of(&path);
+        let dir = path.parent().expect("directory").to_path_buf();
+        let stranded = dir.join(format!(".bootler.link.{}.0", std::process::id()));
+        std::fs::hard_link(&path, &stranded).expect("strand the interrupted attempt's link");
+
+        backup_previous_artifact(&executor(), SUBJECT, HOST, &path).expect("the resumed backup");
+
+        assert_eq!(
+            inode(&previous),
+            inode(&path),
+            "the resumed apply publishes the backup out of a free sibling"
+        );
+        assert_eq!(
+            inode(&stranded),
+            inode(&path),
+            "and leaves the leftover standing rather than consuming or clearing it"
+        );
+        assert_eq!(
+            strays(&dir),
+            vec![stranded],
+            "the only temporary beside the artifact is the one that was already there"
+        );
+    }
+
+    #[test]
     fn backing_up_an_unchanged_artifact_twice_leaves_one_link_and_no_stray() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = artifact(&root, b"unchanged");
