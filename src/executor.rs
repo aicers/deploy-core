@@ -4922,6 +4922,97 @@ exit 127
             }
 
             #[test]
+            fn the_shell_sequence_killed_before_a_first_backup_lands_leaves_none() {
+                // The other half of the fault model on the transports that run
+                // the sequence as a script: with no backup to preserve, absence
+                // is the correct intermediate state, so the criterion is
+                // recovery rather than the file. The caller's journal records no
+                // backup-taken and the resumed apply re-takes it, which is sound
+                // only because this runs before the swap — so what is asserted
+                // here is that the artifact a retry will link is still the live
+                // one, and that the retry then lands.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let stubs = kill_at(root.path(), "mv");
+
+                let output = run_link_script(&artifact, &previous, Some(stubs.as_path()));
+
+                assert!(!output.status.success(), "the rename never ran");
+                assert!(
+                    !previous.exists(),
+                    "an unpublished link is not a backup, and must not look like one"
+                );
+                assert_eq!(std::fs::read(&artifact).expect("read"), RUNNING);
+                assert_eq!(
+                    std::fs::metadata(&artifact)
+                        .expect("stat")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    BINARY_MODE,
+                    "the artifact a retry will link is untouched"
+                );
+                // A kill runs no `EXIT` trap, so the temporary link survives.
+                // It is a whole second name for the artifact's inode and never
+                // a partial file — the point of linking rather than copying —
+                // and it does not stand in the retry's way, since the script
+                // derives the name from the shell's pid and the retry is a new
+                // shell.
+                let left = strays(artifact.parent().expect("dir"));
+                assert_eq!(left.len(), 1, "one temporary, unremoved: {left:?}");
+                assert_eq!(
+                    inode(left.first().expect("the temporary")),
+                    inode(&artifact),
+                    "even the leftover is a link, not truncated bytes"
+                );
+
+                let retry = run_link_script(&artifact, &previous, None);
+
+                assert!(
+                    retry.status.success(),
+                    "the resumed apply re-takes the backup: {}",
+                    String::from_utf8_lossy(&retry.stderr)
+                );
+                assert_eq!(inode(&previous), inode(&artifact));
+                assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
+            }
+
+            #[test]
+            fn the_shell_sequence_refuses_a_directory_at_the_destination() {
+                // `mv` would move the temporary *inside* a directory sitting at
+                // the destination and exit `0`, so the backup would be reported
+                // taken under a path nobody named. It is refused before the link
+                // instead, and nothing is left behind by the refusal.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                std::fs::create_dir(&previous).expect("plant a directory at the destination");
+
+                let output = run_link_script(&artifact, &previous, None);
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!output.status.success(), "a directory must be refused");
+                assert!(
+                    stderr.contains("is a directory"),
+                    "unexpected refusal: {stderr}"
+                );
+                assert!(
+                    std::fs::read_dir(&previous)
+                        .expect("read the destination")
+                        .next()
+                        .is_none(),
+                    "the refusal must not leave the link inside the directory"
+                );
+                assert_eq!(
+                    std::fs::metadata(&artifact).expect("stat").nlink(),
+                    1,
+                    "and must not have linked the artifact at all"
+                );
+                assert!(strays(artifact.parent().expect("dir")).is_empty());
+            }
+
+            #[test]
             fn the_shell_sequence_links_the_artifact_and_replaces_an_older_backup() {
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", INCOMING);
