@@ -267,7 +267,23 @@ trap - EXIT INT TERM"#;
 ///   exist at all. Link-to-temporary then `rename` is atomic and never exposes
 ///   an absent destination, which is the same idiom [`PUT_FILE_SCRIPT`] lands
 ///   the artifact itself with. An entry already sitting at the temporary name
-///   is a failure rather than something to clear away, for the same reason.
+///   is never cleared away either, for the same reason: `ln` refuses it, and
+///   the refusal is what the recovery below is built on rather than something
+///   to work around.
+/// - **The temporary name is chosen, not assumed free.** An attempt
+///   interrupted between the `ln` and the `trap` on the line after it leaves a
+///   completed link behind — an ordinary `TERM` is enough, the trap not being
+///   registered yet — and the caller's journal correctly records no backup, so
+///   a resumed apply must be able to take one. `$$` alone cannot tell this run
+///   apart from the one that left the leftover, because pids are reused, and
+///   under `sudo sh -c` in a container they are reused quickly. So the name
+///   carries an attempt number as well, and an occupied candidate is stepped
+///   over rather than adopted, unlinked or resolved through: the `ln` that
+///   failed is inspected for whether the name is now taken, and only that case
+///   advances to the next candidate. Every other failure is reported with the
+///   diagnostic `ln` gave, and a directory in which 64 consecutive candidates
+///   are taken is reported too rather than being retried forever.
+///   [`link_aside`] chooses the native side's name on the same terms.
 /// - **Not a bare `link`.** A directory entry is not durable until its
 ///   directory is flushed, and a backup is precisely the thing that must
 ///   survive a power loss. The flush runs after the rename, per the ordering
@@ -322,8 +338,20 @@ flush() {
   }
 }
 dir=$(dirname "$dest")
-tmp=$dir/.bootler.link.$$
-ln "$source" "$tmp"
+attempt=0
+while :; do
+  tmp=$dir/.bootler.link.$$.$attempt
+  if err=$(ln "$source" "$tmp" 2>&1); then break; fi
+  if [ ! -e "$tmp" ] && [ ! -h "$tmp" ]; then
+    echo "$err" >&2
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 64 ]; then
+    echo "no free temporary name beside $dest: $err" >&2
+    exit 1
+  fi
+done
 trap 'rm -f "$tmp"' EXIT INT TERM
 if [ -h "$tmp" ] || [ ! -f "$tmp" ]; then
   echo "$source is not a regular file" >&2
@@ -402,6 +430,16 @@ const ROOT_ID: u32 = 0;
 /// overwrite, so this only avoids spurious failures.
 #[cfg(unix)]
 static NATIVE_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many temporary names [`link_aside`] tries beside one destination before
+/// reporting that none is free, mirrored by the same bound in
+/// [`LINK_ASIDE_SCRIPT`].
+///
+/// Each name past the first is one an interrupted attempt under this pid left
+/// behind, or one a concurrent link into the same directory holds; both are
+/// exhausted long before this, and a directory that really does hold this many
+/// is one to report rather than to keep walking.
+#[cfg(unix)]
+const LINK_TEMP_ATTEMPTS: u32 = 64;
 /// The `sh -c` script that runs a command with a caller-chosen working
 /// directory: invoked as `sh -c SCRIPT _ <dir> <command> <args…>`, so `$1` is
 /// the directory and the wrapped command/args follow after a `shift`. The
@@ -1348,22 +1386,38 @@ fn hard_link_over_through_shell<E: Executor + ?Sized>(
     }
 }
 
-/// Step 1 of the link-based backup: `link(2)` `source` to `temp`, refusing a
-/// `source` that is not a regular file.
+/// Step 1 of the link-based backup: `link(2)` `source` to a temporary sibling
+/// in `dir`, refusing a `source` that is not a regular file, and returning the
+/// name the link was made under.
 ///
 /// The refusal is made twice, and the second one is the one that holds.
 /// `std::fs::hard_link` is `linkat(…, 0)`, which does not follow a symlink at
 /// `source`, so a symlink swapped in after the first check would be captured
-/// rather than followed; `temp` shares the linked inode, so its own type
+/// rather than followed; the temporary shares the linked inode, so its own type
 /// reports what was actually linked and a wrong one is unlinked again before
 /// anything is published. The first check exists to say *which* wrong kind of
 /// file was named, which the second cannot.
 ///
-/// On return, `temp` exists as a second name for `source`'s inode and nothing
-/// else on the filesystem has changed — an interruption here leaves the
-/// destination the caller was going to publish over exactly as it was.
+/// **The name is chosen rather than assumed free.** An earlier attempt
+/// interrupted between the link and the publish leaves a completed link at the
+/// name it drew, and the pid the name carries does not distinguish this process
+/// from the one that left it: pids are reused, and [`NATIVE_TEMP_COUNTER`]
+/// would be no help here even where it is used, since it restarts at 0 in every
+/// process. So the attempt number is walked upwards until a name is free, and
+/// an occupied one is stepped over rather than adopted, unlinked or resolved
+/// through — `link(2)` returning `EEXIST` is what says the name is taken, and
+/// every other failure is reported as itself. [`LINK_ASIDE_SCRIPT`] walks the
+/// same candidates under the same bound on the shell transports.
+///
+/// The candidates are siblings of the destination, because `link(2)` cannot
+/// cross a filesystem and only the destination's own directory is guaranteed to
+/// be on the source's.
+///
+/// On return, the returned name exists as a second name for `source`'s inode
+/// and nothing else on the filesystem has changed — an interruption here leaves
+/// the destination the caller was going to publish over exactly as it was.
 #[cfg(unix)]
-fn link_aside(source: &Path, temp: &Path, dest: &Path) -> Result<(), ExecutorError> {
+fn link_aside(source: &Path, dir: &Path, dest: &Path) -> Result<PathBuf, ExecutorError> {
     let refuse = |reason: String| ExecutorError::Transfer {
         path: dest.to_path_buf(),
         reason,
@@ -1382,22 +1436,38 @@ fn link_aside(source: &Path, temp: &Path, dest: &Path) -> Result<(), ExecutorErr
             source.display()
         )));
     }
-    // `link(2)` fails with `EEXIST` rather than adopting an entry already at
-    // the temporary name, so a stale or planted one is reported instead of
-    // being cleared away.
-    std::fs::hard_link(source, temp).map_err(|error| refuse(link_reason(temp, &error)))?;
-    let linked = std::fs::symlink_metadata(temp).map_err(|error| {
-        let _ = std::fs::remove_file(temp);
-        refuse(link_reason(temp, &error))
-    })?;
-    if linked.file_type().is_symlink() || !linked.is_file() {
-        let _ = std::fs::remove_file(temp);
-        return Err(refuse(format!(
-            "{} is not a regular file",
-            source.display()
-        )));
+    let mut occupied = None;
+    for attempt in 0..LINK_TEMP_ATTEMPTS {
+        let temp = dir.join(format!(".bootler.link.{}.{attempt}", std::process::id()));
+        // `link(2)` fails with `EEXIST` rather than adopting an entry already
+        // at the temporary name, so a stale or planted one is left standing and
+        // the next candidate is tried.
+        match std::fs::hard_link(source, &temp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                occupied = Some(link_reason(&temp, &error));
+                continue;
+            }
+            Err(error) => return Err(refuse(link_reason(&temp, &error))),
+        }
+        let linked = std::fs::symlink_metadata(&temp).map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            refuse(link_reason(&temp, &error))
+        })?;
+        if linked.file_type().is_symlink() || !linked.is_file() {
+            let _ = std::fs::remove_file(&temp);
+            return Err(refuse(format!(
+                "{} is not a regular file",
+                source.display()
+            )));
+        }
+        return Ok(temp);
     }
-    Ok(())
+    Err(refuse(format!(
+        "no free temporary name beside {}: {}",
+        dest.display(),
+        occupied.expect("the loop falls through only after a candidate was refused as occupied")
+    )))
 }
 
 /// Renders one failed syscall of the link sequence as a reason string naming
@@ -1445,15 +1515,7 @@ fn hard_link_over_natively(source: &Path, dest: &Path) -> Result<(), ExecutorErr
         path: dest.to_path_buf(),
         reason: "the destination has no directory to link into".to_string(),
     })?;
-    // A sibling of the destination, because `link(2)` cannot cross a
-    // filesystem and only the destination's own directory is guaranteed to be
-    // on the source's.
-    let temp = dir.join(format!(
-        ".bootler.link.{}.{}",
-        std::process::id(),
-        NATIVE_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    link_aside(source, &temp, dest)?;
+    let temp = link_aside(source, dir, dest)?;
     publish_link(&temp, dest)?;
     sync_dir(dir).map_err(|error| ExecutorError::Transfer {
         path: dest.to_path_buf(),
@@ -4710,7 +4772,7 @@ exit 127
 
             use super::super::super::{
                 CommandOutput, Executor, ExecutorError, FileMeta, Identity, InDaemonExecutor,
-                LINK_ASIDE_SCRIPT, link_aside, publish_link,
+                LINK_ASIDE_SCRIPT, LINK_TEMP_ATTEMPTS, link_aside, publish_link,
             };
             use super::{dest_under, write_script};
 
@@ -4721,11 +4783,13 @@ exit 127
             const INCOMING: &[u8] = b"incoming";
             /// The mode a native binary is installed with.
             const BINARY_MODE: u32 = 0o755;
-            /// The temporary name the native steps are driven with. The
-            /// production sequence derives its own from the pid and a counter;
-            /// a test that composes the steps by hand needs a name it can also
-            /// look for afterwards.
-            const TEMP_NAME: &str = ".bootler.link.fixture";
+            /// Builds the temporary name both transports draw for `attempt`
+            /// beside a destination in `dir`, under `pid`. The tests that stage
+            /// a stale candidate need the production spelling exactly: a name
+            /// of their own invention would collide with nothing.
+            fn candidate(dir: &Path, pid: u32, attempt: u32) -> PathBuf {
+                dir.join(format!(".bootler.link.{pid}.{attempt}"))
+            }
 
             /// Seeds a regular file two levels below `root` at a binary's mode.
             fn seed(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
@@ -4782,6 +4846,63 @@ exit 127
                     command.env("PATH", path);
                 }
                 command.output().expect("sh should be runnable")
+            }
+
+            /// Runs [`LINK_ASIDE_SCRIPT`] with `stale` completed links, and
+            /// optionally a symlink to `victim`, already occupying the very
+            /// candidate names it is about to draw. Returns the pid those names
+            /// carry alongside the script's output.
+            ///
+            /// The leftovers an interrupted attempt strands are named from the
+            /// shell's own pid, which nothing outside the shell can predict —
+            /// so they are planted from *inside* a wrapper that uses its `$$`
+            /// and then `exec`s the script. `exec` replaces the process image
+            /// without forking, so the script runs under that same pid: exactly
+            /// what a resumed apply meets when the kernel hands its shell a
+            /// reused one. The pid is printed before the exec, and the script
+            /// itself writes nothing to stdout.
+            fn run_link_script_over_stale_candidates(
+                source: &Path,
+                dest: &Path,
+                stale: u32,
+                victim: Option<&Path>,
+            ) -> (u32, std::process::Output) {
+                const WRAPPER: &str = r#"set -e
+source=$1; dest=$2; stale=$3; victim=$4; script=$5
+dir=$(dirname "$dest")
+echo "$$"
+n=0
+while [ "$n" -lt "$stale" ]; do
+  ln "$source" "$dir/.bootler.link.$$.$n"
+  n=$((n + 1))
+done
+if [ -n "$victim" ]; then
+  ln -s "$victim" "$dir/.bootler.link.$$.$n"
+fi
+exec sh -c "$script" _ "$source" "$dest""#;
+                let output = std::process::Command::new("sh")
+                    .args([
+                        "-c".to_string(),
+                        WRAPPER.to_string(),
+                        "_".to_string(),
+                        source.to_string_lossy().into_owned(),
+                        dest.to_string_lossy().into_owned(),
+                        stale.to_string(),
+                        victim
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        LINK_ASIDE_SCRIPT.to_string(),
+                    ])
+                    .output()
+                    .expect("sh should be runnable");
+                let pid = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .expect("the wrapper prints its pid before the exec")
+                    .trim()
+                    .parse()
+                    .expect("the pid is a number");
+                (pid, output)
             }
 
             /// An [`Executor`] that reaches [`LINK_ASIDE_SCRIPT`] the way the
@@ -4928,9 +5049,9 @@ exit 127
                 let previous = artifact.with_file_name("roxyd.previous");
                 std::fs::write(&previous, RUNNING).expect("seed the existing backup");
                 let old = inode(&previous);
-                let temp = previous.with_file_name(TEMP_NAME);
+                let dir = previous.parent().expect("dir").to_path_buf();
 
-                link_aside(&artifact, &temp, &previous).expect("step one links aside");
+                let temp = link_aside(&artifact, &dir, &previous).expect("step one links aside");
 
                 assert_eq!(inode(&previous), old, "the old backup is still the old one");
                 assert_eq!(
@@ -4956,9 +5077,9 @@ exit 127
                 let artifact = seed(root.path(), "roxyd", INCOMING);
                 let previous = artifact.with_file_name("roxyd.previous");
                 std::fs::write(&previous, RUNNING).expect("seed the existing backup");
-                let temp = previous.with_file_name(TEMP_NAME);
+                let dir = previous.parent().expect("dir").to_path_buf();
 
-                link_aside(&artifact, &temp, &previous).expect("step one");
+                let temp = link_aside(&artifact, &dir, &previous).expect("step one");
                 publish_link(&temp, &previous).expect("step two renames over the old backup");
 
                 assert_eq!(inode(&previous), inode(&artifact));
@@ -4981,9 +5102,9 @@ exit 127
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", RUNNING);
                 let previous = artifact.with_file_name("roxyd.previous");
-                let temp = previous.with_file_name(TEMP_NAME);
+                let dir = previous.parent().expect("dir").to_path_buf();
 
-                link_aside(&artifact, &temp, &previous).expect("step one");
+                let temp = link_aside(&artifact, &dir, &previous).expect("step one");
 
                 assert!(
                     !previous.exists(),
@@ -5001,12 +5122,119 @@ exit 127
                 );
 
                 // The retry itself, with the temporary of the interrupted
-                // attempt still lying there: the production name carries a pid
-                // and a counter, so it never collides with this one.
+                // attempt still lying there. It is the *first* candidate a
+                // retry draws — same pid, same attempt number — so the retry
+                // steps over it onto the next one rather than being blocked by
+                // it, and leaves it exactly where the interruption did.
+                let left = inode(&temp);
                 InDaemonExecutor::new("seat")
                     .hard_link_over(&artifact, &previous)
                     .expect("the resumed apply re-takes the backup");
                 assert_eq!(inode(&previous), inode(&artifact));
+                assert_eq!(
+                    inode(&temp),
+                    left,
+                    "the leftover is stepped over, never consumed by the retry"
+                );
+            }
+
+            #[test]
+            fn a_stale_native_candidate_is_stepped_over_rather_than_reused() {
+                // The recovery the criterion names, staged rather than waited
+                // for: an interrupted attempt's completed link sits at the
+                // first candidate a retry draws, and a pid reused by the
+                // resuming process is what makes the two names identical. The
+                // retry must publish the backup anyway, out of a sibling none
+                // of the leftovers occupies — and must not clear, adopt or
+                // resolve through any of them on the way, which is why one of
+                // them is a symlink to a file that would show the write.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let victim = seed(root.path(), "the-operators-own-file", INCOMING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let dir = previous.parent().expect("dir").to_path_buf();
+                let pid = std::process::id();
+                let stranded: Vec<PathBuf> = (0..2).map(|n| candidate(&dir, pid, n)).collect();
+                for path in &stranded {
+                    std::fs::hard_link(&artifact, path).expect("strand a completed link");
+                }
+                let planted = candidate(&dir, pid, 2);
+                std::os::unix::fs::symlink(&victim, &planted).expect("plant a symlink");
+
+                InDaemonExecutor::new("seat")
+                    .hard_link_over(&artifact, &previous)
+                    .expect("the resumed apply re-takes the backup");
+
+                assert_eq!(inode(&previous), inode(&artifact));
+                assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
+                for path in &stranded {
+                    assert_eq!(
+                        inode(path),
+                        inode(&artifact),
+                        "a leftover is left standing, not unlinked or renamed away: {path:?}"
+                    );
+                }
+                assert!(
+                    std::fs::symlink_metadata(&planted)
+                        .expect("stat")
+                        .file_type()
+                        .is_symlink(),
+                    "the planted entry is still the symlink it was"
+                );
+                assert_eq!(
+                    std::fs::read(&victim).expect("read"),
+                    INCOMING,
+                    "and nothing was resolved through it"
+                );
+                assert!(
+                    !candidate(&dir, pid, 3).exists(),
+                    "the first free candidate is the one the publish renamed away, so the \
+                     retry leaves no temporary of its own behind"
+                );
+                assert_eq!(
+                    strays(&dir).len(),
+                    stranded.len() + 1,
+                    "what is beside the backup is what was already there: {:?}",
+                    strays(&dir)
+                );
+            }
+
+            #[test]
+            fn a_directory_with_no_free_candidate_fails_rather_than_walking_forever() {
+                // The walk is bounded, and the bound is reported rather than
+                // spun on. What reaches the caller is the same
+                // `ExecutorError::Transfer` naming the destination that every
+                // other on-host failure of the sequence reports, so
+                // `backup_previous_artifact` folds it into its
+                // subject-labelled `CoreError::Command` unchanged.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let dir = previous.parent().expect("dir").to_path_buf();
+                let pid = std::process::id();
+                let taken = usize::try_from(LINK_TEMP_ATTEMPTS).expect("the bound fits a usize");
+                for n in 0..LINK_TEMP_ATTEMPTS {
+                    std::fs::hard_link(&artifact, candidate(&dir, pid, n)).expect("occupy");
+                }
+
+                let error = InDaemonExecutor::new("seat")
+                    .hard_link_over(&artifact, &previous)
+                    .expect_err("a backup that could not be linked must not be reported taken");
+
+                assert!(
+                    matches!(&error, ExecutorError::Transfer { path, reason }
+                        if path == &previous && reason.contains("no free temporary name")),
+                    "got: {error:?}"
+                );
+                assert!(
+                    !previous.exists(),
+                    "and no backup was published from a name it could not take"
+                );
+                assert_eq!(
+                    strays(&dir).len(),
+                    taken,
+                    "nor was any of the occupied candidates cleared away"
+                );
             }
 
             #[test]
@@ -5084,10 +5312,12 @@ exit 127
                 );
                 // A kill runs no `EXIT` trap, so the temporary link survives.
                 // It is a whole second name for the artifact's inode and never
-                // a partial file — the point of linking rather than copying —
-                // and it does not stand in the retry's way, since the script
-                // derives the name from the shell's pid and the retry is a new
-                // shell.
+                // a partial file — the point of linking rather than copying.
+                // What it is *named* is the shell's pid, which this test cannot
+                // predict and a retry cannot be relied on to avoid; the retry
+                // here runs under a fresh shell and merely happens not to
+                // collide, and the test below is the one that stages the
+                // collision on purpose.
                 let left = strays(artifact.parent().expect("dir"));
                 assert_eq!(left.len(), 1, "one temporary, unremoved: {left:?}");
                 assert_eq!(
@@ -5105,6 +5335,101 @@ exit 127
                 );
                 assert_eq!(inode(&previous), inode(&artifact));
                 assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
+            }
+
+            #[test]
+            fn a_stale_shell_candidate_is_stepped_over_rather_than_reused() {
+                // The native recovery test's counterpart, with the collision
+                // staged rather than hoped for: the leftovers are planted under
+                // the pid the script itself runs as, which is what a resumed
+                // apply meets when the kernel reuses one. The retry must
+                // publish the backup out of a candidate none of them occupies,
+                // and must not clear, adopt or resolve through any of them —
+                // hence the symlink to a file a write would show.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let victim = seed(root.path(), "the-operators-own-file", INCOMING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let dir = previous.parent().expect("dir").to_path_buf();
+
+                let (pid, output) =
+                    run_link_script_over_stale_candidates(&artifact, &previous, 2, Some(&victim));
+
+                assert!(
+                    output.status.success(),
+                    "the resumed apply re-takes the backup: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(inode(&previous), inode(&artifact));
+                assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
+                for n in 0..2 {
+                    let stranded = candidate(&dir, pid, n);
+                    assert_eq!(
+                        inode(&stranded),
+                        inode(&artifact),
+                        "a leftover is left standing, not unlinked or renamed away: {stranded:?}"
+                    );
+                }
+                let planted = candidate(&dir, pid, 2);
+                assert!(
+                    std::fs::symlink_metadata(&planted)
+                        .expect("stat")
+                        .file_type()
+                        .is_symlink(),
+                    "the planted entry is still the symlink it was"
+                );
+                assert_eq!(
+                    std::fs::read(&victim).expect("read"),
+                    INCOMING,
+                    "and nothing was resolved through it"
+                );
+                assert!(
+                    !candidate(&dir, pid, 3).exists(),
+                    "the first free candidate is the one the `mv` consumed, so the retry \
+                     leaves no temporary of its own behind"
+                );
+                assert_eq!(
+                    strays(&dir).len(),
+                    3,
+                    "what is beside the backup is what was already there: {:?}",
+                    strays(&dir)
+                );
+            }
+
+            #[test]
+            fn the_shell_sequence_with_no_free_candidate_fails_rather_than_walking_forever() {
+                // The shell half of the bound, held to the same number the
+                // native side walks: a script that kept trying would hang the
+                // apply instead of failing it, and one that gave up quietly
+                // would report a backup it never took.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let dir = previous.parent().expect("dir").to_path_buf();
+                let taken = usize::try_from(LINK_TEMP_ATTEMPTS).expect("the bound fits a usize");
+
+                let (_, output) = run_link_script_over_stale_candidates(
+                    &artifact,
+                    &previous,
+                    LINK_TEMP_ATTEMPTS,
+                    None,
+                );
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!output.status.success(), "a backup was not taken: {stderr}");
+                assert!(
+                    stderr.contains("no free temporary name"),
+                    "unexpected failure: {stderr}"
+                );
+                assert!(
+                    !previous.exists(),
+                    "and no backup was published from a name it could not take"
+                );
+                assert_eq!(
+                    strays(&dir).len(),
+                    taken,
+                    "nor was any of the occupied candidates cleared away"
+                );
             }
 
             #[test]
