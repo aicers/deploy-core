@@ -18,9 +18,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and the artifact's mode and timestamps are carried by the shared inode rather
   than preserved beside it. Replacing an existing backup leaves either the old
   file or the new one and never a partial or absent one, because the old entry is
-  never unlinked and the rename is atomic. A symlink at the artifact is refused
-  rather than followed — whether or not it resolves — and so is a directory or
-  any other non-regular file.
+  never unlinked and the rename is atomic. A temporary an interrupted attempt
+  stranded beside the destination does not stand in a resumed apply's way
+  either: the sequence steps onto a free temporary name rather than clearing the
+  occupied one away or failing on it, so no host is left needing a leftover
+  removed by hand before an apply can proceed. A symlink at the artifact is
+  refused rather than followed — whether or not it resolves — and so is a
+  directory or any other non-regular file.
 - `module_spec::UnitTemplate::limit_nofile`, an optional `LimitNOFILE=` a
   package declares against its own unit, so a service whose store outgrows the
   soft descriptor limit systemd hands a unit says so itself instead of leaving
