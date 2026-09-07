@@ -5235,6 +5235,42 @@ exit 127
                 }
                 assert!(strays(artifact.parent().expect("dir")).is_empty());
             }
+
+            #[test]
+            fn the_native_sequence_refuses_a_directory_at_the_destination() {
+                // The shell transports guard this before the link because `mv`
+                // would move the temporary *inside* the directory and exit `0`.
+                // The native sequence needs no guard — `rename(2)` cannot move
+                // a file into a directory, so it fails instead — but the
+                // outcome must be the same one on both: a failure, nothing
+                // taken inside the directory, and no temporary left beside it.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                std::fs::create_dir(&previous).expect("plant a directory at the destination");
+
+                let error = InDaemonExecutor::new("seat")
+                    .hard_link_over(&artifact, &previous)
+                    .expect_err("a directory at the destination must be refused");
+
+                match error {
+                    ExecutorError::Transfer { path, .. } => assert_eq!(path, previous),
+                    other => panic!("expected Transfer naming the destination, got {other:?}"),
+                }
+                assert!(
+                    std::fs::read_dir(&previous)
+                        .expect("read the destination")
+                        .next()
+                        .is_none(),
+                    "the refusal must not leave the link inside the directory"
+                );
+                assert_eq!(
+                    std::fs::metadata(&artifact).expect("stat").nlink(),
+                    1,
+                    "and the temporary link must be cleaned up again"
+                );
+                assert!(strays(artifact.parent().expect("dir")).is_empty());
+            }
         }
     }
 }
