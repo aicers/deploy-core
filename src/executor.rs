@@ -267,9 +267,9 @@ trap - EXIT INT TERM"#;
 ///   exist at all. Link-to-temporary then `rename` is atomic and never exposes
 ///   an absent destination, which is the same idiom [`PUT_FILE_SCRIPT`] lands
 ///   the artifact itself with. An entry already sitting at the temporary name
-///   is never cleared away either, for the same reason: `ln` refuses it, and
-///   the refusal is what the recovery below is built on rather than something
-///   to work around.
+///   is never cleared away either, for the same reason: the link fails on it,
+///   and that refusal is what the recovery below is built on rather than
+///   something to work around.
 /// - **The temporary name is chosen, not assumed free.** An attempt
 ///   interrupted between the `ln` and the `trap` on the line after it leaves a
 ///   completed link behind — an ordinary `TERM` is enough, the trap not being
@@ -278,26 +278,35 @@ trap - EXIT INT TERM"#;
 ///   apart from the one that left the leftover, because pids are reused, and
 ///   under `sudo sh -c` in a container they are reused quickly. So the name
 ///   carries an attempt number as well, and an occupied candidate is stepped
-///   over rather than adopted, unlinked or resolved through: a candidate that
-///   already exists is skipped without `ln` being run on it, and where `ln`
-///   does run, only a failure that left the name taken advances to the next
-///   candidate. Every other failure is reported with the diagnostic `ln` gave,
-///   and a directory in which [`LINK_TEMP_ATTEMPTS`] consecutive candidates are
+///   over rather than adopted, unlinked or resolved through: only a failure
+///   that left the name taken advances to the next candidate. Every other
+///   failure is reported with the diagnostic the link attempt gave, and a
+///   directory in which [`LINK_TEMP_ATTEMPTS`] consecutive candidates are
 ///   taken is reported too rather than being retried forever. [`link_aside`]
 ///   chooses the native side's name on the same terms.
 ///
-///   **The candidate is tested rather than left to `ln` to refuse.** `ln` is
-///   the one step here that does not fail on an occupied name: given a
-///   *directory*, or a symlink to one, it links the source *inside* it and
-///   exits `0`, which would both write through a planted entry and leave the
-///   link behind under a path nobody named. No portable spelling suppresses
-///   that — `-T` is GNU's, `-h` and `-n` are the BSDs' and cover only the
-///   symlink — so the walk asks whether the candidate exists before linking,
-///   `-e` for an entry and `-h` for a dangling symlink `-e` does not see. What
-///   is left is the window between that test and the `ln`, which the type
-///   guard below closes: the link `ln` put inside such a directory is removed
-///   by the name it was given, and the planted entry itself is left exactly as
-///   it was found.
+///   **The link is made by `link`, not by `ln`.** `ln` is the one step here
+///   that does not fail on an occupied name: given a *directory*, or a symlink
+///   to one, it links the source *inside* it and exits `0`, which would both
+///   write through a planted entry and leave the link behind under a path
+///   nobody named. No option suppresses that portably — `-T` is GNU's, `-h`
+///   and `-n` are the BSDs' and cover only the symlink — but `link` is a
+///   different utility rather than another spelling of that one: it passes the
+///   two names it was given to `link(2)` and does nothing else, so an occupied
+///   candidate is `EEXIST` there whatever kind of entry sits at it, and there
+///   is no name to resolve and so no window to race. That is the same refusal
+///   [`link_aside`] gets from the same syscall.
+///
+///   `link` is not POSIX, so its absence is degraded rather than fatal: a host
+///   without it runs `ln` behind a test of the candidate — `-e` for an entry,
+///   `-h` for a dangling symlink `-e` does not see — which refuses every entry
+///   that is there when the walk looks and leaves only the window between that
+///   test and the `ln`. Exploiting that window means creating an entry in the
+///   destination's own directory, which is root-owned and holds the artifact
+///   this sequence is protecting; anyone who can do it can replace the
+///   artifact outright. The type guard below still runs on both paths anyway:
+///   a link `ln` was diverted into making is removed by the name it was given,
+///   and the planted entry itself is left exactly as it was found.
 ///
 ///   The trap stays *after* the walk rather than being hoisted above it, even
 ///   though that is what closes the window this recovery exists for. `$tmp`
@@ -364,12 +373,21 @@ flush() {
   }
 }
 dir=$(dirname "$dest")
+if command -v link >/dev/null 2>&1; then
+  claim() { link "$1" "$2"; }
+else
+  claim() {
+    if [ -e "$2" ] || [ -h "$2" ]; then
+      echo "$2 already exists" >&2
+      return 1
+    fi
+    ln "$1" "$2"
+  }
+fi
 attempt=0
 while :; do
   tmp=$dir/.bootler.link.$$.$attempt
-  if [ -e "$tmp" ] || [ -h "$tmp" ]; then
-    taken="$tmp already exists"
-  elif err=$(ln "$source" "$tmp" 2>&1); then
+  if err=$(claim "$source" "$tmp" 2>&1); then
     break
   elif [ -e "$tmp" ] || [ -h "$tmp" ]; then
     taken=$err
@@ -1440,10 +1458,11 @@ fn hard_link_over_through_shell<E: Executor + ?Sized>(
 /// through — `link(2)` returning `EEXIST` is what says the name is taken, and
 /// every other failure is reported as itself. That refusal covers every kind of
 /// entry: the new name is never resolved, so a directory or a symlink to one
-/// sitting at a candidate is `EEXIST` like anything else, where the `ln` the
-/// shell transports call would have linked the source *inside* it.
-/// [`LINK_ASIDE_SCRIPT`] walks the same candidates under the same bound there,
-/// and tests each one itself for exactly that reason.
+/// sitting at a candidate is `EEXIST` like anything else, where an `ln` handed
+/// the same name would have linked the source *inside* it.
+/// [`LINK_ASIDE_SCRIPT`] walks the same candidates under the same bound, and
+/// reaches this same syscall through `link(1)` for exactly that reason — it
+/// falls back to a tested `ln` only on a host carrying no `link` at all.
 ///
 /// The candidates are siblings of the destination, because `link(2)` cannot
 /// cross a filesystem and only the destination's own directory is guaranteed to
@@ -4854,6 +4873,49 @@ exit 127
                     .collect()
             }
 
+            /// Resolves `name` against this process's `PATH` the way a shell
+            /// does, so a stub directory can be populated with the host's own
+            /// utilities.
+            fn on_path(name: &str) -> PathBuf {
+                std::env::var_os("PATH")
+                    .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|dir| dir.join(name))
+                    .find(|candidate| {
+                        std::fs::metadata(candidate).is_ok_and(|meta| {
+                            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                        })
+                    })
+                    .unwrap_or_else(|| panic!("{name} is on the PATH of any host running these"))
+            }
+
+            /// Builds a directory that resolves every utility
+            /// [`LINK_ASIDE_SCRIPT`] reaches for *except* `link`, to be used as
+            /// the script's whole `PATH`.
+            ///
+            /// `link` is not POSIX, so the script falls back to running `ln`
+            /// behind a test of the candidate on a host without it. Prepending
+            /// a stub cannot express that absence — `command -v` would find the
+            /// stub — so the fallback is reached by handing the script a `PATH`
+            /// on which no `link` exists at all, which is what such a host is.
+            fn path_without_link(root: &Path) -> PathBuf {
+                const NEEDED: [&str; 9] = [
+                    "sh", "dirname", "ln", "ls", "awk", "find", "mv", "rm", "sync",
+                ];
+                let farm = root.join("no-link");
+                std::fs::create_dir_all(&farm).expect("the stand-in PATH");
+                for name in NEEDED {
+                    std::os::unix::fs::symlink(on_path(name), farm.join(name))
+                        .expect("the host's own utility");
+                }
+                assert!(
+                    !farm.join("link").exists(),
+                    "the point of this PATH is that `link` is not on it"
+                );
+                farm
+            }
+
             /// Runs [`LINK_ASIDE_SCRIPT`] the way the shell transports do, minus
             /// the `sudo` a non-root CI cannot use: the same constant text and
             /// the same positional arguments.
@@ -4932,8 +4994,28 @@ exit 127
                 victim: Option<&Path>,
                 victim_dir: Option<&Path>,
             ) -> (u32, std::process::Output) {
+                run_link_script_over_stale_candidates_on_path(
+                    source, dest, plan, victim, victim_dir, None,
+                )
+            }
+
+            /// [`run_link_script_over_stale_candidates`], with `path` replacing
+            /// the script's `PATH` outright where it is given.
+            ///
+            /// The replacement happens inside the wrapper, after the leftovers
+            /// are planted and immediately before the `exec`, so only the
+            /// script under test runs under it; the staging keeps the host's
+            /// own. Nothing here touches this process's environment.
+            fn run_link_script_over_stale_candidates_on_path(
+                source: &Path,
+                dest: &Path,
+                plan: &[Stale],
+                victim: Option<&Path>,
+                victim_dir: Option<&Path>,
+                path: Option<&Path>,
+            ) -> (u32, std::process::Output) {
                 const WRAPPER: &str = r#"set -e
-source=$1; dest=$2; plan=$3; victim=$4; victimdir=$5; script=$6
+source=$1; dest=$2; plan=$3; victim=$4; victimdir=$5; path=$6; script=$7
 dir=$(dirname "$dest")
 echo "$$"
 n=0
@@ -4947,6 +5029,7 @@ for kind in $plan; do
   esac
   n=$((n + 1))
 done
+if [ -n "$path" ]; then PATH=$path; export PATH; fi
 exec sh -c "$script" _ "$source" "$dest""#;
                 // The wrapper spells the candidate name a second time, and a
                 // staged collision the script does not actually meet would let
@@ -4970,10 +5053,12 @@ exec sh -c "$script" _ "$source" "$dest""#;
                             .collect::<Vec<_>>()
                             .join(" "),
                         victim
-                            .map(|path| path.to_string_lossy().into_owned())
+                            .map(|entry| entry.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                         victim_dir
-                            .map(|path| path.to_string_lossy().into_owned())
+                            .map(|entry| entry.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        path.map(|entry| entry.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                         LINK_ASIDE_SCRIPT.to_string(),
                     ])
@@ -5598,6 +5683,70 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            fn a_shell_host_without_link_refuses_a_directory_candidate_before_ln_runs() {
+                // The same staging as above on the other branch of the walk.
+                // `link` is not POSIX, so a host carrying none of it runs `ln`
+                // behind a test of the candidate instead, and that fallback has
+                // to refuse the two entries `ln` would otherwise link *into*
+                // just as the primary path does. Handing the script a `PATH`
+                // with no `link` on it is what makes it such a host; the run
+                // above, on the host's own `PATH`, is the primary path.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let dir = previous.parent().expect("dir").to_path_buf();
+                let victim_dir = dir.join("the-operators-own-directory");
+                std::fs::create_dir(&victim_dir).expect("the operator's directory");
+                let path = path_without_link(root.path());
+
+                let (pid, output) = run_link_script_over_stale_candidates_on_path(
+                    &artifact,
+                    &previous,
+                    &[Stale::Directory, Stale::SymlinkToDirectory],
+                    None,
+                    Some(&victim_dir),
+                    Some(&path),
+                );
+
+                assert!(
+                    output.status.success(),
+                    "the backup is taken out of a free sibling: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(inode(&previous), inode(&artifact));
+                assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
+                let planted = candidate(&dir, pid, 0);
+                assert!(
+                    planted.is_dir(),
+                    "the planted directory is still there: {planted:?}"
+                );
+                assert_eq!(
+                    std::fs::read_dir(&planted).expect("read").count(),
+                    0,
+                    "and nothing was linked into it"
+                );
+                let pointer = candidate(&dir, pid, 1);
+                assert!(
+                    std::fs::symlink_metadata(&pointer)
+                        .expect("stat")
+                        .file_type()
+                        .is_symlink(),
+                    "the planted symlink is still the symlink it was"
+                );
+                assert_eq!(
+                    std::fs::read_dir(&victim_dir).expect("read").count(),
+                    0,
+                    "and nothing was linked through it into the operator's directory"
+                );
+                assert_eq!(
+                    strays(&dir).len(),
+                    2,
+                    "what is beside the backup is what was already there: {:?}",
+                    strays(&dir)
+                );
+            }
+
+            #[test]
             fn the_shell_sequence_with_no_free_candidate_fails_rather_than_walking_forever() {
                 // The shell half of the bound, held to the same number the
                 // native side walks: a script that kept trying would hang the
@@ -5646,24 +5795,25 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 // written, a filesystem boundary — leaves nothing at the
                 // candidate, and walking past it would spend the whole bound to
                 // report the same failure under "no free temporary name", which
-                // names the wrong problem entirely. So the diagnostic `ln` gave
-                // is what the caller is handed, and `ln` runs once.
+                // names the wrong problem entirely. So the diagnostic the
+                // linker gave is what the caller is handed, and it runs once.
+                // Both spellings are stubbed into the same log, since which one
+                // the script reaches depends on whether the host carries
+                // `link`, and either way exactly one of them may run.
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", RUNNING);
                 let previous = artifact.with_file_name("roxyd.previous");
                 let dir = previous.parent().expect("dir").to_path_buf();
                 let stubs = root.path().join("stubs");
                 std::fs::create_dir_all(&stubs).expect("stub directory");
-                let calls = root.path().join("ln-calls");
-                write_script(
-                    &stubs,
-                    "ln",
-                    &format!(
-                        "#!/bin/sh\necho called >> {}\necho \"ln: a diagnostic only ln could \
-                         give\" >&2\nexit 1\n",
-                        calls.display()
-                    ),
+                let calls = root.path().join("link-calls");
+                let body = format!(
+                    "#!/bin/sh\necho called >> {}\necho \"a diagnostic only the linker could \
+                     give\" >&2\nexit 1\n",
+                    calls.display()
                 );
+                write_script(&stubs, "link", &body);
+                write_script(&stubs, "ln", &body);
 
                 let error = StubbedPath::new(&stubs)
                     .hard_link_over(&artifact, &previous)
@@ -5672,9 +5822,9 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 assert!(
                     matches!(&error, ExecutorError::Transfer { path, reason }
                         if path == &previous
-                            && reason.contains("a diagnostic only ln could give")
+                            && reason.contains("a diagnostic only the linker could give")
                             && !reason.contains("no free temporary name")),
-                    "the failure carries `ln`'s own words, not the bound's: {error:?}"
+                    "the failure carries the linker's own words, not the bound's: {error:?}"
                 );
                 assert_eq!(
                     std::fs::read_to_string(&calls)
@@ -5945,7 +6095,7 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     "`ln -f` unlinks the destination before linking, and a symbolic link is not \
                      a backup at all: {script}"
                 );
-                let link_at = script.find(r#"ln "$source" "$tmp""#).expect("the link");
+                let link_at = script.find(r#"claim "$source" "$tmp""#).expect("the link");
                 let rename_at = script.find("mv -f").expect("the rename");
                 let flush_at = script
                     .find(r#"flush "$dir""#)
@@ -5967,11 +6117,21 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     "what the link produced is checked again, since POSIX leaves it to `ln` \
                      whether a symlink is followed: {script}"
                 );
+                let chooses_at = script
+                    .find("command -v link")
+                    .expect("the linker is chosen");
+                let fallback_at = script.find(r#"ln "$1" "$2""#).expect("the fallback links");
                 assert!(
-                    script[..link_at].contains(r#"[ -e "$tmp" ] || [ -h "$tmp" ]"#),
-                    "the walk refuses an occupied candidate itself rather than leaving it to \
-                     `ln`, which links the source *into* a directory sitting at the name \
-                     instead of failing on it: {script}"
+                    chooses_at < link_at
+                        && script[chooses_at..fallback_at].contains(r#"link "$1" "$2""#),
+                    "the link goes through `link`, which hands `link(2)` the name it was given, \
+                     rather than through `ln`, which links the source *into* a directory sitting \
+                     at the name instead of failing on it: {script}"
+                );
+                assert!(
+                    script[chooses_at..fallback_at].contains(r#"[ -e "$2" ] || [ -h "$2" ]"#),
+                    "and the fallback a host without `link` takes refuses an occupied candidate \
+                     itself rather than leaving it to `ln`: {script}"
                 );
                 let trap_at = script
                     .find(r#"trap 'rm -f "$tmp"' EXIT"#)
