@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::exec::CoreError;
 use crate::executor::{
-    DirOutcome, Executor, ExecutorError, FileMeta, Identity, ServiceAccount, path_present,
+    DirOutcome, Executor, ExecutorError, FileMeta, Identity, ServiceAccount, TEST, path_present,
 };
 use crate::layout::NAMESPACE_ROOT_TRAVERSE_MODE;
 
@@ -173,7 +173,10 @@ pub fn run_root_checked(
 /// to, wherever the symlink pointed — and so is a directory or any other
 /// non-regular file. This primitive is specified for the single path
 /// [`place_file`] puts down; a compose bundle or a container image never
-/// reaches it.
+/// reaches it. The refusal covers a symlink that resolves to nothing too: the
+/// presence probe below looks for the *entry* rather than for what it resolves
+/// to, so a dangling one is refused as the non-regular file it is instead of
+/// passing for the absent path a plain `test -e` reads it as.
 ///
 /// **It is still not idempotent.** A resumed apply that runs it a second time
 /// backs up the half-applied bytes and destroys the rollback point — a property
@@ -186,20 +189,22 @@ pub fn run_root_checked(
 /// still the live, un-replaced artifact.
 /// # Errors
 ///
-/// Returns the executor's own error if the `test -e` probe cannot be run or if
+/// Returns the executor's own error if the presence probe cannot be run or if
 /// the link sequence fails to run at all — a transport or elevation failure —
 /// and [`CoreError::Command`], labelled with `subject` and `host`, if the
 /// sequence runs and refuses or fails on the target. A probe that runs and
-/// reports the path absent is not an error: there is nothing to preserve.
+/// finds no entry at all is not an error: there is nothing to preserve.
 pub fn backup_previous_artifact(
     executor: &dyn Executor,
     subject: &str,
     host: &str,
     dest: &Path,
 ) -> Result<(), CoreError> {
-    // Only an artifact already on disk (a changed one) is preserved; a `test -e`
-    // exiting non-zero means a newly-added path with nothing to back up.
-    if !path_present(executor, dest)? {
+    // Only an artifact already on disk (a changed one) is preserved; a probe
+    // that finds no entry means a newly-added path with nothing to back up. An
+    // entry that is there but is not a regular file is not that case, and goes
+    // on to the refusal `hard_link_over` makes of it.
+    if !entry_present(executor, dest)? {
         return Ok(());
     }
     // Built on the `OsStr` rather than through a lossy string, so a path that is
@@ -222,6 +227,24 @@ pub fn backup_previous_artifact(
             },
             other => CoreError::Executor(other),
         })
+}
+
+/// Reports whether a directory entry exists at `path`, without resolving a
+/// symlink standing there.
+///
+/// [`path_present`]'s `test -e` resolves the path it is given, so a *dangling*
+/// symlink answers exactly as an absent path does — and
+/// [`backup_previous_artifact`] would skip it as a newly-added artifact rather
+/// than refuse it as the non-regular file it is, leaving the swap that follows
+/// to replace it with no backup taken and nothing said. The `test -h` runs only
+/// where `-e` said no, so the two cases that actually occur — a regular file,
+/// or nothing at all — cost the single probe they always did.
+fn entry_present(executor: &dyn Executor, path: &Path) -> Result<bool, ExecutorError> {
+    if path_present(executor, path)? {
+        return Ok(true);
+    }
+    let output = executor.run(Identity::Root, TEST, &["-h", &path.to_string_lossy()])?;
+    Ok(output.success())
 }
 
 /// `docker load`s a staged image tarball on `host` (as root), mapping a non-zero
@@ -510,6 +533,37 @@ mod tests {
             "a refused backup writes no `.previous`, whether of the link or of its target"
         );
         assert!(strays(elsewhere.parent().expect("directory")).is_empty());
+    }
+
+    #[test]
+    fn a_dangling_symlink_at_the_artifact_is_refused_rather_than_skipped() {
+        // The refusal has to survive the presence probe that guards it: `test
+        // -e` resolves the link, so a symlink pointing at nothing reads as an
+        // absent path and would be skipped as a newly-added artifact — the swap
+        // replacing the operator's link with no backup taken and nothing said.
+        let root = tempfile::tempdir().expect("tempdir");
+        let seeded = artifact(&root, b"a sibling, so the directory exists");
+        let path = seeded.with_file_name("linked-runner");
+        std::os::unix::fs::symlink(seeded.with_file_name("nothing-here"), &path)
+            .expect("plant the dangling symlink");
+
+        let error = backup_previous_artifact(&executor(), SUBJECT, HOST, &path)
+            .expect_err("a symlink is refused whether or not it resolves");
+
+        let diagnostic = command_diagnostic(error);
+        assert!(
+            diagnostic.contains("is a symbolic link"),
+            "the refusal says what it refused: {diagnostic}"
+        );
+        assert!(
+            !previous_of(&path).exists(),
+            "a refused backup writes no `.previous`"
+        );
+        assert!(
+            path.symlink_metadata().is_ok(),
+            "and leaves the operator's link where it stands"
+        );
+        assert!(strays(seeded.parent().expect("directory")).is_empty());
     }
 
     #[test]

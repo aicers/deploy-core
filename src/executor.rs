@@ -272,6 +272,17 @@ trap - EXIT INT TERM"#;
 ///   directory is flushed, and a backup is precisely the thing that must
 ///   survive a power loss. The flush runs after the rename, per the ordering
 ///   rule [`crate::durability`] states.
+///
+///   It runs through the same `flush` helper [`PUT_FILE_SCRIPT`] uses, and
+///   degrades the same way: an implementation refusing the operand falls back
+///   to the host-wide `sync`, and a host carrying no working `sync` at all
+///   gets a warning on stderr rather than a failure. That is the one point at
+///   which this diverges from [`hard_link_over_natively`], whose `fsync` is a
+///   syscall on a descriptor and whose failure is a real I/O error worth
+///   reporting. A missing utility is not: refusing to back anything up on such
+///   a host would fail every apply outright, to withhold a durability claim
+///   that is [not made portably](Executor::hard_link_over) in the first place
+///   — the caller's journal is what decides after a power loss.
 /// - **The landing is confirmed by inode**, exactly as [`PUT_FILE_SCRIPT`]
 ///   confirms its own: a directory appearing at the destination between the
 ///   guard and the `mv` would otherwise take the temporary *inside* it and exit
@@ -953,8 +964,19 @@ pub trait Executor {
     ///
     /// [`InDaemonExecutor`] runs the sequence as direct syscalls, being root
     /// already; the shell transports run it as a single elevated `sh -c`
-    /// script. Both report every on-host failure as [`ExecutorError::Transfer`]
-    /// naming `dest`, so a caller need not tell the two mechanisms apart.
+    /// script. Both report every on-host failure of the link, the rename and
+    /// the confirmation as [`ExecutorError::Transfer`] naming `dest`, so a
+    /// caller need not tell the two mechanisms apart.
+    ///
+    /// The flush is the exception, because the two do not have the same thing
+    /// to fail at. Natively it is `fsync` on an open descriptor, and a failure
+    /// is an I/O error the caller is told about. On the shell transports it is
+    /// the `sync` utility, which some hosts do not accept an operand for and a
+    /// few do not carry at all; the script falls back to the host-wide `sync`
+    /// and, failing that too, warns on stderr and lets the backup stand. A
+    /// missing utility is not an I/O error, and refusing to back anything up on
+    /// such a host would fail every apply to withhold the power-loss claim
+    /// disclaimed just above — the one the caller's own record already answers.
     ///
     /// # Errors
     ///
@@ -5024,6 +5046,53 @@ exit 127
             }
 
             #[test]
+            fn a_host_with_no_working_sync_publishes_the_backup_and_says_so() {
+                // The flush's one degradation, pinned deliberately rather than
+                // left to be read out of the script: a `sync` that fails both
+                // with the operand and without it is a host that carries no
+                // working one, and the backup stands with a warning instead of
+                // failing. The alternative is an apply that cannot take a
+                // backup at all on such a host, traded for a durability claim
+                // this sequence does not make portably anyway — the caller's
+                // journal is what answers after a power loss.
+                //
+                // This is the flush *failing*, distinct from the flush never
+                // running, which the kill-at-`sync` test above covers.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let stubs = root.path().join("stubs");
+                std::fs::create_dir_all(&stubs).expect("stub directory");
+                write_script(
+                    &stubs,
+                    "sync",
+                    "#!/bin/sh\necho \"sync: not found\" >&2\nexit 127\n",
+                );
+
+                let output = run_link_script(&artifact, &previous, Some(&stubs));
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "a host without `sync` must still be able to take a backup: {stderr}"
+                );
+                assert!(
+                    stderr.contains("was not flushed"),
+                    "and the operator must be told which flush did not happen: {stderr}"
+                );
+                assert_eq!(
+                    inode(&previous),
+                    inode(&artifact),
+                    "the backup is published whether or not its directory was flushed"
+                );
+                assert_eq!(std::fs::read(&previous).expect("read"), RUNNING);
+                assert!(
+                    strays(artifact.parent().expect("dir")).is_empty(),
+                    "and the sequence still cleans up after itself"
+                );
+            }
+
+            #[test]
             fn the_shell_sequence_refuses_a_directory_at_the_destination() {
                 // `mv` would move the temporary *inside* a directory sitting at
                 // the destination and exit `0`, so the backup would be reported
@@ -5173,11 +5242,18 @@ exit 127
 
                 let symlink = target.with_file_name("linked");
                 std::os::unix::fs::symlink(&target, &symlink).expect("plant the symlink");
+                // A symlink is refused for what it is, not for what it resolves
+                // to, so one resolving to nothing is refused on the same terms
+                // rather than read as an absent source.
+                let dangling = target.with_file_name("linked-nowhere");
+                std::os::unix::fs::symlink(target.with_file_name("gone"), &dangling)
+                    .expect("plant the dangling symlink");
                 let directory = target.with_file_name("bundle");
                 std::fs::create_dir(&directory).expect("plant the directory");
 
                 for (source, expected) in [
                     (&symlink, "is a symbolic link"),
+                    (&dangling, "is a symbolic link"),
                     (&directory, "is not a regular file"),
                 ] {
                     let dest = source.with_extension("previous");

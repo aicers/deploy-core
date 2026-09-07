@@ -19,7 +19,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   than preserved beside it. Replacing an existing backup leaves either the old
   file or the new one and never a partial or absent one, because the old entry is
   never unlinked and the rename is atomic. A symlink at the artifact is refused
-  rather than followed, and so is a directory or any other non-regular file.
+  rather than followed — whether or not it resolves — and so is a directory or
+  any other non-regular file.
 - `module_spec::UnitTemplate::limit_nofile`, an optional `LimitNOFILE=` a
   package declares against its own unit, so a service whose store outgrows the
   soft descriptor limit systemd hands a unit says so itself instead of leaving
