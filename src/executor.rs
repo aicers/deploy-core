@@ -278,13 +278,15 @@ trap - EXIT INT TERM"#;
 ///   `0`, reporting success for a file that landed under a path the caller
 ///   never named. `find` does not follow a symlink at the named path, so a
 ///   symlink planted there fails the match rather than being resolved through.
-/// - The final `rm -f "$tmp"` is not the cleanup path — the trap is — but the
-///   one case where the rename is a no-op: `rename(2)` returns success and does
-///   nothing when both names already refer to one inode, which is what a second
-///   backup of an unchanged artifact asks for. GNU `mv` unlinks the source
-///   itself there, so nothing is left; an implementation that takes POSIX's
-///   no-op literally leaves the temporary behind, and this removes it either
-///   way.
+/// - **The rename is skipped where it would be a no-op.** `rename(2)` returns
+///   success and does nothing when both names already refer to one inode,
+///   which is what a second backup of an unchanged artifact asks for, but `mv`
+///   does not pass that case through to it: GNU's refuses it outright with
+///   `are the same file` and exits non-zero. The inode the confirmation below
+///   needs anyway is therefore compared against the destination first, and the
+///   `mv` runs only where the two differ. The final `rm -f "$tmp"` is not the
+///   cleanup path — the trap is — but that skip's last step, since a rename
+///   that never ran leaves the temporary standing.
 const LINK_ASIDE_SCRIPT: &str = r#"set -e
 source=$1; dest=$2
 if [ -h "$source" ]; then
@@ -311,7 +313,9 @@ if [ -h "$tmp" ] || [ ! -f "$tmp" ]; then
   exit 1
 fi
 ino=$(ls -di "$tmp" | awk '{print $1}')
-mv -f "$tmp" "$dest"
+if [ -z "$(find "$dest" -maxdepth 0 -inum "$ino" 2>/dev/null)" ]; then
+  mv -f "$tmp" "$dest"
+fi
 flush "$dir"
 if [ -z "$(find "$dest" -maxdepth 0 -inum "$ino" 2>/dev/null)" ]; then
   if [ -d "$dest" ]; then rm -f "$dest/${tmp##*/}"; fi
@@ -5099,17 +5103,61 @@ exit 127
                 assert!(
                     strays(previous.parent().expect("dir")).is_empty(),
                     "a successful link leaves no temporary behind, including where the rename \
-                     was a no-op"
+                     was skipped"
                 );
 
-                // Re-run against the artifact it already names: the rename does
-                // nothing, and the temporary must not survive it.
+                // Re-run against the artifact it already names: the rename is
+                // skipped, and the temporary must not survive that.
                 let again = run_link_script(&artifact, &previous, None);
                 assert!(
                     again.status.success(),
                     "re-linking an unchanged artifact is not a failure: {}",
                     String::from_utf8_lossy(&again.stderr)
                 );
+                assert_eq!(
+                    std::fs::metadata(&previous).expect("stat").nlink(),
+                    2,
+                    "two names for one inode, not three"
+                );
+                assert!(strays(previous.parent().expect("dir")).is_empty());
+            }
+
+            #[test]
+            fn re_linking_an_unchanged_artifact_never_reaches_mv() {
+                // GNU `mv` refuses two names for one inode with `are the same
+                // file` instead of passing POSIX's no-op rename through to
+                // `rename(2)`, so the script must not hand it that pair at all.
+                // The stub fails however it is called, which is what makes the
+                // skip the thing under test: on a host whose own `mv` tolerates
+                // the pair, the sequence would otherwise pass here while being
+                // broken everywhere the crate ships.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+
+                let first = run_link_script(&artifact, &previous, None);
+                assert!(
+                    first.status.success(),
+                    "the first backup should succeed: {}",
+                    String::from_utf8_lossy(&first.stderr)
+                );
+
+                let stubs = root.path().join("stubs");
+                std::fs::create_dir_all(&stubs).expect("stub directory");
+                write_script(
+                    &stubs,
+                    "mv",
+                    "#!/bin/sh\necho \"mv: refused: $*\" >&2\nexit 1\n",
+                );
+
+                let again = run_link_script(&artifact, &previous, Some(&stubs));
+
+                assert!(
+                    again.status.success(),
+                    "the rename the artifact already satisfies must not be attempted: {}",
+                    String::from_utf8_lossy(&again.stderr)
+                );
+                assert_eq!(inode(&previous), inode(&artifact));
                 assert_eq!(
                     std::fs::metadata(&previous).expect("stat").nlink(),
                     2,
@@ -5195,7 +5243,16 @@ exit 127
                     script.contains(r#"trap 'rm -f "$tmp"' EXIT"#),
                     "a failure must leave no temporary behind: {script}"
                 );
-                let confirm_at = script.find("-inum").expect("an identity check");
+                // `-inum` appears twice: the skip that keeps `mv` from being
+                // handed two names for one inode comes before the rename, and
+                // the confirmation of what landed comes after it.
+                let skip_at = script.find("-inum").expect("the no-op skip");
+                let confirm_at = script.rfind("-inum").expect("an identity check");
+                assert!(
+                    skip_at < rename_at,
+                    "a rename handed two names for one inode is skipped rather than run, since \
+                     `mv` refuses it instead of passing POSIX's no-op through: {script}"
+                );
                 assert!(
                     confirm_at > rename_at,
                     "the destination must be confirmed to be the file just linked, after the \
