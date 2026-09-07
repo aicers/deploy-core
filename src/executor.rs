@@ -281,9 +281,17 @@ trap - EXIT INT TERM"#;
 ///   over rather than adopted, unlinked or resolved through: the `ln` that
 ///   failed is inspected for whether the name is now taken, and only that case
 ///   advances to the next candidate. Every other failure is reported with the
-///   diagnostic `ln` gave, and a directory in which 64 consecutive candidates
-///   are taken is reported too rather than being retried forever.
-///   [`link_aside`] chooses the native side's name on the same terms.
+///   diagnostic `ln` gave, and a directory in which [`LINK_TEMP_ATTEMPTS`]
+///   consecutive candidates are taken is reported too rather than being
+///   retried forever. [`link_aside`] chooses the native side's name on the
+///   same terms.
+///
+///   The trap stays *after* the walk rather than being hoisted above it, even
+///   though that is what closes the window this recovery exists for. `$tmp`
+///   names whichever candidate is in hand, so a trap armed inside the walk
+///   would fire on a *refused* one and `rm -f` a leftover this sequence is
+///   required to leave standing. Narrowing the window is not worth trading
+///   for that, since the leftover is now harmless.
 /// - **Not a bare `link`.** A directory entry is not durable until its
 ///   directory is flushed, and a backup is precisely the thing that must
 ///   survive a power loss. The flush runs after the rename, per the ordering
