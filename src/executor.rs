@@ -929,6 +929,12 @@ pub trait Executor {
     /// produced, so a path swapped under the guard is caught rather than
     /// linked.
     ///
+    /// A symlink at `dest` is neither refused nor followed but **replaced**:
+    /// the publish renames over the name it was given, so an entry planted
+    /// there is displaced rather than written through, and whatever it pointed
+    /// at is left alone. A copy would have opened it and landed the artifact's
+    /// bytes on the pointed-at file instead of at `dest`.
+    ///
     /// The two fault models the sequence answers differ, and only one of them
     /// is a claim about `dest`:
     ///
@@ -4789,6 +4795,41 @@ exit 127
             }
 
             #[test]
+            fn a_symlink_at_the_destination_is_replaced_rather_than_written_through() {
+                // The publish is a rename, which replaces whatever entry sits
+                // at the destination without resolving it. A copy would have
+                // opened a symlink planted there and written *through* it,
+                // landing the artifact's bytes on whatever the operator
+                // pointed it at and still leaving no backup for a revert to
+                // read. The source guard cannot cover this: the symlink is at
+                // the destination, which is the crate's own name and not a
+                // path the caller was asked about.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let elsewhere = seed(root.path(), "the-operators-own-file", INCOMING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                std::os::unix::fs::symlink(&elsewhere, &previous).expect("plant the symlink");
+                let pointed_at = inode(&elsewhere);
+
+                InDaemonExecutor::new("seat")
+                    .hard_link_over(&artifact, &previous)
+                    .expect("link the artifact aside");
+
+                assert_eq!(
+                    inode(&previous),
+                    inode(&artifact),
+                    "the destination is the artifact itself now, not a pointer to something else"
+                );
+                assert_eq!(inode(&elsewhere), pointed_at);
+                assert_eq!(
+                    std::fs::read(&elsewhere).expect("read"),
+                    INCOMING,
+                    "and what the symlink pointed at is untouched"
+                );
+                assert!(strays(artifact.parent().expect("dir")).is_empty());
+            }
+
+            #[test]
             fn an_interruption_between_the_link_and_the_rename_leaves_the_old_backup() {
                 // Replacing an existing backup is a process-interruption
                 // guarantee: the old entry is never unlinked, so a fault here
@@ -5009,6 +5050,33 @@ exit 127
                     1,
                     "and must not have linked the artifact at all"
                 );
+                assert!(strays(artifact.parent().expect("dir")).is_empty());
+            }
+
+            #[test]
+            fn the_shell_sequence_replaces_a_symlink_at_the_destination() {
+                // The same on the transports that run the sequence as a
+                // script: `mv` renames over the symlink rather than following
+                // it, so the operator's file keeps its own inode and its own
+                // bytes, and the confirmation by inode still matches because
+                // `find` does not resolve the name it is given either.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let elsewhere = seed(root.path(), "the-operators-own-file", INCOMING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                std::os::unix::fs::symlink(&elsewhere, &previous).expect("plant the symlink");
+                let pointed_at = inode(&elsewhere);
+
+                let output = run_link_script(&artifact, &previous, None);
+
+                assert!(
+                    output.status.success(),
+                    "the script should succeed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(inode(&previous), inode(&artifact));
+                assert_eq!(inode(&elsewhere), pointed_at);
+                assert_eq!(std::fs::read(&elsewhere).expect("read"), INCOMING);
                 assert!(strays(artifact.parent().expect("dir")).is_empty());
             }
 
