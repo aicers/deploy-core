@@ -49,9 +49,20 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **registration** — service registration against the on-host PKI.
 - **roxyd_selfupdate** — the roxyd self-update rollback supervisor units as
   data: the three activation services and the deadline timer, with no renderer
-  and nothing to substitute. This crate is their single owner — the installer
-  and roxyd's own `join` both embed these bytes from their pinned dependency,
-  so the hosts each onboards cannot roll back under different rules.
+  and nothing to substitute. This crate is their single owner and the installer
+  is its only consumer, embedding these bytes from its pinned dependency onto
+  both host populations — the ones it provisions and the ones roxyd onboards
+  through its join flow — so neither can roll back under different rules.
+- **roxyd_selfupdate_contract** — the frozen on-disk contract those units
+  coordinate through, and a sibling of **roxyd_selfupdate** rather than part of
+  it: the record directory, the file names, the canonical roxyd binary path,
+  the decision subcommand and its three activation reasons, the self-test
+  freshness window and nonce rules, a resolver for every path composed from
+  them, and the versioned JSON record types with the `FORMAT` revision each
+  carries. Unlike the unit text it has two writers, the installer and the
+  on-host agent, which is why one definition lives here rather than a copy in
+  each — a second copy diverges after deployment with both repositories' tests
+  green. Neither module depends on the other.
 - **roxyd_trust** — trust-material activation for the on-host agent: the X.509
   validator for roxyd's staged cert/key/CA triple, over the crate-internal
   tree-neutral generation engine (stage, validate the copy, swap `active`,
