@@ -13,12 +13,13 @@
 //! that turns its active generation back into the verifier's injected trust set,
 //! the install/update diff engine, the apply primitives, the canonical
 //! self-update rollback supervisor unit text both installers embed rather than
-//! each carrying a copy, the
-//! bootroot command wrapper, service registration, and the on-host trust-material
-//! activation. It carries **no** product concept — no component catalog, no
-//! per-component renderers — so both the installer and the per-machine root daemon
-//! depend on it and share a single implementation rather than shelling out to a
-//! CLI.
+//! each carrying a copy, the frozen on-disk self-update contract those units
+//! coordinate through — the record names, paths and versioned JSON shapes the
+//! installer and the on-host agent both write — the bootroot command wrapper,
+//! service registration, and the on-host trust-material activation. It carries
+//! **no** product concept — no component catalog, no per-component renderers —
+//! so both the installer and the per-machine root daemon depend on it and share
+//! a single implementation rather than shelling out to a CLI.
 //!
 //! The product-specific install/update orchestration, the component catalog, and
 //! the per-component rendering stay in the installer crate, which depends on this
@@ -45,6 +46,12 @@ pub mod registration;
 pub mod release_trust;
 pub mod render;
 pub mod roxyd_selfupdate;
+// The frozen on-disk self-update contract. A sibling of `roxyd_selfupdate` and
+// deliberately not part of it: the unit text has one consumer and no
+// parameters, while this shape has two writers — the installer and the on-host
+// agent — and a `FORMAT` they both have to agree on. Neither module depends on
+// the other.
+pub mod roxyd_selfupdate_contract;
 pub mod roxyd_trust;
 pub mod systemd;
 pub mod transport;

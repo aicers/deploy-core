@@ -8,6 +8,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `roxyd_selfupdate_contract`, the frozen on-disk contract the roxyd self-update
+  rollback supervisor coordinates through: the record directory, the file names,
+  the canonical roxyd binary path, the decision subcommand and its three
+  activation reasons, the self-test freshness window and nonce rules, a resolver
+  for every path composed from them, and the versioned JSON record types —
+  `ArmRecord`, `ConfirmMarker`, `StatusRecord`, `SupervisorVersionMarker`,
+  `ReportRequest` and `SelfTestRecord` — with the `FORMAT` revision each carries.
+  It is the one definition both writers of these files can name: the shape is a
+  versioned agreement between the installer and the on-host agent, and a second
+  copy of it diverges after deployment with both repositories' tests green. It
+  is a sibling of `roxyd_selfupdate` rather than part of it and neither module
+  depends on the other — the unit text is byte-identical data with one consumer
+  and deliberately no parameters, where this is a shape two writers have to
+  agree on. Every value is the one already on disk on every host, held there by
+  a test that names each rather than rebuilding it from the constant beside it.
 - `executor::Executor::hard_link_over`, which preserves a root-owned regular
   file under another name by hard-linking it to a temporary sibling, renaming
   that over the destination, and flushing the directory the new entry appeared
