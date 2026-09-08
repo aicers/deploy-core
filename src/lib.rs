@@ -15,12 +15,11 @@
 //! self-update rollback supervisor unit text both installers embed rather than
 //! each carrying a copy, the frozen on-disk self-update contract those units
 //! coordinate through — the record names, paths and versioned JSON shapes the
-//! installer and the on-host agent both write — the
-//! bootroot command wrapper, service registration, and the on-host trust-material
-//! activation. It carries **no** product concept — no component catalog, no
-//! per-component renderers — so both the installer and the per-machine root daemon
-//! depend on it and share a single implementation rather than shelling out to a
-//! CLI.
+//! installer and the on-host agent both write — the bootroot command wrapper,
+//! service registration, and the on-host trust-material activation. It carries
+//! **no** product concept — no component catalog, no per-component renderers —
+//! so both the installer and the per-machine root daemon depend on it and share
+//! a single implementation rather than shelling out to a CLI.
 //!
 //! The product-specific install/update orchestration, the component catalog, and
 //! the per-component rendering stay in the installer crate, which depends on this

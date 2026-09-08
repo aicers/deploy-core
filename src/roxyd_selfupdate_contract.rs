@@ -1034,9 +1034,74 @@ mod tests {
         );
     }
 
+    /// Every `lifecycle` spelling, not only the one the round trip names.
+    ///
+    /// The status record's round trip above fixes a single variant of each of
+    /// its three enums, which leaves the rest free to be renamed without a
+    /// failing test here. They are what one side writes into `status.json` and
+    /// the other reads back out, so every spelling is contract.
     #[test]
-    fn withdrawn_refusal_reasons_keep_their_wire_encodings() {
+    fn every_lifecycle_keeps_its_encoding() {
+        for (lifecycle, encoding) in [
+            (Lifecycle::Committed, "committed"),
+            (Lifecycle::NoAction, "no_action"),
+            (Lifecycle::Reverted, "reverted"),
+            (Lifecycle::Declined, "declined"),
+            (Lifecycle::Failed, "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(lifecycle).expect("a lifecycle serializes"),
+                serde_json::json!(encoding),
+                "a `lifecycle` spelling is part of the contract"
+            );
+        }
+    }
+
+    #[test]
+    fn every_decision_keeps_its_encoding() {
+        for (decision, encoding) in [
+            (Decision::Confirmed, "confirmed"),
+            (Decision::OutgoingStillInstalled, "outgoing_still_installed"),
+            (Decision::BinaryMatchesNeither, "binary_matches_neither"),
+            (Decision::Reverted, "reverted"),
+            (Decision::HoldDeclined, "hold_declined"),
+            (Decision::RevertRefused, "revert_refused"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(decision).expect("a decision serializes"),
+                serde_json::json!(encoding),
+                "a `decision` spelling is part of the contract"
+            );
+        }
+    }
+
+    #[test]
+    fn every_decision_reason_keeps_its_encoding() {
         for (reason, encoding) in [
+            (
+                DecisionReason::MatchingConfirmMarker,
+                "matching_confirm_marker",
+            ),
+            (
+                DecisionReason::OutgoingStillInstalled,
+                "outgoing_still_installed",
+            ),
+            (
+                DecisionReason::MarkerDeadlineExpired,
+                "marker_deadline_expired",
+            ),
+            (
+                DecisionReason::CrashThresholdReached,
+                "crash_threshold_reached",
+            ),
+            (
+                DecisionReason::BinaryMatchesNeither,
+                "binary_matches_neither",
+            ),
+            (
+                DecisionReason::PreviousIdentityUnassertable,
+                "previous_identity_unassertable",
+            ),
             (
                 DecisionReason::PreviousBuildWithdrawn,
                 "previous_build_withdrawn",
