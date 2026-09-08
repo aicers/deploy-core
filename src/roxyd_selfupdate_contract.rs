@@ -600,7 +600,7 @@ mod tests {
         ROXYD_SUPERVISOR_CRASH_ACTIVATION_DROP_IN_FILE, ROXYD_SUPERVISOR_INSTALL_SUBCOMMAND,
         ROXYD_SUPERVISOR_SELFTEST_SUBCOMMAND, ReportRequest, ReportRequestValidity, RollbackPolicy,
         SELF_TEST_FILE, SELF_TEST_FRESHNESS_SECS, SELF_TEST_NONCE_ALPHABET, SELF_TEST_NONCE_LEN,
-        STATUS_FILE, SUPERVISOR_VERSION_FILE, SelfTestRecord, StatusRecord,
+        SELF_TEST_UNIT_STEM, STATUS_FILE, SUPERVISOR_VERSION_FILE, SelfTestRecord, StatusRecord,
         SupervisorVersionMarker, arm_path, binary_directory, binary_path, confirm_path, directory,
         is_valid_self_test_nonce, report_request_path, self_test_instance_unit_name,
         self_test_path, self_test_path_in, self_test_template_unit_name, status_digest,
@@ -677,6 +677,7 @@ mod tests {
         assert_eq!(SELF_TEST_FRESHNESS_SECS, 120);
         assert_eq!(SELF_TEST_NONCE_LEN, 32);
         assert_eq!(SELF_TEST_NONCE_ALPHABET, "0123456789abcdef");
+        assert_eq!(SELF_TEST_UNIT_STEM, "roxyd-supervisor-selftest");
         assert_eq!(
             ROXYD_SUPERVISOR_SELFTEST_SUBCOMMAND,
             "roxyd-supervisor-selftest"
