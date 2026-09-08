@@ -726,7 +726,7 @@ mod tests {
         let elsewhere = PathBuf::from("/tmp/contract");
         assert_eq!(
             self_test_path_in(&elsewhere),
-            elsewhere.join(SELF_TEST_FILE),
+            Path::new("/tmp/contract/selftest.json"),
             "the resolver is the one place the record's name is joined on"
         );
     }
@@ -837,6 +837,85 @@ mod tests {
             serde_json::from_value::<SupervisorVersionMarker>(marker_json)
                 .expect("marker deserializes"),
             marker
+        );
+    }
+
+    /// An unaccepted revision is classified, never a failed read.
+    ///
+    /// The contract-wide `format` rule is that a consumer not accepting a
+    /// record's revision takes no rollback action on it, which it can only
+    /// decide after reading the revision out of the file. A guard added to a
+    /// record's `format` would turn that decision into a parse error
+    /// indistinguishable from a corrupt or truncated record, and the consumer
+    /// would decline for the wrong reason and report the wrong one.
+    #[test]
+    fn a_record_at_an_unaccepted_revision_still_parses_to_be_classified() {
+        let unaccepted = FORMAT + 1;
+
+        let arm = serde_json::from_value::<ArmRecord>(serde_json::json!({
+            "format": unaccepted,
+            "incoming": { "version": "2.0.0", "commit": "incoming" },
+            "outgoing": { "version": "1.0.0", "commit": "outgoing" },
+            "incoming_digest": { "algorithm": "sha256", "hex": "ab".repeat(32) },
+            "outgoing_digest": { "algorithm": "sha256", "hex": "ab".repeat(32) },
+            "policy": "rollback",
+            "deadline_epoch_seconds": 1_700_000_000_u64,
+        }))
+        .expect("an arm record at an unaccepted revision reads back");
+        assert_eq!(arm.format, unaccepted);
+
+        let confirm = serde_json::from_value::<ConfirmMarker>(serde_json::json!({
+            "format": unaccepted,
+            "build": { "version": "2.0.0", "commit": "incoming" },
+        }))
+        .expect("a confirm marker at an unaccepted revision reads back");
+        assert_eq!(confirm.format, unaccepted);
+
+        let status = serde_json::from_value::<StatusRecord>(serde_json::json!({
+            "format": unaccepted,
+            "lifecycle": "failed",
+            "decision": "revert_refused",
+            "reason": "previous_build_withdrawn",
+            "incoming": { "version": "2.0.0", "commit": "incoming" },
+            "outgoing": { "version": "1.0.0", "commit": "outgoing" },
+            "observed": {
+                "digest": { "algorithm": "sha256", "hex": "ab".repeat(32) },
+                "build": serde_json::Value::Null,
+            },
+            "supervisor_version": "2.0.0",
+            "recorded_at_epoch_seconds": 1_700_000_000_u64,
+        }))
+        .expect("a status record at an unaccepted revision reads back");
+        assert_eq!(status.format, unaccepted);
+
+        let marker = serde_json::from_value::<SupervisorVersionMarker>(serde_json::json!({
+            "format": unaccepted,
+            "installed_at_epoch_seconds": 1_700_000_000_u64,
+        }))
+        .expect("a supervisor marker at an unaccepted revision reads back");
+        assert_eq!(marker.format, unaccepted);
+
+        let self_test = serde_json::from_value::<SelfTestRecord>(serde_json::json!({
+            "format": unaccepted,
+            "nonce": NONCE,
+            "written_at": 1_700_000_000_u64,
+            "supervisor_version": "2.0.0",
+            "decision_path": [
+                { "unit": "roxyd-selfupdate-deadline.timer", "state": "ready" },
+            ],
+        }))
+        .expect("a self-test record at an unaccepted revision reads back");
+        assert_eq!(self_test.format, unaccepted);
+
+        let request = serde_json::from_value::<ReportRequest>(serde_json::json!({
+            "format": unaccepted,
+            "status_digest": { "algorithm": "sha256", "hex": "ab".repeat(32) },
+        }))
+        .expect("a report request at an unaccepted revision reads back");
+        assert_eq!(
+            validate_report_request(&request, Some(&status_fixture())),
+            ReportRequestValidity::UnsupportedFormat,
+            "the revision is classified from the parsed request, ahead of the digest"
         );
     }
 
