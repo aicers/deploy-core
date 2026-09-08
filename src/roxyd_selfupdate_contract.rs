@@ -998,6 +998,102 @@ mod tests {
         );
     }
 
+    /// The digest guard reaches every record, not only the report request.
+    ///
+    /// `ReportRequest` parses its digest through its own stricter view, so the
+    /// tests above would all still pass with the guard gone from
+    /// [`BinaryDigest`] itself — while arm and status records silently began
+    /// accepting a representation no writer produces. The digests in those two
+    /// are what a rollback decision compares the on-disk binary against, so an
+    /// uppercase or short one has to be a parse failure rather than a value
+    /// that matches nothing.
+    #[test]
+    fn every_embedded_digest_is_held_to_the_one_accepted_representation() {
+        for invalid in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            format!("{}g", "ab".repeat(31)),
+        ] {
+            assert!(
+                serde_json::from_value::<ArmRecord>(serde_json::json!({
+                    "format": FORMAT,
+                    "incoming": { "version": "2.0.0", "commit": "incoming" },
+                    "outgoing": { "version": "1.0.0", "commit": "outgoing" },
+                    "incoming_digest": { "algorithm": "sha256", "hex": invalid },
+                    "outgoing_digest": { "algorithm": "sha256", "hex": "ab".repeat(32) },
+                    "policy": "rollback",
+                    "deadline_epoch_seconds": 1_700_000_000_u64,
+                }))
+                .is_err(),
+                "an arm record's digest takes only lowercase 64-character hex"
+            );
+            assert!(
+                serde_json::from_value::<StatusRecord>(serde_json::json!({
+                    "format": FORMAT,
+                    "lifecycle": "failed",
+                    "decision": "revert_refused",
+                    "reason": "previous_build_withdrawn",
+                    "incoming": { "version": "2.0.0", "commit": "incoming" },
+                    "outgoing": { "version": "1.0.0", "commit": "outgoing" },
+                    "observed": {
+                        "digest": { "algorithm": "sha256", "hex": invalid },
+                        "build": { "version": "2.0.0", "commit": "incoming" },
+                    },
+                    "supervisor_version": "2.0.0",
+                    "recorded_at_epoch_seconds": 1_700_000_000_u64,
+                }))
+                .is_err(),
+                "a status record's observed digest takes only lowercase 64-character hex"
+            );
+        }
+
+        let malformed = BinaryDigest {
+            algorithm: DigestAlgorithm::Sha256,
+            hex: "ab".repeat(31),
+        };
+        assert!(
+            serde_json::to_value(ArmRecord {
+                format: FORMAT,
+                incoming: build(),
+                outgoing: build(),
+                incoming_digest: malformed.clone(),
+                outgoing_digest: digest(),
+                policy: RollbackPolicy::Rollback,
+                deadline_epoch_seconds: 1_700_000_000,
+            })
+            .is_err(),
+            "a writer cannot put a malformed digest into an arm record either"
+        );
+    }
+
+    /// The encoding of an observed binary whose build could not be determined.
+    ///
+    /// [`ObservedBinary::build`] is optional because a decision can be reached
+    /// against a binary that answers no identity query, and the round trip above
+    /// names only the present case. The absent one is written to `status.json`
+    /// as an explicit `null`: adding a skip to the field would drop the key
+    /// entirely, which is a different record on disk for the same decision.
+    #[test]
+    fn an_undeterminable_observed_build_is_encoded_as_an_explicit_null() {
+        let observed = ObservedBinary {
+            digest: digest(),
+            build: None,
+        };
+        let json = serde_json::to_value(&observed).expect("the observed binary serializes");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "digest": { "algorithm": "sha256", "hex": "ab".repeat(32) },
+                "build": serde_json::Value::Null,
+            }),
+            "an absent build stays a present `build` key holding null"
+        );
+        assert_eq!(
+            serde_json::from_value::<ObservedBinary>(json).expect("it deserializes"),
+            observed
+        );
+    }
+
     #[test]
     fn report_request_validation_distinguishes_invalid_requests() {
         let status = status_fixture();
