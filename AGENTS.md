@@ -9,7 +9,7 @@ re-run its sync. The drift check in CI fails if this copy diverges.
 ## Language
 
 - Code, comments, commit messages, PR descriptions, and issues are written
-  in english.
+  in English.
 
 ## Commit messages
 
