@@ -13,6 +13,13 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **module_spec** — the declarative per-module install spec a package carries in
   its manifest (unit template, bootroot registration template, placement class),
   and the validator every read path runs over it.
+- **image** — the typed declaration a container image artifact makes from
+  manifest format 6 on: its owning namespace and component, its dependency
+  name, the explicit `name:tag` references it is restored under, its one Linux
+  platform, its config digest, its reference lifecycle and its provenance, with
+  the Docker reference syntax every read path checks and the canonical
+  `runtime.invalid` alias helper. It states signed facts only and checks no
+  image bytes.
 - **systemd** — the one systemd serialization and rejection rule, which decides
   whether a package-declared string is representable in a unit file at all and
   turns a host-resolved value into directive text.
@@ -21,8 +28,9 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   the placement check that says whether the artifact belongs on this host.
 - **verify** — the one package verifier the control plane and the root daemon
   both reach a verdict through: the Ed25519 signature over the raw manifest
-  bytes, the trust anchors and withdrawn builds a caller injects, and the error
-  taxonomy downstream repositories match on.
+  bytes, the trust anchors and withdrawn builds a caller injects, the
+  namespace-scoped request a package declaring images is verified under, and
+  the error taxonomy downstream repositories match on.
 - **trust_set** — the generation document that verifier's injected material is
   delivered as, and the reader that refuses a malformed one rather than
   repairing it: a version gate, a structural decode that admits no unknown
