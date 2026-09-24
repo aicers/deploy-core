@@ -15,6 +15,7 @@ use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
+use crate::image::{ImageDeclaration, ImageDeclarationError};
 use crate::module_spec::{ModuleSpec, ModuleSpecError};
 
 /// `format_version` a producer stamps into every manifest it writes.
@@ -22,7 +23,7 @@ use crate::module_spec::{ModuleSpec, ModuleSpecError};
 /// Stamped unconditionally, never derived from a manifest's contents: a
 /// manifest's version is the producer's, not a function of which optional
 /// variables its templates happen to name.
-pub const MANIFEST_FORMAT_VERSION: u32 = 5;
+pub const MANIFEST_FORMAT_VERSION: u32 = 6;
 
 /// Inclusive floor of the `format_version` range this build accepts.
 ///
@@ -40,7 +41,18 @@ pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 3;
 /// Tracks [`MANIFEST_FORMAT_VERSION`]: this build reads what it writes, and a
 /// manifest naming anything newer is refused for its version alone rather than
 /// failing as an opaque decode error somewhere inside it.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 5;
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 6;
+
+/// First `format_version` at which a container image artifact carries an
+/// [`ImageDeclaration`].
+///
+/// At this version and above the declaration is required on every
+/// [`ArtifactKind::ContainerImage`] artifact and its key is refused on every
+/// other kind. Below it — formats [`MIN_MANIFEST_FORMAT_VERSION`] up to this
+/// one, and the pre-versioned baseline — an image artifact is legacy: it
+/// carries no declaration, and an `image` key on any artifact is refused
+/// whatever its value, so no legacy manifest can be read as declaring one.
+pub const IMAGE_DECLARATION_FORMAT_VERSION: u32 = 6;
 
 /// Container footer version the pre-versioned baseline payloads were written
 /// at.
@@ -108,10 +120,16 @@ pub struct PayloadArtifact {
     pub component: String,
     /// Version string of the built component.
     pub version: String,
-    /// Immutable build identity of the artifact: a full 40-hex git commit SHA
-    /// for an artifact built from a clone, or a 64-hex image digest with its
-    /// `sha256:` prefix stripped for a third-party container image (see
-    /// [`is_valid_commit`]).
+    /// Immutable build identity of the artifact (see [`is_valid_commit`]): a
+    /// full 40-hex git commit SHA for an artifact built from a clone.
+    ///
+    /// In a component package at [`IMAGE_DECLARATION_FORMAT_VERSION`] or
+    /// later, a dependency image — a third-party image included in that
+    /// component's package — carries the **consumer build's** commit like
+    /// every other artifact of the package, and its own origin is recorded in
+    /// [`ImageDeclaration::provenance`] instead. The 64-hex width, an image
+    /// digest with its `sha256:` prefix stripped, remains accepted for the
+    /// legacy use of naming a third-party image by digest.
     ///
     /// `None` only on an artifact read off a pre-versioned baseline payload
     /// (see [`PayloadManifest::parse`]); it is never synthesized and never
@@ -140,6 +158,24 @@ pub struct PayloadArtifact {
     /// never reaches the root daemon that executes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<ModuleSpec>,
+    /// What a container image artifact declares about itself: its owner,
+    /// dependency, public references, platform, config digest, reference
+    /// lifecycle and provenance.
+    ///
+    /// Required on an [`ArtifactKind::ContainerImage`] artifact of a manifest
+    /// at [`IMAGE_DECLARATION_FORMAT_VERSION`] or later, and `None` on every
+    /// other artifact: a non-image artifact and every artifact of an older
+    /// manifest carry no declaration, and a legacy image is never given one.
+    /// The writer omits the key when `None`, and every manifest read door
+    /// refuses the key — whatever its value, `null` included — where no
+    /// declaration belongs.
+    ///
+    /// Decoding a lone `PayloadArtifact` checks nothing about this field
+    /// beyond its shape, exactly as it checks nothing about `commit` or
+    /// `spec`: those rules depend on the manifest's `format_version`, so the
+    /// manifest is the door that enforces them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageDeclaration>,
 }
 
 /// One member of the archive block, named and sized as the archive stores it.
@@ -252,6 +288,55 @@ pub enum ManifestError {
     /// The `trust_set` value decoded to zero bytes.
     #[error("manifest `trust_set` decodes to zero bytes")]
     EmptyTrustSet,
+    /// A manifest carrying no `format_version` had an artifact with an
+    /// `image` key, whatever its value.
+    #[error("manifest carries no `format_version` yet artifact `{0}` carries an `image`")]
+    BaselineWithImage(String),
+    /// A manifest below [`IMAGE_DECLARATION_FORMAT_VERSION`] had an artifact
+    /// with an `image` key, whatever its value.
+    #[error(
+        "artifact `{archive_path}` carries an `image`, which manifest format version {format_version} cannot declare"
+    )]
+    ImageBeforeDeclarationFormat {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The manifest's `format_version`.
+        format_version: u32,
+    },
+    /// An artifact that is not a container image carried an `image` key,
+    /// whatever its value.
+    #[error("artifact `{archive_path}` of kind {kind:?} carries an `image`")]
+    ImageOnNonImageArtifact {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The artifact's kind.
+        kind: ArtifactKind,
+    },
+    /// A container image artifact of a manifest at
+    /// [`IMAGE_DECLARATION_FORMAT_VERSION`] or later carried no `image`, or an
+    /// explicit `null` one.
+    #[error("container image artifact `{0}` carries no image declaration")]
+    MissingImageDeclaration(String),
+    /// An artifact's `image` did not decode as an [`ImageDeclaration`]: a
+    /// missing or unknown field, an unknown enum value, a mixed provenance
+    /// arm, or a value of the wrong type.
+    #[error("artifact `{archive_path}` has an undecodable image declaration")]
+    ImageDecode {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The underlying decode failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// An artifact's [`ImageDeclaration`] decoded and violates a syntax rule.
+    #[error("artifact `{archive_path}` declares an invalid image")]
+    InvalidImageDeclaration {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The rule that was violated.
+        #[source]
+        source: ImageDeclarationError,
+    },
 }
 
 /// Reports whether `value` is a valid artifact build identifier: exactly
@@ -264,10 +349,14 @@ pub enum ManifestError {
 /// as `abc1234` is not a valid `commit` anywhere in the ecosystem; uppercase hex
 /// is rejected too, so one build has exactly one identifier.
 ///
-/// A producer legitimately accepts only one of the two widths per artifact — an
-/// artifact built from a clone is always the git width, a third-party image
-/// always the digest width — and narrows using the two constants rather than
-/// restating the literals.
+/// A producer legitimately accepts only one of the two widths per artifact and
+/// narrows using the two constants rather than restating the literals. An
+/// artifact built from a clone is always the git width. The digest width is the
+/// legacy way of naming a third-party image by its digest; in a component
+/// package at [`IMAGE_DECLARATION_FORMAT_VERSION`] or later a dependency image
+/// instead carries the consumer build's git-width commit, with its origin in
+/// the image declaration's provenance. This validator is not narrowed for
+/// that: it still admits both widths on every artifact.
 #[must_use]
 pub fn is_valid_commit(value: &str) -> bool {
     if value.len() != GIT_COMMIT_HEX_LEN && value.len() != IMAGE_DIGEST_HEX_LEN {
@@ -415,7 +504,177 @@ struct RawManifest {
     trust_set: Option<String>,
     #[serde(default)]
     archive_members: Option<Vec<ArchiveMember>>,
-    artifacts: Vec<PayloadArtifact>,
+    artifacts: Vec<RawArtifact>,
+}
+
+/// Unvalidated wire form of one artifact, used only as a deserialization
+/// source.
+///
+/// Identical to [`PayloadArtifact`] in every field but `image`, which is held
+/// as the raw JSON value together with whether the key was present at all.
+/// `Option<ImageDeclaration>` would read an absent key and an explicit `null`
+/// alike, and would decode the declaration here, ahead of the artifact's other
+/// checks; this form lets `from_parts` refuse the key by presence and decode
+/// it at the one point the validation order places it.
+#[derive(Deserialize)]
+struct RawArtifact {
+    component: String,
+    version: String,
+    #[serde(default)]
+    commit: Option<String>,
+    target_arch: TargetArch,
+    kind: ArtifactKind,
+    dispositions: BTreeSet<Disposition>,
+    archive_path: String,
+    sha256: String,
+    #[serde(default)]
+    spec: Option<ModuleSpec>,
+    #[serde(default, deserialize_with = "present_value")]
+    image: Option<serde_json::Value>,
+}
+
+/// Reads a key that is present, `null` included, as `Some`; an absent key
+/// falls to the field's `default` of `None`.
+fn present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+/// Where an artifact's image declaration comes from on its way into
+/// `from_parts`.
+enum ImageSource {
+    /// No `image` key on the wire, or `None` on a producer's artifact.
+    Absent,
+    /// An `image` key on the wire, not yet decoded; `null` included.
+    Wire(serde_json::Value),
+    /// A producer's typed declaration, validated without being serialized.
+    Typed(Box<ImageDeclaration>),
+}
+
+impl RawArtifact {
+    /// Splits the wire form into the typed artifact, still without its
+    /// declaration, and the raw `image` it carried.
+    fn into_parts(self) -> (PayloadArtifact, ImageSource) {
+        let image = self.image.map_or(ImageSource::Absent, ImageSource::Wire);
+        (
+            PayloadArtifact {
+                component: self.component,
+                version: self.version,
+                commit: self.commit,
+                target_arch: self.target_arch,
+                kind: self.kind,
+                dispositions: self.dispositions,
+                archive_path: self.archive_path,
+                sha256: self.sha256,
+                spec: self.spec,
+                image: None,
+            },
+            image,
+        )
+    }
+}
+
+/// Splits producer artifacts into the form `from_parts` validates, taking each
+/// typed declaration out so it is validated in the artifact's place in the
+/// order.
+fn typed_parts(artifacts: Vec<PayloadArtifact>) -> Vec<(PayloadArtifact, ImageSource)> {
+    artifacts
+        .into_iter()
+        .map(|mut artifact| {
+            let image = artifact.image.take().map_or(ImageSource::Absent, |image| {
+                ImageSource::Typed(Box::new(image))
+            });
+            (artifact, image)
+        })
+        .collect()
+}
+
+fn raw_parts(artifacts: Vec<RawArtifact>) -> Vec<(PayloadArtifact, ImageSource)> {
+    artifacts.into_iter().map(RawArtifact::into_parts).collect()
+}
+
+/// Resolves an artifact's image declaration at the end of that artifact's
+/// checks in `from_parts`.
+///
+/// Format, kind and key presence are decided first, from the key alone; only
+/// a declaration the manifest is allowed to carry is then decoded and
+/// validated.
+fn resolve_image(
+    format_version: Option<u32>,
+    artifact: &PayloadArtifact,
+    source: ImageSource,
+) -> Result<Option<ImageDeclaration>, ManifestError> {
+    let present = !matches!(source, ImageSource::Absent);
+    let Some(format_version) = format_version else {
+        return if present {
+            Err(ManifestError::BaselineWithImage(
+                artifact.archive_path.clone(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    if format_version < IMAGE_DECLARATION_FORMAT_VERSION {
+        return if present {
+            Err(ManifestError::ImageBeforeDeclarationFormat {
+                archive_path: artifact.archive_path.clone(),
+                format_version,
+            })
+        } else {
+            Ok(None)
+        };
+    }
+    if artifact.kind != ArtifactKind::ContainerImage {
+        return if present {
+            Err(ManifestError::ImageOnNonImageArtifact {
+                archive_path: artifact.archive_path.clone(),
+                kind: artifact.kind,
+            })
+        } else {
+            Ok(None)
+        };
+    }
+    let declaration = match source {
+        ImageSource::Absent | ImageSource::Wire(serde_json::Value::Null) => {
+            return Err(ManifestError::MissingImageDeclaration(
+                artifact.archive_path.clone(),
+            ));
+        }
+        ImageSource::Wire(value) => decode_declaration(&artifact.archive_path, value)?,
+        ImageSource::Typed(declaration) => *declaration,
+    };
+    declaration
+        .validate()
+        .map_err(|source| ManifestError::InvalidImageDeclaration {
+            archive_path: artifact.archive_path.clone(),
+            source,
+        })?;
+    Ok(Some(declaration))
+}
+
+/// Decodes a wire `image` value.
+///
+/// A `schema` other than the one this build reads is reported as such before
+/// the typed decode, so a future declaration whose fields this build does not
+/// know is refused for its schema rather than for its first unknown field.
+fn decode_declaration(
+    archive_path: &str,
+    value: serde_json::Value,
+) -> Result<ImageDeclaration, ManifestError> {
+    if let Some(found) = value.get("schema").and_then(serde_json::Value::as_u64)
+        && found != u64::from(crate::image::IMAGE_DECLARATION_SCHEMA)
+    {
+        return Err(ManifestError::InvalidImageDeclaration {
+            archive_path: archive_path.to_string(),
+            source: ImageDeclarationError::UnsupportedSchema { found },
+        });
+    }
+    serde_json::from_value(value).map_err(|source| ManifestError::ImageDecode {
+        archive_path: archive_path.to_string(),
+        source,
+    })
 }
 
 impl TryFrom<RawManifest> for PayloadManifest {
@@ -430,7 +689,7 @@ impl TryFrom<RawManifest> for PayloadManifest {
             Some(format_version),
             raw.pinset,
             raw.archive_members,
-            raw.artifacts,
+            raw_parts(raw.artifacts),
             trust_set,
         )
     }
@@ -610,8 +869,12 @@ impl PayloadManifest {
     ///
     /// Returns [`ManifestError`] when an artifact carries no dispositions, uses
     /// an unsafe `archive_path`, shares an `archive_path` with another artifact,
-    /// carries no valid `commit`, or declares a [`ModuleSpec`] that violates a
-    /// spec rule.
+    /// carries no valid `commit`, declares a [`ModuleSpec`] that violates a
+    /// spec rule, is a container image without a valid [`ImageDeclaration`]
+    /// ([`ManifestError::MissingImageDeclaration`],
+    /// [`ManifestError::InvalidImageDeclaration`]), or is any other kind and
+    /// carries one ([`ManifestError::ImageOnNonImageArtifact`]). The checks run
+    /// per artifact, in that order, exactly as the read side runs them.
     pub fn new(
         pinset: Option<String>,
         archive_members: Vec<ArchiveMember>,
@@ -621,7 +884,7 @@ impl PayloadManifest {
             Some(MANIFEST_FORMAT_VERSION),
             pinset,
             Some(archive_members),
-            artifacts,
+            typed_parts(artifacts),
             None,
         )
     }
@@ -653,7 +916,7 @@ impl PayloadManifest {
             self.format_version,
             self.pinset,
             self.archive_members,
-            self.artifacts,
+            typed_parts(self.artifacts),
             Some(generation.to_vec()),
         )
     }
@@ -692,8 +955,17 @@ impl PayloadManifest {
     /// [`ManifestError::BaselineWithArchiveMembers`] when an unversioned
     /// manifest is not the baseline shape,
     /// [`ManifestError::MissingArchiveMembers`] when a manifest carries a
-    /// `format_version` but binds no member list, or any validation error
-    /// [`PayloadManifest::new`] raises.
+    /// `format_version` but binds no member list,
+    /// [`ManifestError::BaselineWithImage`] or
+    /// [`ManifestError::ImageBeforeDeclarationFormat`] when an artifact of a
+    /// manifest below [`IMAGE_DECLARATION_FORMAT_VERSION`] carries an `image`
+    /// key, [`ManifestError::ImageDecode`] when a declaration does not decode,
+    /// or any validation error [`PayloadManifest::new`] raises.
+    ///
+    /// The `image` key is not a term of the baseline conjunction: stage 1 is
+    /// unchanged by it, and an unversioned manifest carrying one is refused at
+    /// the same per-artifact point every image rule is decided, after that
+    /// artifact's other checks.
     ///
     /// [`ManifestError::MissingArchiveMembers`] is not among the errors that
     /// closing catch-all covers: [`PayloadManifest::new`] takes its member list
@@ -730,7 +1002,7 @@ impl PayloadManifest {
             format_version,
             raw.pinset,
             raw.archive_members,
-            raw.artifacts,
+            raw_parts(raw.artifacts),
             trust_set,
         )
     }
@@ -746,7 +1018,7 @@ impl PayloadManifest {
         format_version: Option<u32>,
         pinset: Option<String>,
         archive_members: Option<Vec<ArchiveMember>>,
-        artifacts: Vec<PayloadArtifact>,
+        artifacts: Vec<(PayloadArtifact, ImageSource)>,
         trust_set: Option<Vec<u8>>,
     ) -> Result<Self, ManifestError> {
         if let Some(found) = format_version
@@ -771,7 +1043,8 @@ impl PayloadManifest {
         }
 
         let mut seen = BTreeSet::new();
-        for artifact in &artifacts {
+        let mut validated = Vec::with_capacity(artifacts.len());
+        for (mut artifact, image) in artifacts {
             if artifact.dispositions.is_empty() {
                 return Err(ManifestError::EmptyDispositions(
                     artifact.archive_path.clone(),
@@ -782,7 +1055,7 @@ impl PayloadManifest {
                     artifact.archive_path.clone(),
                 ));
             }
-            if !seen.insert(artifact.archive_path.as_str()) {
+            if !seen.insert(artifact.archive_path.clone()) {
                 return Err(ManifestError::DuplicateArchivePath(
                     artifact.archive_path.clone(),
                 ));
@@ -817,7 +1090,13 @@ impl PayloadManifest {
                     },
                 )?;
             }
+            // Last of this artifact's checks, and before the next artifact's
+            // first: an earlier artifact's fault or an earlier check on this
+            // one wins over the image, and the image wins over anything later.
+            artifact.image = resolve_image(format_version, &artifact, image)?;
+            validated.push(artifact);
         }
+        let artifacts = validated;
 
         if let Some(bytes) = &trust_set {
             if bytes.is_empty() {
@@ -890,10 +1169,15 @@ impl PayloadManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchiveMember, ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN,
-        LEGACY_UNVERSIONED_FOOTER_VERSION, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
-        MIN_MANIFEST_FORMAT_VERSION, ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest,
-        TargetArch, is_pre_versioned_baseline, is_valid_commit,
+        ArchiveMember, ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN,
+        IMAGE_DECLARATION_FORMAT_VERSION, IMAGE_DIGEST_HEX_LEN, LEGACY_UNVERSIONED_FOOTER_VERSION,
+        MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION,
+        ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest, TargetArch,
+        is_pre_versioned_baseline, is_valid_commit,
+    };
+    use crate::image::{
+        ImageArchitecture, ImageDeclaration, ImageDeclarationError, ImageOs, ImageOwner,
+        ImagePlatform, ImageProvenance, ProductBuildProvenance, ReferenceLifecycle, SegmentField,
     };
     use crate::module_spec::{
         Arg, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
@@ -930,7 +1214,21 @@ mod tests {
         PayloadManifest::new(pinset, members, artifacts)
     }
 
+    /// Builds an artifact of `kind`, giving a container image the declaration
+    /// a current-format manifest requires of it and every other kind none.
     fn artifact(
+        archive_path: &str,
+        kind: ArtifactKind,
+        dispositions: &[Disposition],
+    ) -> PayloadArtifact {
+        PayloadArtifact {
+            image: (kind == ArtifactKind::ContainerImage).then(declaration),
+            ..bare_artifact(archive_path, kind, dispositions)
+        }
+    }
+
+    /// [`artifact`] with no image declaration whatever its kind.
+    fn bare_artifact(
         archive_path: &str,
         kind: ArtifactKind,
         dispositions: &[Disposition],
@@ -945,6 +1243,7 @@ mod tests {
             archive_path: archive_path.to_string(),
             sha256: "00".repeat(32),
             spec: None,
+            image: None,
         }
     }
 
@@ -960,6 +1259,39 @@ mod tests {
     /// A 64-hex image digest with its `sha256:` prefix stripped — the width a
     /// third-party container image carries.
     const IMAGE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A synthetic config digest.
+    const CONFIG_DIGEST: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    /// A valid image declaration for the `example` component.
+    fn declaration() -> ImageDeclaration {
+        ImageDeclaration {
+            schema: 1,
+            owner: ImageOwner {
+                namespace: "example-product".to_string(),
+                component: "example".to_string(),
+            },
+            dependency: "web".to_string(),
+            public_refs: vec!["ghcr.io/example/example:1.2.3".to_string()],
+            platform: ImagePlatform {
+                os: ImageOs::Linux,
+                architecture: ImageArchitecture::Amd64,
+                variant: None,
+            },
+            config_digest: CONFIG_DIGEST.to_string(),
+            reference_lifecycle: ReferenceLifecycle::SharedExternal,
+            provenance: ImageProvenance::ProductBuild(ProductBuildProvenance {
+                repository: "https://example.invalid/example.git".to_string(),
+                commit: GIT_COMMIT.to_string(),
+            }),
+        }
+    }
+
+    /// [`declaration`]'s wire JSON.
+    fn declaration_json() -> String {
+        serde_json::to_string(&declaration()).expect("a declaration serializes")
+    }
 
     /// Opaque stand-in for the signed trust-set generation container. This
     /// crate never looks inside it, so arbitrary bytes are a faithful fixture.
@@ -991,6 +1323,39 @@ mod tests {
         let entry = entry_json(archive_path, commit);
         let body = entry.strip_suffix('}').expect("an entry ends with a brace");
         format!(r#"{body},"spec":{spec}}}"#)
+    }
+
+    /// Splices `"key":value` into a wire artifact entry, as its last field.
+    fn with_key(entry: &str, key: &str, value: &str) -> String {
+        let body = entry.strip_suffix('}').expect("an entry ends with a brace");
+        format!(r#"{body},"{key}":{value}}}"#)
+    }
+
+    /// Rewrites a wire artifact entry's kind.
+    fn with_kind(entry: &str, kind: &str) -> String {
+        entry.replace(r#""kind":"native-binary""#, &format!(r#""kind":"{kind}""#))
+    }
+
+    /// Wire JSON for a manifest at `version` carrying `entries`, binding one
+    /// member per distinct `archive_path` named in them.
+    fn manifest_json_at(version: u32, entries: &[String]) -> String {
+        let artifacts = entries.join(",");
+        format!(r#"{{"format_version":{version},"archive_members":[],"artifacts":[{artifacts}]}}"#)
+    }
+
+    /// Reads `json` through both manifest doors — the footer-aware parse and
+    /// the derived `Deserialize` — and returns both refusals, asserting they
+    /// name the same fault.
+    fn refused_by_both_doors(json: &str) -> ManifestError {
+        let parsed = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("the parse must refuse this manifest");
+        let decoded = serde_json::from_str::<PayloadManifest>(json)
+            .expect_err("the serde door must be no laxer");
+        assert!(
+            decoded.to_string().contains(&parsed.to_string()),
+            "the doors disagree: parse {parsed}, serde {decoded}"
+        );
+        parsed
     }
 
     /// Wire JSON of a spec for the `c` component `entry_json` writes, carrying
@@ -1262,6 +1627,10 @@ mod tests {
         // closed the window fails the build rather than one test run.
         const _: () = assert!(MAX_MANIFEST_FORMAT_VERSION == MANIFEST_FORMAT_VERSION);
         const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < MANIFEST_FORMAT_VERSION);
+        // Image declarations begin inside the window and above its floor, so
+        // the window holds both legacy image formats and the declaring one.
+        const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < IMAGE_DECLARATION_FORMAT_VERSION);
+        const _: () = assert!(IMAGE_DECLARATION_FORMAT_VERSION <= MANIFEST_FORMAT_VERSION);
     }
 
     #[test]
@@ -1317,8 +1686,10 @@ mod tests {
     #[test]
     fn an_image_digest_width_commit_is_accepted_on_a_manifest_artifact() {
         // The validator covers both widths; this pins that the manifest-level
-        // check accepts the digest width too, so a third-party container image
-        // is expressible.
+        // check accepts the digest width too. A dependency image in a current
+        // component package carries the consumer build's git-width commit, but
+        // the outer identifier rule is not narrowed for it: the legacy digest
+        // width is still accepted on a declared image.
         let mut digest_artifact = artifact(
             "images/vendor.tar",
             ArtifactKind::ContainerImage,
@@ -1914,6 +2285,7 @@ mod tests {
 
     #[test]
     fn the_read_path_enforces_the_kind_conditional_unit_rule() {
+        // (`artifact` gives the container image the declaration it needs.)
         // A `native-binary` artifact declaring a spec with no unit.
         let no_unit = r#"{"registration":{"package_id":"c","service_name":"c","reload":{"sighup":{"process_path":"/opt/c"}}},"placement":"core-hosts"}"#;
         let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), no_unit);
@@ -2356,5 +2728,433 @@ mod tests {
         let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect("an explicit null format_version is the baseline shape");
         assert_eq!(manifest.format_version(), None);
+    }
+
+    /// The `image` values a key-presence refusal must not care about.
+    const ANY_IMAGE_VALUES: [&str; 4] = ["null", "{}", r#""scalar""#, "7"];
+
+    #[test]
+    fn the_writer_emits_a_declaration_on_an_image_and_no_key_elsewhere() {
+        let manifest = manifest_of(
+            None,
+            vec![
+                artifact(
+                    "bin/native",
+                    ArtifactKind::NativeBinary,
+                    &[Disposition::Install],
+                ),
+                artifact(
+                    "images/web.tar",
+                    ArtifactKind::ContainerImage,
+                    &[Disposition::Install],
+                ),
+            ],
+        )
+        .expect("a declared image is valid");
+        assert_eq!(
+            manifest.format_version(),
+            Some(IMAGE_DECLARATION_FORMAT_VERSION)
+        );
+        let document: serde_json::Value =
+            serde_json::to_value(&manifest).expect("serialization should succeed");
+        let artifacts = document["artifacts"].as_array().expect("an array");
+        assert!(artifacts[0].get("image").is_none(), "got: {document}");
+        assert_eq!(
+            artifacts[1]["image"],
+            serde_json::to_value(declaration()).expect("serializes")
+        );
+
+        // Both doors read it back unchanged.
+        let json = serde_json::to_string(&manifest).expect("serialization should succeed");
+        let parsed = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("the parse accepts what the writer wrote");
+        let decoded: PayloadManifest = serde_json::from_str(&json).expect("so does serde");
+        assert_eq!(parsed, manifest);
+        assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn a_current_image_artifact_without_a_declaration_is_refused_at_every_door() {
+        let image = with_kind(
+            &entry_json("images/web.tar", Some(GIT_COMMIT)),
+            "container-image",
+        );
+        for entry in [image.clone(), with_key(&image, "image", "null")] {
+            let error = refused_by_both_doors(&manifest_json_at(MANIFEST_FORMAT_VERSION, &[entry]));
+            assert!(
+                matches!(error, ManifestError::MissingImageDeclaration(ref path) if path == "images/web.tar"),
+                "got: {error:?}"
+            );
+        }
+
+        let error = manifest_of(
+            None,
+            vec![bare_artifact(
+                "images/web.tar",
+                ArtifactKind::ContainerImage,
+                &[Disposition::Install],
+            )],
+        )
+        .expect_err("the producer must declare its image");
+        assert!(
+            matches!(error, ManifestError::MissingImageDeclaration(_)),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_current_non_image_artifact_refuses_the_image_key_whatever_its_value() {
+        for kind in ["native-binary", "compose-bundle", "static-assets"] {
+            let entry = with_kind(&entry_json("bin/c", Some(GIT_COMMIT)), kind);
+            let mut values = ANY_IMAGE_VALUES.map(str::to_string).to_vec();
+            values.push(declaration_json());
+            for value in values {
+                let json = manifest_json_at(
+                    MANIFEST_FORMAT_VERSION,
+                    &[with_key(&entry, "image", &value)],
+                );
+                let error = refused_by_both_doors(&json);
+                assert!(
+                    matches!(
+                        error,
+                        ManifestError::ImageOnNonImageArtifact { ref archive_path, .. }
+                            if archive_path == "bin/c"
+                    ),
+                    "{kind} {value}: got {error:?}"
+                );
+            }
+            // The absent-key form is the one a current manifest writes.
+            PayloadManifest::parse(
+                manifest_json_at(MANIFEST_FORMAT_VERSION, &[entry]).as_bytes(),
+                LEGACY_UNVERSIONED_FOOTER_VERSION,
+            )
+            .expect("no key is the valid form");
+        }
+
+        let mut native = artifact("bin/c", ArtifactKind::NativeBinary, &[Disposition::Install]);
+        native.image = Some(declaration());
+        let error = manifest_of(None, vec![native]).expect_err("the producer path refuses it too");
+        assert!(
+            matches!(
+                error,
+                ManifestError::ImageOnNonImageArtifact {
+                    kind: ArtifactKind::NativeBinary,
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_manifest_refuses_the_image_key_whatever_its_value() {
+        for version in MIN_MANIFEST_FORMAT_VERSION..IMAGE_DECLARATION_FORMAT_VERSION {
+            for kind in ["container-image", "native-binary"] {
+                let entry = with_kind(&entry_json("bin/c", Some(GIT_COMMIT)), kind);
+                let mut values = ANY_IMAGE_VALUES.map(str::to_string).to_vec();
+                values.push(declaration_json());
+                for value in values {
+                    let json = manifest_json_at(version, &[with_key(&entry, "image", &value)]);
+                    let error = refused_by_both_doors(&json);
+                    assert!(
+                        matches!(
+                            error,
+                            ManifestError::ImageBeforeDeclarationFormat { ref archive_path, format_version }
+                                if archive_path == "bin/c" && format_version == version
+                        ),
+                        "v{version} {kind} {value}: got {error:?}"
+                    );
+                }
+                // Without the key a legacy image stays exactly as readable as
+                // before, and nothing is synthesized onto it.
+                let manifest = PayloadManifest::parse(
+                    manifest_json_at(version, &[entry]).as_bytes(),
+                    LEGACY_UNVERSIONED_FOOTER_VERSION,
+                )
+                .expect("a legacy artifact without the key still parses");
+                assert_eq!(manifest.artifacts()[0].image, None);
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelated_unknown_artifact_key_keeps_its_old_compatibility() {
+        for version in MIN_MANIFEST_FORMAT_VERSION..=MAX_MANIFEST_FORMAT_VERSION {
+            let mut entry = with_key(&entry_json("bin/c", Some(GIT_COMMIT)), "surprise", "null");
+            if version >= IMAGE_DECLARATION_FORMAT_VERSION {
+                entry = with_key(
+                    &with_kind(&entry, "container-image"),
+                    "image",
+                    &declaration_json(),
+                );
+            }
+            let json = manifest_json_at(version, &[entry]);
+            PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect("an unknown key is still ignored");
+            serde_json::from_str::<PayloadManifest>(&json).expect("at both doors");
+        }
+    }
+
+    #[test]
+    fn an_unversioned_baseline_refuses_the_image_key_at_the_artifact_loop() {
+        let entry = entry_json("bin/c", None);
+        // Absent: still the baseline shape.
+        let manifest = PayloadManifest::parse(
+            format!(r#"{{"artifacts":[{entry}]}}"#).as_bytes(),
+            LEGACY_UNVERSIONED_FOOTER_VERSION,
+        )
+        .expect("a baseline without the key still parses");
+        assert_eq!(manifest.artifacts()[0].image, None);
+
+        let mut values = ANY_IMAGE_VALUES.map(str::to_string).to_vec();
+        values.push(declaration_json());
+        for value in &values {
+            let json = format!(r#"{{"artifacts":[{}]}}"#, with_key(&entry, "image", value));
+            // The stage-1 predicate is unchanged: the key is not one of its
+            // terms, so the document passes the gate and the refusal comes
+            // from the per-artifact image check.
+            let document: serde_json::Value =
+                serde_json::from_str(&json).expect("document should decode");
+            assert!(is_pre_versioned_baseline(
+                LEGACY_UNVERSIONED_FOOTER_VERSION,
+                &document
+            ));
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("a baseline must not carry an image key");
+            assert!(
+                matches!(error, ManifestError::BaselineWithImage(ref path) if path == "bin/c"),
+                "{value}: got {error:?}"
+            );
+            // The serde door still refuses the missing version before any of
+            // this, and admits no baseline at all.
+            let error = serde_json::from_str::<PayloadManifest>(&json)
+                .expect_err("serde admits no baseline");
+            assert!(error.to_string().contains("format_version"), "got: {error}");
+        }
+
+        // An earlier baseline-gate failure keeps its verdict.
+        let with_commit = with_key(&entry_json("bin/c", Some(GIT_COMMIT)), "image", "null");
+        let error = PayloadManifest::parse(
+            format!(r#"{{"artifacts":[{with_commit}]}}"#).as_bytes(),
+            LEGACY_UNVERSIONED_FOOTER_VERSION,
+        )
+        .expect_err("a commit fails the gate first");
+        assert!(
+            matches!(error, ManifestError::BaselineWithCommit(_)),
+            "got: {error:?}"
+        );
+
+        // And the artifact loop's order holds: an earlier artifact's fault
+        // wins, a later one loses.
+        let empty = entry_json("bin/empty", None).replace(r#"["install"]"#, "[]");
+        let imaged = with_key(&entry_json("bin/c", None), "image", "null");
+        for (entries, expect_image) in [([&empty, &imaged], false), ([&imaged, &empty], true)] {
+            let json = format!(r#"{{"artifacts":[{},{}]}}"#, entries[0], entries[1]);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("two faults");
+            if expect_image {
+                assert!(
+                    matches!(error, ManifestError::BaselineWithImage(_)),
+                    "got: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, ManifestError::EmptyDispositions(_)),
+                    "got: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_malformed_current_declaration_is_refused_consistently_and_never_legacy() {
+        let image = with_kind(
+            &entry_json("images/web.tar", Some(GIT_COMMIT)),
+            "container-image",
+        );
+        let mut decoded: serde_json::Value =
+            serde_json::from_str(&declaration_json()).expect("decodes");
+
+        // Shape failures keep their serde cause.
+        let mut shapes = Vec::new();
+        let mut unknown = decoded.clone();
+        unknown["source_policy"] = serde_json::json!("reuse");
+        shapes.push(unknown);
+        let mut enum_value = decoded.clone();
+        enum_value["reference_lifecycle"] = serde_json::json!("owned");
+        shapes.push(enum_value);
+        let mut missing = decoded.clone();
+        missing["platform"]
+            .as_object_mut()
+            .expect("object")
+            .remove("variant");
+        shapes.push(missing);
+        shapes.push(serde_json::json!("scalar"));
+        for shape in shapes {
+            let json = manifest_json_at(
+                MANIFEST_FORMAT_VERSION,
+                &[with_key(&image, "image", &shape.to_string())],
+            );
+            let error = refused_by_both_doors(&json);
+            assert!(
+                matches!(error, ManifestError::ImageDecode { ref archive_path, .. } if archive_path == "images/web.tar"),
+                "{shape}: got {error:?}"
+            );
+        }
+
+        // Syntax failures name their rule.
+        decoded["owner"]["namespace"] = serde_json::json!("Example/Product");
+        let json = manifest_json_at(
+            MANIFEST_FORMAT_VERSION,
+            &[with_key(&image, "image", &decoded.to_string())],
+        );
+        let error = refused_by_both_doors(&json);
+        assert!(
+            matches!(
+                error,
+                ManifestError::InvalidImageDeclaration {
+                    source: ImageDeclarationError::InvalidSegment {
+                        field: SegmentField::Namespace,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+        let mut invalid = artifact(
+            "images/web.tar",
+            ArtifactKind::ContainerImage,
+            &[Disposition::Install],
+        );
+        if let Some(image) = invalid.image.as_mut() {
+            image.owner.namespace = "Example/Product".to_string();
+        }
+        let error = manifest_of(None, vec![invalid]).expect_err("the producer path agrees");
+        assert!(
+            matches!(error, ManifestError::InvalidImageDeclaration { .. }),
+            "got: {error:?}"
+        );
+
+        // A future schema is refused for its schema, whatever fields it has.
+        let future = r#"{"schema":2,"something":"else"}"#;
+        let json = manifest_json_at(
+            MANIFEST_FORMAT_VERSION,
+            &[with_key(&image, "image", future)],
+        );
+        let error = refused_by_both_doors(&json);
+        assert!(
+            matches!(
+                error,
+                ManifestError::InvalidImageDeclaration {
+                    source: ImageDeclarationError::UnsupportedSchema { found: 2 },
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_earlier_artifact_fault_wins_over_a_later_image_fault_and_vice_versa() {
+        let malformed = with_key(
+            &with_kind(
+                &entry_json("images/bad.tar", Some(GIT_COMMIT)),
+                "container-image",
+            ),
+            "image",
+            r#"{"schema":1}"#,
+        );
+        let unsafe_path = entry_json("../escape", Some(GIT_COMMIT));
+        let at = |entries: &[String]| manifest_json_at(MANIFEST_FORMAT_VERSION, entries);
+
+        let error = refused_by_both_doors(&at(&[unsafe_path.clone(), malformed.clone()]));
+        assert!(
+            matches!(error, ManifestError::UnsafeArchivePath(_)),
+            "got: {error:?}"
+        );
+        let error = refused_by_both_doors(&at(&[malformed.clone(), unsafe_path]));
+        assert!(
+            matches!(error, ManifestError::ImageDecode { .. }),
+            "got: {error:?}"
+        );
+
+        // Duplicates: the second occurrence of `p` is reported where it sits.
+        let first = entry_json("bin/p", Some(GIT_COMMIT));
+        let second = with_kind(&entry_json("bin/p", Some(GIT_COMMIT)), "static-assets");
+        let error = refused_by_both_doors(&at(&[first.clone(), second.clone(), malformed.clone()]));
+        assert!(
+            matches!(error, ManifestError::DuplicateArchivePath(ref p) if p == "bin/p"),
+            "got: {error:?}"
+        );
+        let error = refused_by_both_doors(&at(&[first.clone(), malformed.clone(), second]));
+        assert!(
+            matches!(error, ManifestError::ImageDecode { .. }),
+            "got: {error:?}"
+        );
+        // A second occurrence that also carries a malformed image: its path
+        // check runs first.
+        let second_malformed = malformed.replace("images/bad.tar", "bin/p");
+        let error = refused_by_both_doors(&at(&[first, second_malformed]));
+        assert!(
+            matches!(error, ManifestError::DuplicateArchivePath(_)),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_image_key_loses_to_an_earlier_fault_and_to_its_own_artifacts_checks() {
+        for version in MIN_MANIFEST_FORMAT_VERSION..IMAGE_DECLARATION_FORMAT_VERSION {
+            let at = |entries: &[String]| manifest_json_at(version, entries);
+            let keyed = with_key(&entry_json("bin/k", Some(GIT_COMMIT)), "image", "null");
+            let empty = entry_json("bin/e", Some(GIT_COMMIT)).replace(r#"["install"]"#, "[]");
+
+            let error = refused_by_both_doors(&at(&[empty.clone(), keyed.clone()]));
+            assert!(
+                matches!(error, ManifestError::EmptyDispositions(_)),
+                "v{version}: {error:?}"
+            );
+            let error = refused_by_both_doors(&at(&[keyed, empty]));
+            assert!(
+                matches!(error, ManifestError::ImageBeforeDeclarationFormat { .. }),
+                "v{version}: {error:?}"
+            );
+
+            // On the same artifact, every existing check comes first.
+            let bad_commit = with_key(&entry_json("bin/k", Some("abc1234")), "image", "{}");
+            let error = refused_by_both_doors(&at(&[bad_commit]));
+            assert!(
+                matches!(error, ManifestError::InvalidCommit { .. }),
+                "v{version}: {error:?}"
+            );
+            let bad_spec = with_key(
+                &entry_json_with_spec(
+                    "bin/k",
+                    Some(GIT_COMMIT),
+                    &spec_json(&unit_json(r#""exec_start":[]"#)),
+                ),
+                "image",
+                "null",
+            );
+            let error = refused_by_both_doors(&at(&[bad_spec]));
+            assert!(
+                matches!(error, ManifestError::InvalidSpec { .. }),
+                "v{version}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_future_format_is_refused_for_its_version_whatever_its_images_look_like() {
+        let found = MAX_MANIFEST_FORMAT_VERSION + 1;
+        let json = format!(
+            r#"{{"format_version":{found},"artifacts":[{{"image":"a future shape","kind":42}}]}}"#
+        );
+        let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect_err("a future format version must be rejected");
+        assert!(
+            matches!(error, ManifestError::UnsupportedManifestFormat { found: got, .. } if got == found),
+            "got: {error:?}"
+        );
     }
 }

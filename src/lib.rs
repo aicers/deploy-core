@@ -3,7 +3,9 @@
 //! `deploy-core` is the slim, component-agnostic core of the deploy stack: the
 //! transport and execution vocabulary, the on-host directory layout, the payload
 //! and manifest formats — one container whether it rides on a base executable or
-//! stands alone as a `.pkg` module package — the declarative per-module install
+//! stands alone as a `.pkg` module package — the typed declaration a container
+//! image artifact makes about its owner, references, platform and provenance,
+//! the declarative per-module install
 //! spec a package carries in its manifest with the systemd serialization rule its
 //! strings are held to, the generic renderer that turns such a spec into a systemd
 //! unit, the one package verifier both the control plane and the root daemon reach
@@ -38,6 +40,7 @@ pub mod executor;
 // mTLS adapter and the release-trust tree's — is in this crate, and each exports its
 // own entry point, so nothing outside needs to name the engine or its types.
 pub(crate) mod generation;
+pub mod image;
 pub mod layout;
 pub mod manifest;
 pub mod module_spec;
