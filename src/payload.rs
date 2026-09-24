@@ -88,6 +88,7 @@ use tempfile::Builder as TempBuilder;
 use zstd::{Decoder, Encoder};
 
 use crate::durability::sync_dir;
+use crate::image::ImageDeclaration;
 use crate::manifest::{
     ArchiveMember, ArtifactKind, Disposition, ManifestError, PayloadArtifact, PayloadManifest,
     TargetArch, is_safe_archive_path,
@@ -496,8 +497,12 @@ pub struct ArtifactInput {
     pub version: String,
     /// Immutable build identity of the artifact, stamped onto the manifest entry
     /// derived from this input: a full 40-hex git commit SHA for an artifact
-    /// built from a clone, or a 64-hex image digest with its `sha256:` prefix
-    /// stripped for a third-party container image.
+    /// built from a clone.
+    ///
+    /// Every artifact of a component package carries that component build's
+    /// commit, a dependency image included: the image's own origin goes in
+    /// [`ArtifactInput::image`]'s provenance, not here. The 64-hex image-digest
+    /// width stays accepted for its legacy use.
     ///
     /// Required on the producer side — absence is a read-side baseline state
     /// only — and validated by
@@ -520,6 +525,16 @@ pub struct ArtifactInput {
     /// [`validate`](crate::module_spec::validate) as the manifest is assembled,
     /// so a producer cannot write a spec a reader would refuse.
     pub spec: Option<ModuleSpec>,
+    /// The image declaration stamped verbatim onto the manifest entry derived
+    /// from this input.
+    ///
+    /// The writer stamps [`MANIFEST_FORMAT_VERSION`](crate::manifest::MANIFEST_FORMAT_VERSION),
+    /// at which a [`ArtifactKind::ContainerImage`] input requires one and every
+    /// other kind must carry `None`. A native, static-asset or compose-bundle
+    /// input — every input a producer wrote before this field existed — passes
+    /// `None`. The declaration is validated as the manifest is assembled, so a
+    /// producer cannot write one a reader would refuse.
+    pub image: Option<ImageDeclaration>,
     /// File holding the raw artifact bytes.
     pub source: PathBuf,
 }
@@ -1154,6 +1169,7 @@ where
             archive_path: input.archive_path.clone(),
             sha256,
             spec: input.spec.clone(),
+            image: input.image.clone(),
         });
     }
     // Taken off the member list itself, so the number the header states below
@@ -2365,6 +2381,10 @@ mod tests {
         open_current_exe, open_package, open_package_path, publish_dirs, read_base_executable,
         read_package_container, rewrap_trailer, sha256_hex, widen_envelope_blocks,
     };
+    use crate::image::{
+        ImageArchitecture, ImageDeclaration, ImageOs, ImageOwner, ImagePlatform, ImageProvenance,
+        ProductBuildProvenance, ReferenceLifecycle,
+    };
     use crate::manifest::{
         ArchiveMember, ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION,
         MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact,
@@ -2429,6 +2449,7 @@ mod tests {
             dispositions: dispositions(dispositions_values),
             archive_path: archive_path.to_string(),
             spec: None,
+            image: None,
             source,
         }
     }
@@ -2925,6 +2946,7 @@ mod tests {
             archive_path: archive_path.to_string(),
             sha256: sha256_hex(bytes),
             spec: None,
+            image: None,
         }
     }
 
@@ -6151,5 +6173,156 @@ mod tests {
                 dir.display()
             );
         }
+    }
+
+    /// A valid declaration for an `example` image input.
+    fn image_declaration() -> ImageDeclaration {
+        ImageDeclaration {
+            schema: 1,
+            owner: ImageOwner {
+                namespace: "example-product".to_string(),
+                component: "example".to_string(),
+            },
+            dependency: "web".to_string(),
+            public_refs: vec!["ghcr.io/example/example:1.0.0".to_string()],
+            platform: ImagePlatform {
+                os: ImageOs::Linux,
+                architecture: ImageArchitecture::Amd64,
+                variant: None,
+            },
+            config_digest: format!("sha256:{}", "c".repeat(64)),
+            reference_lifecycle: ReferenceLifecycle::SharedExternal,
+            provenance: ImageProvenance::ProductBuild(ProductBuildProvenance {
+                repository: "example".to_string(),
+                commit: COMMIT.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_writer_carries_an_inputs_image_declaration_onto_its_manifest_entry() {
+        let src = tempfile::tempdir().expect("source tempdir");
+        let mut image = input(
+            src.path(),
+            "web.src",
+            "images/web.tar",
+            b"image",
+            &[Disposition::Install],
+        );
+        image.kind = ArtifactKind::ContainerImage;
+        image.image = Some(image_declaration());
+        let native = input(
+            src.path(),
+            "app.src",
+            "bin/app",
+            b"app",
+            &[Disposition::Install],
+        );
+
+        let binary = build_binary(&[native.clone(), image.clone()]);
+        let payload = open(Cursor::new(binary))
+            .expect("reader should succeed")
+            .expect("trailer should be present");
+        let artifacts = payload.manifest().artifacts();
+        assert_eq!(artifacts[0].image, None);
+        assert_eq!(artifacts[1].image, Some(image_declaration()));
+
+        // An image input with no declaration, or a native one with one, is
+        // refused before a byte is written.
+        let mut undeclared = image.clone();
+        undeclared.image = None;
+        let mut declared_native = native;
+        declared_native.image = Some(image_declaration());
+        for (inputs, expect_missing) in [(vec![undeclared], true), (vec![declared_native], false)] {
+            let mut out = Vec::new();
+            let error = append_trailer(Cursor::new(BASE), &mut out, None, None, &inputs)
+                .expect_err("the writer must refuse the input");
+            assert!(out.is_empty(), "nothing is written for a refused manifest");
+            if expect_missing {
+                assert!(
+                    matches!(
+                        error,
+                        PayloadError::InvalidManifest(ManifestError::MissingImageDeclaration(_))
+                    ),
+                    "got: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error,
+                        PayloadError::InvalidManifest(
+                            ManifestError::ImageOnNonImageArtifact { .. }
+                        )
+                    ),
+                    "got: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_baseline_payload_refuses_an_image_key_through_open() {
+        let roxyd = b"roxyd binary bytes";
+        let archive = zstd_tar(&[Member::File {
+            path: "bin/roxyd",
+            bytes: roxyd,
+        }]);
+        let baseline = baseline_manifest_json(&[("bin/roxyd", roxyd)]);
+        for value in ["null", "{}", "\"scalar\""] {
+            let text = String::from_utf8(baseline.clone()).expect("utf-8");
+            let json = text
+                .replacen(
+                    r#""component":"example""#,
+                    &format!(r#""image":{value},"component":"example""#),
+                    1,
+                )
+                .into_bytes();
+            let footer = footer_at_version(LEGACY_VERSION, BASE.len(), &json, &archive);
+            let binary = assemble(BASE, &json, &archive, &footer);
+            let error = open(Cursor::new(binary)).expect_err("the image key must be refused");
+            assert!(
+                matches!(
+                    error,
+                    PayloadError::InvalidManifest(ManifestError::BaselineWithImage(ref path))
+                        if path == "bin/roxyd"
+                ),
+                "{value}: got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrap_copies_a_legacy_image_manifest_without_upgrading_it() {
+        // A format-5 manifest carrying an image artifact with no declaration:
+        // the rewrap is a byte copy, so it neither gains a declaration nor
+        // moves to the current format.
+        let bytes = b"legacy image bytes";
+        let json = format!(
+            r#"{{"format_version":5,"archive_members":[{{"name":"images/web.tar","length":{}}}],"artifacts":[{{"component":"example","version":"1.0.0","commit":"{COMMIT}","target_arch":"x86_64","kind":"container-image","dispositions":["install"],"archive_path":"images/web.tar","sha256":"{}"}}]}}"#,
+            bytes.len(),
+            sha256_hex(bytes)
+        )
+        .into_bytes();
+        let archive = zstd_tar(&[Member::File {
+            path: "images/web.tar",
+            bytes,
+        }]);
+        let footer = valid_footer(BASE.len(), &json, &archive);
+        let asset = assemble(BASE, &json, &archive, &footer);
+
+        let mut rewrapped = Vec::new();
+        rewrap_trailer(
+            Cursor::new(&asset),
+            Cursor::new(b"another base".as_slice()),
+            &mut rewrapped,
+        )
+        .expect("rewrap should succeed");
+        let (_, block, _) = trailer_parts(&rewrapped);
+        assert_eq!(block, json.as_slice());
+        let payload = open(Cursor::new(rewrapped))
+            .expect("reader should succeed")
+            .expect("trailer should be present");
+        assert_eq!(payload.manifest().format_version(), Some(5));
+        assert_eq!(payload.manifest().artifacts()[0].image, None);
     }
 }

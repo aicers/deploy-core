@@ -27,6 +27,7 @@ fn a_consumer_can_read_bounded_metadata_without_a_trust_set() {
         dispositions: BTreeSet::from([Disposition::Install]),
         archive_path: "fixture".to_string(),
         spec: None,
+        image: None,
         source,
     }];
     let signature = vec![
@@ -81,6 +82,7 @@ fn a_consumer_can_parse_an_unsigned_bounded_manifest() {
         dispositions: BTreeSet::from([Disposition::Install]),
         archive_path: "fixture".to_string(),
         spec: None,
+        image: None,
         source,
     }];
     let mut package = Vec::new();
@@ -118,6 +120,7 @@ fn a_consumer_can_write_the_widened_fixture_sparsely() {
         dispositions: BTreeSet::from([Disposition::Install]),
         archive_path: "fixture".to_string(),
         spec: None,
+        image: None,
         source,
     }];
     let mut package = Vec::new();
