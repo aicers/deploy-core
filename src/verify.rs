@@ -2290,6 +2290,77 @@ mod tests {
     }
 
     #[test]
+    fn an_unsigned_baseline_is_bad_signature_whatever_its_image_key() {
+        // Genuine pre-versioned baseline manifests: no `format_version`, no
+        // `archive_members`, no `trust_set`, and no artifact `commit` or `spec`.
+        // Each variant differs from the valid one only by the `image` key the
+        // baseline forbids, so a verifier that parsed before authenticating
+        // would report that key rather than the missing signature.
+        let baseline_artifact = |image: Option<&str>| {
+            let image = image.map_or_else(String::new, |value| format!(r#""image":{value},"#));
+            format!(
+                r#"{{{image}"component":"{COMPONENT}","version":"{VERSION}","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"{MEMBER}","sha256":"{ARTIFACT_SHA256}"}}"#
+            )
+        };
+        let cases: [(&str, Option<&str>); 4] = [
+            ("no image key", None),
+            ("a null image", Some("null")),
+            ("an object image", Some(r#"{"reference":"example"}"#)),
+            ("a scalar image", Some(r#""scalar""#)),
+        ];
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let archive = default_archive();
+
+        for (label, image) in cases {
+            let manifest =
+                format!(r#"{{"artifacts":[{}]}}"#, baseline_artifact(image)).into_bytes();
+            let package = assemble(1, &manifest, &archive, None, None);
+
+            // The fixture is what it claims to be: a footer-v1 container with
+            // no envelope blocks, whose manifest parses as a baseline when the
+            // image key is absent and is refused for that key alone otherwise.
+            let container =
+                payload::read_package_container(Cursor::new(package.clone()), &ENVELOPE_BOUNDS)
+                    .expect("the fixture container reads");
+            assert_eq!(container.footer_version(), 1, "{label}");
+            assert!(
+                matches!(container.signature(), EnvelopeBlock::Absent),
+                "{label}"
+            );
+            assert!(
+                matches!(container.key_id(), EnvelopeBlock::Absent),
+                "{label}"
+            );
+            let parsed = container.parse_unverified_manifest();
+            if image.is_none() {
+                let baseline = parsed.expect("the absent-image baseline parses");
+                assert_eq!(baseline.format_version(), None, "{label}");
+                assert_eq!(baseline.artifacts().len(), 1, "{label}");
+            } else {
+                assert!(
+                    matches!(
+                        parsed,
+                        Err(PayloadError::InvalidManifest(ManifestError::BaselineWithImage(ref path)))
+                            if path == MEMBER
+                    ),
+                    "{label}: the parse alone should refuse the image key, got {parsed:?}"
+                );
+            }
+
+            let error = refusal(&package, &trust);
+            assert!(
+                matches!(error, VerifyError::BadSignature),
+                "{label}: got {error:?}"
+            );
+            assert!(
+                !matches!(error, VerifyError::Payload(_)),
+                "{label}: the signature verdict must precede every manifest fault"
+            );
+        }
+    }
+
+    #[test]
     fn no_mutation_of_the_key_id_hint_turns_accept_into_reject() {
         let signer = keypair();
         let revoked = keypair();
