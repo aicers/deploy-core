@@ -8,6 +8,35 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Container image declarations and namespace-scoped package verification. A
+  producer now stamps manifest format version 6, at which every
+  `container-image` artifact carries a typed `image::ImageDeclaration` in
+  `PayloadArtifact::image` (supplied through `payload::ArtifactInput::image`):
+  its owning namespace and component, its dependency name, the explicit
+  `name:tag` references it is restored under, its one Linux platform, its
+  config digest, whether its references are `managed_runtime` or
+  `shared_external`, and a `registry` or `product_build` provenance. Every
+  manifest read door checks the declaration's shape and Docker reference
+  syntax, and refuses an `image` key on any other artifact kind and on any
+  format 3–5 or unversioned manifest, `null` included, so a legacy image is
+  never read as declaring anything. `image::canonical_runtime_alias` and
+  `ImageDeclaration::normalized_third_party` build the
+  `runtime.invalid/<namespace>/<component>/<dependency>:cfg-<config hex>`
+  alias a newly normalized third-party image is published under.
+  `verify::VerifyRequest::for_namespaced_package` scopes a request to the
+  caller's own namespace; a package declaring images verifies only under it,
+  and a declaration that disagrees with its artifact's architecture, misuses
+  the reserved alias registry, conflicts with another declaration's reference,
+  or names another namespace or component is refused under the new
+  `verify::VerifyError::Image` arm. `VerifiedPackage::image_references`
+  reports whether a verified package carries no images, declared ones — with
+  the union of their references — or legacy undeclared ones; it describes
+  signed statements and checks no image bytes. Existing consumers migrate by
+  adding `image: None` to `PayloadArtifact` and `ArtifactInput` literals for
+  every non-image artifact, a declaration for every new image input, and an
+  arm for `VerifyError::Image` and the new `ManifestError` variants to
+  exhaustive matches. This build still reads formats 3–5, while a build
+  predating it refuses a format-6 package for its version alone.
 - `roxyd_selfupdate_contract`, the frozen on-disk contract the roxyd self-update
   rollback supervisor coordinates through: the record directory, the file names,
   the canonical roxyd binary path, the decision subcommand and its three

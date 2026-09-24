@@ -205,6 +205,7 @@ fn manifest_json(
             // container layer checks this one on extraction.
             sha256: member_digest(member),
             spec: None,
+            image: None,
         }],
     )
     .expect("the envelope contract builds a manifest");

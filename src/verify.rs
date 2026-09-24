@@ -32,11 +32,34 @@
 //! 7. **withdrawal** — every distinct manifest triple against the withdrawn
 //!    list;
 //! 8. **target** — every artifact entry against the request;
-//! 9. **epoch** — for the reserved [`TRUST_TARGET`] only.
+//! 9. **epoch** — for the reserved [`TRUST_TARGET`] only;
+//! 10. **declared platform** — each image declaration's architecture against
+//!     its artifact's `target_arch`;
+//! 11. **reserved aliases** — every reference under
+//!     [`RUNTIME_ALIAS_REGISTRY`] against the canonical alias its own
+//!     declaration determines, and its lifecycle;
+//! 12. **reference conflicts** — one normalized reference assigned to
+//!     different images across declarations;
+//! 13. **namespace present** — a request carrying a namespace whenever the
+//!     manifest declares images;
+//! 14. **namespace** — each declaration's `owner.namespace` against it;
+//! 15. **owner component** — each declaration's `owner.component` against the
+//!     requested target.
 //!
 //! Steps 5 through 9 decide about the package first and about the request last:
 //! a package that is malformed, withdrawn, or built from an unsafe identifier
 //! is reported as such whatever was asked for.
+//!
+//! Steps 10 through 15 are the image declaration semantics, reported under
+//! [`VerifyError::Image`]. Each is a pass over the whole manifest, finished
+//! before the next begins, so the order of the artifacts cannot move one
+//! category behind another; within a pass, artifacts are visited in manifest
+//! order and references in declaration order. Only a manifest at
+//! [`IMAGE_DECLARATION_FORMAT_VERSION`](crate::manifest::IMAGE_DECLARATION_FORMAT_VERSION)
+//! or later carries declarations, so a legacy manifest passes all six
+//! untouched. The syntax of a declaration is not among them: that is decided
+//! by the typed parse in step 4, and a malformed declaration arrives as
+//! [`VerifyError::Payload`] carrying [`PayloadError::InvalidManifest`].
 //!
 //! # What it reads before it has authenticated anything
 //!
@@ -55,7 +78,10 @@
 //!
 //! # What it does not do
 //!
-//! It never walks the archive block and never hashes an artifact. It can decide
+//! It never walks the archive block and never hashes an artifact, and it opens no
+//! image: an accepted image declaration is an authenticated *statement* about
+//! an archive member, not evidence that the member's bytes agree with it. It can
+//! decide
 //! completeness without doing either because the manifest binds
 //! `archive_members`, so the enumeration of what the archive holds is a
 //! statement *inside the signed bytes*. Comparing that statement against what
@@ -69,15 +95,19 @@
 //! names no product: the trust set and the request are values a caller builds
 //! from whatever it has already read.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::path::Path;
 
 use ring::signature::{ED25519, UnparsedPublicKey};
 
+use crate::image::{
+    ImageArchitecture, ImageDeclaration, NormalizedReference, RUNTIME_ALIAS_REGISTRY,
+    ReferenceLifecycle, is_valid_segment, parse_tagged_reference,
+};
 use crate::manifest::{
     self, ArtifactKind, MAX_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact,
-    PayloadManifest, is_safe_archive_path,
+    PayloadManifest, TargetArch, is_safe_archive_path,
 };
 use crate::payload::{
     self, EnvelopeBlock, EnvelopeBounds, ExtractedArtifact, Payload, PayloadError,
@@ -234,6 +264,14 @@ pub enum InputError {
         "`{TRUST_TARGET}` is reserved; build a trust-target request with `VerifyRequest::for_trust`"
     )]
     ReservedTarget,
+
+    /// A namespace-scoped request named a namespace that is not a valid
+    /// identifier segment (see [`is_valid_segment`]).
+    #[error("namespace `{namespace}` is not a valid identifier segment")]
+    InvalidNamespace {
+        /// The refused namespace.
+        namespace: String,
+    },
 }
 
 /// One trusted release-signing key, with the revocation flag the trust set was
@@ -365,18 +403,22 @@ impl TrustSet {
 /// The build a caller is asking for, as a plain injected value.
 ///
 /// Every constructor either names the reserved [`TRUST_TARGET`] itself or
-/// refuses it, and only one of them carries an `epoch` — the two exported forms
-/// are [`VerifyRequest::for_package`] and [`VerifyRequest::for_trust`], and the
-/// crate-internal `for_trust_self_admission` joins them. That is what makes an
-/// `epoch` on a non-[`TRUST_TARGET`] target **unrepresentable** rather than
-/// refused at runtime: there is no state in which one accompanies another
-/// target, because the pairing is decided by which constructor was called.
+/// refuses it, and only one of them carries an `epoch` — the exported forms are
+/// [`VerifyRequest::for_package`], [`VerifyRequest::for_namespaced_package`] and
+/// [`VerifyRequest::for_trust`], and the crate-internal
+/// `for_trust_self_admission` joins them. That is what makes an `epoch` on a
+/// non-[`TRUST_TARGET`] target **unrepresentable** rather than refused at
+/// runtime: there is no state in which one accompanies another target, because
+/// the pairing is decided by which constructor was called. A namespace is
+/// paired the same way: only [`VerifyRequest::for_namespaced_package`] carries
+/// one, and it refuses the reserved target.
 #[derive(Debug, Clone)]
 pub struct VerifyRequest {
     target: String,
     version: String,
     commit: String,
     epoch: Option<u64>,
+    namespace: Option<String>,
 }
 
 impl VerifyRequest {
@@ -400,7 +442,46 @@ impl VerifyRequest {
             version: version.to_string(),
             commit: commit.to_string(),
             epoch: None,
+            namespace: None,
         })
+    }
+
+    /// Creates a request for an ordinary package deployed in `namespace`: the
+    /// form a package declaring container images must be verified under.
+    ///
+    /// `namespace` is the caller's own trusted ownership configuration — the
+    /// namespace its product or deployment is installed under — and never a
+    /// value read off the package being verified. Every image declaration's
+    /// `owner.namespace` must equal it verbatim, with no prefix stripped and no
+    /// normalization, and its `owner.component` must equal `target`.
+    ///
+    /// Everything [`VerifyRequest::for_package`] enforces still holds: every
+    /// artifact entry, a dependency image included, must match `target`,
+    /// `version` and `commit` exactly. A package declaring no images verifies
+    /// exactly as it would under [`VerifyRequest::for_package`], and so does a
+    /// legacy package whose images carry no declaration; neither acquires one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError::ReservedTarget`] when `target` is
+    /// [`TRUST_TARGET`], whose epoch contract only
+    /// [`VerifyRequest::for_trust`] carries, and
+    /// [`InputError::InvalidNamespace`] when `namespace` is not a valid
+    /// identifier segment. It never panics.
+    pub fn for_namespaced_package(
+        target: &str,
+        version: &str,
+        commit: &str,
+        namespace: &str,
+    ) -> Result<Self, InputError> {
+        let mut request = Self::for_package(target, version, commit)?;
+        if !is_valid_segment(namespace) {
+            return Err(InputError::InvalidNamespace {
+                namespace: namespace.to_string(),
+            });
+        }
+        request.namespace = Some(namespace.to_string());
+        Ok(request)
     }
 
     /// Creates a request for the reserved [`TRUST_TARGET`], supplying the
@@ -417,6 +498,7 @@ impl VerifyRequest {
             version: version.to_string(),
             commit: commit.to_string(),
             epoch: Some(epoch),
+            namespace: None,
         })
     }
 
@@ -522,6 +604,7 @@ impl VerifyRequest {
             version: version.to_string(),
             commit: commit.to_string(),
             epoch: None,
+            namespace: None,
         })
     }
 
@@ -542,13 +625,24 @@ impl VerifyRequest {
     pub fn commit(&self) -> &str {
         &self.commit
     }
+
+    /// Returns the namespace this request is scoped to, or `None` for a
+    /// request built by any constructor but
+    /// [`VerifyRequest::for_namespaced_package`].
+    #[must_use]
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
 }
 
 /// Errors describing **the package being verified**.
 ///
-/// The top level is exactly fourteen variants and downstream repositories match
+/// The top level is exactly fifteen variants and downstream repositories match
 /// on them, so neither the set nor the spelling is this crate's to change. What
-/// each one carries is.
+/// each one carries is. The fifteenth, [`VerifyError::Image`], was added for the
+/// image declaration semantics; a downstream exhaustive match gains one arm for
+/// it, and every later image condition extends [`ImageVerifyError`] rather than
+/// this set.
 ///
 /// Container-layer conditions are not lifted here: they stay inside
 /// [`PayloadError`] and reach a caller through [`VerifyError::Payload`], matched
@@ -721,6 +815,159 @@ pub enum VerifyError {
     /// [`VerifyError::ManifestHashMismatch`].
     #[error(transparent)]
     Payload(PayloadError),
+
+    /// An image declaration the package makes disagrees with its artifact,
+    /// with another declaration, or with the request.
+    ///
+    /// Only the semantic checks that follow the target and epoch — steps 10
+    /// through 15 of the order this module states — arrive here. A declaration
+    /// whose shape or syntax is invalid is refused by the typed parse and
+    /// arrives as [`VerifyError::Payload`] carrying
+    /// [`PayloadError::InvalidManifest`].
+    #[error(transparent)]
+    Image(ImageVerifyError),
+}
+
+/// Image declaration semantics a package violates, reported as
+/// [`VerifyError::Image`].
+///
+/// This is the extension point for later image checks, so a caller matching
+/// [`VerifyError`] exhaustively names image conditions through one arm.
+#[derive(Debug, thiserror::Error)]
+pub enum ImageVerifyError {
+    /// A declaration's architecture is not the one its artifact's
+    /// `target_arch` maps to.
+    #[error(
+        "image artifact `{archive_path}` is built for {target_arch:?} yet declares architecture {declared}"
+    )]
+    PlatformMismatch {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The artifact's architecture.
+        target_arch: TargetArch,
+        /// The architecture its declaration names.
+        declared: ImageArchitecture,
+    },
+
+    /// A reference under [`RUNTIME_ALIAS_REGISTRY`] is not exactly the
+    /// canonical alias its own declaration's owner, dependency and config
+    /// digest determine.
+    #[error("{}", describe_reserved_reference(.archive_path, .reference, .expected.as_deref()))]
+    NonCanonicalReservedReference {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The refused reference, as signed.
+        reference: String,
+        /// The alias the declaration determines, or `None` when its segments
+        /// cannot form a valid alias at all.
+        expected: Option<String>,
+    },
+
+    /// A canonical reference under [`RUNTIME_ALIAS_REGISTRY`] is declared
+    /// with a lifecycle other than [`ReferenceLifecycle::ManagedRuntime`].
+    #[error(
+        "reserved reference `{reference}` of image artifact `{archive_path}` is not managed_runtime"
+    )]
+    ReservedReferenceLifecycle {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The reference.
+        reference: String,
+    },
+
+    /// Two declarations assign one normalized reference to images that
+    /// differ in config digest, platform, owner or lifecycle.
+    #[error(
+        "reference `{reference}` of image artifact `{archive_path}` conflicts in {conflict} with `{first_reference}` of `{first_archive_path}`"
+    )]
+    ConflictingReference {
+        /// `archive_path` of the later artifact.
+        archive_path: String,
+        /// The later reference, as signed.
+        reference: String,
+        /// `archive_path` of the artifact that assigned it first.
+        first_archive_path: String,
+        /// The first assignment's reference, as signed.
+        first_reference: String,
+        /// The first facet, in that order, in which the two differ.
+        conflict: ReferenceConflict,
+    },
+
+    /// The manifest declares images and the request carries no namespace to
+    /// check their owner against.
+    #[error(
+        "image artifact `{archive_path}` declares an owner, and the request carries no namespace"
+    )]
+    MissingNamespace {
+        /// `archive_path` of the first declaring artifact.
+        archive_path: String,
+    },
+
+    /// A declaration's `owner.namespace` is not verbatim the request's.
+    #[error(
+        "image artifact `{archive_path}` is owned by namespace `{declared}`, not the requested `{expected}`"
+    )]
+    NamespaceMismatch {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The request's namespace.
+        expected: String,
+        /// The declared namespace.
+        declared: String,
+    },
+
+    /// A declaration's `owner.component` is not the requested target.
+    #[error(
+        "image artifact `{archive_path}` is owned by component `{declared}`, not the requested `{expected}`"
+    )]
+    OwnerComponentMismatch {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The requested target.
+        expected: String,
+        /// The declared owner component.
+        declared: String,
+    },
+}
+
+/// Which facet of two assignments of one reference differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceConflict {
+    /// `config_digest`, the image identity.
+    ConfigDigest,
+    /// `platform`, its variant included.
+    Platform,
+    /// `owner`.
+    Owner,
+    /// `reference_lifecycle`.
+    Lifecycle,
+}
+
+impl std::fmt::Display for ReferenceConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ConfigDigest => "config digest",
+            Self::Platform => "platform",
+            Self::Owner => "owner",
+            Self::Lifecycle => "lifecycle",
+        })
+    }
+}
+
+/// Renders [`ImageVerifyError::NonCanonicalReservedReference`]'s message.
+fn describe_reserved_reference(
+    archive_path: &str,
+    reference: &str,
+    expected: Option<&str>,
+) -> String {
+    match expected {
+        Some(expected) => format!(
+            "reserved reference `{reference}` of image artifact `{archive_path}` is not its canonical alias `{expected}`"
+        ),
+        None => format!(
+            "reserved reference `{reference}` of image artifact `{archive_path}` has no valid canonical alias to match"
+        ),
+    }
 }
 
 /// Renders [`VerifyError::MissingRequiredMember`]'s message for both cases it
@@ -791,6 +1038,29 @@ impl<R: Read + Seek> VerifiedPackage<R> {
         self.payload.manifest()
     }
 
+    /// Returns what the verified manifest states about its image references.
+    ///
+    /// This describes authenticated statements and nothing more. No archive
+    /// member has been extracted, hashed or opened as an image, so a
+    /// [`ImageReferences::Declared`] result says what the signer declared and
+    /// the request agreed with — not that the archive holds such an image.
+    #[must_use]
+    pub fn image_references(&self) -> ImageReferences<'_> {
+        let images: Vec<&PayloadArtifact> = self
+            .manifest()
+            .artifacts()
+            .iter()
+            .filter(|artifact| artifact.kind == ArtifactKind::ContainerImage)
+            .collect();
+        if images.is_empty() {
+            ImageReferences::NoImages
+        } else if images.iter().all(|artifact| artifact.image.is_some()) {
+            ImageReferences::Declared(DeclaredImageReferences { artifacts: images })
+        } else {
+            ImageReferences::LegacyUndeclared
+        }
+    }
+
     /// Extracts every artifact into `dest`, under this taxonomy's names.
     ///
     /// The walk itself is the container layer's own
@@ -813,6 +1083,53 @@ impl<R: Read + Seek> VerifiedPackage<R> {
     }
 }
 
+/// What a verified package states about its container image references.
+#[derive(Debug, Clone)]
+pub enum ImageReferences<'a> {
+    /// The package carries no container image artifact.
+    NoImages,
+    /// Every container image artifact carries an image declaration, and the
+    /// declarations passed the namespace-scoped checks.
+    Declared(DeclaredImageReferences<'a>),
+    /// The package is a legacy manifest carrying container images that
+    /// declare nothing. Their references are unknown — not empty.
+    LegacyUndeclared,
+}
+
+/// The image declarations of a verified package, and the union of their
+/// references.
+#[derive(Debug, Clone)]
+pub struct DeclaredImageReferences<'a> {
+    artifacts: Vec<&'a PayloadArtifact>,
+}
+
+impl<'a> DeclaredImageReferences<'a> {
+    /// Returns each container image artifact with its declaration, in manifest
+    /// order.
+    pub fn declarations(
+        &self,
+    ) -> impl Iterator<Item = (&'a PayloadArtifact, &'a ImageDeclaration)> {
+        self.artifacts
+            .iter()
+            .filter_map(|artifact| artifact.image.as_ref().map(|image| (*artifact, image)))
+    }
+
+    /// Returns the union of every declaration's references: the signed
+    /// literal strings, sorted and deduplicated as strings.
+    ///
+    /// Two spellings of one normalized reference both appear, because each is
+    /// a literal some declaration signed; conflicts between them were decided
+    /// on the normalized form during verification.
+    #[must_use]
+    pub fn references(&self) -> Vec<&'a str> {
+        let union: BTreeSet<&'a str> = self
+            .declarations()
+            .flat_map(|(_, image)| image.public_refs.iter().map(String::as_str))
+            .collect();
+        union.into_iter().collect()
+    }
+}
+
 /// Verifies the package in `src` against `trust` and `request`, returning it as
 /// a [`VerifiedPackage`].
 ///
@@ -832,9 +1149,12 @@ impl<R: Read + Seek> VerifiedPackage<R> {
 /// [`VerifyError::MissingRequiredMember`] for an incomplete manifest;
 /// [`VerifyError::UnsafeBuildIdentifier`], [`VerifyError::WithdrawnBuild`],
 /// [`VerifyError::TargetMismatch`] or [`VerifyError::StaleTrustSet`] for the
-/// checks that follow; and [`VerifyError::Payload`] for a container-layer
-/// condition, including [`PayloadError::NoTrailer`] when `src` carries no
-/// container at all.
+/// checks that follow; [`VerifyError::Image`] for an image declaration that
+/// disagrees with its artifact, another declaration, or the request; and
+/// [`VerifyError::Payload`] for a container-layer condition, including
+/// [`PayloadError::NoTrailer`] when `src` carries no container at all, and for
+/// a manifest that fails its typed parse, a malformed image declaration
+/// included.
 pub fn verify_package<R: Read + Seek>(
     src: R,
     trust: &TrustSet,
@@ -869,6 +1189,9 @@ pub fn verify_package<R: Read + Seek>(
     check_withdrawal(&manifest, trust)?;
     check_target(&manifest, request)?;
     check_epoch(request, trust)?;
+
+    // 10-15. The image declaration semantics, each a whole-manifest pass.
+    check_images(&manifest, request).map_err(VerifyError::Image)?;
 
     Ok(VerifiedPackage {
         payload: container.into_payload(manifest),
@@ -1181,6 +1504,170 @@ fn check_epoch(request: &VerifyRequest, trust: &TrustSet) -> Result<(), VerifyEr
     }
 }
 
+/// Returns every artifact that carries an image declaration, with it, in
+/// manifest order.
+fn declared_images(
+    manifest: &PayloadManifest,
+) -> impl Iterator<Item = (&PayloadArtifact, &ImageDeclaration)> {
+    manifest
+        .artifacts()
+        .iter()
+        .filter_map(|artifact| artifact.image.as_ref().map(|image| (artifact, image)))
+}
+
+/// Runs steps 10 through 15, each over the whole manifest before the next.
+fn check_images(
+    manifest: &PayloadManifest,
+    request: &VerifyRequest,
+) -> Result<(), ImageVerifyError> {
+    check_declared_platforms(manifest)?;
+    check_reserved_aliases(manifest)?;
+    check_reference_conflicts(manifest)?;
+    check_owners(manifest, request)
+}
+
+/// Step 10: each declared architecture against its artifact's `target_arch`.
+fn check_declared_platforms(manifest: &PayloadManifest) -> Result<(), ImageVerifyError> {
+    for (artifact, image) in declared_images(manifest) {
+        if image.platform.architecture != ImageArchitecture::for_target(artifact.target_arch) {
+            return Err(ImageVerifyError::PlatformMismatch {
+                archive_path: artifact.archive_path.clone(),
+                target_arch: artifact.target_arch,
+                declared: image.platform.architecture,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Returns a declaration's reference in normalized form.
+///
+/// The typed parse already refused every reference that does not parse, so a
+/// failure here is a manifest that did not come through it; it is skipped
+/// rather than trusted, since every door that yields a manifest runs that
+/// parse.
+fn normalized(reference: &str) -> Option<NormalizedReference> {
+    parse_tagged_reference(reference).ok()
+}
+
+/// Step 11: every reference whose registry host is [`RUNTIME_ALIAS_REGISTRY`]
+/// — compared case-insensitively, whatever its port — must be literally the
+/// canonical alias of its own declaration, under a managed lifecycle.
+fn check_reserved_aliases(manifest: &PayloadManifest) -> Result<(), ImageVerifyError> {
+    for (artifact, image) in declared_images(manifest) {
+        for reference in &image.public_refs {
+            let Some(parsed) = normalized(reference) else {
+                continue;
+            };
+            if !parsed.host().eq_ignore_ascii_case(RUNTIME_ALIAS_REGISTRY) {
+                continue;
+            }
+            let expected = image.canonical_runtime_alias().ok();
+            if expected.as_deref() != Some(reference.as_str()) {
+                return Err(ImageVerifyError::NonCanonicalReservedReference {
+                    archive_path: artifact.archive_path.clone(),
+                    reference: reference.clone(),
+                    expected,
+                });
+            }
+            if image.reference_lifecycle != ReferenceLifecycle::ManagedRuntime {
+                return Err(ImageVerifyError::ReservedReferenceLifecycle {
+                    archive_path: artifact.archive_path.clone(),
+                    reference: reference.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns the first facet, in [`ReferenceConflict`] order, in which two
+/// declarations assigning one reference differ. Dependency and provenance are
+/// not facets: two declarations of one image may differ in both.
+fn conflict_between(
+    first: &ImageDeclaration,
+    later: &ImageDeclaration,
+) -> Option<ReferenceConflict> {
+    if first.config_digest != later.config_digest {
+        Some(ReferenceConflict::ConfigDigest)
+    } else if first.platform != later.platform {
+        Some(ReferenceConflict::Platform)
+    } else if first.owner != later.owner {
+        Some(ReferenceConflict::Owner)
+    } else if first.reference_lifecycle != later.reference_lifecycle {
+        Some(ReferenceConflict::Lifecycle)
+    } else {
+        None
+    }
+}
+
+/// Step 12: one normalized reference may be assigned by several declarations
+/// only when they agree on the image it names.
+fn check_reference_conflicts(manifest: &PayloadManifest) -> Result<(), ImageVerifyError> {
+    let mut assigned: HashMap<NormalizedReference, (&PayloadArtifact, &str, &ImageDeclaration)> =
+        HashMap::new();
+    for (artifact, image) in declared_images(manifest) {
+        for reference in &image.public_refs {
+            let Some(key) = normalized(reference) else {
+                continue;
+            };
+            match assigned.get(&key) {
+                Some((first_artifact, first_reference, first_image)) => {
+                    if let Some(conflict) = conflict_between(first_image, image) {
+                        return Err(ImageVerifyError::ConflictingReference {
+                            archive_path: artifact.archive_path.clone(),
+                            reference: reference.clone(),
+                            first_archive_path: first_artifact.archive_path.clone(),
+                            first_reference: (*first_reference).to_string(),
+                            conflict,
+                        });
+                    }
+                }
+                None => {
+                    assigned.insert(key, (artifact, reference, image));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Steps 13, 14 and 15, each a pass of its own: a namespace to check against,
+/// each owner namespace verbatim against it, then each owner component against
+/// the requested target.
+fn check_owners(
+    manifest: &PayloadManifest,
+    request: &VerifyRequest,
+) -> Result<(), ImageVerifyError> {
+    let Some((first, _)) = declared_images(manifest).next() else {
+        return Ok(());
+    };
+    let Some(namespace) = request.namespace.as_deref() else {
+        return Err(ImageVerifyError::MissingNamespace {
+            archive_path: first.archive_path.clone(),
+        });
+    };
+    for (artifact, image) in declared_images(manifest) {
+        if image.owner.namespace != namespace {
+            return Err(ImageVerifyError::NamespaceMismatch {
+                archive_path: artifact.archive_path.clone(),
+                expected: namespace.to_string(),
+                declared: image.owner.namespace.clone(),
+            });
+        }
+    }
+    for (artifact, image) in declared_images(manifest) {
+        if image.owner.component != request.target {
+            return Err(ImageVerifyError::OwnerComponentMismatch {
+                archive_path: artifact.archive_path.clone(),
+                expected: request.target.clone(),
+                declared: image.owner.component.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -1191,13 +1678,19 @@ mod tests {
     use zstd::Encoder;
 
     use super::{
-        BuildIdentifier, ED25519_SIGNATURE_LEN, ENVELOPE_BOUNDS, InputError, KEY_ID_HEX_LEN,
-        MAX_BUILD_IDENTIFIER_BYTES, TRUST_TARGET, TrustAnchor, TrustSet, VerifiedPackage,
-        VerifyError, VerifyRequest, is_safe_build_identifier, key_id, verify_package,
+        BuildIdentifier, ED25519_SIGNATURE_LEN, ENVELOPE_BOUNDS, ImageReferences, ImageVerifyError,
+        InputError, KEY_ID_HEX_LEN, MAX_BUILD_IDENTIFIER_BYTES, ReferenceConflict, TRUST_TARGET,
+        TrustAnchor, TrustSet, VerifiedPackage, VerifyError, VerifyRequest,
+        is_safe_build_identifier, key_id, verify_package,
+    };
+    use crate::image::{
+        ImageArchitecture, ImageDeclaration, ImageDeclarationError, ImageOs, ImageOwner,
+        ImagePlatform, ImageProvenance, ProductBuildProvenance, ReferenceLifecycle,
+        RegistryProvenance,
     };
     use crate::manifest::{
-        Disposition, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION,
-        MIN_MANIFEST_FORMAT_VERSION, TargetArch,
+        Disposition, IMAGE_DECLARATION_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
+        MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION, ManifestError, TargetArch,
     };
     use crate::payload::{
         self, ArtifactInput, EnvelopeBlock, FORMAT_VERSION, MAGIC, PayloadError, Signed,
@@ -1703,6 +2196,7 @@ mod tests {
             dispositions: [Disposition::Install].into_iter().collect(),
             archive_path: MEMBER.to_string(),
             spec: None,
+            image: None,
             source,
         };
         let mut package = Vec::new();
@@ -1730,6 +2224,7 @@ mod tests {
             dispositions: [Disposition::Install].into_iter().collect(),
             archive_path: MEMBER.to_string(),
             spec: None,
+            image: None,
             source,
         };
         let pair = keypair();
@@ -2195,15 +2690,23 @@ mod tests {
         // verifies; unbound, it is `MissingRequiredMember`. The second entry is
         // what makes the fault reachable — a bound member no artifact claimed
         // would be `UnlistedMember` first.
+        //
+        // A container image at the current format carries its declaration and
+        // is verified under the namespace it declares; the namespaced request
+        // verifies every other kind exactly as the plain one does.
         for kind in kinds {
-            let second = artifact_json(
-                COMPONENT,
-                VERSION,
-                COMMIT,
-                kind,
-                "bin/second",
-                ARTIFACT_SHA256,
-            );
+            let second = if kind == "container-image" {
+                image_artifact_json("bin/second", &declaration("web", &[PRODUCT_REF]))
+            } else {
+                artifact_json(
+                    COMPONENT,
+                    VERSION,
+                    COMMIT,
+                    kind,
+                    "bin/second",
+                    ARTIFACT_SHA256,
+                )
+            };
             let bound = manifest_json(
                 &[
                     (MEMBER, len_u64(ARTIFACT_BYTES)),
@@ -2213,7 +2716,7 @@ mod tests {
             );
             let package = signed_pkg(&pair, &bound, &default_archive(), None);
             assert!(
-                verify_package(Cursor::new(package), &trusting(&pair), &request()).is_ok(),
+                verify_package(Cursor::new(package), &trusting(&pair), &namespaced()).is_ok(),
                 "a bound {kind} member should verify"
             );
 
@@ -2224,7 +2727,7 @@ mod tests {
             let package = signed_pkg(&pair, &unbound, &default_archive(), None);
             assert!(
                 matches!(
-                    refusal(&package, &trusting(&pair)),
+                    verify_err(&package, &trusting(&pair), &namespaced()),
                     VerifyError::MissingRequiredMember { member: Some(ref name) }
                         if name == "bin/second"
                 ),
@@ -2838,5 +3341,1107 @@ mod tests {
         let verified = verify_package(Cursor::new(package), &trust, &fresh)
             .expect("the package should verify");
         assert_eq!(verified.manifest().trust_set(), Some(&b"generation"[..]));
+    }
+
+    // ---- Image declarations ----------------------------------------------
+
+    /// The namespace image fixtures are owned by, and the one a namespaced
+    /// fixture request names.
+    const NAMESPACE: &str = "example-product";
+    /// A product-built tag an image fixture keeps as its producer chose it.
+    const PRODUCT_REF: &str = "ghcr.io/example/example:1.0.0";
+    /// Synthetic digests, each naming a different object.
+    const CONFIG_A: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const CONFIG_B: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const CONFIG_C: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const PINNED: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const SELECTED: &str =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    /// A 64-hex outer identifier, the legacy digest width.
+    const DIGEST_COMMIT: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    /// Changes one facet of a declaration.
+    type Mutation = fn(&mut ImageDeclaration);
+    /// Names which image refusal a case must report.
+    type ImageCheck = fn(&ImageVerifyError) -> bool;
+
+    /// The namespaced request the image fixtures satisfy.
+    fn namespaced() -> VerifyRequest {
+        VerifyRequest::for_namespaced_package(COMPONENT, VERSION, COMMIT, NAMESPACE)
+            .expect("a valid namespace and an ordinary target")
+    }
+
+    fn owner() -> ImageOwner {
+        ImageOwner {
+            namespace: NAMESPACE.to_string(),
+            component: COMPONENT.to_string(),
+        }
+    }
+
+    fn amd64() -> ImagePlatform {
+        ImagePlatform {
+            os: ImageOs::Linux,
+            architecture: ImageArchitecture::Amd64,
+            variant: None,
+        }
+    }
+
+    fn registry(repository: &str, tag: &str) -> RegistryProvenance {
+        RegistryProvenance {
+            repository: repository.to_string(),
+            tag: tag.to_string(),
+            version: None,
+            pinned_digest: PINNED.to_string(),
+            selected_manifest_digest: SELECTED.to_string(),
+        }
+    }
+
+    /// A product-built amd64 declaration of `dependency` under `refs`, owned by
+    /// the fixture namespace and component, at [`CONFIG_A`].
+    fn declaration(dependency: &str, refs: &[&str]) -> ImageDeclaration {
+        ImageDeclaration {
+            schema: 1,
+            owner: owner(),
+            dependency: dependency.to_string(),
+            public_refs: refs.iter().map(|value| (*value).to_string()).collect(),
+            platform: amd64(),
+            config_digest: CONFIG_A.to_string(),
+            reference_lifecycle: ReferenceLifecycle::ManagedRuntime,
+            provenance: ImageProvenance::ProductBuild(ProductBuildProvenance {
+                repository: "https://example.invalid/example.git".to_string(),
+                commit: COMMIT.to_string(),
+            }),
+        }
+    }
+
+    /// A newly normalized third-party declaration, whose one reference is its
+    /// canonical alias.
+    fn normalized(dependency: &str, config: &str, repository: &str) -> ImageDeclaration {
+        ImageDeclaration::normalized_third_party(
+            owner(),
+            dependency,
+            amd64(),
+            config,
+            registry(repository, "1.0"),
+        )
+        .expect("a valid normalized declaration")
+    }
+
+    /// Splices `image` into the wire entry of a `container-image` artifact of
+    /// the requested build.
+    fn image_artifact_json(archive_path: &str, image: &ImageDeclaration) -> String {
+        image_artifact_json_with(archive_path, COMMIT, image)
+    }
+
+    fn image_artifact_json_with(
+        archive_path: &str,
+        commit: &str,
+        image: &ImageDeclaration,
+    ) -> String {
+        let entry = artifact_json(
+            COMPONENT,
+            VERSION,
+            commit,
+            "container-image",
+            archive_path,
+            ARTIFACT_SHA256,
+        );
+        let body = entry.strip_suffix('}').expect("an entry ends with a brace");
+        let image = serde_json::to_string(image).expect("a declaration serializes");
+        format!(r#"{body},"image":{image}}}"#)
+    }
+
+    /// Wire JSON of an entry whose `archive_path` is its first field, so a
+    /// fixture can put the path first and assert it in errors.
+    fn member_path(entry: &str) -> String {
+        let at = entry
+            .find(r#""archive_path":""#)
+            .expect("an entry carries a path");
+        let rest = entry.get(at + 16..).expect("in range");
+        rest.get(..rest.find('"').expect("closed"))
+            .expect("in range")
+            .to_string()
+    }
+
+    /// Signs a manifest at `format_version` carrying `entries`, binding one
+    /// member per entry at the fixture artifact's length.
+    fn package_of_at(pair: &Ed25519KeyPair, format_version: u32, entries: &[String]) -> Vec<u8> {
+        let paths: Vec<String> = entries.iter().map(|entry| member_path(entry)).collect();
+        let members: Vec<(&str, u64)> = paths
+            .iter()
+            .map(|path| (path.as_str(), len_u64(ARTIFACT_BYTES)))
+            .collect();
+        let manifest = manifest_json_at(format_version, &members, entries);
+        signed_pkg(pair, &manifest, &default_archive(), None)
+    }
+
+    fn package_of(pair: &Ed25519KeyPair, entries: &[String]) -> Vec<u8> {
+        package_of_at(pair, MANIFEST_FORMAT_VERSION, entries)
+    }
+
+    /// Verifies a package under the namespaced request, returning the image
+    /// error it must be refused with.
+    fn image_refusal(
+        package: &[u8],
+        trust: &TrustSet,
+        request: &VerifyRequest,
+    ) -> ImageVerifyError {
+        match verify_err(package, trust, request) {
+            VerifyError::Image(error) => error,
+            other => panic!("expected an image refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_namespaced_constructor_validates_its_namespace_and_refuses_the_trust_target() {
+        let scoped = namespaced();
+        assert_eq!(scoped.namespace(), Some(NAMESPACE));
+        assert_eq!(scoped.target(), COMPONENT);
+        for invalid in ["", "Example", "a/b", "${NAMESPACE}", "../x", "-x", " x"] {
+            assert!(
+                matches!(
+                    VerifyRequest::for_namespaced_package(COMPONENT, VERSION, COMMIT, invalid),
+                    Err(InputError::InvalidNamespace { ref namespace }) if namespace == invalid
+                ),
+                "{invalid:?}"
+            );
+        }
+        // The reserved target keeps its own constructor and epoch contract.
+        assert!(matches!(
+            VerifyRequest::for_namespaced_package(TRUST_TARGET, VERSION, COMMIT, NAMESPACE),
+            Err(InputError::ReservedTarget)
+        ));
+        // The existing constructors carry no namespace.
+        assert_eq!(request().namespace(), None);
+        assert_eq!(
+            VerifyRequest::for_trust(VERSION, COMMIT, 1)
+                .expect("trust")
+                .namespace(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_projection_distinguishes_no_images_declared_images_and_legacy_images() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+
+        // A native package, under either ordinary constructor.
+        for request in [request(), namespaced()] {
+            let verified = verify_package(Cursor::new(default_pkg(&pair)), &trust, &request)
+                .expect("a native package verifies");
+            assert!(matches!(
+                verified.image_references(),
+                ImageReferences::NoImages
+            ));
+        }
+
+        // A trust package under its own constructor.
+        let trust_entry = artifact_json(
+            TRUST_TARGET,
+            VERSION,
+            COMMIT,
+            "static-assets",
+            MEMBER,
+            ARTIFACT_SHA256,
+        );
+        let trust_request = VerifyRequest::for_trust(VERSION, COMMIT, 1).expect("trust request");
+        let verified = verify_package(
+            Cursor::new(package_of(&pair, &[trust_entry])),
+            &trust,
+            &trust_request,
+        )
+        .expect("a trust package verifies");
+        assert!(matches!(
+            verified.image_references(),
+            ImageReferences::NoImages
+        ));
+
+        // A legacy image at every pre-declaration format, under either
+        // constructor: never an empty reference set, never a declaration.
+        for version in MIN_MANIFEST_FORMAT_VERSION..IMAGE_DECLARATION_FORMAT_VERSION {
+            let legacy = artifact_json(
+                COMPONENT,
+                VERSION,
+                COMMIT,
+                "container-image",
+                "images/legacy.tar",
+                ARTIFACT_SHA256,
+            );
+            let package = package_of_at(&pair, version, &[default_artifact(), legacy]);
+            for request in [request(), namespaced()] {
+                let verified = verify_package(Cursor::new(package.clone()), &trust, &request)
+                    .expect("a legacy image package verifies");
+                assert!(
+                    matches!(
+                        verified.image_references(),
+                        ImageReferences::LegacyUndeclared
+                    ),
+                    "v{version}"
+                );
+                assert!(
+                    verified
+                        .manifest()
+                        .artifacts()
+                        .iter()
+                        .all(|a| a.image.is_none())
+                );
+            }
+        }
+
+        // A declared image, only through the namespaced constructor.
+        let image = declaration("web", &[PRODUCT_REF]);
+        let package = package_of(
+            &pair,
+            &[
+                default_artifact(),
+                image_artifact_json("images/web.tar", &image),
+            ],
+        );
+        let verified = verify_package(Cursor::new(package.clone()), &trust, &namespaced())
+            .expect("a declared image verifies under its namespace");
+        let ImageReferences::Declared(declared) = verified.image_references() else {
+            panic!("expected declared references");
+        };
+        assert_eq!(declared.references(), vec![PRODUCT_REF]);
+        let declarations: Vec<_> = declared.declarations().collect();
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].0.archive_path, "images/web.tar");
+        assert_eq!(declarations[0].1, &image);
+
+        assert!(matches!(
+            image_refusal(&package, &trust, &request()),
+            ImageVerifyError::MissingNamespace { ref archive_path } if archive_path == "images/web.tar"
+        ));
+    }
+
+    #[test]
+    fn the_namespace_is_compared_verbatim_and_the_owner_component_against_the_target() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let package = package_of(
+            &pair,
+            &[image_artifact_json(
+                "images/web.tar",
+                &declaration("web", &[PRODUCT_REF]),
+            )],
+        );
+
+        // No prefix is stripped in either direction, and case is not folded.
+        for other in [
+            "product",
+            "example-product-2",
+            "example_product",
+            "prod-example-product",
+        ] {
+            let request = VerifyRequest::for_namespaced_package(COMPONENT, VERSION, COMMIT, other)
+                .expect("a valid namespace");
+            assert!(
+                matches!(
+                    image_refusal(&package, &trust, &request),
+                    ImageVerifyError::NamespaceMismatch { ref expected, ref declared, .. }
+                        if expected == other && declared == NAMESPACE
+                ),
+                "{other}"
+            );
+        }
+
+        let mut foreign = declaration("web", &[PRODUCT_REF]);
+        foreign.owner.component = "other".to_string();
+        let package = package_of(&pair, &[image_artifact_json("images/web.tar", &foreign)]);
+        assert!(matches!(
+            image_refusal(&package, &trust, &namespaced()),
+            ImageVerifyError::OwnerComponentMismatch { ref expected, ref declared, .. }
+                if expected == COMPONENT && declared == "other"
+        ));
+    }
+
+    #[test]
+    fn a_declared_architecture_must_be_its_artifacts() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let mut arm = declaration("web", &[PRODUCT_REF]);
+        arm.platform.architecture = ImageArchitecture::Arm64;
+        let on_x86 = image_artifact_json("images/web.tar", &arm);
+        assert!(matches!(
+            image_refusal(
+                &package_of(&pair, std::slice::from_ref(&on_x86)),
+                &trust,
+                &namespaced()
+            ),
+            ImageVerifyError::PlatformMismatch {
+                target_arch: TargetArch::X86_64,
+                declared: ImageArchitecture::Arm64,
+                ..
+            }
+        ));
+        // The same declaration on an aarch64 artifact, variant and all.
+        arm.platform.variant = Some("v8".to_string());
+        let on_arm = image_artifact_json("images/web.tar", &arm)
+            .replace(r#""target_arch":"x86_64""#, r#""target_arch":"aarch64""#);
+        verify_package(
+            Cursor::new(package_of(&pair, &[on_arm])),
+            &trust,
+            &namespaced(),
+        )
+        .expect("an arm64 declaration on an aarch64 artifact verifies");
+    }
+
+    #[test]
+    fn a_reserved_reference_must_be_its_own_declarations_canonical_alias() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let valid = normalized("database", CONFIG_C, "docker.io/library/postgres");
+        let alias = valid.public_refs[0].clone();
+        verify_package(
+            Cursor::new(package_of(
+                &pair,
+                &[image_artifact_json("images/db.tar", &valid)],
+            )),
+            &trust,
+            &namespaced(),
+        )
+        .expect("the canonical alias verifies");
+
+        let hex_c = CONFIG_C.trim_start_matches("sha256:");
+        let hex_b = CONFIG_B.trim_start_matches("sha256:");
+        let wrong = [
+            format!("runtime.invalid/other-product/{COMPONENT}/database:cfg-{hex_c}"),
+            format!("runtime.invalid/{NAMESPACE}/other/database:cfg-{hex_c}"),
+            format!("runtime.invalid/{NAMESPACE}/{COMPONENT}/cache:cfg-{hex_c}"),
+            format!("runtime.invalid/{NAMESPACE}/{COMPONENT}/database:cfg-{hex_b}"),
+            format!("RUNTIME.INVALID/{NAMESPACE}/{COMPONENT}/database:cfg-{hex_c}"),
+            format!("Runtime.Invalid/{NAMESPACE}/{COMPONENT}/database:cfg-{hex_c}"),
+            format!("runtime.invalid:5000/{NAMESPACE}/{COMPONENT}/database:cfg-{hex_c}"),
+            format!("runtime.invalid/{NAMESPACE}/{COMPONENT}/database:{hex_c}"),
+            format!("runtime.invalid/{NAMESPACE}/{COMPONENT}/database:latest"),
+        ];
+        for reference in wrong {
+            let mut image = valid.clone();
+            image.public_refs = vec![reference.clone()];
+            let package = package_of(&pair, &[image_artifact_json("images/db.tar", &image)]);
+            assert!(
+                matches!(
+                    image_refusal(&package, &trust, &namespaced()),
+                    ImageVerifyError::NonCanonicalReservedReference { reference: ref got, ref expected, .. }
+                        if *got == reference && expected.as_deref() == Some(alias.as_str())
+                ),
+                "{reference}"
+            );
+        }
+
+        // The canonical alias under a shared lifecycle.
+        let mut shared = valid.clone();
+        shared.reference_lifecycle = ReferenceLifecycle::SharedExternal;
+        let package = package_of(&pair, &[image_artifact_json("images/db.tar", &shared)]);
+        assert!(matches!(
+            image_refusal(&package, &trust, &namespaced()),
+            ImageVerifyError::ReservedReferenceLifecycle { ref reference, .. } if *reference == alias
+        ));
+
+        // A declaration whose segments form no valid alias has nothing a
+        // reserved reference could equal.
+        let mut trailing = valid.clone();
+        trailing.dependency = "database-".to_string();
+        let package = package_of(&pair, &[image_artifact_json("images/db.tar", &trailing)]);
+        assert!(matches!(
+            image_refusal(&package, &trust, &namespaced()),
+            ImageVerifyError::NonCanonicalReservedReference { expected: None, .. }
+        ));
+
+        // Other references beside the alias need not be canonical aliases,
+        // and a managed product tag is not rewritten.
+        let mut beside = valid;
+        beside.public_refs.push(PRODUCT_REF.to_string());
+        verify_package(
+            Cursor::new(package_of(
+                &pair,
+                &[image_artifact_json("images/db.tar", &beside)],
+            )),
+            &trust,
+            &namespaced(),
+        )
+        .expect("a product tag beside the alias verifies");
+    }
+
+    #[test]
+    fn a_normalized_reference_may_be_shared_only_by_agreeing_declarations() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let first = declaration("proxy", &["nginx:1.27"]);
+        let conflicts: [(Mutation, ReferenceConflict); 5] = [
+            (
+                |d| d.config_digest = CONFIG_B.to_string(),
+                ReferenceConflict::ConfigDigest,
+            ),
+            (
+                |d| d.platform.variant = Some("v2".to_string()),
+                ReferenceConflict::Platform,
+            ),
+            (
+                |d| d.owner.component = "other".to_string(),
+                ReferenceConflict::Owner,
+            ),
+            (
+                |d| d.owner.namespace = "other-product".to_string(),
+                ReferenceConflict::Owner,
+            ),
+            (
+                |d| d.reference_lifecycle = ReferenceLifecycle::SharedExternal,
+                ReferenceConflict::Lifecycle,
+            ),
+        ];
+        for (mutate, expected) in conflicts {
+            let mut second = declaration("edge", &["docker.io/library/nginx:1.27"]);
+            mutate(&mut second);
+            let package = package_of(
+                &pair,
+                &[
+                    image_artifact_json("images/proxy.tar", &first),
+                    image_artifact_json("images/edge.tar", &second),
+                ],
+            );
+            assert!(
+                matches!(
+                    image_refusal(&package, &trust, &namespaced()),
+                    ImageVerifyError::ConflictingReference {
+                        ref archive_path, ref reference, ref first_archive_path, ref first_reference, conflict
+                    } if archive_path == "images/edge.tar"
+                        && reference == "docker.io/library/nginx:1.27"
+                        && first_archive_path == "images/proxy.tar"
+                        && first_reference == "nginx:1.27"
+                        && conflict == expected
+                ),
+                "{expected}"
+            );
+        }
+
+        // Same image, different dependency and provenance: not a conflict.
+        let mut agreeing = declaration("edge", &["docker.io/library/nginx:1.27"]);
+        agreeing.provenance =
+            ImageProvenance::Registry(registry("docker.io/library/nginx", "1.27"));
+        let package = package_of(
+            &pair,
+            &[
+                image_artifact_json("images/proxy.tar", &first),
+                image_artifact_json("images/edge.tar", &agreeing),
+            ],
+        );
+        verify_package(Cursor::new(package), &trust, &namespaced())
+            .expect("a provenance-only difference is accepted");
+
+        // Within one declaration a normalized duplicate is a parse refusal.
+        let duplicate = declaration(
+            "proxy",
+            &["nginx:1.27", "index.docker.io/library/nginx:1.27"],
+        );
+        let package = package_of(
+            &pair,
+            &[image_artifact_json("images/proxy.tar", &duplicate)],
+        );
+        assert!(matches!(
+            verify_err(&package, &trust, &namespaced()),
+            VerifyError::Payload(PayloadError::InvalidManifest(
+                ManifestError::InvalidImageDeclaration {
+                    source: ImageDeclarationError::DuplicateReference { .. },
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_six_image_component_package_verifies_to_a_deterministic_union() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let database = normalized("database", CONFIG_C, "docker.io/library/postgres");
+        let cache = normalized("cache", CONFIG_B, "docker.io/library/redis");
+        let web = declaration("web", &[PRODUCT_REF]);
+        let mut worker = declaration(
+            "worker",
+            &["ghcr.io/example/worker:1.0.0", "ghcr.io/example/worker:1.0"],
+        );
+        worker.config_digest = CONFIG_B.to_string();
+        worker.reference_lifecycle = ReferenceLifecycle::SharedExternal;
+        // Two spellings of one reference, on two declarations of one image
+        // that differ only in dependency and provenance.
+        let mut proxy = declaration("proxy", &["nginx:1.27"]);
+        proxy.config_digest = CONFIG_C.to_string();
+        proxy.provenance = ImageProvenance::Registry(registry("docker.io/library/nginx", "1.27"));
+        let mut edge = declaration(
+            "edge",
+            &[
+                "docker.io/library/nginx:1.27",
+                "docker.io/library/nginx:stable",
+            ],
+        );
+        edge.config_digest = CONFIG_C.to_string();
+
+        let entries = vec![
+            artifact_json(
+                COMPONENT,
+                VERSION,
+                COMMIT,
+                "compose-bundle",
+                "compose/stack.tar",
+                ARTIFACT_SHA256,
+            ),
+            image_artifact_json("images/database.tar", &database),
+            image_artifact_json("images/cache.tar", &cache),
+            image_artifact_json("images/web.tar", &web),
+            artifact_json(
+                COMPONENT,
+                VERSION,
+                COMMIT,
+                "static-assets",
+                "assets/web.tar",
+                ARTIFACT_SHA256,
+            ),
+            image_artifact_json("images/worker.tar", &worker),
+            image_artifact_json("images/proxy.tar", &proxy),
+            image_artifact_json("images/edge.tar", &edge),
+        ];
+        let package = package_of(&pair, &entries);
+        let verified = verify_package(Cursor::new(package.clone()), &trust, &namespaced())
+            .expect("the component package verifies");
+        let ImageReferences::Declared(declared) = verified.image_references() else {
+            panic!("expected declared references");
+        };
+        assert_eq!(declared.declarations().count(), 6);
+        let mut expected: Vec<String> = [&database, &cache, &web, &worker, &proxy, &edge]
+            .iter()
+            .flat_map(|image| image.public_refs.clone())
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(declared.references(), expected);
+        // Both signed spellings survive; nothing is rewritten.
+        assert!(declared.references().contains(&"nginx:1.27"));
+        assert!(
+            declared
+                .references()
+                .contains(&"docker.io/library/nginx:1.27")
+        );
+        assert!(declared.references().contains(&PRODUCT_REF));
+
+        // The same version at another commit is a different requested build.
+        let other =
+            VerifyRequest::for_namespaced_package(COMPONENT, VERSION, OTHER_COMMIT, NAMESPACE)
+                .expect("a valid request");
+        assert!(matches!(
+            verify_err(&package, &trust, &other),
+            VerifyError::TargetMismatch { .. }
+        ));
+
+        // A third-party image carrying its own digest as its outer commit is
+        // not the requested build, whatever its provenance says.
+        let mut exempt = entries;
+        exempt[1] = image_artifact_json_with("images/database.tar", DIGEST_COMMIT, &database);
+        assert!(matches!(
+            verify_err(&package_of(&pair, &exempt), &trust, &namespaced()),
+            VerifyError::TargetMismatch { ref commit, .. } if commit == DIGEST_COMMIT
+        ));
+    }
+
+    #[test]
+    fn each_image_pass_finishes_before_the_next_whatever_the_artifact_order() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let hex = CONFIG_C.trim_start_matches("sha256:");
+
+        let mut platform_fault = declaration("platform", &["ghcr.io/example/platform:1"]);
+        platform_fault.platform.architecture = ImageArchitecture::Arm64;
+        let mut alias_fault = normalized("alias", CONFIG_C, "docker.io/library/postgres");
+        alias_fault.public_refs = vec![format!(
+            "runtime.invalid/{NAMESPACE}/{COMPONENT}/other:cfg-{hex}"
+        )];
+        let conflict_first = declaration("one", &["ghcr.io/example/shared:1"]);
+        let mut conflict_second = declaration("two", &["ghcr.io/example/shared:1"]);
+        conflict_second.config_digest = CONFIG_B.to_string();
+        let mut namespace_fault = declaration("namespace", &["ghcr.io/example/namespace:1"]);
+        namespace_fault.owner.namespace = "other-product".to_string();
+        let mut component_fault = declaration("component", &["ghcr.io/example/component:1"]);
+        component_fault.owner.component = "other".to_string();
+
+        let entry = |path: &str, image: &ImageDeclaration| image_artifact_json(path, image);
+        // Each pair puts the later category's fault on the earlier artifact.
+        let cases: Vec<(Vec<String>, VerifyRequest, ImageCheck)> = vec![
+            (
+                vec![
+                    entry("a.tar", &alias_fault),
+                    entry("b.tar", &platform_fault),
+                ],
+                namespaced(),
+                |e| matches!(e, ImageVerifyError::PlatformMismatch { archive_path, .. } if archive_path == "b.tar"),
+            ),
+            (
+                vec![
+                    entry("a.tar", &conflict_first),
+                    entry("b.tar", &conflict_second),
+                    entry("c.tar", &alias_fault),
+                ],
+                namespaced(),
+                |e| matches!(e, ImageVerifyError::NonCanonicalReservedReference { archive_path, .. } if archive_path == "c.tar"),
+            ),
+            (
+                vec![
+                    entry("a.tar", &conflict_first),
+                    entry("b.tar", &conflict_second),
+                ],
+                request(),
+                |e| matches!(e, ImageVerifyError::ConflictingReference { .. }),
+            ),
+            (
+                vec![
+                    entry("a.tar", &conflict_first),
+                    entry("b.tar", &namespace_fault),
+                ],
+                request(),
+                |e| matches!(e, ImageVerifyError::MissingNamespace { archive_path } if archive_path == "a.tar"),
+            ),
+            (
+                vec![
+                    entry("a.tar", &component_fault),
+                    entry("b.tar", &namespace_fault),
+                ],
+                namespaced(),
+                |e| matches!(e, ImageVerifyError::NamespaceMismatch { archive_path, .. } if archive_path == "b.tar"),
+            ),
+            (
+                vec![
+                    entry("a.tar", &conflict_first),
+                    entry("b.tar", &component_fault),
+                ],
+                namespaced(),
+                |e| matches!(e, ImageVerifyError::OwnerComponentMismatch { archive_path, .. } if archive_path == "b.tar"),
+            ),
+        ];
+        for (index, (entries, request, is_expected)) in cases.into_iter().enumerate() {
+            let error = image_refusal(&package_of(&pair, &entries), &trust, &request);
+            assert!(is_expected(&error), "case {index}: got {error:?}");
+        }
+    }
+
+    #[test]
+    fn image_semantics_follow_withdrawal_target_and_epoch() {
+        let pair = keypair();
+        let mut arm = declaration("web", &[PRODUCT_REF]);
+        arm.platform.architecture = ImageArchitecture::Arm64;
+        let package = package_of(&pair, &[image_artifact_json("images/web.tar", &arm)]);
+
+        let withdrawn = TrustSet::new(
+            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![(
+                COMPONENT.to_string(),
+                VERSION.to_string(),
+                COMMIT.to_string(),
+            )],
+            MIN_MANIFEST_FORMAT_VERSION,
+            0,
+        )
+        .expect("a trust set");
+        assert!(matches!(
+            verify_err(&package, &withdrawn, &namespaced()),
+            VerifyError::WithdrawnBuild { .. }
+        ));
+        let elsewhere = VerifyRequest::for_namespaced_package("other", VERSION, COMMIT, NAMESPACE)
+            .expect("a valid request");
+        assert!(matches!(
+            verify_err(&package, &trusting(&pair), &elsewhere),
+            VerifyError::TargetMismatch { .. }
+        ));
+        assert!(matches!(
+            verify_err(&package, &trusting(&pair), &namespaced()),
+            VerifyError::Image(ImageVerifyError::PlatformMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_declaration_loses_to_the_signature_and_the_version() {
+        let pair = keypair();
+        let malformed = image_artifact_json("images/web.tar", &declaration("web", &[PRODUCT_REF]))
+            .replace(r#""schema":1,"#, r#""schema":1,"source_policy":"reuse","#);
+        let manifest = manifest_json(
+            &[("images/web.tar", len_u64(ARTIFACT_BYTES))],
+            std::slice::from_ref(&malformed),
+        );
+
+        // Unsigned by anything the trust set holds.
+        let stranger = signed_pkg(&keypair(), &manifest, &default_archive(), None);
+        assert!(matches!(
+            verify_err(&stranger, &trusting(&pair), &namespaced()),
+            VerifyError::BadSignature
+        ));
+        // Below an injected floor.
+        let floor = TrustSet::new(
+            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            Vec::new(),
+            MANIFEST_FORMAT_VERSION + 1,
+            0,
+        )
+        .expect("a trust set");
+        let signed = signed_pkg(&pair, &manifest, &default_archive(), None);
+        assert!(matches!(
+            verify_err(&signed, &floor, &namespaced()),
+            VerifyError::UnsupportedManifestFormat { .. }
+        ));
+        // A future format, whatever the body.
+        let future = manifest_json_at(
+            MAX_MANIFEST_FORMAT_VERSION + 1,
+            &[("images/web.tar", len_u64(ARTIFACT_BYTES))],
+            &[malformed],
+        );
+        let package = signed_pkg(&pair, &future, &default_archive(), None);
+        assert!(matches!(
+            verify_err(&package, &trusting(&pair), &namespaced()),
+            VerifyError::UnsupportedManifestFormat { found, .. } if found == MAX_MANIFEST_FORMAT_VERSION + 1
+        ));
+        // And otherwise the typed parse names it, nested.
+        assert!(matches!(
+            verify_err(&signed, &trusting(&pair), &namespaced()),
+            VerifyError::Payload(PayloadError::InvalidManifest(
+                ManifestError::ImageDecode { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn typed_parse_faults_keep_their_artifact_order_through_the_verifier() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let malformed = image_artifact_json("images/bad.tar", &declaration("web", &[PRODUCT_REF]))
+            .replace(
+                r#""kind":"product_build","#,
+                r#""kind":"product_build","pinned_digest":"x","#,
+            );
+        let unsafe_path = artifact_json(
+            COMPONENT,
+            VERSION,
+            COMMIT,
+            "native-binary",
+            "../escape",
+            ARTIFACT_SHA256,
+        );
+        let is_image_decode = |error: &VerifyError| {
+            matches!(
+                error,
+                VerifyError::Payload(PayloadError::InvalidManifest(ManifestError::ImageDecode { archive_path, .. }))
+                    if archive_path == "images/bad.tar"
+            )
+        };
+
+        let error = verify_err(
+            &package_of(&pair, &[unsafe_path.clone(), malformed.clone()]),
+            &trust,
+            &namespaced(),
+        );
+        assert!(
+            matches!(error, VerifyError::UnsafePath(ref p) if p == "../escape"),
+            "got: {error:?}"
+        );
+        let error = verify_err(
+            &package_of(&pair, &[malformed.clone(), unsafe_path]),
+            &trust,
+            &namespaced(),
+        );
+        assert!(is_image_decode(&error), "got: {error:?}");
+
+        let first = artifact_json(
+            COMPONENT,
+            VERSION,
+            COMMIT,
+            "native-binary",
+            "bin/p",
+            ARTIFACT_SHA256,
+        );
+        let second = artifact_json(
+            COMPONENT,
+            VERSION,
+            COMMIT,
+            "static-assets",
+            "bin/p",
+            ARTIFACT_SHA256,
+        );
+        let error = verify_err(
+            &package_of(&pair, &[first.clone(), second.clone(), malformed.clone()]),
+            &trust,
+            &namespaced(),
+        );
+        assert!(
+            matches!(error, VerifyError::DuplicatePath(ref p) if p == "bin/p"),
+            "got: {error:?}"
+        );
+        let error = verify_err(
+            &package_of(&pair, &[first.clone(), malformed.clone(), second]),
+            &trust,
+            &namespaced(),
+        );
+        assert!(is_image_decode(&error), "got: {error:?}");
+        let second_malformed = malformed.replace("images/bad.tar", "bin/p");
+        let error = verify_err(
+            &package_of(&pair, &[first, second_malformed]),
+            &trust,
+            &namespaced(),
+        );
+        assert!(
+            matches!(error, VerifyError::DuplicatePath(_)),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_image_key_is_refused_through_the_verifier_after_earlier_faults() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        for version in MIN_MANIFEST_FORMAT_VERSION..IMAGE_DECLARATION_FORMAT_VERSION {
+            for value in ["null", "{}", r#""malformed""#] {
+                let keyed = artifact_json(
+                    COMPONENT,
+                    VERSION,
+                    COMMIT,
+                    "container-image",
+                    "images/k.tar",
+                    ARTIFACT_SHA256,
+                )
+                .replace(r#""kind":"#, &format!(r#""image":{value},"kind":"#));
+                let bad_commit = artifact_json(
+                    COMPONENT,
+                    VERSION,
+                    "abc1234",
+                    "native-binary",
+                    "bin/c",
+                    ARTIFACT_SHA256,
+                );
+
+                let error = verify_err(
+                    &package_of_at(&pair, version, &[bad_commit.clone(), keyed.clone()]),
+                    &trust,
+                    &namespaced(),
+                );
+                assert!(
+                    matches!(
+                        error,
+                        VerifyError::Payload(PayloadError::InvalidManifest(
+                            ManifestError::InvalidCommit { .. }
+                        ))
+                    ),
+                    "v{version} {value}: got {error:?}"
+                );
+                let error = verify_err(
+                    &package_of_at(&pair, version, &[keyed.clone(), bad_commit]),
+                    &trust,
+                    &namespaced(),
+                );
+                assert!(
+                    matches!(
+                        error,
+                        VerifyError::Payload(PayloadError::InvalidManifest(
+                            ManifestError::ImageBeforeDeclarationFormat { format_version, .. }
+                        )) if format_version == version
+                    ),
+                    "v{version} {value}: got {error:?}"
+                );
+                // The same artifact's own earlier check wins.
+                let keyed_bad_commit = keyed.replace(COMMIT, "abc1234");
+                let error = verify_err(
+                    &package_of_at(&pair, version, &[keyed_bad_commit]),
+                    &trust,
+                    &namespaced(),
+                );
+                assert!(
+                    matches!(
+                        error,
+                        VerifyError::Payload(PayloadError::InvalidManifest(
+                            ManifestError::InvalidCommit { .. }
+                        ))
+                    ),
+                    "v{version} {value}: got {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_multi_fault_package_keeps_its_old_verdicts() {
+        // A format-5 image package that is withdrawn and requested wrongly
+        // reports withdrawal whichever ordinary constructor asks.
+        let pair = keypair();
+        let legacy = artifact_json(
+            COMPONENT,
+            VERSION,
+            COMMIT,
+            "container-image",
+            "images/legacy.tar",
+            ARTIFACT_SHA256,
+        );
+        let package = package_of_at(&pair, IMAGE_DECLARATION_FORMAT_VERSION - 1, &[legacy]);
+        let withdrawn = TrustSet::new(
+            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![(
+                COMPONENT.to_string(),
+                VERSION.to_string(),
+                COMMIT.to_string(),
+            )],
+            MIN_MANIFEST_FORMAT_VERSION,
+            0,
+        )
+        .expect("a trust set");
+        let wrong = VerifyRequest::for_package("other", VERSION, COMMIT).expect("ordinary");
+        let wrong_namespaced =
+            VerifyRequest::for_namespaced_package("other", VERSION, COMMIT, "elsewhere")
+                .expect("ordinary");
+        for request in [wrong.clone(), wrong_namespaced.clone()] {
+            assert!(matches!(
+                verify_err(&package, &withdrawn, &request),
+                VerifyError::WithdrawnBuild { .. }
+            ));
+            assert!(matches!(
+                verify_err(&package, &trusting(&pair), &request),
+                VerifyError::TargetMismatch { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_declared_image_package_still_binds_every_member_and_reads_no_archive() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let image = image_artifact_json("images/web.tar", &declaration("web", &[PRODUCT_REF]));
+        // A member omitted from the bound list is still missing.
+        let manifest = manifest_json(
+            &[(MEMBER, len_u64(ARTIFACT_BYTES))],
+            &[default_artifact(), image.clone()],
+        );
+        let package = signed_pkg(&pair, &manifest, &default_archive(), None);
+        assert!(matches!(
+            verify_err(&package, &trust, &namespaced()),
+            VerifyError::MissingRequiredMember { member: Some(ref m) } if m == "images/web.tar"
+        ));
+        // And an accepted declaration says nothing about the archive bytes:
+        // an archive that is not even zstd still verifies.
+        let manifest = manifest_json(&[("images/web.tar", len_u64(ARTIFACT_BYTES))], &[image]);
+        let package = signed_pkg(&pair, &manifest, b"not an archive", None);
+        let verified = verify_package(Cursor::new(package), &trust, &namespaced())
+            .expect("verification never reads the archive");
+        assert!(matches!(
+            verified.image_references(),
+            ImageReferences::Declared(_)
+        ));
+    }
+
+    #[test]
+    fn a_new_image_error_arrives_under_the_image_arm_and_never_nested() {
+        let pair = keypair();
+        let mut foreign = declaration("web", &[PRODUCT_REF]);
+        foreign.owner.namespace = "other-product".to_string();
+        let package = package_of(&pair, &[image_artifact_json("images/web.tar", &foreign)]);
+        let error = verify_err(&package, &trusting(&pair), &namespaced());
+        assert!(matches!(
+            error,
+            VerifyError::Image(ImageVerifyError::NamespaceMismatch { .. })
+        ));
+        assert!(!matches!(error, VerifyError::Payload(_)));
+        assert!(error.to_string().contains("other-product"), "got: {error}");
+    }
+
+    /// A signed format-6 component package checked in as raw bytes: a compose
+    /// bundle and two declared images — a normalized third-party database
+    /// under its canonical alias and a product-built web image under its own
+    /// tag — for `example-app` 1.0.0 in `example-product`.
+    const SIGNED_V6_PACKAGE: &[u8] =
+        include_bytes!("../assets/test-fixtures/signed-v6-images/package.pkg");
+    /// The raw Ed25519 public key that signed it, in hex. Only this half was
+    /// kept: the fixture is test trust and nothing else, and its private key
+    /// was discarded once the package was written.
+    const SIGNED_V6_PUBLIC_KEY: &str =
+        include_str!("../assets/test-fixtures/signed-v6-images/public-key.hex");
+
+    fn signed_v6_trust() -> TrustSet {
+        let hex = SIGNED_V6_PUBLIC_KEY.trim();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| {
+                u8::from_str_radix(hex.get(at..at + 2).expect("an even-length key"), 16)
+                    .expect("hex")
+            })
+            .collect();
+        let key: [u8; 32] = bytes.try_into().expect("a 32-byte key");
+        trust_of(vec![TrustAnchor::new(key, false)])
+    }
+
+    #[test]
+    fn the_checked_in_v6_package_verifies_under_its_namespace_from_its_raw_bytes() {
+        let trust = signed_v6_trust();
+        let request =
+            VerifyRequest::for_namespaced_package("example-app", "1.0.0", COMMIT, NAMESPACE)
+                .expect("a valid request");
+
+        // The raw manifest block declares the current format; that is the
+        // stage-1 reading an older reader refuses before its body decode.
+        let container =
+            payload::read_package_container(Cursor::new(SIGNED_V6_PACKAGE), &ENVELOPE_BOUNDS)
+                .expect("the fixture is a container");
+        assert_eq!(
+            crate::manifest::parse_format_version(container.manifest_bytes())
+                .expect("a readable version"),
+            Some(IMAGE_DECLARATION_FORMAT_VERSION)
+        );
+
+        let mut verified = verify_package(Cursor::new(SIGNED_V6_PACKAGE), &trust, &request)
+            .expect("the fixture verifies");
+        let ImageReferences::Declared(declared) = verified.image_references() else {
+            panic!("expected declared references");
+        };
+        assert_eq!(
+            declared.references(),
+            vec![
+                "ghcr.io/example/example-app:1.0.0",
+                "runtime.invalid/example-product/example-app/database:cfg-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ]
+        );
+        let dependencies: Vec<&str> = declared
+            .declarations()
+            .map(|(_, image)| image.dependency.as_str())
+            .collect();
+        assert_eq!(dependencies, vec!["database", "web"]);
+        // Every artifact carries the requested build's commit, the dependency
+        // image included; the web image's own source commit is provenance.
+        assert!(
+            verified
+                .manifest()
+                .artifacts()
+                .iter()
+                .all(|a| a.commit.as_deref() == Some(COMMIT))
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extracted = verified
+            .extract_to(dir.path())
+            .expect("the archive matches its manifest");
+        assert_eq!(extracted.len(), 3);
+
+        // Without the namespace its images cannot be checked, so it is refused.
+        let plain = VerifyRequest::for_package("example-app", "1.0.0", COMMIT).expect("ordinary");
+        assert!(matches!(
+            verify_err(SIGNED_V6_PACKAGE, &trust, &plain),
+            VerifyError::Image(ImageVerifyError::MissingNamespace { .. })
+        ));
+        // A floor above it refuses it for its version while its signature is
+        // valid — the same stage-1 refusal an older reader makes at its own
+        // ceiling.
+        let floor = TrustSet::new(
+            signed_v6_trust().anchors().to_vec(),
+            Vec::new(),
+            IMAGE_DECLARATION_FORMAT_VERSION + 1,
+            0,
+        )
+        .expect("a trust set");
+        assert!(matches!(
+            verify_err(SIGNED_V6_PACKAGE, &floor, &request),
+            VerifyError::UnsupportedManifestFormat { found, .. } if found == IMAGE_DECLARATION_FORMAT_VERSION
+        ));
     }
 }
