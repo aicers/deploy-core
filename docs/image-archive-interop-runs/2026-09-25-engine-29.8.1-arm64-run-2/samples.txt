@@ -1,0 +1,224 @@
+## Host and build
+
+$ date -u '+%Y-%m-%dT%H:%M:%SZ'
+2026-09-25T13:37:15Z
+[exit 0]
+
+$ git -C ../.. rev-parse HEAD
+4dee63ef87026c810f3554b50ecc0a7421b8d8ed
+[exit 0]
+
+$ git -C ../.. status --porcelain
+[exit 0]
+
+$ cargo build --manifest-path ../../Cargo.toml --example write_synthetic_image --features test-support --quiet
+[exit 0]
+
+$ EXAMPLE=../../target/debug/examples/write_synthetic_image; echo $EXAMPLE
+../../target/debug/examples/write_synthetic_image
+[exit 0]
+
+## Step 1: write samples
+
+$ mkdir -p work/samples
+[exit 0]
+
+$ $EXAMPLE write work/samples/sample-amd64.tar work/samples/sample-amd64.declaration.json amd64 registry.example/interop/sample-amd64:1.0
+[exit 0]
+
+$ $EXAMPLE write work/samples/many-amd64.tar work/samples/many-amd64.declaration.json amd64 registry.example/interop/many-amd64:1.0 registry.example/interop/many-amd64:latest
+[exit 0]
+
+$ $EXAMPLE write work/samples/sample-arm64.tar work/samples/sample-arm64.declaration.json arm64 registry.example/interop/sample-arm64:1.0
+[exit 0]
+
+$ $EXAMPLE write work/samples/many-arm64.tar work/samples/many-arm64.declaration.json arm64 registry.example/interop/many-arm64:1.0 registry.example/interop/many-arm64:latest
+[exit 0]
+
+$ cp ../../assets/test-fixtures/images/explicit-variant.tar ../../assets/test-fixtures/images/explicit-variant.declaration.json work/samples/
+[exit 0]
+
+$ cat work/samples/sample-amd64.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "sample",
+  "public_refs": [
+    "registry.example/interop/sample-amd64:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "amd64",
+    "variant": null
+  },
+  "config_digest": "sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "registry",
+    "repository": "registry.example/synthetic/sample",
+    "tag": "1.0.0",
+    "version": "1.0.0",
+    "pinned_digest": "sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607",
+    "selected_manifest_digest": "sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607"
+  }
+}
+[exit 0]
+
+$ shasum -a 256 work/samples/sample-amd64.tar
+429ca54b5bae4fa55b30e065992988def18b0f4305c5f982fa0b2e7f8fcbf2a5  work/samples/sample-amd64.tar
+[exit 0]
+
+$ tar -xOf work/samples/sample-amd64.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607","size":401,"annotations":{"io.containerd.image.name":"registry.example/interop/sample-amd64:1.0","org.opencontainers.image.ref.name":"1.0"}}]}
+[exit 0]
+
+$ cat work/samples/many-amd64.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "sample",
+  "public_refs": [
+    "registry.example/interop/many-amd64:1.0",
+    "registry.example/interop/many-amd64:latest"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "amd64",
+    "variant": null
+  },
+  "config_digest": "sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "registry",
+    "repository": "registry.example/synthetic/sample",
+    "tag": "1.0.0",
+    "version": "1.0.0",
+    "pinned_digest": "sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607",
+    "selected_manifest_digest": "sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607"
+  }
+}
+[exit 0]
+
+$ shasum -a 256 work/samples/many-amd64.tar
+17b5a5c21184504b29cfdd99d0bd0b4028625c98c6d7199572f60124b3419cf4  work/samples/many-amd64.tar
+[exit 0]
+
+$ tar -xOf work/samples/many-amd64.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607","size":401,"annotations":{"io.containerd.image.name":"registry.example/interop/many-amd64:1.0","org.opencontainers.image.ref.name":"1.0"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607","size":401,"annotations":{"io.containerd.image.name":"registry.example/interop/many-amd64:latest","org.opencontainers.image.ref.name":"latest"}}]}
+[exit 0]
+
+$ cat work/samples/sample-arm64.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "sample",
+  "public_refs": [
+    "registry.example/interop/sample-arm64:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": null
+  },
+  "config_digest": "sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "registry",
+    "repository": "registry.example/synthetic/sample",
+    "tag": "1.0.0",
+    "version": "1.0.0",
+    "pinned_digest": "sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d",
+    "selected_manifest_digest": "sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d"
+  }
+}
+[exit 0]
+
+$ shasum -a 256 work/samples/sample-arm64.tar
+7eb4c4ce4b7195f955162d2a5f027291441a4dbc45e6b9b5798647a30e782299  work/samples/sample-arm64.tar
+[exit 0]
+
+$ tar -xOf work/samples/sample-arm64.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d","size":401,"annotations":{"io.containerd.image.name":"registry.example/interop/sample-arm64:1.0","org.opencontainers.image.ref.name":"1.0"}}]}
+[exit 0]
+
+$ cat work/samples/many-arm64.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "sample",
+  "public_refs": [
+    "registry.example/interop/many-arm64:1.0",
+    "registry.example/interop/many-arm64:latest"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": null
+  },
+  "config_digest": "sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "registry",
+    "repository": "registry.example/synthetic/sample",
+    "tag": "1.0.0",
+    "version": "1.0.0",
+    "pinned_digest": "sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d",
+    "selected_manifest_digest": "sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d"
+  }
+}
+[exit 0]
+
+$ shasum -a 256 work/samples/many-arm64.tar
+011ae518215bd389748df893bd1ead39b4d82fee5c596543586b7358dfd20e31  work/samples/many-arm64.tar
+[exit 0]
+
+$ tar -xOf work/samples/many-arm64.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d","size":401,"annotations":{"io.containerd.image.name":"registry.example/interop/many-arm64:1.0","org.opencontainers.image.ref.name":"1.0"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d","size":401,"annotations":{"io.containerd.image.name":"registry.example/interop/many-arm64:latest","org.opencontainers.image.ref.name":"latest"}}]}
+[exit 0]
+
+$ cat work/samples/explicit-variant.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "app",
+  "public_refs": [
+    "registry.example/synthetic/explicit-variant:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": "v8"
+  },
+  "config_digest": "sha256:88996685f1c0d5ae36656e5616613e49c59f0a4347ecb456d6c854d1b4c9f283",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "product_build",
+    "repository": "https://example.com/synthetic-images.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+[exit 0]
+
+$ shasum -a 256 work/samples/explicit-variant.tar
+454556a5933af7835f564d9a314accae25cf2d3288a9fb4b7aa8e46bd99916bf  work/samples/explicit-variant.tar
+[exit 0]
+
+$ tar -xOf work/samples/explicit-variant.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:3c35860ad37ea42c1804770e087a1d32bb9a44d111f40d8f2ae111ab1ba27fd8","size":401,"annotations":{"io.containerd.image.name":"registry.example/synthetic/explicit-variant:1.0","org.opencontainers.image.ref.name":"1.0"}}]}
+[exit 0]
+

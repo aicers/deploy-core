@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "app",
+  "public_refs": [
+    "registry.example/interop/raw-cd-run2:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": null
+  },
+  "config_digest": "sha256:143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "product_build",
+    "repository": "https://example.com/synthetic-images.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  }
+}

@@ -1,0 +1,142 @@
+# LATER EXTRACTION -- NOT THE ORIGINAL CAPTURE OUTPUT
+#
+# Run 1 retained no command output. This file was produced on 2026-09-25,
+# after that run, while its record was corrected, from the repository root.
+# It reads the two checked-in run 1 captures and classifies them again with
+# the example. None of it is output of a command run during run 1: no
+# `docker` command runs here, and the `classify` verdicts below reproduce
+# the byte-based verdicts from the checked-in bytes rather than recording
+# when run 1 classified them.
+#
+# Each command is printed after `$ `, followed by its combined stdout and
+# stderr and its exit code.
+
+$ date -u +%Y-%m-%dT%H:%M:%SZ
+2026-09-25T13:39:02Z
+[exit 0]
+
+$ git rev-parse HEAD
+4dee63ef87026c810f3554b50ecc0a7421b8d8ed
+[exit 0]
+
+$ EXAMPLE=target/debug/examples/write_synthetic_image; echo $EXAMPLE
+target/debug/examples/write_synthetic_image
+[exit 0]
+
+## docker-graphdriver-scratch
+
+$ shasum -a 256 assets/test-fixtures/images/docker-graphdriver-scratch.tar
+3497a77343b11902aad7d3d85504ef86a0bc0d78dd89091b6d02220a7ffd5eb8  assets/test-fixtures/images/docker-graphdriver-scratch.tar
+[exit 0]
+
+$ tar -tvf assets/test-fixtures/images/docker-graphdriver-scratch.tar
+drwxr-xr-x  0 0      0           0 Sep 25 21:15 blobs/
+drwxr-xr-x  0 0      0           0 Jan  1  1970 blobs/sha256/
+-rw-r--r--  0 0      0         397 Jan  1  1970 blobs/sha256/16439ff04d5d79789990c03bc15e13dff6a4bfe03b83f7c519fe773d3825ffbf
+-rw-r--r--  0 0      0         442 Sep 25 21:15 blobs/sha256/830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182
+-rw-r--r--  0 0      0         742 Sep 25 21:15 blobs/sha256/850291227688e66b53cb21b955ed187526da2335886c082124cefaf9cf32632a
+-rw-rw-rw-  0 0      0        2048 Sep 25 21:15 blobs/sha256/8904da134fd4d9e9dcd17c59edac74028c5459d4abfc9db4ff4f62a2cafdcceb
+-rw-r--r--  0 0      0         363 Jan  1  1970 index.json
+-rw-r--r--  0 0      0         476 Jan  1  1970 manifest.json
+-rw-r--r--  0 0      0          31 Jan  1  1970 oci-layout
+-rw-r--r--  0 0      0         111 Jan  1  1970 repositories
+[exit 0]
+
+$ tar -xOf assets/test-fixtures/images/docker-graphdriver-scratch.tar manifest.json; echo
+[{"Config":"blobs/sha256/830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182","RepoTags":["registry.example/interop/raw-gd:1.0"],"Layers":["blobs/sha256/8904da134fd4d9e9dcd17c59edac74028c5459d4abfc9db4ff4f62a2cafdcceb"],"LayerSources":{"sha256:8904da134fd4d9e9dcd17c59edac74028c5459d4abfc9db4ff4f62a2cafdcceb":{"mediaType":"application/vnd.oci.image.layer.v1.tar","size":2048,"digest":"sha256:8904da134fd4d9e9dcd17c59edac74028c5459d4abfc9db4ff4f62a2cafdcceb"}}}]
+
+[exit 0]
+
+$ tar -xOf assets/test-fixtures/images/docker-graphdriver-scratch.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:16439ff04d5d79789990c03bc15e13dff6a4bfe03b83f7c519fe773d3825ffbf","size":397,"annotations":{"io.containerd.image.name":"registry.example/interop/raw-gd:1.0","org.opencontainers.image.ref.name":"1.0"}}]}
+[exit 0]
+
+$ cat assets/test-fixtures/images/docker-graphdriver-scratch.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "app",
+  "public_refs": [
+    "registry.example/interop/raw-gd:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": null
+  },
+  "config_digest": "sha256:830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "product_build",
+    "repository": "https://example.com/synthetic-images.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+[exit 0]
+
+$ $EXAMPLE classify assets/test-fixtures/images/docker-graphdriver-scratch.tar assets/test-fixtures/images/docker-graphdriver-scratch.declaration.json
+image archive `assets/test-fixtures/images/docker-graphdriver-scratch.tar` uses a legacy docker-save export file
+[exit 1]
+
+## docker-containerd-scratch
+
+$ shasum -a 256 assets/test-fixtures/images/docker-containerd-scratch.tar
+1b8979c2cd3510953839e879c21d8dea11ac63bbc630d475f8a770eef83219fb  assets/test-fixtures/images/docker-containerd-scratch.tar
+[exit 0]
+
+$ tar -tvf assets/test-fixtures/images/docker-containerd-scratch.tar
+drwxr-xr-x  0 0      0           0 Jan  1  1970 blobs/
+drwxr-xr-x  0 0      0           0 Jan  1  1970 blobs/sha256/
+-r--r--r--  0 0      0         835 Jan  1  1970 blobs/sha256/415d73cfee38cc93e0dff7c3347bcf112f034452afc9f84a45da83204c774807
+-r--r--r--  0 0      0           2 Jan  1  1970 blobs/sha256/44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
+-r--r--r--  0 0      0         442 Jan  1  1970 blobs/sha256/4d3513a55c81a90e8ade85146882cb40ea0480961be2105bfd5c3c74fd4ff237
+-r--r--r--  0 0      0         938 Jan  1  1970 blobs/sha256/76f130d06c97c7b5205844c10cc3f7f0bc391a11ed9995c8193006b632f23213
+-r--r--r--  0 0      0         108 Jan  1  1970 blobs/sha256/9b343a86367942b345bb3453a8668b14bea0a9d50a436c6423bcda04344f7e70
+-r--r--r--  0 0      0         855 Jan  1  1970 blobs/sha256/ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff
+-r--r--r--  0 0      0         476 Jan  1  1970 blobs/sha256/d20eb55c282ea00819a9e36084a1b9c24cfec347bbdeb79bbb8799f92d0898f6
+-rw-r--r--  0 0      0         360 Jan  1  1970 index.json
+-rw-r--r--  0 0      0         234 Jan  1  1970 manifest.json
+-r--r--r--  0 0      0          30 Jan  1  1970 oci-layout
+[exit 0]
+
+$ tar -xOf assets/test-fixtures/images/docker-containerd-scratch.tar manifest.json; echo
+[{"Config":"blobs/sha256/4d3513a55c81a90e8ade85146882cb40ea0480961be2105bfd5c3c74fd4ff237","RepoTags":["registry.example/interop/raw-cd:1.0"],"Layers":["blobs/sha256/9b343a86367942b345bb3453a8668b14bea0a9d50a436c6423bcda04344f7e70"]}]
+[exit 0]
+
+$ tar -xOf assets/test-fixtures/images/docker-containerd-scratch.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff","size":855,"annotations":{"io.containerd.image.name":"registry.example/interop/raw-cd:1.0","org.opencontainers.image.ref.name":"1.0"}}]}
+[exit 0]
+
+$ cat assets/test-fixtures/images/docker-containerd-scratch.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "app",
+  "public_refs": [
+    "registry.example/interop/raw-cd:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": null
+  },
+  "config_digest": "sha256:4d3513a55c81a90e8ade85146882cb40ea0480961be2105bfd5c3c74fd4ff237",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "product_build",
+    "repository": "https://example.com/synthetic-images.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+[exit 0]
+
+$ $EXAMPLE classify assets/test-fixtures/images/docker-containerd-scratch.tar assets/test-fixtures/images/docker-containerd-scratch.declaration.json
+image archive `assets/test-fixtures/images/docker-containerd-scratch.tar` uses a nested image index
+[exit 1]
+

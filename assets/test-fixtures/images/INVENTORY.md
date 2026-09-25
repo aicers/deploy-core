@@ -32,8 +32,11 @@ never recorded here.
   Its provenance is the manual capture record: `engine_version`,
   `store_mode`, `architecture`, the exact `command`, the
   `source_image_digest`, and the `declaration_derivation` that
-  `docs/image-archive-interoperability.md` describes. Replacing a capture
-  means making a new capture with new provenance.
+  `docs/image-archive-interoperability.md` describes. Its `evidence` object
+  says whether the capture run's command output was retained: either
+  `"outputs_retained": true` and the path of the checked-in `transcript`, or
+  `"outputs_retained": false`, no transcript, and what is `not_retained`.
+  Replacing a capture means making a new capture with new provenance.
 
 ## Verdicts
 
@@ -113,24 +116,55 @@ To add a synthetic fixture, add its record with its parameters to
 
 ## Docker captures
 
-Both captures were made on 2026-09-25 from disposable Docker Engine 29.8.1
-daemons (containerd v2.3.5, runc 1.5.1, `arm64`), each running in its own
-`docker:29-dind` container with its own data root, one per image store. Each
-daemon built the same tiny image, `FROM scratch` with one six-byte file
-`hello.txt`, and saved exactly one reference with `docker save -o`. The
-declaration was derived from the saved archive's `manifest.json` as
-`docs/image-archive-interoperability.md` step 4 describes; no fallback was
-needed. `inventory.json` holds each full capture record.
+Four captures come from two manual runs on 2026-09-25, both on disposable
+Docker Engine 29.8.1 daemons (containerd v2.3.5, runc 1.5.1, `arm64`), each
+running in its own `docker:29-dind` container with its own data root, one per
+image store. In each run each daemon built the same tiny image, `FROM
+scratch` with one six-byte file `hello.txt`, and saved exactly one reference
+with `docker save -o`. The declaration was derived from the saved archive's
+`manifest.json` as `docs/image-archive-interoperability.md` step 4 describes;
+no fallback was needed. `inventory.json` holds each full capture record, and
+its `evidence` object says what was retained. The procedure's
+[Recorded runs](../../../docs/image-archive-interoperability.md#recorded-runs)
+give each run's result per store.
 
-- `docker-graphdriver-scratch`: the graphdriver store (`overlay2`). The
-  export carries `repositories`, `blobs/` directory entries and a
-  `LayerSources` record — `UnsupportedArchive`, `LegacyExportFile`.
-- `docker-containerd-scratch`: the containerd store (`overlayfs` snapshotter).
-  `index.json` points to a nested image index that also lists an attestation
-  manifest — `UnsupportedArchive`, `NestedIndex`. On this store
-  `docker image inspect --format '{{.Id}}'` reports that index's digest
-  rather than the config digest, so `config_digest` follows the record's
-  `Config` path, and the capture record notes the disagreement.
+Every capture's bytes, declaration, SHA-256 and verdict are retained and
+checked by the inventory tests. What differs between the runs is whether the
+commands' output was kept:
 
-Both are refused, as the profile expects of raw `docker save` output.
-Replacing either means a new capture with a new capture record.
+- **Run 1** retained no command output. Its records hold the command lines
+  and values the run wrote down as a summary, marked `"outputs_retained":
+  false` with no transcript; the output of `docker build`, `docker save`,
+  `tar -xOf <out.tar> manifest.json`, `docker image inspect` and `classify`
+  is missing, and so is anything showing that `classify` ran before any
+  load. The `manifest.json` of each capture was read out of the checked-in
+  archive afterwards, on 2026-09-25, into
+  `docs/image-archive-interop-runs/2026-09-25-engine-29.8.1-arm64-run-1/later-extraction.txt`.
+  That file is a later extraction, not the run's output.
+  - `docker-graphdriver-scratch`: the graphdriver store (`overlay2`). The
+    export carries `repositories`, `blobs/` directory entries and a
+    `LayerSources` record — `UnsupportedArchive`, `LegacyExportFile`.
+  - `docker-containerd-scratch`: the containerd store (`overlayfs`
+    snapshotter). `index.json` points to a nested image index that also
+    lists an attestation manifest — `UnsupportedArchive`, `NestedIndex`. On
+    this store `docker image inspect --format '{{.Id}}'` reported that
+    index's digest rather than the config digest, so `config_digest` follows
+    the record's `Config` path, and the capture record notes the
+    disagreement.
+- **Run 2** retained every command with its output and exit code, in the
+  transcript each record's `evidence.transcript` names under
+  `docs/image-archive-interop-runs/2026-09-25-engine-29.8.1-arm64-run-2/`.
+  The transcript shows the `docker save` command, the archive's SHA-256, the
+  `manifest.json` output, the inspect output, the derived declaration and
+  the `classify` refusal, all before the daemon loaded any sample.
+  - `docker-graphdriver-scratch-run2`: the graphdriver store (`overlay2`),
+    with the same shape as its run 1 counterpart — `UnsupportedArchive`,
+    `LegacyExportFile`.
+  - `docker-containerd-scratch-run2`: the containerd store (`overlayfs`
+    snapshotter), again a nested image index with an attestation manifest,
+    and again `.Id` reported the index digest — `UnsupportedArchive`,
+    `NestedIndex`.
+
+All four are refused, as the profile expects of raw `docker save` output.
+None is ever regenerated, overwritten or renamed. A new capture gets a new
+name and a new capture record, as run 2's did.
