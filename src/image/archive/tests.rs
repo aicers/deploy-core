@@ -63,9 +63,15 @@ fn limits(settings: &[(LimitResource, u64)]) -> ContentLimits {
 /// Asserts `built` is accepted and its summary matches it.
 fn accept(built: &Built) -> ValidatedImageArchive {
     let validated = run(built).unwrap_or_else(|fault| panic!("refused: {fault:?}"));
+    assert_summary(&validated, built);
+    validated
+}
+
+#[track_caller]
+fn assert_summary(validated: &ValidatedImageArchive, built: &Built) {
     assert_eq!(validated.config_digest, built.config_digest);
     assert_eq!(validated.manifest_digest, built.manifest_digest);
-    validated
+    assert_eq!(validated.layer_count, built.layer_count);
 }
 
 fn render(fault: &ImageArchiveFault) -> String {
@@ -82,7 +88,16 @@ fn assert_fault(
 ) {
     match result {
         Ok(validated) => panic!("accepted {validated:?}, expected {expected:?}"),
-        Err(fault) => assert_eq!(render(&fault), render(expected)),
+        Err(fault) => match (&fault, expected) {
+            (
+                ImageArchiveFault::LimitExceeded { resource, limit },
+                ImageArchiveFault::LimitExceeded {
+                    resource: expected_resource,
+                    limit: expected_limit,
+                },
+            ) => assert_eq!((resource, limit), (expected_resource, expected_limit)),
+            _ => assert_eq!(render(&fault), render(expected)),
+        },
     }
 }
 
@@ -295,6 +310,7 @@ fn a_repeated_layer_position_is_decoded_and_charged_again() {
         &mut operation,
     )
     .unwrap();
+    assert_summary(&validated, &built);
     assert_eq!(validated.layer_count, 3);
     let expected = 2 * a.len() + b.len();
     assert_eq!(operation.used(), u64::try_from(expected).unwrap());
@@ -1725,7 +1741,8 @@ fn additional_config_metadata_stays_bounded() {
         .json(Doc::Config, |c| c["notes"] = json!("x".repeat(1000)))
         .build();
     let size = built_config_len(&built);
-    assert!(run_with(&built, &limits(&[(LimitResource::ConfigJson, size)])).is_ok());
+    let validated = run_with(&built, &limits(&[(LimitResource::ConfigJson, size)])).unwrap();
+    assert_summary(&validated, &built);
     assert_fault(
         run_with(&built, &limits(&[(LimitResource::ConfigJson, size - 1)])),
         &limit(LimitResource::ConfigJson, size - 1),
@@ -1746,7 +1763,7 @@ fn built_config_len(built: &Built) -> u64 {
 }
 
 fn blob_len(built: &Built, hex: &str) -> u64 {
-    let validated = run(built).unwrap_or_else(|fault| panic!("refused: {fault:?}"));
+    let validated = accept(built);
     validated
         .entries
         .iter()
@@ -2448,7 +2465,8 @@ fn the_compression_probe_charges_each_byte_once() {
 
     let built = ImageBuilder::new().build();
     let len = u64::try_from(built.bytes.len()).unwrap();
-    assert!(run_with(&built, &limits(&[(LimitResource::ImageArchive, len)])).is_ok());
+    let validated = run_with(&built, &limits(&[(LimitResource::ImageArchive, len)])).unwrap();
+    assert_summary(&validated, &built);
     assert_fault(
         run_with(&built, &limits(&[(LimitResource::ImageArchive, len - 1)])),
         &limit(LimitResource::ImageArchive, len - 1),
@@ -2618,19 +2636,28 @@ fn config_profile_order() {
 // Resources
 // ---------------------------------------------------------------------------
 
-/// Asserts `built` is not refused for `resource` at `value`, and is refused
-/// for it at `value - 1`.
+/// Asserts `built` succeeds at `value` and exceeds `resource` at `value - 1`.
 #[track_caller]
 fn boundary(built: &Built, resource: LimitResource, value: u64) {
-    match run_with(built, &limits(&[(resource, value)])) {
-        Err(ImageArchiveFault::LimitExceeded {
-            resource: hit,
-            limit: configured,
-        }) if hit == resource && configured == value => {
-            panic!("{resource:?} refused at its limit {value}")
-        }
-        _ => {}
-    }
+    let validated = run_with(built, &limits(&[(resource, value)]))
+        .unwrap_or_else(|fault| panic!("{resource:?} refused at its limit {value}: {fault:?}"));
+    assert_summary(&validated, built);
+    assert_fault(
+        run_with(built, &limits(&[(resource, value - 1)])),
+        &limit(resource, value - 1),
+    );
+}
+
+/// Asserts an inconsistent fixture reaches its exact semantic verdict at the
+/// limit, but exceeds `resource` at `value - 1` before reaching that verdict.
+#[track_caller]
+fn boundary_refused(
+    built: &Built,
+    resource: LimitResource,
+    value: u64,
+    expected: &ImageArchiveFault,
+) {
+    assert_fault(run_with(built, &limits(&[(resource, value)])), expected);
     assert_fault(
         run_with(built, &limits(&[(resource, value - 1)])),
         &limit(resource, value - 1),
@@ -2668,7 +2695,12 @@ fn tag_limits_at_each_site() {
             c[0]["RepoTags"] = json!(["a:1", "b:1", "c:1"]);
         })
         .build();
-    boundary(&built, LimitResource::TagsPerImage, 3);
+    boundary_refused(
+        &built,
+        LimitResource::TagsPerImage,
+        3,
+        &reference(false, "b:1", ReferenceSource::RepoTags),
+    );
 }
 
 #[test]
@@ -2690,7 +2722,12 @@ fn layer_limits_at_each_site() {
             c[0]["Layers"].as_array_mut().unwrap().pop();
         })
         .build();
-    boundary(&built, LimitResource::LayersPerImage, 2);
+    boundary_refused(
+        &built,
+        LimitResource::LayersPerImage,
+        2,
+        &invalid(InvalidArchiveReason::InconsistentCompatibility),
+    );
     // `diff_ids` alone over the limit.
     let built = ImageBuilder::new()
         .layers(layers())
@@ -2703,7 +2740,12 @@ fn layer_limits_at_each_site() {
             c["history"].as_array_mut().unwrap().push(json!({}));
         })
         .build();
-    boundary(&built, LimitResource::LayersPerImage, 2);
+    boundary_refused(
+        &built,
+        LimitResource::LayersPerImage,
+        2,
+        &layer_mismatch(None, LayerMismatchKind::CountMismatch, "2", "1"),
+    );
 }
 
 #[test]
@@ -2769,7 +2811,7 @@ fn the_operation_budget_is_shared_across_images() {
         max: len(tar.len() * 2),
     });
     for _ in 0..2 {
-        validate_image_archive(
+        let validated = validate_image_archive(
             Cursor::new(built.bytes.as_slice()),
             &built.declaration,
             PATH,
@@ -2777,6 +2819,7 @@ fn the_operation_budget_is_shared_across_images() {
             &mut operation,
         )
         .unwrap();
+        assert_summary(&validated, &built);
     }
     assert_fault(
         validate_image_archive(
@@ -2895,8 +2938,7 @@ fn source_failures() {
     );
     // So does a layer range: one seek for the inventory, five for the
     // documents, and the seventh opens the layer.
-    let layer_offset = run(&built)
-        .unwrap()
+    let layer_offset = accept(&built)
         .entries
         .iter()
         .find(|entry| entry.name == blob_name(&built.parts.layer_hexes[0]))
@@ -3344,6 +3386,7 @@ fn a_large_layer_validates_from_a_file_within_bounded_buffers() {
     )
     .unwrap();
     let elapsed = started.elapsed();
+    assert_summary(&validated, &built);
     assert_eq!(validated.layer_count, 1);
     assert!(operation.used() >= DECODED);
     let events = seam::take();
