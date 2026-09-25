@@ -295,9 +295,10 @@ fn every_file_in_the_directory_is_in_the_inventory() {
 }
 
 /// A capture either points at the retained transcript of the run that made
-/// it, which must show its `docker save` command and its archive's hash, or
-/// says that its output was not retained and what is missing. Either way
-/// `INVENTORY.md` names it.
+/// it, which must show its `docker save` command, its archive's hash and its
+/// derived declaration, or says that its output was not retained and what is
+/// missing, pointing at most at a file labelled as a later extraction. Either
+/// way `INVENTORY.md` names it.
 #[test]
 fn every_docker_capture_states_whether_its_output_was_retained() {
     let inventory = String::from_utf8(read("INVENTORY.md")).unwrap();
@@ -326,9 +327,29 @@ fn every_docker_capture_states_whether_its_output_was_retained() {
             );
             let sha256 = text(&fixture["sha256"]);
             assert!(transcript.contains(sha256), "{name}: {path} shows {sha256}");
+            let declaration =
+                String::from_utf8(read(text(&fixture["declaration"]))).expect("UTF-8 declaration");
+            assert!(
+                transcript.contains(&declaration),
+                "{name}: {path} shows the derived declaration"
+            );
         } else {
             assert!(evidence["transcript"].is_null(), "{name}");
             assert!(!text(&evidence["not_retained"]).is_empty(), "{name}");
+            if let Some(extraction) = evidence["later_extraction"].as_str() {
+                let path = extraction.split(',').next().unwrap_or(extraction);
+                let output =
+                    std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR")))
+                        .unwrap_or_else(|error| panic!("{name}: {path}: {error}"));
+                assert!(
+                    output.starts_with("# LATER EXTRACTION"),
+                    "{name}: {path} is labelled a later extraction"
+                );
+                assert!(
+                    output.contains(&format!("{name}.tar")),
+                    "{name}: {path} reads {name}.tar"
+                );
+            }
         }
     }
 }
