@@ -114,6 +114,15 @@ use crate::payload::{
     UnparsedContainer,
 };
 
+mod image_archive;
+
+pub use image_archive::{
+    BlobMismatchKind, BlobRole, ConfigField, ExtensionField, GzipFault, GzipHeaderFault,
+    ImageDocument, InvalidArchiveReason, InvalidConfigReason, JsonFault, LayerMismatchKind,
+    LayoutFile, PaxKey, PlatformFacet, PlatformLocation, ReferenceSource, TarFault, TarFeature,
+    TarHeaderField, UnsupportedArchiveFeature,
+};
+
 /// Reserved package-id of the trust-material target, the one target that
 /// carries a delivered `epoch`.
 ///
@@ -833,13 +842,10 @@ pub enum VerifyError {
 ///
 /// This is the extension point for later image checks, so a caller matching
 /// [`VerifyError`] exhaustively names image conditions through one arm.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ImageVerifyError {
     /// A declaration's architecture is not the one its artifact's
     /// `target_arch` maps to.
-    #[error(
-        "image artifact `{archive_path}` is built for {target_arch:?} yet declares architecture {declared}"
-    )]
     PlatformMismatch {
         /// `archive_path` of the offending artifact.
         archive_path: String,
@@ -852,7 +858,6 @@ pub enum ImageVerifyError {
     /// A reference under [`RUNTIME_ALIAS_REGISTRY`] is not exactly the
     /// canonical alias its own declaration's owner, dependency and config
     /// digest determine.
-    #[error("{}", describe_reserved_reference(.archive_path, .reference, .expected.as_deref()))]
     NonCanonicalReservedReference {
         /// `archive_path` of the offending artifact.
         archive_path: String,
@@ -865,9 +870,6 @@ pub enum ImageVerifyError {
 
     /// A canonical reference under [`RUNTIME_ALIAS_REGISTRY`] is declared
     /// with a lifecycle other than [`ReferenceLifecycle::ManagedRuntime`].
-    #[error(
-        "reserved reference `{reference}` of image artifact `{archive_path}` is not managed_runtime"
-    )]
     ReservedReferenceLifecycle {
         /// `archive_path` of the offending artifact.
         archive_path: String,
@@ -877,9 +879,6 @@ pub enum ImageVerifyError {
 
     /// Two declarations assign one normalized reference to images that
     /// differ in config digest, platform, owner or lifecycle.
-    #[error(
-        "reference `{reference}` of image artifact `{archive_path}` conflicts in {conflict} with `{first_reference}` of `{first_archive_path}`"
-    )]
     ConflictingReference {
         /// `archive_path` of the later artifact.
         archive_path: String,
@@ -895,18 +894,12 @@ pub enum ImageVerifyError {
 
     /// The manifest declares images and the request carries no namespace to
     /// check their owner against.
-    #[error(
-        "image artifact `{archive_path}` declares an owner, and the request carries no namespace"
-    )]
     MissingNamespace {
         /// `archive_path` of the first declaring artifact.
         archive_path: String,
     },
 
     /// A declaration's `owner.namespace` is not verbatim the request's.
-    #[error(
-        "image artifact `{archive_path}` is owned by namespace `{declared}`, not the requested `{expected}`"
-    )]
     NamespaceMismatch {
         /// `archive_path` of the offending artifact.
         archive_path: String,
@@ -917,9 +910,6 @@ pub enum ImageVerifyError {
     },
 
     /// A declaration's `owner.component` is not the requested target.
-    #[error(
-        "image artifact `{archive_path}` is owned by component `{declared}`, not the requested `{expected}`"
-    )]
     OwnerComponentMismatch {
         /// `archive_path` of the offending artifact.
         archive_path: String,
@@ -928,6 +918,229 @@ pub enum ImageVerifyError {
         /// The declared owner component.
         declared: String,
     },
+
+    /// An image artifact of a legacy manifest carries no declaration, so no
+    /// image evidence can be made for it. It is refused explicitly rather
+    /// than represented as no images.
+    LegacyImageEvidence {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+    },
+
+    /// An image archive uses a form the supported archive profile names as
+    /// excluded.
+    UnsupportedArchive {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The excluded feature.
+        feature: UnsupportedArchiveFeature,
+    },
+
+    /// An image archive is malformed or internally inconsistent.
+    InvalidArchive {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// What is wrong with it.
+        reason: InvalidArchiveReason,
+    },
+
+    /// An image archive restores a reference its declaration does not sign.
+    UndeclaredReference {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The reference as the archive spells it; it parsed as a tagged
+        /// reference.
+        reference: String,
+        /// Where the archive names it.
+        source: ReferenceSource,
+    },
+
+    /// An image archive does not restore a reference its declaration signs.
+    MissingReference {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The signed reference, as signed.
+        reference: String,
+        /// Where the archive should have named it.
+        source: ReferenceSource,
+    },
+
+    /// An image archive's config does not hash to the declared config digest.
+    ConfigDigestMismatch {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The signed config digest.
+        declared: String,
+        /// The digest of the config the archive holds.
+        actual: String,
+    },
+
+    /// A platform the image archive states disagrees with the declared
+    /// platform.
+    ///
+    /// This is the archive's own config or descriptor platform against the
+    /// declaration; [`ImageVerifyError::PlatformMismatch`] is the
+    /// declaration against its artifact's target. The message never renders
+    /// `actual`, which is archive content.
+    ConfigPlatformMismatch {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// Where the archive states the platform.
+        location: PlatformLocation,
+        /// The first facet that disagrees.
+        facet: PlatformFacet,
+        /// The signed value, or `None` for a signed null variant.
+        declared: Option<String>,
+        /// The value the archive states, or `None` for an absent or null
+        /// variant.
+        actual: Option<String>,
+    },
+
+    /// An image archive's layers disagree with its config or descriptors.
+    LayerMismatch {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The layer's position in the manifest's `layers`, or `None` for a
+        /// disagreement about the layers as a whole.
+        position: Option<usize>,
+        /// How they disagree.
+        kind: LayerMismatchKind,
+        /// The digest or decimal count expected.
+        expected: Option<String>,
+        /// The digest or decimal count found.
+        actual: Option<String>,
+    },
+}
+
+// Written by hand rather than derived: `UndeclaredReference` and
+// `MissingReference` carry a field named `source` that is a
+// [`ReferenceSource`], and `thiserror` takes any field of that name to be the
+// underlying error. None of these conditions wraps another error.
+impl std::error::Error for ImageVerifyError {}
+
+impl std::fmt::Display for ImageVerifyError {
+    // One arm per variant, each a single message; splitting it would only
+    // scatter them.
+    #[allow(clippy::too_many_lines)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PlatformMismatch {
+                archive_path,
+                target_arch,
+                declared,
+            } => write!(
+                f,
+                "image artifact `{archive_path}` is built for {target_arch:?} yet declares architecture {declared}"
+            ),
+            Self::NonCanonicalReservedReference {
+                archive_path,
+                reference,
+                expected,
+            } => f.write_str(&describe_reserved_reference(
+                archive_path,
+                reference,
+                expected.as_deref(),
+            )),
+            Self::ReservedReferenceLifecycle {
+                archive_path,
+                reference,
+            } => write!(
+                f,
+                "reserved reference `{reference}` of image artifact `{archive_path}` is not managed_runtime"
+            ),
+            Self::ConflictingReference {
+                archive_path,
+                reference,
+                first_archive_path,
+                first_reference,
+                conflict,
+            } => write!(
+                f,
+                "reference `{reference}` of image artifact `{archive_path}` conflicts in {conflict} with `{first_reference}` of `{first_archive_path}`"
+            ),
+            Self::MissingNamespace { archive_path } => write!(
+                f,
+                "image artifact `{archive_path}` declares an owner, and the request carries no namespace"
+            ),
+            Self::NamespaceMismatch {
+                archive_path,
+                expected,
+                declared,
+            } => write!(
+                f,
+                "image artifact `{archive_path}` is owned by namespace `{declared}`, not the requested `{expected}`"
+            ),
+            Self::OwnerComponentMismatch {
+                archive_path,
+                expected,
+                declared,
+            } => write!(
+                f,
+                "image artifact `{archive_path}` is owned by component `{declared}`, not the requested `{expected}`"
+            ),
+            Self::LegacyImageEvidence { archive_path } => write!(
+                f,
+                "image artifact `{archive_path}` is a legacy image with no declaration"
+            ),
+            Self::UnsupportedArchive {
+                archive_path,
+                feature,
+            } => write!(f, "image archive `{archive_path}` uses {feature}"),
+            Self::InvalidArchive {
+                archive_path,
+                reason,
+            } => write!(f, "image archive `{archive_path}` is invalid: {reason}"),
+            Self::UndeclaredReference {
+                archive_path,
+                reference,
+                source,
+            } => write!(
+                f,
+                "image archive `{archive_path}` restores undeclared reference `{reference}` in its {source}"
+            ),
+            Self::MissingReference {
+                archive_path,
+                reference,
+                source,
+            } => write!(
+                f,
+                "image archive `{archive_path}` does not restore declared reference `{reference}` in its {source}"
+            ),
+            Self::ConfigDigestMismatch {
+                archive_path,
+                declared,
+                actual,
+            } => write!(
+                f,
+                "image archive `{archive_path}` holds config `{actual}`, not the declared `{declared}`"
+            ),
+            Self::ConfigPlatformMismatch {
+                archive_path,
+                location,
+                facet,
+                declared,
+                actual: _,
+            } => f.write_str(&describe_config_platform_mismatch(
+                archive_path,
+                *location,
+                *facet,
+                declared.as_deref(),
+            )),
+            Self::LayerMismatch {
+                archive_path,
+                position,
+                kind,
+                expected,
+                actual,
+            } => f.write_str(&describe_layer_mismatch(
+                archive_path,
+                *position,
+                *kind,
+                expected.as_deref(),
+                actual.as_deref(),
+            )),
+        }
+    }
 }
 
 /// Which facet of two assignments of one reference differs.
@@ -968,6 +1181,38 @@ fn describe_reserved_reference(
             "reserved reference `{reference}` of image artifact `{archive_path}` has no valid canonical alias to match"
         ),
     }
+}
+
+/// Renders [`ImageVerifyError::ConfigPlatformMismatch`]'s message, which names
+/// the signed value and never the observed one.
+fn describe_config_platform_mismatch(
+    archive_path: &str,
+    location: PlatformLocation,
+    facet: PlatformFacet,
+    declared: Option<&str>,
+) -> String {
+    let declared = declared.map_or_else(|| "no variant".to_string(), |value| format!("`{value}`"));
+    format!(
+        "image archive `{archive_path}` states a {facet} in its {location} that differs from the declared {declared}"
+    )
+}
+
+/// Renders [`ImageVerifyError::LayerMismatch`]'s message.
+fn describe_layer_mismatch(
+    archive_path: &str,
+    position: Option<usize>,
+    kind: LayerMismatchKind,
+    expected: Option<&str>,
+    actual: Option<&str>,
+) -> String {
+    let at = position.map_or_else(String::new, |position| format!(" at layer {position}"));
+    let values = match (expected, actual) {
+        (Some(expected), Some(actual)) => format!(": expected {expected}, found {actual}"),
+        (Some(expected), None) => format!(": expected {expected}"),
+        (None, Some(actual)) => format!(": found {actual}"),
+        (None, None) => String::new(),
+    };
+    format!("image archive `{archive_path}` has a {kind} mismatch{at}{values}")
 }
 
 /// Renders [`VerifyError::MissingRequiredMember`]'s message for both cases it
