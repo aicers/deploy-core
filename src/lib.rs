@@ -18,7 +18,9 @@
 //! each carrying a copy, the frozen on-disk self-update contract those units
 //! coordinate through — the record names, paths and versioned JSON shapes the
 //! installer and the on-host agent both write — the bootroot command wrapper,
-//! service registration, and the on-host trust-material activation. It carries
+//! service registration, the on-host trust-material activation, and the
+//! read-only retained bytes and no-clobber publication receipts that verified
+//! package content is read and published through. It carries
 //! **no** product concept — no component catalog, no per-component renderers —
 //! so both the installer and the per-machine root daemon depend on it and share
 //! a single implementation rather than shelling out to a CLI.
@@ -44,6 +46,7 @@ pub mod image;
 pub mod layout;
 pub mod manifest;
 pub mod module_spec;
+pub mod package;
 pub mod payload;
 pub mod registration;
 pub mod release_trust;
@@ -55,6 +58,14 @@ pub mod roxyd_selfupdate;
 // agent — and a `FORMAT` they both have to agree on. Neither module depends on
 // the other.
 pub mod roxyd_selfupdate_contract;
+// Private byte retention and no-clobber publication. Crate-private: its public
+// read-only, receipt and error types are exported from `package`.
+//
+// `dead_code` is allowed because the verification, preparation and finalization
+// work that consumes this storage core lands after it; until then only its own
+// tests call most of it.
+#[allow(dead_code)]
+pub(crate) mod retain;
 pub mod roxyd_trust;
 pub mod systemd;
 pub mod transport;

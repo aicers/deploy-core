@@ -9,8 +9,13 @@
 //! [`sync_dir`] after the rename that made the entry appear.
 //!
 //! It lives here rather than being open-coded at each site so there is one
-//! spelling of it to read and to get right.
+//! spelling of it to read and to get right. [`sync_open_dir`] is that
+//! spelling for a caller already holding the directory open, which is how
+//! every handle-relative write in `retain` flushes: reopening the directory by
+//! path would flush whatever the path names by then, not the directory the
+//! entry was created in.
 
+use std::fs::File;
 use std::path::Path;
 
 /// Flushes the directory at `path`, so the entries in it — the new name a
@@ -37,7 +42,19 @@ use std::path::Path;
 /// path that does not exist or is not readable by this process fails here
 /// rather than succeeding silently.
 pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+    sync_open_dir(&File::open(path)?)
+}
+
+/// Flushes the directory `dir` is open on, with the same guarantee and the
+/// same ordering rule as [`sync_dir`].
+///
+/// # Errors
+///
+/// Returns the [`std::io::Error`] from the flush, its kind preserved: a
+/// filesystem that refuses to sync a directory fails here rather than
+/// succeeding silently.
+pub(crate) fn sync_open_dir(dir: &File) -> std::io::Result<()> {
+    dir.sync_all()
 }
 
 #[cfg(test)]
