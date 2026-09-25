@@ -888,8 +888,8 @@ fn pax_record_faults() {
         b"13 path=abc\n",
         b"012 path=abc\n",
         b"11path=abc\n",
-        b"12  path=ab\n",
         b"9 =value\n",
+        b"4 =\n",
         b"11 pathabc\n",
         b"12 path=abc\n7",
         b"1",
@@ -912,6 +912,29 @@ fn pax_record_faults() {
     assert_eq!(
         layer(&with_pax(&pax(&[("comment", b"hi")]))).unwrap_err(),
         unsupported(UnsupportedFeature::PaxKey)
+    );
+}
+
+#[test]
+fn a_pax_key_may_begin_with_a_space() {
+    // Only the first space after the length separates; the next one is the
+    // key's own first byte, so these keys parse and then fail the key policy.
+    for payload in [
+        &b"7  a=b\n"[..],
+        b"12  path=ab\n",
+        b"13  path=abc\n",
+        b"5  =\n",
+    ] {
+        assert_eq!(
+            layer(&with_pax(payload)).unwrap_err(),
+            unsupported(UnsupportedFeature::PaxKey),
+            "{payload:?}"
+        );
+    }
+    // Record syntax still wins over the key policy when the length is wrong.
+    assert_eq!(
+        layer(&with_pax(b"8  a=b\n")).unwrap_err(),
+        malformed(MalformedReason::PaxRecord)
     );
 }
 
