@@ -8,11 +8,12 @@ use super::assembly::{
     remove_entry,
 };
 use super::{
-    ImageArchiveFault, Site, ValidatedImageArchive, Verdict, convert, seam, validate_image_archive,
+    ImageArchiveFault, Site, ValidatedImageArchive, Verdict, convert, probe, seam,
+    validate_image_archive,
 };
 use crate::content::{
-    Budget, ContentFault, GzipHeaderFault as ContentGzipHeader, MalformedReason,
-    PaxKey as ContentPaxKey, TarField, UnsupportedFeature,
+    Budget, ContentFault, CountingReader, GzipHeaderFault as ContentGzipHeader, MalformedReason,
+    PaxKey as ContentPaxKey, ResourceLimit, TarField, UnsupportedFeature,
 };
 use crate::image::ImageArchitecture;
 use crate::package::{ContentLimits, LimitResource};
@@ -2396,6 +2397,29 @@ fn the_compression_probe_charges_each_byte_once() {
     );
     // Two bytes delivered and charged, then one probe byte read to tell end of
     // file from excess, and never delivered.
+    assert_eq!(log.borrow().delivered, 3);
+    // The same, at the probe itself: the source gave up three bytes, and only
+    // the two within the limit were delivered to it and charged.
+    let (mut source, log) = Source::new(b"abcd".to_vec());
+    let mut counted = CountingReader::new(
+        &mut source,
+        ResourceLimit {
+            resource: LimitResource::ImageArchive,
+            max: 2,
+        },
+        Vec::new(),
+        ContentLimits::default().copy_buffer_len(),
+    );
+    assert!(matches!(
+        probe(&mut counted),
+        Err(Verdict::Limit {
+            resource: LimitResource::ImageArchive,
+            limit: 2,
+        })
+    ));
+    assert_eq!(counted.position(), 2);
+    assert_eq!(counted.own().used(), 2);
+    drop(counted);
     assert_eq!(log.borrow().delivered, 3);
 
     let built = ImageBuilder::new().build();

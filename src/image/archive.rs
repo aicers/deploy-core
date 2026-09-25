@@ -1404,12 +1404,12 @@ fn decode_layer<R: Read + Seek>(
     source
         .seek(SeekFrom::Start(span.offset))
         .map_err(Verdict::Io)?;
-    #[cfg_attr(not(test), allow(unused_mut))]
-    let mut range = Range::new(&mut *source, span.len);
+    let range = Range::new(&mut *source, span.len);
     #[cfg(test)]
-    {
-        range.layer = Some(position);
-    }
+    let range = Range {
+        layer: Some(position),
+        ..range
+    };
     let stored = CountingReader::new(
         range,
         limits.resource_limit(LimitResource::StoredLayerBlob),
