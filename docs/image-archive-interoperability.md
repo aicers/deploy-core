@@ -93,10 +93,18 @@ In each daemon, for each loaded sample:
    descriptors), and confirm the config digest by saving the loaded
    reference again and reading the `Config` path of that archive's
    `manifest.json`. Note which check matched.
-3. **Platform.** `docker image inspect <ref> --format
-   '{{.Os}}/{{.Architecture}}/{{.Variant}}'` matches the declaration's
-   platform: `linux`, the declared architecture, and the declared variant or
-   an empty variant for a declared `null`.
+3. **Platform.** The output of
+
+   ```sh
+   docker image inspect <ref> \
+     --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+   ```
+
+   matches the declaration's platform: `linux`, the declared architecture,
+   and the declared variant or an empty variant for a declared `null`. The
+   `index` form matters: when an image has no variant, the inspect output has
+   no `Variant` key, and a plain `{{.Variant}}` fails with `map has no entry
+   for key "Variant"`.
 
 A mismatch in any of these is a failed run for that store and version, and is
 recorded as such.
@@ -133,9 +141,13 @@ before anything is loaded. For each daemon:
      ```
 
      That inspect value is also the fallback when there is no
-     `manifest.json`. Record any disagreement.
+     `manifest.json`. Record any disagreement. On the containerd store
+     `.Id` reports the digest of the image index `index.json` points to,
+     not the config digest; that disagreement is expected there, and
+     `config_digest` still follows the `Config` path.
    - **Architecture and variant** are `.Architecture` and `.Variant` of the
-     same inspect. An empty or absent variant becomes `null`.
+     same inspect, read with the `index` form from step 3. An empty or absent
+     variant becomes `null`.
    - **Owner, dependency, lifecycle and provenance** are fixed: owner
      `example-product`/`example-app`, dependency `app`, lifecycle
      `shared_external`, and provenance `product_build` with repository
@@ -173,4 +185,67 @@ Report the result per store and version as run, with its outcome, or as
 
 ## Recorded runs
 
-None yet. The graphdriver-store and containerd-store runs are **not run**.
+### 2026-09-25: Docker Engine 29.8.1, `arm64`, both stores
+
+Two disposable daemons, each a `docker:29-dind` container
+(`docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0`)
+run with `--privileged` and its own data root inside the container. Server
+components: Engine 29.8.1, containerd v2.3.5, runc 1.5.1, all `linux/arm64`.
+
+- **graphdriver store:** `daemon.json` set
+  `{"features":{"containerd-snapshotter":false}}`, and `docker info`
+  reported the driver `overlay2`.
+- **containerd store:** `daemon.json` set
+  `{"features":{"containerd-snapshotter":true}}`, and `docker info`
+  reported the driver `overlayfs` with driver type
+  `io.containerd.snapshotter.v1`.
+
+**Samples (steps 1–3).** `write` produced four samples, each classified
+`accepted` before loading:
+
+- `amd64` and `arm64`, each with one tag
+  (`registry.example/interop/sample-<arch>:1.0`);
+- `amd64` and `arm64`, each with two tags
+  (`registry.example/interop/many-<arch>:1.0` and `:latest`).
+
+The checked-in `explicit-variant` fixture (`arm64`/`v8`) was loaded as well,
+since `write` only produces a null variant.
+
+On both daemons, every sample loaded and passed step 3:
+
+- **Tags.** `docker load` reported exactly the declared tags, and
+  `docker image ls -a` listed exactly those tags, with no other tag and no
+  `<none>` entry.
+- **Config ID.** On the graphdriver store, `.Id` equalled the declared
+  `config_digest` for every sample. On the containerd store, `.Id` was the
+  sample's manifest digest (the `digest` of its `index.json` descriptor).
+  Saving `sample-arm64:1.0` and `many-amd64:latest` again from that daemon
+  gave a `manifest.json` whose `Config` path is the declared
+  `config_digest`. The manifest-digest check and the re-save check both
+  matched.
+- **Platform.** `linux/amd64/` and `linux/arm64/` (empty variant) for the
+  null-variant samples, and `linux/arm64/v8` for `explicit-variant`, on both
+  stores.
+
+**Raw exports (step 4).** Each daemon built `FROM scratch` with one six-byte
+file and saved `registry.example/interop/raw-<store>:1.0`. The declarations
+were derived from each archive's `manifest.json`, with no fallback. Neither
+export was loaded anywhere. `classify` refused both, exit code 1:
+
+- graphdriver:
+  ``image archive `raw-gd.tar` uses a legacy docker-save export file``
+  (`UnsupportedArchive`, `LegacyExportFile`). The export carries
+  `repositories`, `blobs/` directory entries and `LayerSources`.
+- containerd:
+  ``image archive `raw-cd.tar` uses a nested image index``
+  (`UnsupportedArchive`, `NestedIndex`). `index.json` points to an image
+  index that also lists an attestation manifest. `.Id` was that index's
+  digest, not the config digest, and this disagreement was recorded.
+
+Both exports are checked in as the `docker-capture` fixtures
+`docker-graphdriver-scratch` and `docker-containerd-scratch`, with their full
+capture records in `assets/test-fixtures/images/inventory.json`.
+
+**Result.** Engine 29.8.1 on `arm64`, graphdriver store: run, passed.
+Engine 29.8.1 on `arm64`, containerd store: run, passed. No other engine
+version, architecture or store combination has been run.

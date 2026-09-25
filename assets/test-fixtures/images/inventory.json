@@ -667,6 +667,83 @@
         "detail": "LayerMediaType { position: 0 }",
         "error": "UnsupportedArchive"
       }
+    },
+    {
+      "archive": "docker-graphdriver-scratch.tar",
+      "declaration": "docker-graphdriver-scratch.declaration.json",
+      "kind": "docker-capture",
+      "name": "docker-graphdriver-scratch",
+      "provenance": {
+        "architecture": "arm64",
+        "build": {
+          "command": "docker build -t registry.example/interop/raw-gd:1.0 .",
+          "context_files": {
+            "hello.txt": "hello\n"
+          },
+          "dockerfile": "FROM scratch\nCOPY hello.txt /hello.txt\n"
+        },
+        "captured_on": "2026-09-25",
+        "checked_in_as": "docker-graphdriver-scratch.tar, renamed from raw-gd.tar with its bytes unchanged",
+        "command": "docker save -o /work/raw-gd.tar registry.example/interop/raw-gd:1.0",
+        "daemon": "docker:29-dind (docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0), run with --privileged and its own data root inside the container",
+        "declaration_derivation": {
+          "architecture_and_variant": "`.Architecture` arm64 and an absent `.Variant` (null) from `docker image inspect`",
+          "config_digest": "sha256: plus the hex of the record's Config path (blobs/sha256/830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182)",
+          "fallback_used": false,
+          "inspect_id": "sha256:830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182",
+          "manifest_json": "present",
+          "owner_dependency_lifecycle_provenance": "fixed values from docs/image-archive-interoperability.md step 4",
+          "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
+        },
+        "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "source_image_digest": "sha256:830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182",
+        "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":false}}; docker info Driver overlay2",
+        "store_mode": "graphdriver"
+      },
+      "sha256": "3497a77343b11902aad7d3d85504ef86a0bc0d78dd89091b6d02220a7ffd5eb8",
+      "verdict": {
+        "detail": "LegacyExportFile",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "docker-containerd-scratch.tar",
+      "declaration": "docker-containerd-scratch.declaration.json",
+      "kind": "docker-capture",
+      "name": "docker-containerd-scratch",
+      "provenance": {
+        "architecture": "arm64",
+        "build": {
+          "command": "docker build -t registry.example/interop/raw-cd:1.0 .",
+          "context_files": {
+            "hello.txt": "hello\n"
+          },
+          "dockerfile": "FROM scratch\nCOPY hello.txt /hello.txt\n"
+        },
+        "captured_on": "2026-09-25",
+        "checked_in_as": "docker-containerd-scratch.tar, renamed from raw-cd.tar with its bytes unchanged",
+        "command": "docker save -o /work/raw-cd.tar registry.example/interop/raw-cd:1.0",
+        "daemon": "docker:29-dind (docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0), run with --privileged and its own data root inside the container",
+        "declaration_derivation": {
+          "architecture_and_variant": "`.Architecture` arm64 and an absent `.Variant` (null) from `docker image inspect`",
+          "config_digest": "sha256: plus the hex of the record's Config path (blobs/sha256/4d3513a55c81a90e8ade85146882cb40ea0480961be2105bfd5c3c74fd4ff237)",
+          "fallback_used": false,
+          "inspect_disagreement": "`docker image inspect .Id` is the image index digest sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff on the containerd store, not the config digest; config_digest follows the Config path",
+          "inspect_id": "sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff",
+          "manifest_json": "present",
+          "owner_dependency_lifecycle_provenance": "fixed values from docs/image-archive-interoperability.md step 4",
+          "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
+        },
+        "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "source_image_digest": "sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff",
+        "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":true}}; docker info Driver overlayfs, driver-type io.containerd.snapshotter.v1",
+        "store_mode": "containerd"
+      },
+      "sha256": "1b8979c2cd3510953839e879c21d8dea11ac63bbc630d475f8a770eef83219fb",
+      "verdict": {
+        "detail": "NestedIndex",
+        "error": "UnsupportedArchive"
+      }
     }
   ]
 }

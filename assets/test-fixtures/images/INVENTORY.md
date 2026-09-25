@@ -105,14 +105,24 @@ To add a synthetic fixture, add its record with its parameters to
 
 ## Docker captures
 
-No disposable Docker engine was available when these fixtures were made, so no
-real `docker save` capture is checked in. The evidence is reported as not
-run, never mocked:
+Both captures were made on 2026-09-25 from disposable Docker Engine 29.8.1
+daemons (containerd v2.3.5, runc 1.5.1, `arm64`), each running in its own
+`docker:29-dind` container with its own data root, one per image store. Each
+daemon built the same tiny image, `FROM scratch` with one six-byte file
+`hello.txt`, and saved exactly one reference with `docker save -o`. The
+declaration was derived from the saved archive's `manifest.json` as
+`docs/image-archive-interoperability.md` step 4 describes; no fallback was
+needed. `inventory.json` holds each full capture record.
 
-- `graphdriver-store` `docker save` capture: **not run**
-- `containerd-store` `docker save` capture: **not run**
+- `docker-graphdriver-scratch`: the graphdriver store (`overlay2`). The
+  export carries `repositories`, `blobs/` directory entries and a
+  `LayerSources` record — `UnsupportedArchive`, `LegacyExportFile`.
+- `docker-containerd-scratch`: the containerd store (`overlayfs` snapshotter).
+  `index.json` points to a nested image index that also lists an attestation
+  manifest — `UnsupportedArchive`, `NestedIndex`. On this store
+  `docker image inspect --format '{{.Id}}'` reports that index's digest
+  rather than the config digest, so `config_digest` follows the record's
+  `Config` path, and the capture record notes the disagreement.
 
-When a disposable engine is available, capture a tiny `FROM scratch` image
-from each store as `docs/image-archive-interoperability.md` describes, add
-each as a `docker-capture` fixture with its full capture record and the
-verdict the validator reports for it, and remove its line above.
+Both are refused, as the profile expects of raw `docker save` output.
+Replacing either means a new capture with a new capture record.
