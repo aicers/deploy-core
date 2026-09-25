@@ -410,8 +410,10 @@ What the run reported, not retained as output:
   the image index digest, against the `Config` digest
   `sha256:4d3513a55c81a90e8ade85146882cb40ea0480961be2105bfd5c3c74fd4ff237`
   that the declaration uses. `classify` was reported to refuse both with
-  exit code 1, `LegacyExportFile` for graphdriver and `NestedIndex` for
-  containerd, and neither export was reported as loaded. With no transcript,
+  exit code 1: ``image archive `raw-gd.tar` uses a legacy docker-save
+  export file`` (`LegacyExportFile`) for graphdriver and ``image archive
+  `raw-cd.tar` uses a nested image index`` (`NestedIndex`) for containerd.
+  Neither export was reported as loaded. With no transcript,
   the order of classification and loading is unverified.
 
 What is retained: the two raw exports, checked in with their bytes unchanged
