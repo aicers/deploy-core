@@ -32,6 +32,10 @@ use crate::manifest::{GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN, TargetArch};
 // The byte-level image-archive validator. Crate-private: package verification
 // is what calls it.
 mod archive;
+// Synthetic image archives and an archive classifier, for this crate's tests
+// and for dependents that enable `test-support` under `[dev-dependencies]`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 /// The one declaration `schema` this build reads and writes.
 pub const IMAGE_DECLARATION_SCHEMA: u32 = 1;

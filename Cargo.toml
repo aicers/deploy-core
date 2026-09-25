@@ -37,6 +37,25 @@ test-support = []
 rcgen = "0.14"
 time = "0.3"
 
+# Writes and classifies synthetic image archives through the public
+# `image::test_support` API, so it exists only under `test-support`.
+[[example]]
+name = "write_synthetic_image"
+path = "examples/write_synthetic_image/main.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "synthetic_image_builder"
+required-features = ["test-support"]
+
+[[test]]
+name = "image_fixture_inventory"
+required-features = ["test-support"]
+
+[[test]]
+name = "write_synthetic_image_cli"
+required-features = ["test-support"]
+
 [lints.clippy]
 pedantic = "warn"
 unwrap_used = "warn"
