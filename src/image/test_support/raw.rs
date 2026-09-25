@@ -428,6 +428,7 @@ fn zstd_layer(base: &SyntheticImageArchive) -> Vec<u8> {
     let entries = read_entries(base.bytes());
     let mut manifest = json_blob(&entries, base.manifest_digest());
     let mut blobs = Vec::new();
+    let mut layer_paths = Vec::new();
     for descriptor in manifest["layers"].as_array_mut().unwrap() {
         let blob = zstd_frame(&decode(&entries, descriptor));
         *descriptor = json!({
@@ -435,6 +436,7 @@ fn zstd_layer(base: &SyntheticImageArchive) -> Vec<u8> {
             "digest": digest(&blob),
             "size": blob.len(),
         });
+        layer_paths.push(json!(format!("{BLOB_PREFIX}{}", sha256_hex(&blob))));
         if !blobs.contains(&blob) {
             blobs.push(blob);
         }
@@ -457,10 +459,7 @@ fn zstd_layer(base: &SyntheticImageArchive) -> Vec<u8> {
         }
     });
     edit_json(&mut raw, COMPATIBILITY_FILE, |compatibility| {
-        compatibility[0]["Layers"] = blobs
-            .iter()
-            .map(|blob| json!(format!("{BLOB_PREFIX}{}", sha256_hex(blob))))
-            .collect();
+        compatibility[0]["Layers"] = Value::Array(layer_paths);
     });
     raw.push(RawEntry::file(
         &format!("{BLOB_PREFIX}{}", sha256_hex(&manifest)),

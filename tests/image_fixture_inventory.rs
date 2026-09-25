@@ -296,16 +296,27 @@ fn every_file_in_the_directory_is_in_the_inventory() {
 
 #[test]
 fn missing_docker_captures_are_listed_as_not_run() {
-    let captures = fixtures()
+    const STORES: [&str; 2] = ["graphdriver", "containerd"];
+    let captured: BTreeSet<String> = fixtures()
         .iter()
         .filter(|fixture| fixture["kind"] == "docker-capture")
-        .count();
-    if captures > 0 {
-        return;
+        .map(|fixture| text(&fixture["provenance"]["store_mode"]).to_owned())
+        .collect();
+    for store in &captured {
+        assert!(
+            STORES.contains(&store.as_str()),
+            "unknown store_mode {store}"
+        );
     }
     let inventory = String::from_utf8(read("INVENTORY.md")).unwrap();
-    for store in ["graphdriver-store", "containerd-store"] {
-        let line = format!("- `{store}` `docker save` capture: **not run**");
-        assert!(inventory.contains(&line), "INVENTORY.md lists {store}");
+    for store in STORES {
+        if captured.contains(store) {
+            continue;
+        }
+        let line = format!("- `{store}-store` `docker save` capture: **not run**");
+        assert!(
+            inventory.contains(&line),
+            "INVENTORY.md lists {store}-store"
+        );
     }
 }

@@ -87,8 +87,16 @@ Refused, from the raw generator:
 ## Regenerating synthetic fixtures
 
 Synthetic output depends on the `tar`, `flate2` and `miniz_oxide` versions the
-build resolves. A dependency update that changes the bytes fails the
-regeneration tests, and the fixtures are regenerated in the same change:
+build resolves. This repository does not track `Cargo.lock`, and `Cargo.toml`
+asks only for `flate2 = "1"` and `tar = "0.4"`, so nothing pins those versions:
+each build resolves the newest compatible releases, and `flate2` has moved its
+`miniz_oxide` requirement within its 1.1 line before. A release that changes
+the DEFLATE output therefore fails the regeneration tests on an unchanged
+tree, with no dependency update in any change here to regenerate them in.
+Nine synthetic fixtures have a gzip layer somewhere in their parameters and
+are exposed; `uncompressed`, `scratch`, `classic-layout` and `zstd-layer` have
+none and depend only on `tar`. When the regeneration tests fail this way,
+regenerate the fixtures in the change that fixes the build:
 
 ```sh
 cargo test --lib -- --ignored write_synthetic_fixtures
