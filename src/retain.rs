@@ -42,7 +42,8 @@ use ring::rand::SecureRandom;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
-use crate::package::{DirectoryTrustReason, RetainedBytes, hex};
+use crate::package::{DirectoryTrustReason, RetainedBytes};
+use crate::payload::to_hex;
 
 /// Runs `$op`, an `io::Result` expression, after the test seam has had its
 /// say about `$step`. A release build expands to `$op` alone.
@@ -316,13 +317,13 @@ fn random_hex() -> io::Result<String> {
     step!(DrawName, Ok(()))?;
     #[cfg(test)]
     if let Some(forced) = fault::forced_name() {
-        return Ok(hex(&forced));
+        return Ok(to_hex(&forced));
     }
     let mut bytes = [0u8; 16];
     ring::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| io::Error::other("system random source failed"))?;
-    Ok(hex(&bytes))
+    Ok(to_hex(&bytes))
 }
 
 /// Creates a fresh directory `<prefix><hex><suffix>` in `parent` with

@@ -31,6 +31,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::payload::to_hex;
 use crate::retain::Charge;
 
 /// A read-only handle on bytes the library copied once into private storage.
@@ -167,7 +168,7 @@ impl fmt::Debug for RetainedBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RetainedBytes")
             .field("len", &self.backing.len)
-            .field("sha256", &hex(&self.backing.sha256))
+            .field("sha256", &to_hex(&self.backing.sha256))
             .finish()
     }
 }
@@ -512,15 +513,4 @@ impl fmt::Display for DirectoryTrustReason {
             Self::NotWritableByEffectiveUser => "the effective user cannot write to the directory",
         })
     }
-}
-
-/// Lowercase hex, for `Debug`.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        // Writing to a `String` is infallible.
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }

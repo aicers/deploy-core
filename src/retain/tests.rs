@@ -440,7 +440,7 @@ fn unsafe_staging_parent_is_refused() {
 fn colliding_name_is_redrawn_and_existing_entry_untouched() {
     let (_dir, root) = root();
     let forced = [0xab; 16];
-    let existing = root.join(format!(".deploy-core-retain-{}", hex(&forced)));
+    let existing = root.join(format!(".deploy-core-retain-{}", to_hex(&forced)));
     fs::create_dir(&existing).unwrap();
     fs::write(existing.join("marker"), b"keep").unwrap();
 
@@ -467,7 +467,7 @@ fn colliding_name_is_redrawn_and_existing_entry_untouched() {
 fn eight_collisions_fail_with_already_exists() {
     let (_dir, root) = root();
     let forced = [0x11; 16];
-    let existing = root.join(format!(".deploy-core-retain-{}", hex(&forced)));
+    let existing = root.join(format!(".deploy-core-retain-{}", to_hex(&forced)));
     fs::create_dir(&existing).unwrap();
     let mut seam = Seam::new();
     for _ in 0..NAME_ATTEMPTS {
@@ -923,7 +923,7 @@ fn debug_shows_only_length_and_digest() {
         debug,
         format!(
             "RetainedBytes {{ len: 10, sha256: \"{}\" }}",
-            hex(&sha(b"secret-ish"))
+            to_hex(&sha(b"secret-ish"))
         )
     );
 }
