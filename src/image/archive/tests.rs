@@ -2311,6 +2311,30 @@ fn each_earlier_phase_wins_over_the_next() {
 }
 
 #[test]
+fn the_compatibility_links_fall_between_documents_and_tags() {
+    // Image manifest shape before compatibility links.
+    let built = ImageBuilder::new()
+        .json(Doc::Manifest, |m| m["annotations"] = json!({"x": "y"}))
+        .json(Doc::Compat, |c| {
+            c[0]["Config"] = json!(format!("blobs/sha256/{FAKE_HEX}"));
+        })
+        .build();
+    assert_fault(
+        run(&built),
+        &unsupported(UnsupportedArchiveFeature::ManifestAnnotation),
+    );
+    // Blob set before tags.
+    let built = ImageBuilder::new()
+        .entries(|entries, _| entries.push(Entry::file(&blob_name(FAKE_HEX), b"x".to_vec())))
+        .json(Doc::Compat, |c| c[0]["RepoTags"] = json!(["other:1"]))
+        .build();
+    assert_fault(
+        run(&built),
+        &unsupported(UnsupportedArchiveFeature::UnreferencedBlob),
+    );
+}
+
+#[test]
 fn a_deferred_finding_loses_to_a_later_hazard() {
     let extra = || Entry::file("extra", b"x".to_vec());
     let checksum = ImageBuilder::new()
