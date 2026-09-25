@@ -29,6 +29,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::manifest::{GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN, TargetArch};
 
+// The byte-level image-archive validator. Crate-private: package verification
+// is what calls it.
+mod archive;
+
 /// The one declaration `schema` this build reads and writes.
 pub const IMAGE_DECLARATION_SCHEMA: u32 = 1;
 
