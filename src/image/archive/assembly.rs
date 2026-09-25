@@ -324,6 +324,8 @@ pub(super) struct Built {
     pub(super) declaration: ImageDeclaration,
     pub(super) config_digest: String,
     pub(super) manifest_digest: String,
+    /// Number of layer positions specified by the builder, including repeats.
+    pub(super) layer_count: usize,
     pub(super) parts: Parts,
 }
 
@@ -562,6 +564,7 @@ impl ImageBuilder {
             declaration,
             config_digest,
             manifest_digest,
+            layer_count: positions.len(),
             parts,
         }
     }
