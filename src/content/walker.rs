@@ -933,13 +933,12 @@ fn split_pax_record(payload: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     let record = payload.get(..length)?;
     let tail = payload.get(length..)?;
     // After the digits: exactly one space, then a body ending in a newline.
+    // The key starts right after that space, so a second space is the key's
+    // first byte rather than another separator.
     let body = record
         .get(digits..)?
         .strip_prefix(b" ")?
         .strip_suffix(b"\n")?;
-    if body.first() == Some(&b' ') {
-        return None;
-    }
     let equals = body.iter().position(|byte| *byte == b'=')?;
     let (key, value) = body.split_at(equals);
     if key.is_empty() {
