@@ -142,22 +142,9 @@ impl RetentionError {
         operation: RetentionOperation,
         path: Option<PathBuf>,
     ) -> Self {
-        if error
-            .get_ref()
-            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<RetentionError>)
-        {
-            match error
-                .into_inner()
-                .map(<dyn std::error::Error + Send + Sync>::downcast::<RetentionError>)
-            {
-                Some(Ok(retention)) => return *retention,
-                // Unreachable after the `is` check above, but recovered
-                // rather than asserted.
-                Some(Err(inner)) => return Self::io(operation, path, io::Error::other(inner)),
-                None => return Self::io(operation, path, io::Error::other("empty i/o error")),
-            }
-        }
-        Self::io(operation, path, error)
+        error
+            .downcast::<RetentionError>()
+            .unwrap_or_else(|error| Self::io(operation, path, error))
     }
 }
 
