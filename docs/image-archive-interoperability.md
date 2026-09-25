@@ -88,9 +88,11 @@ In each daemon, for each loaded sample:
    tag, and no other tag and no `<none>` entry for it.
 2. **Config ID.** `docker image inspect <ref> --format '{{.Id}}'` equals the
    declaration's `config_digest`. On the containerd store `.Id` may report
-   the manifest digest instead; in that case record it, compare
-   `docker image inspect <ref> --format '{{.Config.Image}}'` and the
-   config digest of `docker save` output, and note which field matched.
+   the image's manifest digest instead. In that case record it, check that
+   it equals the sample's manifest digest (the `digest` of its `index.json`
+   descriptors), and confirm the config digest by saving the loaded
+   reference again and reading the `Config` path of that archive's
+   `manifest.json`. Note which check matched.
 3. **Platform.** `docker image inspect <ref> --format
    '{{.Os}}/{{.Architecture}}/{{.Variant}}'` matches the declaration's
    platform: `linux`, the declared architecture, and the declared variant or
