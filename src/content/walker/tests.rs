@@ -919,7 +919,12 @@ fn pax_record_faults() {
 fn a_pax_key_may_begin_with_a_space() {
     // Only the first space after the length separates; the next one is the
     // key's own first byte, so these keys parse and then fail the key policy.
-    for payload in [&b"7  a=b\n"[..], b"12  path=ab\n", b"13  path=abc\n"] {
+    for payload in [
+        &b"7  a=b\n"[..],
+        b"12  path=ab\n",
+        b"13  path=abc\n",
+        b"5  =\n",
+    ] {
         assert_eq!(
             layer(&with_pax(payload)).unwrap_err(),
             unsupported(UnsupportedFeature::PaxKey),
