@@ -1,4 +1,24 @@
-//! Retained package bytes and the publication of verified output.
+//! Whole-package content APIs, the resource policy they share, and the
+//! retained bytes and publication they read and write through.
+//!
+//! This module will also host the package verification and writer APIs, which
+//! check and produce complete packages together with the container images they
+//! carry. What it holds today is what those APIs are built on.
+//!
+//! [`ContentLimits`] is the policy they enforce: the finite ceilings on every
+//! resource reading a package's full content can consume — bytes stored and
+//! decoded, entries, path lengths, JSON documents and nesting, disk and
+//! buffers — together with [`LimitResource`], which names each ceiling, and
+//! [`ContentLimitsError`], which reports a setting that was refused.
+//!
+//! The defaults are deliberately generous: they admit GB-scale images streamed
+//! through bounded memory while still bounding parser state, decompression and
+//! disk use. A caller may lower any of them for its own operation and never
+//! raise one. Raising a default is a reviewed change to this library, not a
+//! configuration choice, and nothing makes a resource unlimited.
+//!
+//! These are operational ceilings only. They change neither the manifest
+//! versions a verifier accepts nor any trust floor.
 //!
 //! Validated package and image content has to be read from bytes nothing
 //! outside this library can change between the check and the use.
@@ -31,8 +51,17 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::content::ResourceLimit;
 use crate::payload::to_hex;
 use crate::retain::Charge;
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+const GIB: u64 = 1024 * MIB;
+
+/// Smallest `ZstdWindow` a caller may set: a 1 KiB window, the least zstd
+/// itself can describe.
+const MIN_ZSTD_WINDOW: u64 = 1024;
 
 /// A read-only handle on bytes the library copied once into private storage.
 ///
@@ -513,4 +542,316 @@ impl fmt::Display for DirectoryTrustReason {
             Self::NotWritableByEffectiveUser => "the effective user cannot write to the directory",
         })
     }
+}
+
+/// Declares [`LimitResource`], its default table and its labels, and the
+/// private per-resource storage of [`ContentLimits`], from one table, so a
+/// resource cannot gain a variant without also gaining a default, a label and
+/// a slot.
+macro_rules! limit_resources {
+    ($(
+        $(#[$doc:meta])*
+        $variant:ident => $field:ident, $label:literal, $default:expr;
+    )*) => {
+        /// One finite resource a [`ContentLimits`] bounds.
+        ///
+        /// Each variant names a single ceiling. Its [`Display`](fmt::Display)
+        /// form is a fixed lowercase label, such as `decoded layer`, suitable
+        /// for a diagnostic.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum LimitResource {
+            $(
+                $(#[$doc])*
+                $variant,
+            )*
+        }
+
+        impl LimitResource {
+            /// Every resource exactly once, in the order of the default table.
+            pub const ALL: &'static [LimitResource] = &[$(LimitResource::$variant,)*];
+
+            /// Returns the library default for this resource, which is also
+            /// the highest value [`ContentLimits::with_limit`] accepts for it.
+            #[must_use]
+            pub fn default_limit(self) -> u64 {
+                match self {
+                    $(LimitResource::$variant => $default,)*
+                }
+            }
+
+            fn label(self) -> &'static str {
+                match self {
+                    $(LimitResource::$variant => $label,)*
+                }
+            }
+        }
+
+        /// The configured value of every resource, one private slot each.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct LimitValues {
+            $($field: u64,)*
+        }
+
+        impl Default for LimitValues {
+            fn default() -> Self {
+                Self {
+                    $($field: $default,)*
+                }
+            }
+        }
+
+        impl LimitValues {
+            fn get(&self, resource: LimitResource) -> u64 {
+                match resource {
+                    $(LimitResource::$variant => self.$field,)*
+                }
+            }
+
+            fn slot(&mut self, resource: LimitResource) -> &mut u64 {
+                match resource {
+                    $(LimitResource::$variant => &mut self.$field,)*
+                }
+            }
+        }
+    };
+}
+
+limit_resources! {
+    /// Bytes of one package's raw manifest.
+    RawManifest => raw_manifest, "raw manifest", 16 * MIB;
+    /// Bytes of one package's compressed archive block.
+    CompressedArchive => compressed_archive, "compressed archive", 64 * GIB;
+    /// Bytes of one whole package file: the archive block, the manifest and
+    /// the fixed-size envelope around them.
+    Package => package, "package", 64 * GIB + 16 * MIB + 201;
+    /// Members of one package's outer archive.
+    OuterMembers => outer_members, "outer members", 1024;
+    /// Uncompressed bytes across every member of one package's outer archive.
+    OuterUncompressedTotal => outer_uncompressed_total, "outer uncompressed total", 128 * GIB;
+    /// Bytes of one image archive: the docker-save tar a package carries.
+    ImageArchive => image_archive, "image archive", 32 * GIB;
+    /// Stored bytes of one layer blob, before any decompression.
+    StoredLayerBlob => stored_layer_blob, "stored layer blob", 16 * GIB;
+    /// Decoded bytes of one layer.
+    DecodedLayer => decoded_layer, "decoded layer", 16 * GIB;
+    /// Decoded bytes across every layer of one image.
+    DecodedLayersPerImage => decoded_layers_per_image, "decoded layers per image", 128 * GIB;
+    /// Decoded bytes across every layer one operation reads.
+    DecodedLayersPerOperation => decoded_layers_per_operation, "decoded layers per operation", 256 * GIB;
+    /// Bytes of one gzip member header, from its first magic byte through its
+    /// header CRC.
+    GzipHeader => gzip_header, "gzip header", 64 * KIB;
+    /// Entries of one image archive.
+    ImageEntries => image_entries, "image entries", 4096;
+    /// Bytes of one image archive entry name, as written.
+    ImagePathBytes => image_path_bytes, "image path bytes", 255;
+    /// Layers of one image.
+    LayersPerImage => layers_per_image, "layers per image", 256;
+    /// Tags of one image.
+    TagsPerImage => tags_per_image, "tags per image", 256;
+    /// Bytes of one image's `index.json`.
+    IndexJson => index_json, "index json", MIB;
+    /// Bytes of one image's OCI image manifest.
+    ImageManifestJson => image_manifest_json, "image manifest json", MIB;
+    /// Bytes of one image's docker-save compatibility `manifest.json`.
+    CompatibilityJson => compatibility_json, "compatibility json", MIB;
+    /// Bytes of one image config.
+    ConfigJson => config_json, "config json", 4 * MIB;
+    /// Bytes of one image's `oci-layout`.
+    OciLayout => oci_layout, "oci layout", KIB;
+    /// Bytes across every JSON document of one image.
+    ImageJsonTotal => image_json_total, "image json total", 16 * MIB;
+    /// Nesting depth of one JSON document, counting each array or object as
+    /// one level.
+    JsonDepth => json_depth, "json depth", 64;
+    /// Tar headers across every layer of one image, extension headers
+    /// included.
+    LayerEntries => layer_entries, "layer entries", 1_000_000;
+    /// Bytes of one layer entry's effective name.
+    LayerPathBytes => layer_path_bytes, "layer path bytes", 4096;
+    /// Bytes of one layer entry's effective link target.
+    LayerLinkTargetBytes => layer_link_target_bytes, "layer link target bytes", 4096;
+    /// Payload bytes of one layer extension record.
+    LayerExtension => layer_extension, "layer extension", 64 * KIB;
+    /// Payload bytes across every layer extension record of one image.
+    LayerExtensionTotal => layer_extension_total, "layer extension total", 64 * MIB;
+    /// Bytes of disk one operation may retain.
+    RetainedDisk => retained_disk, "retained disk", 512 * GIB;
+    /// Bytes of one copy buffer, and so of any single request made of a
+    /// caller's source.
+    CopyBuffer => copy_buffer, "copy buffer", MIB;
+    /// Bytes of the zstd window a decoder may use.
+    ZstdWindow => zstd_window, "zstd window", 64 * MIB;
+    /// Bytes of one preparation record.
+    PreparationRecord => preparation_record, "preparation record", 64 * KIB;
+}
+
+impl LimitResource {
+    /// Whether a zero setting would leave the resource unable to do any work
+    /// at all rather than merely admitting nothing: a copy needs a buffer, a
+    /// JSON document has a root, and a zstd frame has a window.
+    fn refuses_zero(self) -> bool {
+        matches!(
+            self,
+            LimitResource::CopyBuffer | LimitResource::JsonDepth | LimitResource::ZstdWindow
+        )
+    }
+}
+
+impl fmt::Display for LimitResource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// The finite resource policy every full-content package API enforces.
+///
+/// Every [`LimitResource`] has a value, which starts at the library default —
+/// [`ContentLimits::default`] holds every [`LimitResource::default_limit`] —
+/// and can only be lowered. There is no way to raise a value above its default
+/// and no unlimited setting. A zero, where accepted, admits nothing of that
+/// resource; it never disables the bound.
+///
+/// ```
+/// use deploy_core::package::{ContentLimits, LimitResource};
+///
+/// let limits = ContentLimits::default()
+///     .with_limit(LimitResource::JsonDepth, 10)?
+///     .with_limit(LimitResource::JsonDepth, 20)?;
+/// assert_eq!(limits.get(LimitResource::JsonDepth), 20);
+/// # Ok::<(), deploy_core::package::ContentLimitsError>(())
+/// ```
+///
+/// Its storage is private, so a value cannot be set around
+/// [`with_limit`](Self::with_limit):
+///
+/// ```compile_fail
+/// let limits = deploy_core::package::ContentLimits::default();
+/// let _ = limits.values;
+/// ```
+///
+/// and it cannot be read from a configuration document either, since it
+/// implements neither `Deserialize` nor `Serialize`:
+///
+/// ```compile_fail
+/// let _: deploy_core::package::ContentLimits = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentLimits {
+    values: LimitValues,
+}
+
+impl ContentLimits {
+    /// Returns the configured value of `resource`.
+    #[must_use]
+    pub fn get(&self, resource: LimitResource) -> u64 {
+        self.values.get(resource)
+    }
+
+    /// Returns this policy with `resource` set to `value`, replacing whatever
+    /// value it had.
+    ///
+    /// The ceiling is always the library default, never the current value, so
+    /// a lowered value may be raised again as far as the default. Lowering one
+    /// resource never checks or adjusts another. An accepted `ZstdWindow` is
+    /// stored rounded down to the largest power of two not above it.
+    ///
+    /// # Errors
+    ///
+    /// Checked in this order:
+    ///
+    /// - [`ContentLimitsError::AboveDefault`] when `value` is above the
+    ///   resource's default, which `u64::MAX` always is.
+    /// - [`ContentLimitsError::Zero`] when `value` is zero and the resource is
+    ///   `CopyBuffer`, `JsonDepth` or `ZstdWindow`.
+    /// - [`ContentLimitsError::BelowMinimum`] when `value` is a `ZstdWindow`
+    ///   below 1,024.
+    ///
+    /// On error the consumed policy is gone; clone it first to keep it.
+    pub fn with_limit(
+        mut self,
+        resource: LimitResource,
+        value: u64,
+    ) -> Result<ContentLimits, ContentLimitsError> {
+        let default = resource.default_limit();
+        if value > default {
+            return Err(ContentLimitsError::AboveDefault {
+                resource,
+                requested: value,
+                default,
+            });
+        }
+        if value == 0 && resource.refuses_zero() {
+            return Err(ContentLimitsError::Zero { resource });
+        }
+        let stored = if resource == LimitResource::ZstdWindow {
+            if value < MIN_ZSTD_WINDOW {
+                return Err(ContentLimitsError::BelowMinimum {
+                    resource,
+                    requested: value,
+                    minimum: MIN_ZSTD_WINDOW,
+                });
+            }
+            1 << value.ilog2()
+        } else {
+            value
+        };
+        *self.values.slot(resource) = stored;
+        Ok(self)
+    }
+
+    /// Returns `resource` with its configured value, the form every primitive
+    /// takes a per-item limit in, so each fault names the resource it hit.
+    // Consumed only by the tests until the image-archive validator and the
+    // package pipeline are built on these primitives.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resource_limit(&self, resource: LimitResource) -> ResourceLimit {
+        ResourceLimit {
+            resource,
+            max: self.get(resource),
+        }
+    }
+
+    /// Returns the configured `CopyBuffer` as a buffer length.
+    // Consumed only by the tests until the image-archive validator and the
+    // package pipeline are built on these primitives.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn copy_buffer_len(&self) -> usize {
+        crate::content::alloc_len(
+            self.get(LimitResource::CopyBuffer),
+            self.resource_limit(LimitResource::CopyBuffer),
+        )
+        .expect("CopyBuffer never exceeds its 1 MiB default, which fits in usize on every target")
+    }
+}
+
+/// A refused [`ContentLimits::with_limit`] setting.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ContentLimitsError {
+    /// The requested value is above the resource's library default.
+    #[error("the {resource} limit {requested} is above its default of {default}")]
+    AboveDefault {
+        /// The resource being set.
+        resource: LimitResource,
+        /// The value that was requested.
+        requested: u64,
+        /// The library default, the highest value the resource accepts.
+        default: u64,
+    },
+    /// The resource cannot be set to zero.
+    #[error("the {resource} limit cannot be zero")]
+    Zero {
+        /// The resource being set.
+        resource: LimitResource,
+    },
+    /// The requested value is below the smallest the resource accepts.
+    #[error("the {resource} limit {requested} is below its minimum of {minimum}")]
+    BelowMinimum {
+        /// The resource being set.
+        resource: LimitResource,
+        /// The value that was requested.
+        requested: u64,
+        /// The smallest value the resource accepts.
+        minimum: u64,
+    },
 }

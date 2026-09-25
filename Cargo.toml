@@ -6,6 +6,10 @@ repository = "https://github.com/aicers/deploy-core"
 
 [dependencies]
 base64 = "0.22"
+# Inflates gzip-compressed image layers. Neither std nor any other dependency
+# here provides a DEFLATE decoder, and a hand-written codec is not an option;
+# the pure-Rust backend avoids a C toolchain dependency.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hostname = "0.4"
 ring = "0.17"
 rustls-pki-types = "1"
