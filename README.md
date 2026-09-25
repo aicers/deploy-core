@@ -99,11 +99,17 @@ cargo test
 ```
 
 The `test-support` feature exposes test-only account fixtures
-(`Principal::Fixture` / `ServiceAccount::Fixture`) and payload fixtures such as
-`payload::widen_envelope_blocks` so a **dependent** crate's tests can construct
-them across the crate boundary. Enable it only as a `[dev-dependencies]` feature
-— never under normal `[dependencies]` — so the fixtures stay absent from every
-release build.
+(`Principal::Fixture` / `ServiceAccount::Fixture`), payload fixtures such as
+`payload::widen_envelope_blocks`, and `image::test_support` — a builder for
+synthetic image archives the image validator accepts, and a classifier that
+holds any image archive against a declaration — so a **dependent** crate's
+tests can construct them across the crate boundary. Enable it only as a
+`[dev-dependencies]` feature — never under normal `[dependencies]` — so the
+fixtures stay absent from every release build.
+
+The checked-in image archive fixtures, and how each one is regenerated, are
+described in `assets/test-fixtures/images/INVENTORY.md`. The manual Docker
+interoperability procedure is `docs/image-archive-interoperability.md`.
 
 ## License
 

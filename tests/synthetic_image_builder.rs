@@ -274,6 +274,38 @@ fn every_supported_shape_is_accepted() {
     );
 }
 
+#[test]
+fn edge_entries_the_builder_admits_are_accepted() {
+    let tagged = refs(&[REF]);
+    // A full-width target leaves the ustar `linkname` field with no NUL, and
+    // a target is copied through as given: non-ASCII, absolute or climbing.
+    let full_target = "t".repeat(MAX_SYNTHETIC_LINK_BYTES);
+    let full_name = "n".repeat(100);
+    accept(
+        builder(amd64())
+            .layer(
+                SyntheticLayer::new()
+                    .file(&full_name, "full")
+                    .symlink("full", &full_target)
+                    .symlink("utf8", "caf\u{e9}")
+                    .symlink("climb", "../../../etc/passwd"),
+                LayerCompression::Gzip,
+            )
+            .unwrap(),
+        &tagged,
+    );
+    // One layer stored both ways: two blobs sharing one diff ID.
+    let both = accept(
+        builder(amd64())
+            .layer(hello(), LayerCompression::Uncompressed)
+            .unwrap()
+            .layer(hello(), LayerCompression::Gzip)
+            .unwrap(),
+        &tagged,
+    );
+    assert_eq!(both.diff_ids()[0], both.diff_ids()[1]);
+}
+
 // ---------------------------------------------------------------------------
 // Determinism and config before tags
 // ---------------------------------------------------------------------------
