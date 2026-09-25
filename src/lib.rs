@@ -9,7 +9,8 @@
 //! spec a package carries in its manifest with the systemd serialization rule its
 //! strings are held to, the generic renderer that turns such a spec into a systemd
 //! unit, the one package verifier both the control plane and the root daemon reach
-//! a verdict through, the trust-set generation document that verifier's material
+//! a verdict through, the finite resource policy the full-content package APIs
+//! will enforce, the trust-set generation document that verifier's material
 //! is delivered as together with the reader that refuses a malformed one, the
 //! on-host release-trust tree that document is installed into and the constructor
 //! that turns its active generation back into the verifier's injected trust set,
@@ -31,6 +32,12 @@
 
 pub mod apply;
 pub mod bootroot_cmd;
+// Bounded tar, gzip and JSON primitives and their shared fault vocabulary.
+// Crate-private: the image-archive validator and the package verification and
+// writer pipeline are built on them and map their faults onto public errors of
+// their own. Until those consumers land, only the tests exercise them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod content;
 // The one directory flush every staged write in this crate publishes through.
 // Crate-private: it is an implementation detail of those writes, not vocabulary
 // a dependent has any reason to name.

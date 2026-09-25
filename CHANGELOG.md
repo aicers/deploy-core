@@ -37,6 +37,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   arm for `VerifyError::Image` and the new `ManifestError` variants to
   exhaustive matches. This build still reads formats 3–5, while a build
   predating it refuses a format-6 package for its version alone.
+- `package::ContentLimits`, the finite resource policy the full-content package
+  and image APIs will enforce: one ceiling per `package::LimitResource` — stored
+  and decoded bytes, entries, path lengths, JSON document sizes and nesting,
+  disk and buffers — each starting at a generous library default. A caller may
+  lower any of them with `with_limit` and never raise one; a value above the
+  default, a zero copy buffer, JSON depth or zstd window, and a zstd window
+  below 1 KiB are refused as a `package::ContentLimitsError`. No existing API
+  consults it yet.
 - `roxyd_selfupdate_contract`, the frozen on-disk contract the roxyd self-update
   rollback supervisor coordinates through: the record directory, the file names,
   the canonical roxyd binary path, the decision subcommand and its three

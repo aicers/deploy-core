@@ -31,13 +31,18 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   bytes, the trust anchors and withdrawn builds a caller injects, the
   namespace-scoped request a package declaring images is verified under, and
   the error taxonomy downstream repositories match on.
-- **package** — the read-only `RetainedBytes` handle that validated package
-  content is read through: a private, already unlinked copy the library made
-  of an untrusted source in one pass, exposing no path, file or descriptor, so
-  nothing outside the library can change it between the check and the use.
-  Beside it, the receipt and error types of no-clobber, durable publication,
-  which never replaces an existing entry and reports a failure after the output
-  became visible as uncertain durability rather than as success.
+- **package** — the finite resource policy the full-content package
+  verification and writer APIs will enforce: one ceiling per resource — stored
+  and decoded bytes, entries, path lengths, JSON documents and nesting, disk
+  and buffers — each starting at a generous library default that a caller may
+  lower and never raise. No existing API consults it yet. Beside it, the
+  read-only `RetainedBytes` handle that validated package content is read
+  through: a private, already unlinked copy the library made of an untrusted
+  source in one pass, exposing no path, file or descriptor, so nothing outside
+  the library can change it between the check and the use. And the receipt and
+  error types of no-clobber, durable publication, which never replaces an
+  existing entry and reports a failure after the output became visible as
+  uncertain durability rather than as success.
 - **trust_set** — the generation document that verifier's injected material is
   delivered as, and the reader that refuses a malformed one rather than
   repairing it: a version gate, a structural decode that admits no unknown
