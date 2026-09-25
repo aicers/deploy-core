@@ -486,11 +486,13 @@ Where the crate handles key material or secrets:
 
 ## Features
 
-`test-support` exists only to expose the test-only account fixtures
-(`Principal::Fixture`, `ServiceAccount::Fixture`) across the crate
-boundary, since `cfg(test)` is invisible to dependents. Enable it in a
-dependent's `[dev-dependencies]` only — never under `[dependencies]`,
-so the fixtures stay out of every release build.
+`test-support` exists only to expose test-only fixtures across the
+crate boundary, since `cfg(test)` is invisible to dependents: the
+account fixtures (`Principal::Fixture`, `ServiceAccount::Fixture`),
+payload fixtures, and the synthetic image archive builder in
+`image::test_support`. Enable it in a dependent's `[dev-dependencies]`
+only — never under `[dependencies]`, so the fixtures stay out of every
+release build.
 
 ## CI requirements
 

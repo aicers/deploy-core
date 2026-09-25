@@ -1,0 +1,749 @@
+{
+  "fixtures": [
+    {
+      "archive": "uncompressed.tar",
+      "declaration": "uncompressed.declaration.json",
+      "kind": "synthetic",
+      "name": "uncompressed",
+      "provenance": {
+        "generator": "builder",
+        "parameters": {
+          "architecture": "amd64",
+          "layers": [
+            {
+              "compression": "uncompressed",
+              "entries": [
+                {
+                  "kind": "dir",
+                  "path": "etc"
+                },
+                {
+                  "kind": "file",
+                  "path": "etc/hello.txt",
+                  "text": "hello from a synthetic layer\n"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/hello",
+                  "target": "hello.txt"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/localtime",
+                  "target": "/usr/share/zoneinfo/UTC"
+                }
+              ]
+            }
+          ],
+          "public_refs": [
+            "registry.example/synthetic/uncompressed:1.0"
+          ],
+          "variant": null
+        },
+        "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "e0583c49158a9fd22d12cd395158ace8c116e7164627bf6b35da792b6f6b662c",
+      "verdict": "accepted"
+    },
+    {
+      "archive": "gzip.tar",
+      "declaration": "gzip.declaration.json",
+      "kind": "synthetic",
+      "name": "gzip",
+      "provenance": {
+        "generator": "builder",
+        "parameters": {
+          "architecture": "amd64",
+          "layers": [
+            {
+              "compression": "gzip",
+              "entries": [
+                {
+                  "kind": "dir",
+                  "path": "etc"
+                },
+                {
+                  "kind": "file",
+                  "path": "etc/hello.txt",
+                  "text": "hello from a synthetic layer\n"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/hello",
+                  "target": "hello.txt"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/localtime",
+                  "target": "/usr/share/zoneinfo/UTC"
+                }
+              ]
+            }
+          ],
+          "public_refs": [
+            "registry.example/synthetic/gzip:1.0"
+          ],
+          "variant": null
+        },
+        "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "297ce23860e2d5db4b8f688c30ba29dee10f280ec2e5e1649068590a88317e61",
+      "verdict": "accepted"
+    },
+    {
+      "archive": "multi-tag.tar",
+      "declaration": "multi-tag.declaration.json",
+      "kind": "synthetic",
+      "name": "multi-tag",
+      "provenance": {
+        "generator": "builder",
+        "parameters": {
+          "architecture": "amd64",
+          "layers": [
+            {
+              "compression": "gzip",
+              "entries": [
+                {
+                  "kind": "dir",
+                  "path": "etc"
+                },
+                {
+                  "kind": "file",
+                  "path": "etc/hello.txt",
+                  "text": "hello from a synthetic layer\n"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/hello",
+                  "target": "hello.txt"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/localtime",
+                  "target": "/usr/share/zoneinfo/UTC"
+                }
+              ]
+            }
+          ],
+          "public_refs": [
+            "registry.example/synthetic/multi-tag:1.0",
+            "registry.example/synthetic/multi-tag:latest",
+            "localhost:5000/multi-tag:stable"
+          ],
+          "variant": null
+        },
+        "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "72fe49234c3283f44396889edf605a9454642882730de6634e1a1ec30a603c7f",
+      "verdict": "accepted"
+    },
+    {
+      "archive": "scratch.tar",
+      "declaration": "scratch.declaration.json",
+      "kind": "synthetic",
+      "name": "scratch",
+      "provenance": {
+        "generator": "builder",
+        "parameters": {
+          "architecture": "amd64",
+          "layers": [],
+          "public_refs": [
+            "registry.example/synthetic/scratch:1.0"
+          ],
+          "variant": null
+        },
+        "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "b30d305df57cdf1a799ffc4d558b69b7b1ad2e9418bd0cbe1387bf681d21a588",
+      "verdict": "accepted"
+    },
+    {
+      "archive": "repeated-layer.tar",
+      "declaration": "repeated-layer.declaration.json",
+      "kind": "synthetic",
+      "name": "repeated-layer",
+      "provenance": {
+        "generator": "builder",
+        "parameters": {
+          "architecture": "amd64",
+          "layers": [
+            {
+              "compression": "gzip",
+              "entries": [
+                {
+                  "kind": "dir",
+                  "path": "etc"
+                },
+                {
+                  "kind": "file",
+                  "path": "etc/base.txt",
+                  "text": "base from a synthetic layer\n"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/base",
+                  "target": "base.txt"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/localtime",
+                  "target": "/usr/share/zoneinfo/UTC"
+                }
+              ]
+            },
+            {
+              "compression": "uncompressed",
+              "entries": [
+                {
+                  "kind": "file",
+                  "path": "app/config.txt",
+                  "text": "repeated\n"
+                }
+              ]
+            },
+            {
+              "compression": "gzip",
+              "entries": [
+                {
+                  "kind": "dir",
+                  "path": "etc"
+                },
+                {
+                  "kind": "file",
+                  "path": "etc/base.txt",
+                  "text": "base from a synthetic layer\n"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/base",
+                  "target": "base.txt"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/localtime",
+                  "target": "/usr/share/zoneinfo/UTC"
+                }
+              ]
+            }
+          ],
+          "public_refs": [
+            "registry.example/synthetic/repeated-layer:1.0"
+          ],
+          "variant": null
+        },
+        "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "a6e477aa67bc3b28d9b9ce0546d69265ca01aa32c0880df1ac74abcd4c4f1496",
+      "verdict": "accepted"
+    },
+    {
+      "archive": "explicit-variant.tar",
+      "declaration": "explicit-variant.declaration.json",
+      "kind": "synthetic",
+      "name": "explicit-variant",
+      "provenance": {
+        "generator": "builder",
+        "parameters": {
+          "architecture": "arm64",
+          "layers": [
+            {
+              "compression": "gzip",
+              "entries": [
+                {
+                  "kind": "dir",
+                  "path": "etc"
+                },
+                {
+                  "kind": "file",
+                  "path": "etc/hello.txt",
+                  "text": "hello from a synthetic layer\n"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/hello",
+                  "target": "hello.txt"
+                },
+                {
+                  "kind": "symlink",
+                  "path": "etc/localtime",
+                  "target": "/usr/share/zoneinfo/UTC"
+                }
+              ]
+            }
+          ],
+          "public_refs": [
+            "registry.example/synthetic/explicit-variant:1.0"
+          ],
+          "variant": "v8"
+        },
+        "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "454556a5933af7835f564d9a314accae25cf2d3288a9fb4b7aa8e46bd99916bf",
+      "verdict": "accepted"
+    },
+    {
+      "archive": "layer-sources.tar",
+      "declaration": "layer-sources.declaration.json",
+      "kind": "synthetic",
+      "name": "layer-sources",
+      "provenance": {
+        "generator": "raw-generator",
+        "parameters": {
+          "base": {
+            "architecture": "amd64",
+            "layers": [
+              {
+                "compression": "gzip",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/hello.txt",
+                    "text": "hello from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/hello",
+                    "target": "hello.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/gzip:1.0"
+            ],
+            "variant": null
+          },
+          "form": "layer-sources"
+        },
+        "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "b42e30f5fd1a07ca93b1d1a27fe5ef4b8d89a53ca6cd2256ef705a59cc690fb2",
+      "verdict": "accepted"
+    },
+    {
+      "archive": "classic-layout.tar",
+      "declaration": "classic-layout.declaration.json",
+      "kind": "synthetic",
+      "name": "classic-layout",
+      "provenance": {
+        "generator": "raw-generator",
+        "parameters": {
+          "base": {
+            "architecture": "amd64",
+            "layers": [
+              {
+                "compression": "uncompressed",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/classic.txt",
+                    "text": "classic from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/classic",
+                    "target": "classic.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/classic-layout:1.0"
+            ],
+            "variant": null
+          },
+          "form": "classic-layout"
+        },
+        "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "bdec01e759357d63d42901e312e2526f090aef476edf9bf04abd1714cc16052b",
+      "verdict": {
+        "detail": "LegacyExportFile",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "graphdriver-extras.tar",
+      "declaration": "graphdriver-extras.declaration.json",
+      "kind": "synthetic",
+      "name": "graphdriver-extras",
+      "provenance": {
+        "generator": "raw-generator",
+        "parameters": {
+          "base": {
+            "architecture": "amd64",
+            "layers": [
+              {
+                "compression": "gzip",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/graphdriver.txt",
+                    "text": "graphdriver from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/graphdriver",
+                    "target": "graphdriver.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/graphdriver-extras:1.0"
+            ],
+            "variant": null
+          },
+          "form": "graphdriver-extras"
+        },
+        "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "c1981e1f3c14b03c36c2ccccb59fe5a11c79de977b5f8dad43ec94c7e5683806",
+      "verdict": {
+        "detail": "LegacyExportFile",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "containerd-nested-index.tar",
+      "declaration": "containerd-nested-index.declaration.json",
+      "kind": "synthetic",
+      "name": "containerd-nested-index",
+      "provenance": {
+        "generator": "raw-generator",
+        "parameters": {
+          "base": {
+            "architecture": "amd64",
+            "layers": [
+              {
+                "compression": "gzip",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/containerd.txt",
+                    "text": "containerd from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/containerd",
+                    "target": "containerd.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/containerd-nested-index:1.0"
+            ],
+            "variant": null
+          },
+          "form": "containerd-nested-index"
+        },
+        "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "bcd66160cb14bcab711e8a23adf88925ae46756adc607a71f2cc6a5a1ad7edb2",
+      "verdict": {
+        "detail": "NestedIndex",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "oci-without-compat-manifest.tar",
+      "declaration": "oci-without-compat-manifest.declaration.json",
+      "kind": "synthetic",
+      "name": "oci-without-compat-manifest",
+      "provenance": {
+        "generator": "raw-generator",
+        "parameters": {
+          "base": {
+            "architecture": "amd64",
+            "layers": [
+              {
+                "compression": "gzip",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/oci.txt",
+                    "text": "oci from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/oci",
+                    "target": "oci.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/oci-without-compat-manifest:1.0"
+            ],
+            "variant": null
+          },
+          "form": "oci-without-compat-manifest"
+        },
+        "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "ab2de01e76e0cf33519e9a48b9ab1954f15fd626cc222c4c0d926a4c5680deb2",
+      "verdict": {
+        "detail": "MissingLayoutFile { file: CompatibilityManifest }",
+        "error": "InvalidArchive"
+      }
+    },
+    {
+      "archive": "multi-platform-index.tar",
+      "declaration": "multi-platform-index.declaration.json",
+      "kind": "synthetic",
+      "name": "multi-platform-index",
+      "provenance": {
+        "generator": "raw-generator",
+        "parameters": {
+          "base": {
+            "architecture": "amd64",
+            "layers": [
+              {
+                "compression": "gzip",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/multi.txt",
+                    "text": "multi from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/multi",
+                    "target": "multi.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/multi-platform-index:1.0"
+            ],
+            "variant": null
+          },
+          "form": "multi-platform-index",
+          "second": {
+            "architecture": "arm64",
+            "layers": [
+              {
+                "compression": "gzip",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/multi.txt",
+                    "text": "multi from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/multi",
+                    "target": "multi.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/multi-platform-index:1.0"
+            ],
+            "variant": "v8"
+          }
+        },
+        "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "94ad201fd4053dbbb6c6563e8caa1d52e2f417172e4f27fa3097393b0cbdb252",
+      "verdict": {
+        "detail": "MultipleImages",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "zstd-layer.tar",
+      "declaration": "zstd-layer.declaration.json",
+      "kind": "synthetic",
+      "name": "zstd-layer",
+      "provenance": {
+        "generator": "raw-generator",
+        "parameters": {
+          "base": {
+            "architecture": "amd64",
+            "layers": [
+              {
+                "compression": "uncompressed",
+                "entries": [
+                  {
+                    "kind": "dir",
+                    "path": "etc"
+                  },
+                  {
+                    "kind": "file",
+                    "path": "etc/zstd.txt",
+                    "text": "zstd from a synthetic layer\n"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/zstd",
+                    "target": "zstd.txt"
+                  },
+                  {
+                    "kind": "symlink",
+                    "path": "etc/localtime",
+                    "target": "/usr/share/zoneinfo/UTC"
+                  }
+                ]
+              }
+            ],
+            "public_refs": [
+              "registry.example/synthetic/zstd-layer:1.0"
+            ],
+            "variant": null
+          },
+          "form": "zstd-layer"
+        },
+        "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
+      },
+      "sha256": "87550495cb1e3104116e30e8bb2e2616315cdf4e77d14505180127c6f1fa0be6",
+      "verdict": {
+        "detail": "LayerMediaType { position: 0 }",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "docker-graphdriver-scratch.tar",
+      "declaration": "docker-graphdriver-scratch.declaration.json",
+      "kind": "docker-capture",
+      "name": "docker-graphdriver-scratch",
+      "provenance": {
+        "architecture": "arm64",
+        "build": {
+          "command": "docker build -t registry.example/interop/raw-gd:1.0 .",
+          "context_files": {
+            "hello.txt": "hello\n"
+          },
+          "dockerfile": "FROM scratch\nCOPY hello.txt /hello.txt\n"
+        },
+        "captured_on": "2026-09-25",
+        "checked_in_as": "docker-graphdriver-scratch.tar, renamed from raw-gd.tar with its bytes unchanged",
+        "command": "docker save -o /work/raw-gd.tar registry.example/interop/raw-gd:1.0",
+        "daemon": "docker:29-dind (docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0), run with --privileged and its own data root inside the container",
+        "declaration_derivation": {
+          "architecture_and_variant": "`.Architecture` arm64 and an absent `.Variant` (null) from `docker image inspect`",
+          "config_digest": "sha256: plus the hex of the record's Config path (blobs/sha256/830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182)",
+          "fallback_used": false,
+          "inspect_id": "sha256:830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182",
+          "manifest_json": "present",
+          "owner_dependency_lifecycle_provenance": "fixed values from docs/image-archive-interoperability.md step 4",
+          "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
+        },
+        "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "source_image_digest": "sha256:830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182",
+        "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":false}}; docker info Driver overlay2",
+        "store_mode": "graphdriver"
+      },
+      "sha256": "3497a77343b11902aad7d3d85504ef86a0bc0d78dd89091b6d02220a7ffd5eb8",
+      "verdict": {
+        "detail": "LegacyExportFile",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "docker-containerd-scratch.tar",
+      "declaration": "docker-containerd-scratch.declaration.json",
+      "kind": "docker-capture",
+      "name": "docker-containerd-scratch",
+      "provenance": {
+        "architecture": "arm64",
+        "build": {
+          "command": "docker build -t registry.example/interop/raw-cd:1.0 .",
+          "context_files": {
+            "hello.txt": "hello\n"
+          },
+          "dockerfile": "FROM scratch\nCOPY hello.txt /hello.txt\n"
+        },
+        "captured_on": "2026-09-25",
+        "checked_in_as": "docker-containerd-scratch.tar, renamed from raw-cd.tar with its bytes unchanged",
+        "command": "docker save -o /work/raw-cd.tar registry.example/interop/raw-cd:1.0",
+        "daemon": "docker:29-dind (docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0), run with --privileged and its own data root inside the container",
+        "declaration_derivation": {
+          "architecture_and_variant": "`.Architecture` arm64 and an absent `.Variant` (null) from `docker image inspect`",
+          "config_digest": "sha256: plus the hex of the record's Config path (blobs/sha256/4d3513a55c81a90e8ade85146882cb40ea0480961be2105bfd5c3c74fd4ff237)",
+          "fallback_used": false,
+          "inspect_disagreement": "`docker image inspect .Id` is the image index digest sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff on the containerd store, not the config digest; config_digest follows the Config path",
+          "inspect_id": "sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff",
+          "manifest_json": "present",
+          "owner_dependency_lifecycle_provenance": "fixed values from docs/image-archive-interoperability.md step 4",
+          "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
+        },
+        "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "source_image_digest": "sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff",
+        "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":true}}; docker info Driver overlayfs, driver-type io.containerd.snapshotter.v1",
+        "store_mode": "containerd"
+      },
+      "sha256": "1b8979c2cd3510953839e879c21d8dea11ac63bbc630d475f8a770eef83219fb",
+      "verdict": {
+        "detail": "NestedIndex",
+        "error": "UnsupportedArchive"
+      }
+    }
+  ]
+}
