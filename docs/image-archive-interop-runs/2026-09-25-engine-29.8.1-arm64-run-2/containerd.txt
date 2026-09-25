@@ -1,0 +1,454 @@
+## Daemon: containerd store
+
+$ date -u '+%Y-%m-%dT%H:%M:%SZ'
+2026-09-25T13:37:28Z
+[exit 0]
+
+$ EXAMPLE=../../target/debug/examples/write_synthetic_image; echo $EXAMPLE
+../../target/debug/examples/write_synthetic_image
+[exit 0]
+
+$ mkdir -p work/containerd && printf '{"features":{"containerd-snapshotter":true}}\n' > work/containerd/daemon.json && cat work/containerd/daemon.json
+{"features":{"containerd-snapshotter":true}}
+[exit 0]
+
+$ docker run -d --rm --privileged --name interop-117-containerd -v /Users/sehkone/.agentcoop/worktrees/aicers/deploy-core/issue-117/target/interop-run/work:/work -v /Users/sehkone/.agentcoop/worktrees/aicers/deploy-core/issue-117/target/interop-run/work/containerd/daemon.json:/etc/docker/daemon.json:ro docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0
+972f036eb49e0501d3d967a0c63b8ade7570351817d6d79b15c23c960c677358
+[exit 0]
+
+# waiting for the daemon in interop-117-containerd to answer
+
+$ docker exec interop-117-containerd docker version
+Client:
+ Version:           29.8.1
+ API version:       1.56
+ Go version:        go1.26.8
+ Git commit:        4a63305
+ Built:             Tue Sep 15 16:24:36 2026
+ OS/Arch:           linux/arm64
+ Context:           default
+
+Server: Docker Engine - Community
+ Engine:
+  Version:          29.8.1
+  API version:      1.56 (minimum version 1.40)
+  Go version:       go1.26.8
+  Git commit:       464cd50
+  Built:            Tue Sep 15 16:25:54 2026
+  OS/Arch:          linux/arm64
+  Experimental:     false
+ containerd:
+  Version:          v2.3.5
+  GitCommit:        1294c24a7da8e5a793ed378161673abe94118892
+ runc:
+  Version:          1.5.1
+  GitCommit:        v1.5.1-0-g8f2685a
+ docker-init:
+  Version:          0.19.0
+  GitCommit:        de40ad0
+[exit 0]
+
+$ docker exec interop-117-containerd docker version --format '{{.Server.Version}}'
+29.8.1
+[exit 0]
+
+$ docker exec interop-117-containerd docker info --format '{{.Driver}}'
+overlayfs
+[exit 0]
+
+$ docker exec interop-117-containerd docker info --format '{{json .DriverStatus}}'
+[["driver-type","io.containerd.snapshotter.v1"]]
+[exit 0]
+
+$ docker exec interop-117-containerd docker info --format '{{.Architecture}}'
+aarch64
+[exit 0]
+
+$ docker exec interop-117-containerd docker info --format '{{.OSType}} {{.OperatingSystem}} {{.KernelVersion}}'
+linux Alpine Linux v3.24 (containerized) 7.0.14-orbstack-00380-ga7e0a2dc9535
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+[exit 0]
+
+## Step 4 (containerd): raw export, classified before anything is loaded
+
+$ mkdir -p work/containerd/raw-ctx && printf 'hello\n' > work/containerd/raw-ctx/hello.txt && printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > work/containerd/raw-ctx/Dockerfile && cat work/containerd/raw-ctx/Dockerfile work/containerd/raw-ctx/hello.txt
+FROM scratch
+COPY hello.txt /hello.txt
+hello
+[exit 0]
+
+$ docker exec interop-117-containerd docker build -t registry.example/interop/raw-cd-run2:1.0 /work/containerd/raw-ctx
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile:
+#1 transferring dockerfile: 76B done
+#1 DONE 0.2s
+
+#2 [internal] load .dockerignore
+#2 transferring context: 2B done
+#2 DONE 0.1s
+
+#3 [internal] load build context
+#3 transferring context: 42B done
+#3 DONE 0.2s
+
+#4 [1/1] COPY hello.txt /hello.txt
+#4 DONE 0.1s
+
+#5 exporting to image
+#5 exporting layers
+#5 exporting layers 1.3s done
+#5 exporting manifest sha256:e47e82f45bd898f9e00ce6a1ef0578eff9f646d771d79ba21e8367704e025614
+#5 exporting manifest sha256:e47e82f45bd898f9e00ce6a1ef0578eff9f646d771d79ba21e8367704e025614 0.2s done
+#5 exporting config sha256:143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd
+#5 exporting config sha256:143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd 0.2s done
+#5 exporting attestation manifest sha256:726a7f67b8765dd9a4af98e42eb902467d20853b45d19fb1d879ee19844fdf43 0.1s done
+#5 exporting manifest list sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7 0.0s done
+#5 naming to registry.example/interop/raw-cd-run2:1.0
+#5 naming to registry.example/interop/raw-cd-run2:1.0 done
+#5 unpacking to registry.example/interop/raw-cd-run2:1.0 0.1s done
+#5 DONE 2.0s
+[exit 0]
+
+$ docker exec interop-117-containerd docker save -o /work/containerd/raw-cd-run2.tar registry.example/interop/raw-cd-run2:1.0
+[exit 0]
+
+$ shasum -a 256 work/containerd/raw-cd-run2.tar
+c5793fab3c0a36effaf627ca7d2ab0757a5689c46b56f9f96891fcf2e81e4d70  work/containerd/raw-cd-run2.tar
+[exit 0]
+
+$ tar -tvf work/containerd/raw-cd-run2.tar
+drwxr-xr-x  0 0      0           0 Jan  1  1970 blobs/
+drwxr-xr-x  0 0      0           0 Jan  1  1970 blobs/sha256/
+-r--r--r--  0 0      0         442 Jan  1  1970 blobs/sha256/143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd
+-r--r--r--  0 0      0           2 Jan  1  1970 blobs/sha256/44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
+-r--r--r--  0 0      0         835 Jan  1  1970 blobs/sha256/726a7f67b8765dd9a4af98e42eb902467d20853b45d19fb1d879ee19844fdf43
+-r--r--r--  0 0      0         108 Jan  1  1970 blobs/sha256/739a881b1fc0e2ebe88d6256f9a3f5d6df70eedd3290bb32d5fb9a0d9054d69d
+-r--r--r--  0 0      0         855 Jan  1  1970 blobs/sha256/8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+-r--r--r--  0 0      0         476 Jan  1  1970 blobs/sha256/e47e82f45bd898f9e00ce6a1ef0578eff9f646d771d79ba21e8367704e025614
+-r--r--r--  0 0      0         944 Jan  1  1970 blobs/sha256/e56dfaedaa9523b3ac26bc3e6582ea1134d4e619d539a5235e9bf1cec00d60c0
+-rw-r--r--  0 0      0         365 Jan  1  1970 index.json
+-rw-r--r--  0 0      0         239 Jan  1  1970 manifest.json
+-r--r--r--  0 0      0          30 Jan  1  1970 oci-layout
+[exit 0]
+
+$ tar -xOf work/containerd/raw-cd-run2.tar manifest.json; echo
+[{"Config":"blobs/sha256/143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd","RepoTags":["registry.example/interop/raw-cd-run2:1.0"],"Layers":["blobs/sha256/739a881b1fc0e2ebe88d6256f9a3f5d6df70eedd3290bb32d5fb9a0d9054d69d"]}]
+[exit 0]
+
+$ tar -xOf work/containerd/raw-cd-run2.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7","size":855,"annotations":{"io.containerd.image.name":"registry.example/interop/raw-cd-run2:1.0","org.opencontainers.image.ref.name":"1.0"}}]}
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/raw-cd-run2:1.0 --format '{{.Id}}'
+sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/raw-cd-run2:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ tar -xOf work/containerd/raw-cd-run2.tar manifest.json | jq --arg platform "$(docker exec interop-117-containerd docker image inspect registry.example/interop/raw-cd-run2:1.0 --format '{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}')" 'if length != 1 then error("expected one manifest.json record") else .[0] end | ($platform | split("/")) as [$arch, $variant] | {schema: 1, owner: {namespace: "example-product", component: "example-app"}, dependency: "app", public_refs: .RepoTags, platform: {os: "linux", architecture: $arch, variant: (if $variant == "" then null else $variant end)}, config_digest: ("sha256:" + (.Config | ltrimstr("blobs/sha256/") | rtrimstr(".json"))), reference_lifecycle: "shared_external", provenance: {kind: "product_build", repository: "https://example.com/synthetic-images.git", commit: "0123456789abcdef0123456789abcdef01234567"}}' > work/containerd/raw-cd-run2.declaration.json
+[exit 0]
+
+$ cat work/containerd/raw-cd-run2.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "app",
+  "public_refs": [
+    "registry.example/interop/raw-cd-run2:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": null
+  },
+  "config_digest": "sha256:143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "product_build",
+    "repository": "https://example.com/synthetic-images.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+[exit 0]
+
+$ $EXAMPLE classify work/containerd/raw-cd-run2.tar work/containerd/raw-cd-run2.declaration.json
+image archive `work/containerd/raw-cd-run2.tar` uses a nested image index
+[exit 1]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+[exit 0]
+
+## Steps 2-3 (containerd): classify, load and check samples
+
+### sample-amd64
+
+$ $EXAMPLE classify work/samples/sample-amd64.tar work/samples/sample-amd64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/sample-amd64.declaration.json
+{"public_refs":["registry.example/interop/sample-amd64:1.0"],"config_digest":"sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d","platform":{"os":"linux","architecture":"amd64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/sample-amd64.tar index.json | jq -r '.manifests[].digest'
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker load -i /work/samples/sample-amd64.tar
+Loaded image: registry.example/interop/sample-amd64:1.0
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+registry.example/interop/sample-amd64:1.0 sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/sample-amd64:1.0 --format '{{.Id}}'
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/sample-amd64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/sample-amd64:1.0"]
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/sample-amd64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/amd64/
+[exit 0]
+
+$ docker exec interop-117-containerd docker image rm registry.example/interop/sample-amd64:1.0
+Untagged: registry.example/interop/sample-amd64:1.0
+Deleted: sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+[exit 0]
+
+### many-amd64
+
+$ $EXAMPLE classify work/samples/many-amd64.tar work/samples/many-amd64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/many-amd64.declaration.json
+{"public_refs":["registry.example/interop/many-amd64:1.0","registry.example/interop/many-amd64:latest"],"config_digest":"sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d","platform":{"os":"linux","architecture":"amd64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/many-amd64.tar index.json | jq -r '.manifests[].digest'
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker load -i /work/samples/many-amd64.tar
+Loaded image: registry.example/interop/many-amd64:1.0
+Loaded image: registry.example/interop/many-amd64:latest
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+registry.example/interop/many-amd64:1.0 sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+registry.example/interop/many-amd64:latest sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-amd64:1.0 --format '{{.Id}}'
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-amd64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/many-amd64:1.0","registry.example/interop/many-amd64:latest"]
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-amd64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/amd64/
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-amd64:latest --format '{{.Id}}'
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-amd64:latest --format '{{json .RepoTags}}'
+["registry.example/interop/many-amd64:1.0","registry.example/interop/many-amd64:latest"]
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-amd64:latest --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/amd64/
+[exit 0]
+
+$ docker exec interop-117-containerd docker image rm registry.example/interop/many-amd64:1.0 registry.example/interop/many-amd64:latest
+Untagged: registry.example/interop/many-amd64:1.0
+Untagged: registry.example/interop/many-amd64:latest
+Deleted: sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+[exit 0]
+
+### sample-arm64
+
+$ $EXAMPLE classify work/samples/sample-arm64.tar work/samples/sample-arm64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/sample-arm64.declaration.json
+{"public_refs":["registry.example/interop/sample-arm64:1.0"],"config_digest":"sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c","platform":{"os":"linux","architecture":"arm64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/sample-arm64.tar index.json | jq -r '.manifests[].digest'
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker load -i /work/samples/sample-arm64.tar
+Loaded image: registry.example/interop/sample-arm64:1.0
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+registry.example/interop/sample-arm64:1.0 sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/sample-arm64:1.0 --format '{{.Id}}'
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/sample-arm64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/sample-arm64:1.0"]
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/sample-arm64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ docker exec interop-117-containerd docker image rm registry.example/interop/sample-arm64:1.0
+Untagged: registry.example/interop/sample-arm64:1.0
+Deleted: sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+[exit 0]
+
+### many-arm64
+
+$ $EXAMPLE classify work/samples/many-arm64.tar work/samples/many-arm64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/many-arm64.declaration.json
+{"public_refs":["registry.example/interop/many-arm64:1.0","registry.example/interop/many-arm64:latest"],"config_digest":"sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c","platform":{"os":"linux","architecture":"arm64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/many-arm64.tar index.json | jq -r '.manifests[].digest'
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker load -i /work/samples/many-arm64.tar
+Loaded image: registry.example/interop/many-arm64:1.0
+Loaded image: registry.example/interop/many-arm64:latest
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+registry.example/interop/many-arm64:1.0 sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+registry.example/interop/many-arm64:latest sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-arm64:1.0 --format '{{.Id}}'
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-arm64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/many-arm64:1.0","registry.example/interop/many-arm64:latest"]
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-arm64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-arm64:latest --format '{{.Id}}'
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-arm64:latest --format '{{json .RepoTags}}'
+["registry.example/interop/many-arm64:1.0","registry.example/interop/many-arm64:latest"]
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/interop/many-arm64:latest --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ docker exec interop-117-containerd docker image rm registry.example/interop/many-arm64:1.0 registry.example/interop/many-arm64:latest
+Untagged: registry.example/interop/many-arm64:1.0
+Untagged: registry.example/interop/many-arm64:latest
+Deleted: sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+[exit 0]
+
+### explicit-variant
+
+$ $EXAMPLE classify work/samples/explicit-variant.tar work/samples/explicit-variant.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/explicit-variant.declaration.json
+{"public_refs":["registry.example/synthetic/explicit-variant:1.0"],"config_digest":"sha256:88996685f1c0d5ae36656e5616613e49c59f0a4347ecb456d6c854d1b4c9f283","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}
+[exit 0]
+
+$ tar -xOf work/samples/explicit-variant.tar index.json | jq -r '.manifests[].digest'
+sha256:3c35860ad37ea42c1804770e087a1d32bb9a44d111f40d8f2ae111ab1ba27fd8
+[exit 0]
+
+$ docker exec interop-117-containerd docker load -i /work/samples/explicit-variant.tar
+Loaded image: registry.example/synthetic/explicit-variant:1.0
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+registry.example/synthetic/explicit-variant:1.0 sha256:3c35860ad37ea42c1804770e087a1d32bb9a44d111f40d8f2ae111ab1ba27fd8
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/synthetic/explicit-variant:1.0 --format '{{.Id}}'
+sha256:3c35860ad37ea42c1804770e087a1d32bb9a44d111f40d8f2ae111ab1ba27fd8
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/synthetic/explicit-variant:1.0 --format '{{json .RepoTags}}'
+["registry.example/synthetic/explicit-variant:1.0"]
+[exit 0]
+
+$ docker exec interop-117-containerd docker image inspect registry.example/synthetic/explicit-variant:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/v8
+[exit 0]
+
+$ docker exec interop-117-containerd docker image rm registry.example/synthetic/explicit-variant:1.0
+Untagged: registry.example/synthetic/explicit-variant:1.0
+Deleted: sha256:3c35860ad37ea42c1804770e087a1d32bb9a44d111f40d8f2ae111ab1ba27fd8
+[exit 0]
+
+$ docker exec interop-117-containerd docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-cd-run2:1.0 sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7
+[exit 0]
+
+## Teardown (containerd)
+
+$ date -u '+%Y-%m-%dT%H:%M:%SZ'
+2026-09-25T13:37:41Z
+[exit 0]
+
+$ docker stop interop-117-containerd
+interop-117-containerd
+[exit 0]
+

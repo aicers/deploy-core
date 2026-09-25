@@ -294,6 +294,45 @@ fn every_file_in_the_directory_is_in_the_inventory() {
     assert_eq!(present, recorded);
 }
 
+/// A capture either points at the retained transcript of the run that made
+/// it, which must show its `docker save` command and its archive's hash, or
+/// says that its output was not retained and what is missing. Either way
+/// `INVENTORY.md` names it.
+#[test]
+fn every_docker_capture_states_whether_its_output_was_retained() {
+    let inventory = String::from_utf8(read("INVENTORY.md")).unwrap();
+    for fixture in fixtures() {
+        if fixture["kind"] != "docker-capture" {
+            continue;
+        }
+        let name = text(&fixture["name"]);
+        assert!(
+            inventory.contains(&format!("`{name}`")),
+            "INVENTORY.md names {name}"
+        );
+        let evidence = &fixture["provenance"]["evidence"];
+        let retained = evidence["outputs_retained"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("{name} says whether its output was retained"));
+        if retained {
+            let path = text(&evidence["transcript"]);
+            let transcript =
+                std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR")))
+                    .unwrap_or_else(|error| panic!("{name}: {path}: {error}"));
+            let command = text(&fixture["provenance"]["command"]);
+            assert!(
+                transcript.contains(&format!("$ {command}\n")),
+                "{name}: {path} shows {command}"
+            );
+            let sha256 = text(&fixture["sha256"]);
+            assert!(transcript.contains(sha256), "{name}: {path} shows {sha256}");
+        } else {
+            assert!(evidence["transcript"].is_null(), "{name}");
+            assert!(!text(&evidence["not_retained"]).is_empty(), "{name}");
+        }
+    }
+}
+
 #[test]
 fn missing_docker_captures_are_listed_as_not_run() {
     const STORES: [&str; 2] = ["graphdriver", "containerd"];

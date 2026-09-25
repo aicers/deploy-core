@@ -1,0 +1,449 @@
+## Daemon: graphdriver store
+
+$ date -u '+%Y-%m-%dT%H:%M:%SZ'
+2026-09-25T13:37:15Z
+[exit 0]
+
+$ EXAMPLE=../../target/debug/examples/write_synthetic_image; echo $EXAMPLE
+../../target/debug/examples/write_synthetic_image
+[exit 0]
+
+$ mkdir -p work/graphdriver && printf '{"features":{"containerd-snapshotter":false}}\n' > work/graphdriver/daemon.json && cat work/graphdriver/daemon.json
+{"features":{"containerd-snapshotter":false}}
+[exit 0]
+
+$ docker run -d --rm --privileged --name interop-117-graphdriver -v /Users/sehkone/.agentcoop/worktrees/aicers/deploy-core/issue-117/target/interop-run/work:/work -v /Users/sehkone/.agentcoop/worktrees/aicers/deploy-core/issue-117/target/interop-run/work/graphdriver/daemon.json:/etc/docker/daemon.json:ro docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0
+ebdfd017fcd13d8d84f240c626311f626e41bdbd286f7bed7cc0aa422c608591
+[exit 0]
+
+# waiting for the daemon in interop-117-graphdriver to answer
+
+$ docker exec interop-117-graphdriver docker version
+Client:
+ Version:           29.8.1
+ API version:       1.56
+ Go version:        go1.26.8
+ Git commit:        4a63305
+ Built:             Tue Sep 15 16:24:36 2026
+ OS/Arch:           linux/arm64
+ Context:           default
+
+Server: Docker Engine - Community
+ Engine:
+  Version:          29.8.1
+  API version:      1.56 (minimum version 1.40)
+  Go version:       go1.26.8
+  Git commit:       464cd50
+  Built:            Tue Sep 15 16:25:54 2026
+  OS/Arch:          linux/arm64
+  Experimental:     false
+ containerd:
+  Version:          v2.3.5
+  GitCommit:        1294c24a7da8e5a793ed378161673abe94118892
+ runc:
+  Version:          1.5.1
+  GitCommit:        v1.5.1-0-g8f2685a
+ docker-init:
+  Version:          0.19.0
+  GitCommit:        de40ad0
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker version --format '{{.Server.Version}}'
+29.8.1
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker info --format '{{.Driver}}'
+overlay2
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker info --format '{{json .DriverStatus}}'
+[["Backing Filesystem","btrfs"],["Supports d_type","true"],["Using metacopy","false"],["Native Overlay Diff","true"],["userxattr","false"]]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker info --format '{{.Architecture}}'
+aarch64
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker info --format '{{.OSType}} {{.OperatingSystem}} {{.KernelVersion}}'
+linux Alpine Linux v3.24 (containerized) 7.0.14-orbstack-00380-ga7e0a2dc9535
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+[exit 0]
+
+## Step 4 (graphdriver): raw export, classified before anything is loaded
+
+$ mkdir -p work/graphdriver/raw-ctx && printf 'hello\n' > work/graphdriver/raw-ctx/hello.txt && printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > work/graphdriver/raw-ctx/Dockerfile && cat work/graphdriver/raw-ctx/Dockerfile work/graphdriver/raw-ctx/hello.txt
+FROM scratch
+COPY hello.txt /hello.txt
+hello
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker build -t registry.example/interop/raw-gd-run2:1.0 /work/graphdriver/raw-ctx
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 76B 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load .dockerignore
+#2 transferring context: 2B done
+#2 DONE 0.0s
+
+#3 [internal] load build context
+#3 transferring context: 42B done
+#3 DONE 0.0s
+
+#4 [1/1] COPY hello.txt /hello.txt
+#4 DONE 0.0s
+
+#5 exporting to image
+#5 exporting layers 0.0s done
+#5 writing image sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee done
+#5 naming to registry.example/interop/raw-gd-run2:1.0 done
+#5 DONE 0.0s
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker save -o /work/graphdriver/raw-gd-run2.tar registry.example/interop/raw-gd-run2:1.0
+[exit 0]
+
+$ shasum -a 256 work/graphdriver/raw-gd-run2.tar
+fe16713040290873f91e3f6c39bbc6e526bb32eb2d6041d249215464799eda67  work/graphdriver/raw-gd-run2.tar
+[exit 0]
+
+$ tar -tvf work/graphdriver/raw-gd-run2.tar
+drwxr-xr-x  0 0      0           0 Sep 25 22:37 blobs/
+drwxr-xr-x  0 0      0           0 Jan  1  1970 blobs/sha256/
+-rw-rw-rw-  0 0      0        2048 Sep 25 22:37 blobs/sha256/2b5d2cb60e88dee8d08cc6af83b83addbe7178774d8c985c5bfb828575241a02
+-rw-r--r--  0 0      0         742 Sep 25 22:37 blobs/sha256/655c68bf197ff2ff4f93676f39638479d2f34c25bfe83b759f133c475be6f84f
+-rw-r--r--  0 0      0         442 Sep 25 22:37 blobs/sha256/b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+-rw-r--r--  0 0      0         397 Jan  1  1970 blobs/sha256/d68a90b1ca8159d7a5dd91ee15bbc40a44e0cd4af604abadd2187d3326b1cf03
+-rw-r--r--  0 0      0         368 Jan  1  1970 index.json
+-rw-r--r--  0 0      0         481 Jan  1  1970 manifest.json
+-rw-r--r--  0 0      0          31 Jan  1  1970 oci-layout
+-rw-r--r--  0 0      0         116 Jan  1  1970 repositories
+[exit 0]
+
+$ tar -xOf work/graphdriver/raw-gd-run2.tar manifest.json; echo
+[{"Config":"blobs/sha256/b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee","RepoTags":["registry.example/interop/raw-gd-run2:1.0"],"Layers":["blobs/sha256/2b5d2cb60e88dee8d08cc6af83b83addbe7178774d8c985c5bfb828575241a02"],"LayerSources":{"sha256:2b5d2cb60e88dee8d08cc6af83b83addbe7178774d8c985c5bfb828575241a02":{"mediaType":"application/vnd.oci.image.layer.v1.tar","size":2048,"digest":"sha256:2b5d2cb60e88dee8d08cc6af83b83addbe7178774d8c985c5bfb828575241a02"}}}]
+
+[exit 0]
+
+$ tar -xOf work/graphdriver/raw-gd-run2.tar index.json; echo
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:d68a90b1ca8159d7a5dd91ee15bbc40a44e0cd4af604abadd2187d3326b1cf03","size":397,"annotations":{"io.containerd.image.name":"registry.example/interop/raw-gd-run2:1.0","org.opencontainers.image.ref.name":"1.0"}}]}
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/raw-gd-run2:1.0 --format '{{.Id}}'
+sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/raw-gd-run2:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ tar -xOf work/graphdriver/raw-gd-run2.tar manifest.json | jq --arg platform "$(docker exec interop-117-graphdriver docker image inspect registry.example/interop/raw-gd-run2:1.0 --format '{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}')" 'if length != 1 then error("expected one manifest.json record") else .[0] end | ($platform | split("/")) as [$arch, $variant] | {schema: 1, owner: {namespace: "example-product", component: "example-app"}, dependency: "app", public_refs: .RepoTags, platform: {os: "linux", architecture: $arch, variant: (if $variant == "" then null else $variant end)}, config_digest: ("sha256:" + (.Config | ltrimstr("blobs/sha256/") | rtrimstr(".json"))), reference_lifecycle: "shared_external", provenance: {kind: "product_build", repository: "https://example.com/synthetic-images.git", commit: "0123456789abcdef0123456789abcdef01234567"}}' > work/graphdriver/raw-gd-run2.declaration.json
+[exit 0]
+
+$ cat work/graphdriver/raw-gd-run2.declaration.json
+{
+  "schema": 1,
+  "owner": {
+    "namespace": "example-product",
+    "component": "example-app"
+  },
+  "dependency": "app",
+  "public_refs": [
+    "registry.example/interop/raw-gd-run2:1.0"
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "variant": null
+  },
+  "config_digest": "sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee",
+  "reference_lifecycle": "shared_external",
+  "provenance": {
+    "kind": "product_build",
+    "repository": "https://example.com/synthetic-images.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+[exit 0]
+
+$ $EXAMPLE classify work/graphdriver/raw-gd-run2.tar work/graphdriver/raw-gd-run2.declaration.json
+image archive `work/graphdriver/raw-gd-run2.tar` uses a legacy docker-save export file
+[exit 1]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+[exit 0]
+
+## Steps 2-3 (graphdriver): classify, load and check samples
+
+### sample-amd64
+
+$ $EXAMPLE classify work/samples/sample-amd64.tar work/samples/sample-amd64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/sample-amd64.declaration.json
+{"public_refs":["registry.example/interop/sample-amd64:1.0"],"config_digest":"sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d","platform":{"os":"linux","architecture":"amd64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/sample-amd64.tar index.json | jq -r '.manifests[].digest'
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker load -i /work/samples/sample-amd64.tar
+Loaded image: registry.example/interop/sample-amd64:1.0
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+registry.example/interop/sample-amd64:1.0 sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/sample-amd64:1.0 --format '{{.Id}}'
+sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/sample-amd64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/sample-amd64:1.0"]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/sample-amd64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/amd64/
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image rm registry.example/interop/sample-amd64:1.0
+Untagged: registry.example/interop/sample-amd64:1.0
+Deleted: sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+Deleted: sha256:fcc97f12d541157644424ba243f8ba4d81268878770e9c3faea05205da1aca09
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+[exit 0]
+
+### many-amd64
+
+$ $EXAMPLE classify work/samples/many-amd64.tar work/samples/many-amd64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/many-amd64.declaration.json
+{"public_refs":["registry.example/interop/many-amd64:1.0","registry.example/interop/many-amd64:latest"],"config_digest":"sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d","platform":{"os":"linux","architecture":"amd64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/many-amd64.tar index.json | jq -r '.manifests[].digest'
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+sha256:a2200f9b3dc099e02d81f12f1f6e06f6ee0a9cadf8dc91bb9e1367da84a0a607
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker load -i /work/samples/many-amd64.tar
+Loaded image: registry.example/interop/many-amd64:1.0
+Loaded image: registry.example/interop/many-amd64:latest
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+registry.example/interop/many-amd64:1.0 sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+registry.example/interop/many-amd64:latest sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-amd64:1.0 --format '{{.Id}}'
+sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-amd64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/many-amd64:1.0","registry.example/interop/many-amd64:latest"]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-amd64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/amd64/
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-amd64:latest --format '{{.Id}}'
+sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-amd64:latest --format '{{json .RepoTags}}'
+["registry.example/interop/many-amd64:1.0","registry.example/interop/many-amd64:latest"]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-amd64:latest --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/amd64/
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image rm registry.example/interop/many-amd64:1.0 registry.example/interop/many-amd64:latest
+Untagged: registry.example/interop/many-amd64:1.0
+Untagged: registry.example/interop/many-amd64:latest
+Deleted: sha256:ef49718b32fecc17059a2b5a2ebd772b6fbf2e49894a917ce6893aab77b9bf1d
+Deleted: sha256:fcc97f12d541157644424ba243f8ba4d81268878770e9c3faea05205da1aca09
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+[exit 0]
+
+### sample-arm64
+
+$ $EXAMPLE classify work/samples/sample-arm64.tar work/samples/sample-arm64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/sample-arm64.declaration.json
+{"public_refs":["registry.example/interop/sample-arm64:1.0"],"config_digest":"sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c","platform":{"os":"linux","architecture":"arm64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/sample-arm64.tar index.json | jq -r '.manifests[].digest'
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker load -i /work/samples/sample-arm64.tar
+Loaded image: registry.example/interop/sample-arm64:1.0
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+registry.example/interop/sample-arm64:1.0 sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/sample-arm64:1.0 --format '{{.Id}}'
+sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/sample-arm64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/sample-arm64:1.0"]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/sample-arm64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image rm registry.example/interop/sample-arm64:1.0
+Untagged: registry.example/interop/sample-arm64:1.0
+Deleted: sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+Deleted: sha256:fcc97f12d541157644424ba243f8ba4d81268878770e9c3faea05205da1aca09
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+[exit 0]
+
+### many-arm64
+
+$ $EXAMPLE classify work/samples/many-arm64.tar work/samples/many-arm64.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/many-arm64.declaration.json
+{"public_refs":["registry.example/interop/many-arm64:1.0","registry.example/interop/many-arm64:latest"],"config_digest":"sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c","platform":{"os":"linux","architecture":"arm64","variant":null}}
+[exit 0]
+
+$ tar -xOf work/samples/many-arm64.tar index.json | jq -r '.manifests[].digest'
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+sha256:8b0b6a5432159408e186137760d78b7c42752ab4ed3a65581886cc8816a7155d
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker load -i /work/samples/many-arm64.tar
+Loaded image: registry.example/interop/many-arm64:1.0
+Loaded image: registry.example/interop/many-arm64:latest
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+registry.example/interop/many-arm64:1.0 sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+registry.example/interop/many-arm64:latest sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-arm64:1.0 --format '{{.Id}}'
+sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-arm64:1.0 --format '{{json .RepoTags}}'
+["registry.example/interop/many-arm64:1.0","registry.example/interop/many-arm64:latest"]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-arm64:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-arm64:latest --format '{{.Id}}'
+sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-arm64:latest --format '{{json .RepoTags}}'
+["registry.example/interop/many-arm64:1.0","registry.example/interop/many-arm64:latest"]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/interop/many-arm64:latest --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image rm registry.example/interop/many-arm64:1.0 registry.example/interop/many-arm64:latest
+Untagged: registry.example/interop/many-arm64:1.0
+Untagged: registry.example/interop/many-arm64:latest
+Deleted: sha256:406c010d2966ab276167c9598e9ec5b587a29d44e567d1e34462b4d3eb6f3b6c
+Deleted: sha256:fcc97f12d541157644424ba243f8ba4d81268878770e9c3faea05205da1aca09
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+[exit 0]
+
+### explicit-variant
+
+$ $EXAMPLE classify work/samples/explicit-variant.tar work/samples/explicit-variant.declaration.json
+accepted
+[exit 0]
+
+$ jq -c '{public_refs, config_digest, platform}' work/samples/explicit-variant.declaration.json
+{"public_refs":["registry.example/synthetic/explicit-variant:1.0"],"config_digest":"sha256:88996685f1c0d5ae36656e5616613e49c59f0a4347ecb456d6c854d1b4c9f283","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}
+[exit 0]
+
+$ tar -xOf work/samples/explicit-variant.tar index.json | jq -r '.manifests[].digest'
+sha256:3c35860ad37ea42c1804770e087a1d32bb9a44d111f40d8f2ae111ab1ba27fd8
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker load -i /work/samples/explicit-variant.tar
+Loaded image: registry.example/synthetic/explicit-variant:1.0
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+registry.example/synthetic/explicit-variant:1.0 sha256:88996685f1c0d5ae36656e5616613e49c59f0a4347ecb456d6c854d1b4c9f283
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/synthetic/explicit-variant:1.0 --format '{{.Id}}'
+sha256:88996685f1c0d5ae36656e5616613e49c59f0a4347ecb456d6c854d1b4c9f283
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/synthetic/explicit-variant:1.0 --format '{{json .RepoTags}}'
+["registry.example/synthetic/explicit-variant:1.0"]
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image inspect registry.example/synthetic/explicit-variant:1.0 --format '{{.Os}}/{{.Architecture}}/{{with index . "Variant"}}{{.}}{{end}}'
+linux/arm64/v8
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image rm registry.example/synthetic/explicit-variant:1.0
+Untagged: registry.example/synthetic/explicit-variant:1.0
+Deleted: sha256:88996685f1c0d5ae36656e5616613e49c59f0a4347ecb456d6c854d1b4c9f283
+Deleted: sha256:958788168ef7fef481d18cd2c6fbe262f35208f463c6900e1c0bddda7ac2f983
+[exit 0]
+
+$ docker exec interop-117-graphdriver docker image ls -a --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+registry.example/interop/raw-gd-run2:1.0 sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee
+[exit 0]
+
+## Teardown (graphdriver)
+
+$ date -u '+%Y-%m-%dT%H:%M:%SZ'
+2026-09-25T13:37:27Z
+[exit 0]
+
+$ docker stop interop-117-graphdriver
+interop-117-graphdriver
+[exit 0]
+

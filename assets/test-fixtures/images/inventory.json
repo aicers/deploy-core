@@ -696,6 +696,15 @@
           "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
         },
         "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "evidence": {
+          "classified_before_load": "unverified: the run 1 summary says the export was never loaded, but no transcript shows the order",
+          "later_extraction": "docs/image-archive-interop-runs/2026-09-25-engine-29.8.1-arm64-run-1/later-extraction.txt, made on 2026-09-25 after the run from the checked-in archive and declaration; it is not the original command output",
+          "not_retained": "the output of every run 1 command: docker version and docker info, docker build, docker save, `tar -xOf <out.tar> manifest.json`, docker image inspect, and the example `classify` refusal",
+          "outputs_retained": false,
+          "retained": "the archive bytes, renamed and otherwise unchanged; the derived declaration; and the command lines and values this record states, which were written down as a summary",
+          "transcript": null
+        },
+        "run": "run 1",
         "source_image_digest": "sha256:830c106a738a79799b9adf67a8a0caf84046d579a4faef8e2588595b93288182",
         "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":false}}; docker info Driver overlay2",
         "store_mode": "graphdriver"
@@ -735,11 +744,111 @@
           "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
         },
         "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "evidence": {
+          "classified_before_load": "unverified: the run 1 summary says the export was never loaded, but no transcript shows the order",
+          "later_extraction": "docs/image-archive-interop-runs/2026-09-25-engine-29.8.1-arm64-run-1/later-extraction.txt, made on 2026-09-25 after the run from the checked-in archive and declaration; it is not the original command output",
+          "not_retained": "the output of every run 1 command: docker version and docker info, docker build, docker save, `tar -xOf <out.tar> manifest.json`, docker image inspect, and the example `classify` refusal",
+          "outputs_retained": false,
+          "retained": "the archive bytes, renamed and otherwise unchanged; the derived declaration; and the command lines and values this record states, which were written down as a summary",
+          "transcript": null
+        },
+        "run": "run 1",
         "source_image_digest": "sha256:ca34fcd24e5149d0d0efb77248685d45e20d12d02a50a0dfe9d380d543f077ff",
         "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":true}}; docker info Driver overlayfs, driver-type io.containerd.snapshotter.v1",
         "store_mode": "containerd"
       },
       "sha256": "1b8979c2cd3510953839e879c21d8dea11ac63bbc630d475f8a770eef83219fb",
+      "verdict": {
+        "detail": "NestedIndex",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "docker-graphdriver-scratch-run2.tar",
+      "declaration": "docker-graphdriver-scratch-run2.declaration.json",
+      "kind": "docker-capture",
+      "name": "docker-graphdriver-scratch-run2",
+      "provenance": {
+        "architecture": "arm64",
+        "build": {
+          "command": "docker exec interop-117-graphdriver docker build -t registry.example/interop/raw-gd-run2:1.0 /work/graphdriver/raw-ctx",
+          "context_files": {
+            "hello.txt": "hello\n"
+          },
+          "dockerfile": "FROM scratch\nCOPY hello.txt /hello.txt\n"
+        },
+        "captured_on": "2026-09-25",
+        "checked_in_as": "docker-graphdriver-scratch-run2.tar, copied from work/graphdriver/raw-gd-run2.tar with its bytes unchanged; the declaration is copied unchanged from work/graphdriver/raw-gd-run2.declaration.json",
+        "command": "docker exec interop-117-graphdriver docker save -o /work/graphdriver/raw-gd-run2.tar registry.example/interop/raw-gd-run2:1.0",
+        "daemon": "docker:29-dind (docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0), container interop-117-graphdriver, run with --privileged, the store's daemon.json mounted read-only, and its own data root inside the container",
+        "declaration_derivation": {
+          "architecture_and_variant": "`{{.Architecture}}/{{with index . \"Variant\"}}{{.}}{{end}}` from `docker image inspect` printed arm64/ (arm64, variant null)",
+          "command": "tar -xOf work/graphdriver/raw-gd-run2.tar manifest.json | jq ... > work/graphdriver/raw-gd-run2.declaration.json (the full command is in the transcript)",
+          "config_digest": "sha256: plus the hex of the record's Config path (blobs/sha256/b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee)",
+          "fallback_used": false,
+          "inspect_id": "sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee",
+          "manifest_json": "present, with one record; its output is retained in the transcript",
+          "owner_dependency_lifecycle_provenance": "fixed values from docs/image-archive-interoperability.md step 4",
+          "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
+        },
+        "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "evidence": {
+          "classified_before_load": "yes: classify refused the export before the first docker load in this daemon, and the export was never loaded",
+          "outputs_retained": true,
+          "transcript": "docs/image-archive-interop-runs/2026-09-25-engine-29.8.1-arm64-run-2/graphdriver.txt"
+        },
+        "run": "run 2",
+        "source_image_digest": "sha256:b26bb177eaa91ddfb9e281b108232849bb25942f6f18501194bff7a0b99003ee",
+        "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":false}}; docker info Driver overlay2, DriverStatus Backing Filesystem btrfs",
+        "store_mode": "graphdriver"
+      },
+      "sha256": "fe16713040290873f91e3f6c39bbc6e526bb32eb2d6041d249215464799eda67",
+      "verdict": {
+        "detail": "LegacyExportFile",
+        "error": "UnsupportedArchive"
+      }
+    },
+    {
+      "archive": "docker-containerd-scratch-run2.tar",
+      "declaration": "docker-containerd-scratch-run2.declaration.json",
+      "kind": "docker-capture",
+      "name": "docker-containerd-scratch-run2",
+      "provenance": {
+        "architecture": "arm64",
+        "build": {
+          "command": "docker exec interop-117-containerd docker build -t registry.example/interop/raw-cd-run2:1.0 /work/containerd/raw-ctx",
+          "context_files": {
+            "hello.txt": "hello\n"
+          },
+          "dockerfile": "FROM scratch\nCOPY hello.txt /hello.txt\n"
+        },
+        "captured_on": "2026-09-25",
+        "checked_in_as": "docker-containerd-scratch-run2.tar, copied from work/containerd/raw-cd-run2.tar with its bytes unchanged; the declaration is copied unchanged from work/containerd/raw-cd-run2.declaration.json",
+        "command": "docker exec interop-117-containerd docker save -o /work/containerd/raw-cd-run2.tar registry.example/interop/raw-cd-run2:1.0",
+        "daemon": "docker:29-dind (docker@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0), container interop-117-containerd, run with --privileged, the store's daemon.json mounted read-only, and its own data root inside the container",
+        "declaration_derivation": {
+          "architecture_and_variant": "`{{.Architecture}}/{{with index . \"Variant\"}}{{.}}{{end}}` from `docker image inspect` printed arm64/ (arm64, variant null)",
+          "command": "tar -xOf work/containerd/raw-cd-run2.tar manifest.json | jq ... > work/containerd/raw-cd-run2.declaration.json (the full command is in the transcript)",
+          "config_digest": "sha256: plus the hex of the record's Config path (blobs/sha256/143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd)",
+          "fallback_used": false,
+          "inspect_disagreement": "`docker image inspect .Id` is the image index digest sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7 on the containerd store, not the config digest sha256:143ed2bacf3134effc4fec01dc3a32cc284e56e6e204953919f3d836a738f5fd; config_digest follows the Config path",
+          "inspect_id": "sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7",
+          "manifest_json": "present, with one record; its output is retained in the transcript",
+          "owner_dependency_lifecycle_provenance": "fixed values from docs/image-archive-interoperability.md step 4",
+          "public_refs": "RepoTags of the only manifest.json record, read with `tar -xOf <out.tar> manifest.json`"
+        },
+        "engine_version": "29.8.1 (containerd v2.3.5, runc 1.5.1)",
+        "evidence": {
+          "classified_before_load": "yes: classify refused the export before the first docker load in this daemon, and the export was never loaded",
+          "outputs_retained": true,
+          "transcript": "docs/image-archive-interop-runs/2026-09-25-engine-29.8.1-arm64-run-2/containerd.txt"
+        },
+        "run": "run 2",
+        "source_image_digest": "sha256:8d7a672b0bb9df20685029ab74fbd01ad656790117982b7a8f94d5b8251550a7",
+        "store_detail": "daemon.json {\"features\":{\"containerd-snapshotter\":true}}; docker info Driver overlayfs, DriverStatus driver-type io.containerd.snapshotter.v1",
+        "store_mode": "containerd"
+      },
+      "sha256": "c5793fab3c0a36effaf627ca7d2ab0757a5689c46b56f9f96891fcf2e81e4d70",
       "verdict": {
         "detail": "NestedIndex",
         "error": "UnsupportedArchive"
