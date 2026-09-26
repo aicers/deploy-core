@@ -3,12 +3,16 @@
 //!
 //! Nothing outside this crate can otherwise produce an image archive the
 //! validator accepts: real `docker save` output carries attestations, nested
-//! indexes, legacy files or extra blobs, all of which the supported profile
-//! refuses. [`SyntheticImageArchiveBuilder`] writes one bounded, deterministic
-//! form of that profile — an OCI layout holding one image, a Docker
-//! compatibility `manifest.json`, and uncompressed or gzip layers — and
+//! indexes, legacy files, extra blobs or a non-canonical manifest, all of
+//! which the supported profile refuses. [`SyntheticImageArchiveBuilder`]
+//! writes one bounded, deterministic form of that profile — an OCI layout
+//! holding one image, a Docker compatibility `manifest.json`, and uncompressed
+//! layers under the canonical manifest
+//! [`canonical_image_manifest`] renders — and
 //! [`check_image_archive`] runs the crate's validator over any archive under
-//! the default [`ContentLimits`].
+//! the default [`ContentLimits`]. A gzip layer remains available only to
+//! build refusal fixtures: its manifest is not canonical, and the validator
+//! refuses it.
 //!
 //! The builder exposes the config digest before any tag is chosen, so a caller
 //! can derive a canonical runtime alias with
@@ -35,7 +39,7 @@ use sha2::{Digest, Sha256};
 use super::archive::{ImageArchiveFault, validate_image_archive};
 use super::{
     ImageArchitecture, ImageDeclaration, ImageOs, ImagePlatform, NormalizedReference,
-    parse_tagged_reference,
+    canonical_image_manifest, parse_tagged_reference,
 };
 use crate::content::Budget;
 use crate::package::{ContentLimits, LimitResource};
@@ -266,10 +270,16 @@ impl SyntheticLayer {
 /// How a layer's tar is stored in the image archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerCompression {
-    /// The tar as is, under `application/vnd.oci.image.layer.v1.tar`.
+    /// The tar as is, under `application/vnd.oci.image.layer.v1.tar`: the
+    /// supported form. An image whose layers are all uncompressed carries the
+    /// canonical manifest, and the validator accepts it.
     Uncompressed,
     /// One gzip member at level 6, under
     /// `application/vnd.oci.image.layer.v1.tar+gzip`.
+    ///
+    /// For building refusal fixtures only: no canonical manifest names a gzip
+    /// layer, so the validator refuses every archive holding one as
+    /// [`UnsupportedArchiveFeature::NonCanonicalManifest`](crate::verify::UnsupportedArchiveFeature::NonCanonicalManifest).
     Gzip,
 }
 
@@ -652,9 +662,15 @@ impl SyntheticImageArchiveBuilder {
 
     /// Tags the image with `public_refs`, in order, and writes the archive.
     ///
-    /// With no layers the archive holds a scratch image. Every archive this
-    /// returns passes [`check_image_archive`] against a declaration whose
-    /// platform, `config_digest` and `public_refs` match.
+    /// With no layers the archive holds a scratch image. When every layer is
+    /// [`LayerCompression::Uncompressed`] — the default form — the image
+    /// manifest is exactly what
+    /// [`canonical_image_manifest`] renders,
+    /// and the archive passes [`check_image_archive`] against a declaration
+    /// whose platform, `config_digest` and `public_refs` match. An archive
+    /// with a [`LayerCompression::Gzip`] layer is a refusal fixture: the
+    /// validator refuses it as
+    /// [`UnsupportedArchiveFeature::NonCanonicalManifest`](crate::verify::UnsupportedArchiveFeature::NonCanonicalManifest).
     ///
     /// # Errors
     ///
@@ -762,12 +778,32 @@ impl SyntheticImageArchiveBuilder {
         })
     }
 
+    /// Writes the image manifest: the canonical one when every layer is
+    /// uncompressed, and otherwise the same form with each layer's stored
+    /// media type, digest and size.
     fn manifest_bytes(&self, config_hex: &str, config_size: u64) -> Vec<u8> {
-        let layers = self
+        let config_digest = format!("{SHA256_PREFIX}{config_hex}");
+        let stored: Vec<(&Position, &StoredBlob)> = self
             .positions
             .iter()
-            .filter_map(|position| self.blobs.get(position.blob))
-            .map(|blob| DescriptorDocument {
+            .filter_map(|position| Some((position, self.blobs.get(position.blob)?)))
+            .collect();
+        if stored
+            .iter()
+            .all(|(_, blob)| blob.media_type == OCI_LAYER_MEDIA_TYPE)
+        {
+            let layers: Vec<(&str, u64)> = stored
+                .iter()
+                .map(|(position, blob)| (position.diff_id.as_str(), blob.size()))
+                .collect();
+            return canonical_image_manifest(&config_digest, config_size, &layers).expect(
+                "the builder computed the config digest and every diff id as sha-256 digests, \
+                 and its config is a nonempty json object",
+            );
+        }
+        let layers = stored
+            .iter()
+            .map(|(_, blob)| DescriptorDocument {
                 media_type: blob.media_type,
                 digest: format!("{SHA256_PREFIX}{}", blob.hex),
                 size: blob.size(),
@@ -778,7 +814,7 @@ impl SyntheticImageArchiveBuilder {
             media_type: OCI_MANIFEST_MEDIA_TYPE,
             config: DescriptorDocument {
                 media_type: OCI_CONFIG_MEDIA_TYPE,
-                digest: format!("{SHA256_PREFIX}{config_hex}"),
+                digest: config_digest,
                 size: config_size,
             },
             layers,
@@ -829,7 +865,12 @@ impl SyntheticImageArchive {
         &self.config_digest
     }
 
-    /// Returns the `sha256:` digest of the OCI image manifest blob.
+    /// Returns the `sha256:` digest of the OCI image manifest blob the
+    /// builder wrote, which is also its `index.json` descriptor digest.
+    ///
+    /// For an accepted archive this is the value package verification
+    /// reports as
+    /// [`VerifiedImage::manifest_digest`](crate::package::VerifiedImage::manifest_digest).
     #[must_use]
     pub fn manifest_digest(&self) -> &str {
         &self.manifest_digest

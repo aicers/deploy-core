@@ -8,8 +8,9 @@
 //! ```
 //!
 //! `six` is six small images with a Compose file and a native binary; `large`
-//! is one image whose gzip layer decodes to 64 MiB of incompressible bytes,
-//! with the same two files. `generate` writes `package.pkg` and
+//! is one image whose uncompressed layer holds 64 MiB of incompressible bytes,
+//! with the same two files. Every layer is uncompressed: a gzip layer's
+//! manifest is not canonical, and verification refuses it. `generate` writes `package.pkg` and
 //! `public-key.hex` into `<dir>` and discards the private key. `verify` prints
 //! the elapsed time and the retained-disk high-water mark, which is the
 //! package snapshot plus the archive-block copy plus every member snapshot.
@@ -117,17 +118,10 @@ fn generate(kind: &str, dir: &Path) -> Result<(), Failure> {
     let mut members: Vec<(String, ArtifactKind, Vec<u8>, Option<ImageDeclaration>)> = Vec::new();
     match kind {
         "six" => {
-            for (at, dependency) in ["web", "database", "worker", "cache", "api", "queue"]
-                .iter()
-                .enumerate()
-            {
-                let compression = if at % 2 == 0 {
-                    LayerCompression::Gzip
-                } else {
-                    LayerCompression::Uncompressed
-                };
+            for dependency in ["web", "database", "worker", "cache", "api", "queue"] {
                 let layer = SyntheticLayer::new().file("app/run", format!("{dependency} binary"));
-                let (bytes, declaration) = image(dependency, layer, compression)?;
+                let (bytes, declaration) =
+                    image(dependency, layer, LayerCompression::Uncompressed)?;
                 members.push((
                     format!("images/{dependency}.tar"),
                     ArtifactKind::ContainerImage,
@@ -138,7 +132,7 @@ fn generate(kind: &str, dir: &Path) -> Result<(), Failure> {
         }
         "large" => {
             let layer = SyntheticLayer::new().file("data.bin", incompressible(LARGE_LAYER_BYTES));
-            let (bytes, declaration) = image("bulk", layer, LayerCompression::Gzip)?;
+            let (bytes, declaration) = image("bulk", layer, LayerCompression::Uncompressed)?;
             members.push((
                 "images/bulk.tar".to_string(),
                 ArtifactKind::ContainerImage,

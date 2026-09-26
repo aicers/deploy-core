@@ -88,7 +88,10 @@
         "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
       },
       "sha256": "297ce23860e2d5db4b8f688c30ba29dee10f280ec2e5e1649068590a88317e61",
-      "verdict": "accepted"
+      "verdict": {
+        "detail": "NonCanonicalManifest",
+        "error": "UnsupportedArchive"
+      }
     },
     {
       "archive": "multi-tag.tar",
@@ -101,7 +104,7 @@
           "architecture": "amd64",
           "layers": [
             {
-              "compression": "gzip",
+              "compression": "uncompressed",
               "entries": [
                 {
                   "kind": "dir",
@@ -134,7 +137,7 @@
         },
         "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
       },
-      "sha256": "72fe49234c3283f44396889edf605a9454642882730de6634e1a1ec30a603c7f",
+      "sha256": "bfc6d31ccd6b754dff6381921a0cf57acdf227fb717241a0328b943da9a65569",
       "verdict": "accepted"
     },
     {
@@ -168,7 +171,7 @@
           "architecture": "amd64",
           "layers": [
             {
-              "compression": "gzip",
+              "compression": "uncompressed",
               "entries": [
                 {
                   "kind": "dir",
@@ -202,7 +205,7 @@
               ]
             },
             {
-              "compression": "gzip",
+              "compression": "uncompressed",
               "entries": [
                 {
                   "kind": "dir",
@@ -233,7 +236,7 @@
         },
         "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
       },
-      "sha256": "a6e477aa67bc3b28d9b9ce0546d69265ca01aa32c0880df1ac74abcd4c4f1496",
+      "sha256": "dd7e656d9f30952d850e9edf477f82a5d191332902aae054ffc47dd7ad7576e0",
       "verdict": "accepted"
     },
     {
@@ -247,7 +250,7 @@
           "architecture": "arm64",
           "layers": [
             {
-              "compression": "gzip",
+              "compression": "uncompressed",
               "entries": [
                 {
                   "kind": "dir",
@@ -278,7 +281,7 @@
         },
         "test": "tests/image_fixture_inventory.rs::builder_fixtures_regenerate_byte_for_byte"
       },
-      "sha256": "454556a5933af7835f564d9a314accae25cf2d3288a9fb4b7aa8e46bd99916bf",
+      "sha256": "f54b2a3691c6aebd987ff9527f2d683654c840b1aa3c5662a78b1bd85c286bbb",
       "verdict": "accepted"
     },
     {
@@ -293,7 +296,7 @@
             "architecture": "amd64",
             "layers": [
               {
-                "compression": "gzip",
+                "compression": "uncompressed",
                 "entries": [
                   {
                     "kind": "dir",
@@ -318,7 +321,7 @@
               }
             ],
             "public_refs": [
-              "registry.example/synthetic/gzip:1.0"
+              "registry.example/synthetic/layer-sources:1.0"
             ],
             "variant": null
           },
@@ -326,7 +329,7 @@
         },
         "test": "src/image/test_support/tests.rs::raw_generator_fixtures_regenerate_byte_for_byte"
       },
-      "sha256": "b42e30f5fd1a07ca93b1d1a27fe5ef4b8d89a53ca6cd2256ef705a59cc690fb2",
+      "sha256": "419a4ba0bab53e8940a7634e9a47878bffb1c3ec2335354a08bc38ef63b67900",
       "verdict": "accepted"
     },
     {

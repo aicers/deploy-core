@@ -10,6 +10,8 @@
 use serde_json::{Map, Value};
 
 use super::{Checked, Verdict, invalid, is_digest, shape, unsupported};
+use crate::image::canonical::OCI_CONFIG_MEDIA_TYPE;
+pub(super) use crate::image::canonical::{OCI_LAYER_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE};
 use crate::package::{ContentLimits, LimitResource};
 use crate::verify::{
     ExtensionField, ImageDocument, InvalidArchiveReason, PlatformLocation,
@@ -47,11 +49,10 @@ const COMPAT_LAYER_SOURCES: &str = "LayerSources";
 const SUPPORTED_SCHEMA_VERSION: u64 = 2;
 
 pub(super) const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
-pub(super) const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
     "application/vnd.docker.distribution.manifest.list.v2+json";
-const OCI_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
-pub(super) const OCI_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+/// Admitted here so the phases before the canonical-manifest check judge a
+/// gzip archive as they always have; that check then refuses it.
 pub(super) const OCI_GZIP_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
 /// The index descriptor annotation marking an attestation manifest.
@@ -59,8 +60,9 @@ const ATTESTATION_ANNOTATION: &str = "vnd.docker.reference.type";
 
 /// Prefix of every standard OCI annotation the image manifest may carry.
 const OCI_ANNOTATION_PREFIX: &str = "org.opencontainers.image.";
-/// The standard OCI annotations the image manifest may carry, after
-/// [`OCI_ANNOTATION_PREFIX`].
+/// The standard OCI annotations this phase admits on the image manifest,
+/// after [`OCI_ANNOTATION_PREFIX`]. The canonical-manifest check refuses
+/// every one of them later: a canonical manifest carries no annotation.
 const OCI_MANIFEST_ANNOTATIONS: &[&str] = &[
     "created",
     "authors",
@@ -76,7 +78,7 @@ const OCI_MANIFEST_ANNOTATIONS: &[&str] = &[
     "base.name",
     "base.digest",
 ];
-/// The one non-OCI annotation the image manifest may carry.
+/// The one non-OCI annotation this phase admits on the image manifest.
 const BASHBREW_ARCH_ANNOTATION: &str = "com.docker.official-images.bashbrew.arch";
 
 /// The fields that refer outside the archive, in the order they are checked.

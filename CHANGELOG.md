@@ -46,8 +46,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   every outer member, and then holds each image archive to its signed
   declaration. One image form is accepted, the supported docker-save profile:
   an OCI-layout, single-image `docker save` tar with a Docker compatibility
-  `manifest.json` and uncompressed or gzip layers, whose tags, config,
-  platform and layers must all agree with the declaration. The returned
+  `manifest.json` and uncompressed layers, whose tags, config, platform and
+  layers must all agree with the declaration, and whose image manifest is
+  exactly the canonical manifest its config determines, as
+  `image::canonical_image_manifest` renders it for producers to write. Each
+  `package::VerifiedImage` reports that manifest's digest with
+  `manifest_digest`, which is the image ID Docker's containerd image store
+  gives the loaded image. The returned
   `package::VerifiedContents` exposes the authenticated manifest, every
   artifact as a `package::VerifiedArtifact`, the images as
   `package::VerifiedImages`, and the exact package bytes, all as read-only
@@ -89,10 +94,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `UnsupportedArchive`, `InvalidArchive`, `UndeclaredReference`,
   `MissingReference`, `ConfigDigestMismatch`, `ConfigPlatformMismatch` and
   `LayerMismatch` — to exhaustive matches. The new public error enums are
-  `package::ContentError`, `package::ContentLimitsError`,
-  `package::PublicationError`, `package::PackageWriteError`,
-  `package::PreparationFault`, `package::RecordFault`,
-  `image::test_support::SyntheticImageError` and
+  `image::CanonicalManifestError`, `package::ContentError`,
+  `package::ContentLimitsError`, `package::PublicationError`,
+  `package::PackageWriteError`, `package::PreparationFault`,
+  `package::RecordFault`, `image::test_support::SyntheticImageError` and
   `image::test_support::ArchiveCheckError`, with the detail enums they carry:
   `package::IoOperation`, `package::PublicationOperation`,
   `package::CopyMismatchKind`, `package::DirectoryTrustReason`,

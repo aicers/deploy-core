@@ -2,10 +2,12 @@
 //! image its signed [`ImageDeclaration`] describes.
 //!
 //! One representation is accepted: an OCI-layout, single-image `docker save`
-//! tar carrying a Docker compatibility `manifest.json`, with uncompressed or
-//! gzip layers. Whether an archive is accepted depends only on its bytes.
+//! tar carrying a Docker compatibility `manifest.json`, whose image manifest
+//! is the canonical manifest its config determines — uncompressed layers, no
+//! annotations, and exactly the bytes [`canonical_image_manifest`] renders.
+//! Whether an archive is accepted depends only on its bytes.
 //!
-//! [`validate_image_archive`] runs eight phases in a fixed order and returns
+//! [`validate_image_archive`] runs nine phases in a fixed order and returns
 //! the first verdict:
 //!
 //! 1. **raw inventory** — the whole image tar is walked once, every blob's
@@ -18,13 +20,23 @@
 //!    normalized identity, against the signed `public_refs`;
 //! 5. **config** — its digest against the declaration, then its profile;
 //! 6. **platform** — every stated platform against the declared one;
-//! 7. **layers** — each position's stored blob, decoded tar and diff ID;
-//! 8. **`LayerSources`** — against the manifest's layer descriptors.
+//! 7. **canonical manifest** — the stored manifest blob, byte for byte,
+//!    against the canonical manifest rendered from the config's digest and
+//!    length and each diff ID's stored layer length, before any layer blob
+//!    is read again or decoded;
+//! 8. **layers** — each position's stored blob, decoded tar and diff ID;
+//! 9. **`LayerSources`** — against the manifest's layer descriptors.
+//!
+//! Phase 2 still admits a gzip layer media type and the standard manifest
+//! annotations, so that phases 3 to 6 judge such an archive as they always
+//! have; phase 7 then refuses both, since no canonical manifest carries
+//! either. A zstd or other excluded layer media type, and an annotation
+//! outside the standard set, keep their own phase-2 verdicts.
 //!
 //! A structural, limit or I/O fault anywhere in phase 1 wins at once, since
 //! nothing after it is safe to read otherwise; an entry outside the layout is
 //! remembered and reported only once the walk has completed. Phases 2 through
-//! 8 read only what they name, so reordering archive entries never changes
+//! 9 read only what they name, so reordering archive entries never changes
 //! their verdict. Nothing here touches a registry, the network, Docker or the
 //! host filesystem, and no buffer is ever the size of an image or a layer.
 
@@ -35,11 +47,14 @@ use std::io::{self, Read, Seek, SeekFrom};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{ImageDeclaration, ImageOs, NormalizedReference, parse_tagged_reference};
+use super::{
+    ImageDeclaration, ImageOs, NormalizedReference, canonical_image_manifest,
+    parse_tagged_reference,
+};
 use crate::content::json::{parse, read_bounded};
 use crate::content::{
     Budget, ContentFault, CountingReader, EntryKind, EntryPolicy, GzipDecoder, MalformedReason,
-    TarField, TarWalker, UnsupportedFeature,
+    ResourceLimit, TarField, TarWalker, UnsupportedFeature,
 };
 use crate::manifest::IMAGE_DIGEST_HEX_LEN;
 use crate::package::{ContentLimits, LimitResource};
@@ -91,11 +106,12 @@ const HISTORY_EMPTY_LAYER: &str = "empty_layer";
 const IMPOSSIBLE_FAULT: &str = "a content primitive reported a fault its call site cannot raise";
 
 /// A summary of an image archive that passed validation, for the caller's
-/// bookkeeping. It is not evidence: the evidence is the declaration it was
-/// held against.
-// Package verification keeps one per image for the preparation and
-// finalization work that reports it; until that lands only the tests read
-// its fields.
+/// bookkeeping. Only its manifest digest becomes evidence, as
+/// `VerifiedImage::manifest_digest`; the rest of the evidence is the
+/// declaration the archive was held against.
+// Package verification keeps one per image and reads the manifest digest;
+// the other fields are kept for the preparation and finalization work that
+// reports them, and until that lands only the tests read them.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ValidatedImageArchive {
@@ -203,7 +219,9 @@ fn validate<R: Read + Seek>(
             })
         })?;
     check_blob(manifest_blob, manifest_descriptor, BlobRole::Manifest)?;
-    let manifest = reader.read(manifest_blob.span, ImageDocument::ImageManifest)?;
+    // The bytes are kept for phase 7, which compares them as stored.
+    let manifest_bytes = reader.read_bytes(manifest_blob.span, ImageDocument::ImageManifest)?;
+    let manifest = reader.parse(&manifest_bytes, ImageDocument::ImageManifest)?;
     let manifest = documents::image_manifest(&manifest, limits)?;
 
     // Phase 3.
@@ -227,6 +245,9 @@ fn validate<R: Read + Seek>(
     platforms(&config, &index, &manifest.config, declaration)?;
 
     // Phase 7.
+    canonical_manifest(&inventory, config_blob, &config.diff_ids, &manifest_bytes)?;
+
+    // Phase 8.
     let mut budgets = LayerBudgets::new(limits);
     layers(
         reader.source,
@@ -240,7 +261,7 @@ fn validate<R: Read + Seek>(
         operation_decoded,
     )?;
 
-    // Phase 8.
+    // Phase 9.
     layer_sources(&compatibility, &manifest.layers, &config.diff_ids)?;
 
     Ok(ValidatedImageArchive {
@@ -588,7 +609,7 @@ impl<R: Read> Read for Replay<R> {
 struct Range<R> {
     source: R,
     remaining: u64,
-    /// The layer position a phase-7 read is for, recorded by the test seam.
+    /// The layer position a phase-8 read is for, recorded by the test seam.
     #[cfg(test)]
     layer: Option<usize>,
 }
@@ -880,26 +901,39 @@ struct DocumentReader<'a, R> {
 
 impl<R: Read + Seek> DocumentReader<'_, R> {
     fn read(&mut self, span: Span, document: ImageDocument) -> Checked<Value> {
-        let site = Site::Document(document);
-        let limit = self.limits.resource_limit(match document {
+        let bytes = self.read_bytes(span, document)?;
+        self.parse(&bytes, document)
+    }
+
+    /// Reads one document's stored bytes, charging them.
+    fn read_bytes(&mut self, span: Span, document: ImageDocument) -> Checked<Vec<u8>> {
+        let limit = self.limit(document);
+        self.source
+            .seek(SeekFrom::Start(span.offset))
+            .map_err(Verdict::Io)?;
+        let range = Range::new(&mut *self.source, span.len);
+        read_bounded(range, limit, &mut self.total, self.copy_buffer)
+            .map_err(|fault| convert(fault, Site::Document(document)))
+    }
+
+    /// Parses bytes [`read_bytes`](Self::read_bytes) returned for `document`.
+    fn parse(&self, bytes: &[u8], document: ImageDocument) -> Checked<Value> {
+        parse(
+            bytes,
+            self.limit(document),
+            self.limits.resource_limit(LimitResource::JsonDepth),
+        )
+        .map_err(|fault| convert(fault, Site::Document(document)))
+    }
+
+    fn limit(&self, document: ImageDocument) -> ResourceLimit {
+        self.limits.resource_limit(match document {
             ImageDocument::OciLayout => LimitResource::OciLayout,
             ImageDocument::Index => LimitResource::IndexJson,
             ImageDocument::CompatibilityManifest => LimitResource::CompatibilityJson,
             ImageDocument::ImageManifest => LimitResource::ImageManifestJson,
             ImageDocument::Config => LimitResource::ConfigJson,
-        });
-        self.source
-            .seek(SeekFrom::Start(span.offset))
-            .map_err(Verdict::Io)?;
-        let range = Range::new(&mut *self.source, span.len);
-        let bytes = read_bounded(range, limit, &mut self.total, self.copy_buffer)
-            .map_err(|fault| convert(fault, site))?;
-        parse(
-            &bytes,
-            limit,
-            self.limits.resource_limit(LimitResource::JsonDepth),
-        )
-        .map_err(|fault| convert(fault, site))
+        })
     }
 }
 
@@ -1291,7 +1325,48 @@ fn compare_platform(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7: ordered layers
+// Phase 7: canonical manifest
+// ---------------------------------------------------------------------------
+
+/// Holds the stored image manifest blob, byte for byte, to the canonical
+/// manifest its config determines.
+///
+/// Nothing is read here. The config blob's digest and length, and the length
+/// of each diff ID's stored layer blob, are what the raw inventory recorded;
+/// phase 8 then checks that each such blob hashes to its name.
+fn canonical_manifest(
+    inventory: &Inventory,
+    config: &Blob,
+    diff_ids: &[String],
+    stored: &[u8],
+) -> Checked<()> {
+    let non_canonical = || unsupported(UnsupportedArchiveFeature::NonCanonicalManifest);
+    // Phase 3 found every blob the manifest names. A diff ID with no stored
+    // blob is therefore not what the manifest names at its position.
+    let layers = diff_ids
+        .iter()
+        .map(|diff_id| {
+            let hex = diff_id.strip_prefix(SHA256_PREFIX)?;
+            let blob = inventory.blobs.get(hex)?;
+            Some((diff_id.as_str(), blob.span.len))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(non_canonical)?;
+    let config_digest = format!("{SHA256_PREFIX}{}", config.sha256);
+    // Every input was checked on the way here, so the renderer cannot refuse
+    // it; if it ever did, no canonical manifest exists for this config and
+    // the stored one is not it.
+    let canonical = canonical_image_manifest(&config_digest, config.span.len, &layers)
+        .map_err(|_| non_canonical())?;
+    if stored == canonical.as_slice() {
+        Ok(())
+    } else {
+        Err(non_canonical())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: ordered layers
 // ---------------------------------------------------------------------------
 
 /// The per-image budgets every layer walk shares.
@@ -1311,7 +1386,7 @@ impl LayerBudgets {
     }
 }
 
-// Phase 7 needs the source, the three views of the layers, the limits and the
+// Phase 8 needs the source, the three views of the layers, the limits and the
 // two tiers of budgets; bundling them into a struct would only rename them.
 #[allow(clippy::too_many_arguments)]
 fn layers<R: Read + Seek>(
@@ -1486,7 +1561,7 @@ fn walk_layer<R: Read>(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 8: LayerSources
+// Phase 9: LayerSources
 // ---------------------------------------------------------------------------
 
 fn layer_sources(
@@ -1528,11 +1603,11 @@ pub(super) mod seam {
         InventoryBlob(String),
         /// Phase 1 allocated its copy buffer, of this length.
         Buffer(usize),
-        /// Phase 7 opened the stored range of this position.
+        /// Phase 8 opened the stored range of this position.
         LayerOpened(usize),
-        /// Phase 7 read stored bytes for this position.
+        /// Phase 8 read stored bytes for this position.
         LayerRead { position: usize, bytes: usize },
-        /// Phase 7 built a gzip decoder for this position.
+        /// Phase 8 built a gzip decoder for this position.
         LayerDecoded(usize),
     }
 

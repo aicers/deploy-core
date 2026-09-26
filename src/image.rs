@@ -17,6 +17,11 @@
 //! artifact's, the reserved runtime alias binding, cross-artifact reference
 //! conflicts and the caller's namespace — live in [`crate::verify`].
 //!
+//! [`canonical_image_manifest`] is the one exception that concerns archive
+//! bytes: it renders the canonical image manifest a config determines, which
+//! producers write when they normalize an archive and which the archive
+//! validator requires byte for byte.
+//!
 //! Reference syntax follows [distribution/reference] v0.6.0, reimplemented
 //! here rather than depended on: its grammar is a handful of character classes
 //! and its normalization three rules, while no Rust crate in the dependency
@@ -32,8 +37,13 @@ use crate::manifest::{GIT_COMMIT_HEX_LEN, IMAGE_DIGEST_HEX_LEN, TargetArch};
 // The byte-level image-archive validator. Crate-private: package verification
 // is what calls it.
 mod archive;
+// The canonical image manifest: one production renderer, which producers call
+// when they normalize an archive and the archive validator holds every
+// manifest blob to.
+mod canonical;
 
 pub(crate) use archive::{ImageArchiveFault, ValidatedImageArchive, validate_image_archive};
+pub use canonical::{CanonicalManifestError, canonical_image_manifest};
 // Synthetic image archives and an archive classifier, for this crate's tests
 // and for dependents that enable `test-support` under `[dev-dependencies]`.
 #[cfg(any(test, feature = "test-support"))]

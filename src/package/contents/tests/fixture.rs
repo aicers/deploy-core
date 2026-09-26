@@ -161,7 +161,7 @@ impl Art {
             .expect("a valid platform")
             .layer(
                 SyntheticLayer::new().file("data.bin", content.to_vec()),
-                LayerCompression::Gzip,
+                LayerCompression::Uncompressed,
             )
             .expect("a valid layer")
             .finish(&refs)

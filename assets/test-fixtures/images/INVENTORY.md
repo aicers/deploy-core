@@ -60,16 +60,29 @@ exclusion.
 
 ## Fixtures
 
+An accepted archive's image manifest is the canonical manifest its config
+determines, which needs every layer uncompressed; see
+`image::canonical_image_manifest`. Every accepted fixture below has only
+uncompressed layers.
+
 Accepted, from the builder:
 
-- `uncompressed`, `gzip`, `multi-tag` and `scratch`;
+- `uncompressed`, `multi-tag` and `scratch`;
 - `repeated-layer`, with one blob at positions 0 and 2;
 - `explicit-variant`, `arm64` with `v8`.
 
 Accepted, from the raw generator:
 
-- `layer-sources`: the `gzip` archive plus a complete, consistent
-  `LayerSources`.
+- `layer-sources`: the `uncompressed` image, tagged
+  `registry.example/synthetic/layer-sources:1.0`, plus a complete,
+  consistent `LayerSources`.
+
+Refused, from the builder:
+
+- `gzip`: the `uncompressed` image with its layer gzip-compressed. The
+  manifest names the gzip blob, so it is not the canonical manifest of the
+  config — `UnsupportedArchive`, `NonCanonicalManifest`. Accepted before the
+  profile required canonical manifests.
 
 Refused, from the raw generator:
 
@@ -87,6 +100,11 @@ Refused, from the raw generator:
 - `zstd-layer`: a layer re-stored as a zstd frame under the zstd media type —
   `UnsupportedArchive`, `LayerMediaType { position: 0 }`.
 
+The raw-generator refusals other than `classic-layout` and `zstd-layer` start
+from a base image with a gzip layer. Each is refused in an earlier phase than
+the canonical-manifest check, so its verdict names its own form, not the gzip
+layer.
+
 ## Regenerating synthetic fixtures
 
 Synthetic output depends on the `tar`, `flate2` and `miniz_oxide` versions the
@@ -96,9 +114,10 @@ each build resolves the newest compatible releases, and `flate2` has moved its
 `miniz_oxide` requirement within its 1.1 line before. A release that changes
 the DEFLATE output therefore fails the regeneration tests on an unchanged
 tree, with no dependency update in any change here to regenerate them in.
-Nine synthetic fixtures have a gzip layer somewhere in their parameters and
-are exposed; `uncompressed`, `scratch`, `classic-layout` and `zstd-layer` have
-none and depend only on `tar`. When the regeneration tests fail this way,
+Five synthetic fixtures have a gzip layer somewhere in their parameters and
+are exposed: `gzip`, `graphdriver-extras`, `containerd-nested-index`,
+`oci-without-compat-manifest` and `multi-platform-index`. The other eight
+have none and depend only on `tar`. When the regeneration tests fail this way,
 regenerate the fixtures in the change that fixes the build:
 
 ```sh

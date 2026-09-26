@@ -158,7 +158,7 @@ fn own_image(arch: TargetArch) -> Artifact {
             SyntheticLayer::new()
                 .dir("app")
                 .file("app/run", b"#!/bin/sh\nexec app\n".to_vec()),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .expect("a valid layer")
         .finish(&refs)
@@ -191,7 +191,7 @@ fn managed_dependency(arch: TargetArch) -> (Artifact, String) {
         .expect("a valid platform")
         .layer(
             SyntheticLayer::new().file("etc/database.conf", b"port = 5432\n".to_vec()),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .expect("a valid layer")
         .layer(
@@ -275,7 +275,7 @@ fn product_dependency(arch: TargetArch) -> Artifact {
         .expect("a valid platform")
         .layer(
             SyntheticLayer::new().file("worker/run", b"worker binary".to_vec()),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .expect("a valid layer")
         .layer(

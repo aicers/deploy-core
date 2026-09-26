@@ -34,7 +34,9 @@ pub enum UnsupportedArchiveFeature {
     ManifestMediaType,
     /// A config media type other than the OCI image config.
     ConfigMediaType,
-    /// A layer media type other than an uncompressed or gzip OCI layer.
+    /// A layer media type other than an uncompressed or gzip OCI layer. A
+    /// gzip layer passes this check and is refused as
+    /// [`NonCanonicalManifest`](Self::NonCanonicalManifest) instead.
     LayerMediaType {
         /// The layer's position in the manifest's `layers`.
         position: usize,
@@ -49,7 +51,11 @@ pub enum UnsupportedArchiveFeature {
     },
     /// A descriptor carries an annotation the profile does not admit.
     DescriptorAnnotation,
-    /// The image manifest carries an annotation the profile does not admit.
+    /// The image manifest carries an annotation outside the standard OCI set
+    /// and `com.docker.official-images.bashbrew.arch`. One inside that set
+    /// passes this check and is refused as
+    /// [`NonCanonicalManifest`](Self::NonCanonicalManifest) instead, since a
+    /// canonical manifest carries no annotation.
     ManifestAnnotation,
     /// A blob that neither the image manifest, its config nor its layers
     /// reference.
@@ -66,6 +72,13 @@ pub enum UnsupportedArchiveFeature {
         /// The excluded tar feature.
         feature: TarFeature,
     },
+    /// The image manifest blob is not, byte for byte, the canonical manifest
+    /// its config determines, as
+    /// [`canonical_image_manifest`](crate::image::canonical_image_manifest)
+    /// renders it: a gzip layer, a manifest annotation, another key order,
+    /// whitespace, an explicit default member, or a layer digest that is not
+    /// the diff ID at its position.
+    NonCanonicalManifest,
 }
 
 impl fmt::Display for UnsupportedArchiveFeature {
@@ -93,6 +106,7 @@ impl fmt::Display for UnsupportedArchiveFeature {
                 write!(f, "a concatenated gzip member in layer {position}")
             }
             Self::LayerTar { position, feature } => write!(f, "{feature} in layer {position}"),
+            Self::NonCanonicalManifest => f.write_str("a non-canonical image manifest"),
         }
     }
 }

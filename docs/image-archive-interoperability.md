@@ -2,10 +2,21 @@
 
 deploy-core decides whether a container image archive is acceptable from its
 bytes alone: one OCI-layout, single-image `docker save` profile with a Docker
-compatibility `manifest.json` and uncompressed or gzip layers. Whether Docker
-itself loads such an archive, and refuses nothing the profile admits, is a
-separate question that no automated test answers. This document is the manual
-procedure that gathers that evidence.
+compatibility `manifest.json`, whose image manifest is the canonical manifest
+its config determines — uncompressed layers, no annotations, and exactly the
+bytes `image::canonical_image_manifest` renders. The manifest digest is
+therefore a pure function of the config, and verification reports it as
+`VerifiedImage::manifest_digest`. Whether Docker itself loads such an
+archive, and refuses nothing the profile admits, is a separate question that
+no automated test answers. This document is the manual procedure that
+gathers that evidence.
+
+Consumers support one Docker image store: **Docker Engine 29.0.0 or later
+with the containerd image store**. On that store `docker image inspect`
+reports an image's `.Id` as the digest of the loaded image manifest, not the
+config digest, so the identity this procedure checks there is the verified
+manifest digest. The graphdriver store is outside the supported set; its
+check and the runs that exercised it are kept as historical evidence.
 
 ## What this evidence gates
 
@@ -58,14 +69,16 @@ separately: a run can be both failed and incomplete. Neither is a pass.
 
 ## Before you start
 
-Prepare two disposable daemons of the engine version under test:
+Prepare a disposable daemon of the engine version under test, 29.0.0 or
+later, with the **containerd** image store (`"features":
+{"containerd-snapshotter": true}` in `daemon.json`). This is the store a
+result can support.
 
-- one with the classic **graphdriver** image store (`"features":
-  {"containerd-snapshotter": false}` in `daemon.json`);
-- one with the **containerd** image store (`"features":
-  {"containerd-snapshotter": true}`).
+A second daemon with the classic **graphdriver** image store (`"features":
+{"containerd-snapshotter": false}`) is optional. It only extends the
+historical record of that store, and no result on it supports anything.
 
-For each, record:
+For each daemon, record:
 
 - the engine version, from `docker version --format '{{.Server.Version}}'`;
 - the store mode, from `docker info --format '{{.Driver}}'` and
@@ -103,7 +116,20 @@ $EXAMPLE write sample-many.tar sample-many.declaration.json amd64 \
 ```
 
 `write` produces the same image for the same architecture, so samples of one
-architecture share a config digest and differ only in their tags.
+architecture share a config digest and differ only in their tags. Its layer
+is uncompressed, so each sample carries the canonical manifest of its config,
+and samples of one architecture share one manifest digest too.
+
+For each sample, record its **verified manifest digest**: the `digest` of the
+descriptors in its `index.json`, which step 2's `classify` verifies. The
+validator accepts an archive only when that digest names the stored manifest
+blob and the blob is the canonical manifest, so for an accepted sample it is
+the value `VerifiedImage::manifest_digest` reports. Run, and retain the output
+of:
+
+```sh
+tar -xOf sample-one.tar index.json
+```
 
 ## Step 2: load only accepted samples
 
@@ -115,8 +141,8 @@ $EXAMPLE classify sample-one.tar sample-one.declaration.json   # must print: acc
 docker load -i sample-one.tar
 ```
 
-Load every accepted sample into both disposable daemons, the graphdriver
-store and the containerd store. Load one sample at a time, into a store that
+Load every accepted sample into the containerd daemon, and into the
+graphdriver daemon if one is run. Load one sample at a time, into a store that
 holds no image with that sample's config digest: after step 3 for a sample,
 remove its tags with `docker image rm <ref>...` before loading the next.
 Otherwise a later sample with the same config adds its tags to the image an
@@ -133,27 +159,25 @@ In each daemon, for each loaded sample, run and retain:
    and no other tag and no `<none>` entry for it. For each declared
    reference, `docker image inspect <ref> --format '{{json .RepoTags}}'`
    lists exactly the declared tags.
-2. **Config ID.** For each declared reference,
+2. **Image ID.** For each declared reference, run
 
    ```sh
    docker image inspect <ref> --format '{{.Id}}'
    ```
 
-   prints exactly the declaration's `config_digest`. This equality is the
-   check, and it is mandatory: a loaded sample whose `.Id` differs has
-   failed this check for that store and version, and the combination is
-   **failed**.
+   On the **containerd** store it must print exactly the sample's verified
+   manifest digest, recorded in step 1. This equality is the check, and it
+   is mandatory: a loaded sample whose `.Id` differs has failed this check
+   for that engine version, and the combination is **failed**. Nothing
+   substitutes for it — not the config digest, and not a `Config` path
+   found by saving the loaded reference again.
 
-   Nothing else substitutes for it. On the containerd store `.Id` reports
-   the image's manifest digest, not its config digest. Two diagnostics may
-   be recorded next to a mismatch, as **supplemental** evidence only:
-   - whether `.Id` equals the sample's manifest digest, the `digest` of its
-     `index.json` descriptors;
-   - whether saving the loaded reference again gives a `manifest.json` whose
-     `Config` path names the declared `config_digest`.
+   On the **graphdriver** store `.Id` reports the config digest, and the
+   check there is the historical one: `.Id` prints exactly the
+   declaration's `config_digest`. It is kept so a graphdriver daemon can be
+   read as the recorded runs read it, and a result on that store supports
+   nothing.
 
-   Either diagnostic may explain the mismatch. Neither turns a failed
-   config-ID check into a pass.
 3. **Platform.** The output of
 
    ```sh
@@ -168,12 +192,13 @@ In each daemon, for each loaded sample, run and retain:
    for key "Variant"`.
 
 A mismatch in any of these is a failed run for that store and version, and is
-recorded as such, with the observed value next to the declared one.
+recorded as such, with the observed value next to the declared or verified
+one.
 
 ## Step 4: raw exports are refused before any load
 
-Confirm that the classifier refuses raw `docker save` output from both stores
-before anything is loaded. Do this in each daemon before step 2 loads any
+Confirm that the classifier refuses raw `docker save` output before anything
+is loaded. Do this in each daemon the run uses before step 2 loads any
 sample, and never load the raw export anywhere. For each daemon:
 
 1. Build a tiny image — `FROM scratch` with one small file — and save
@@ -204,10 +229,11 @@ sample, and never load the raw export anywhere. For each daemon:
 
      That inspect value is the fallback when there is no `manifest.json`.
      Record any disagreement between the two. On the containerd store `.Id`
-     reports the digest of the image index `index.json` points to, not the
-     config digest; the declaration still follows the `Config` path. This
-     derivation is not step 3's config-ID check, and a disagreement here is
-     recorded but does not decide the raw export's verdict.
+     reports the digest of what `index.json` points to — for a raw export,
+     an image index — not the config digest; the declaration still follows
+     the `Config` path. This derivation is not step 3's image-ID check, and a
+     disagreement here is recorded but does not decide the raw export's
+     verdict.
    - **Architecture and variant** are `.Architecture` and `.Variant` of the
      same inspect, read with the `index` form from step 3. An empty or absent
      variant becomes `null`.
@@ -242,8 +268,8 @@ daemon they show:
 
 - the engine version, store mode and architecture;
 - every command run, its complete output and its exit code;
-- for each sample, its declaration, the `classify` verdict, the `docker load`
-  output, the image listing and the three step 3 inspects;
+- for each sample, its declaration, its `index.json`, the `classify` verdict,
+  the `docker load` output, the image listing and the three step 3 inspects;
 - for each raw export, the `manifest.json` output, the inspect output, the
   derived declaration and the exact refusal, before any sample was loaded.
 
@@ -258,10 +284,28 @@ store.
 
 ### Support summary
 
-| Engine | Architecture | Store | Result | Evidence |
+The supported store is the containerd image store on Docker Engine 29.0.0
+or later, and its identity check is now `.Id` against the verified manifest
+digest. **No run has made that check yet: a new run is required** before any
+engine version or architecture is supported. Until then every combination
+of that store is **not run** under the current procedure.
+
+The runs below predate canonical manifests and the current identity check.
+Their results stand as they were recorded, under the check they ran:
+
+| Engine | Architecture | Store | Result then | Evidence |
 | --- | --- | --- | --- | --- |
 | 29.8.1 | `arm64` | graphdriver | passed | run 2 |
 | 29.8.1 | `arm64` | containerd | failed: config ID | runs 1 and 2 |
+
+Run 2's containerd result is not reinterpreted as a pass. Its `.Id` values
+did equal each sample's `index.json` descriptor digest, but that was
+recorded as a supplemental diagnostic under the config-ID check, and its
+samples are not the archives the current profile accepts: `write` then
+stored its layer gzip-compressed, and the `explicit-variant` fixture it
+loaded had a gzip layer too, so none of them carried a canonical manifest
+and the current validator refuses all of them. The graphdriver result is
+historical evidence about a store consumers no longer support.
 
 No other engine version, architecture or store combination has been run;
 each is **not run**.
@@ -306,7 +350,11 @@ end; every command under test ran against the inner daemons through
   `{"features":{"containerd-snapshotter":true}}`; `docker info` reported
   the driver `overlayfs` with driver type `io.containerd.snapshotter.v1`.
 
-**Samples.** `write` produced `sample-amd64` and `sample-arm64`, each tagged
+**Samples.** These were written before canonical manifests, when `write`
+stored its one layer gzip-compressed, and the checked-in `explicit-variant`
+fixture then had a gzip layer as well. The validator of the day accepted
+them; the current one refuses every one as a non-canonical manifest.
+`write` produced `sample-amd64` and `sample-arm64`, each tagged
 `registry.example/interop/sample-<arch>:1.0`, and `many-amd64` and
 `many-arm64`, each tagged `registry.example/interop/many-<arch>:1.0` and
 `:latest`. The checked-in `explicit-variant` fixture (`arm64`/`v8`) was loaded

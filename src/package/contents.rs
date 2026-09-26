@@ -308,9 +308,9 @@ pub(crate) struct CheckedContents {
 struct CheckedImage {
     /// The image artifact's position in the manifest.
     index: usize,
-    // Kept for the preparation and finalization work that reports it; the
-    // evidence exposes the declaration it was held against instead.
-    #[allow(dead_code)]
+    /// What validation found. The evidence takes its manifest digest; the
+    /// rest is kept for the preparation and finalization work that reports
+    /// it.
     summary: ValidatedImageArchive,
 }
 
@@ -768,6 +768,7 @@ impl VerifiedContents {
                     artifact: artifact.clone(),
                     declaration,
                     archive,
+                    manifest_digest: image.summary.manifest_digest.clone(),
                 })
             })
             .collect();
@@ -994,7 +995,12 @@ impl fmt::Debug for VerifiedImageSet<'_> {
 ///
 /// ```compile_fail
 /// fn forge(declaration: deploy_core::image::ImageDeclaration) -> deploy_core::package::VerifiedImage {
-///     deploy_core::package::VerifiedImage { declaration, artifact: todo!(), archive: todo!() }
+///     deploy_core::package::VerifiedImage {
+///         declaration,
+///         artifact: todo!(),
+///         archive: todo!(),
+///         manifest_digest: todo!(),
+///     }
 /// }
 /// ```
 ///
@@ -1007,10 +1013,25 @@ impl fmt::Debug for VerifiedImageSet<'_> {
 /// ```compile_fail
 /// let _ = deploy_core::package::VerifiedImage::default();
 /// ```
+///
+/// ```compile_fail
+/// fn decodable<T: serde::de::DeserializeOwned>() {}
+/// decodable::<deploy_core::package::VerifiedImage>();
+/// ```
+///
+/// Its manifest digest is the verifier's, and cannot be written:
+///
+/// ```compile_fail
+/// fn forge(image: &mut deploy_core::package::VerifiedImage) {
+///     image.manifest_digest = format!("sha256:{}", "0".repeat(64));
+/// }
+/// ```
 pub struct VerifiedImage {
     artifact: PayloadArtifact,
     declaration: ImageDeclaration,
     archive: RetainedBytes,
+    /// The `sha256:` digest of the verified image manifest blob.
+    manifest_digest: String,
 }
 
 impl VerifiedImage {
@@ -1038,6 +1059,20 @@ impl VerifiedImage {
     pub fn artifact(&self) -> &PayloadArtifact {
         &self.artifact
     }
+
+    /// Returns the `sha256:<64 lowercase hex>` digest of the image manifest
+    /// blob the verifier checked.
+    ///
+    /// The manifest is the canonical manifest of the declared config, so this
+    /// digest is a pure function of
+    /// [`config_digest`](ImageDeclaration::config_digest). It is also the
+    /// `index.json` descriptor digest, and so the image ID a Docker Engine
+    /// using the containerd image store reports once the archive is loaded:
+    /// a consumer compares a loaded image's `.Id` against this value.
+    #[must_use]
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
 }
 
 impl fmt::Debug for VerifiedImage {
@@ -1045,6 +1080,7 @@ impl fmt::Debug for VerifiedImage {
         f.debug_struct("VerifiedImage")
             .field("archive_path", &self.artifact.archive_path)
             .field("config_digest", &self.declaration.config_digest)
+            .field("manifest_digest", &self.manifest_digest)
             .field("archive", &self.archive)
             .finish()
     }
