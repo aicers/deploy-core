@@ -64,7 +64,9 @@ pub(super) fn exceeded(limit: u64) -> io::Error {
 #[error("a tar extension record too large for the framing allowance overrides its member")]
 pub(super) enum OversizedExtension {
     /// A GNU long name or a PAX `path` record:
-    /// [`PayloadError::NameOverridingHeader`].
+    /// [`PayloadError::NameOverridingHeader`]. The member's header lies past
+    /// the record unread, so the name is refused even where it would have
+    /// matched that header.
     Name {
         header_name: String,
         resolved_name: String,
@@ -75,8 +77,11 @@ pub(super) enum OversizedExtension {
         header_size: u64,
         resolved_size: u64,
     },
-    /// A GNU long link, which only a link entry has:
-    /// [`PayloadError::UnsupportedEntryType`].
+    /// A GNU long link, which names a link entry's target:
+    /// [`PayloadError::UnsupportedEntryType`], the verdict every link entry
+    /// gets. The entry it describes lies past the record unread, so a crafted
+    /// archive putting one before a regular file, which the legacy walk
+    /// accepts, is refused the same way.
     Link { path: String },
 }
 
