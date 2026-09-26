@@ -1400,6 +1400,40 @@ fn a_full_filesystem_writing_a_member_is_write_snapshot_not_the_budget() {
     assert_empty(dir.path());
 }
 
+#[test]
+fn a_snapshot_mismatch_is_write_snapshot_at_the_snapshot_name() {
+    use crate::retain::SnapshotMismatchKind;
+
+    let name = PathBuf::from("/staging/.deploy-core-retain-x/snap-3");
+    for kind in [
+        SnapshotMismatchKind::Identity,
+        SnapshotMismatchKind::Length {
+            expected: 3,
+            actual: 4,
+        },
+    ] {
+        let error = from_retention(
+            RetentionError::SnapshotMismatch {
+                path: name.clone(),
+                kind,
+            },
+            &RetentionSite {
+                read_source: IoOperation::ReadSnapshot,
+                max_len: ContentLimits::default().resource_limit(LimitResource::Package),
+                staging_parent: None,
+            },
+        );
+        assert_eq!(
+            io_of(&error),
+            (
+                IoOperation::WriteSnapshot,
+                Some(name.as_path()),
+                ErrorKind::Other
+            )
+        );
+    }
+}
+
 /// Verifies the mixed fixture with the `n`th `op` of a `role` source failing
 /// with `kind`, and returns the refusal.
 fn retained_fault(role: SourceRole, op: Op, n: usize, kind: ErrorKind) -> ContentError {

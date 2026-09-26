@@ -99,9 +99,13 @@ pub(crate) enum RetentionError {
         reason: DirectoryTrustReason,
     },
 
-    /// A finished snapshot did not match what was written to it.
-    #[error("snapshot does not match what was written: {kind}")]
-    SnapshotMismatch { kind: SnapshotMismatchKind },
+    /// A finished snapshot did not match what was written to it. `path` is
+    /// the name the snapshot was written under, before it was unlinked.
+    #[error("snapshot {} does not match what was written: {kind}", .path.display())]
+    SnapshotMismatch {
+        path: PathBuf,
+        kind: SnapshotMismatchKind,
+    },
 
     /// A filesystem operation failed. `path` is `None` for source reads and
     /// anything touching an anonymous retained inode.
@@ -758,8 +762,8 @@ impl SnapshotWriter<'_> {
     /// # Errors
     ///
     /// Returns `Io` under `WriteSnapshot`, `ReopenSnapshot`,
-    /// `InspectSnapshot` or `UnlinkSnapshot` with the snapshot's path, or
-    /// `SnapshotMismatch`. On any failure the name is unlinked best-effort,
+    /// `InspectSnapshot` or `UnlinkSnapshot`, or `SnapshotMismatch`, each
+    /// with the snapshot's path. On any failure the name is unlinked best-effort,
     /// the charge is released and no handle exists.
     pub(crate) fn finish(mut self) -> Result<RetainedBytes, RetentionError> {
         let private = self.scope.private.file();
@@ -791,6 +795,7 @@ impl SnapshotWriter<'_> {
         .map_err(|e| self.fail(RetentionOperation::InspectSnapshot, e))?;
         if !same_inode(&written, &retained) {
             return Err(RetentionError::SnapshotMismatch {
+                path: self.path(),
                 kind: SnapshotMismatchKind::Identity,
             });
         }
@@ -806,6 +811,7 @@ impl SnapshotWriter<'_> {
             stat_len(&retained).map_err(|e| self.fail(RetentionOperation::InspectSnapshot, e))?;
         if actual != self.len {
             return Err(RetentionError::SnapshotMismatch {
+                path: self.path(),
                 kind: SnapshotMismatchKind::Length {
                     expected: self.len,
                     actual,

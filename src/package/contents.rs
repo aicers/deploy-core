@@ -461,9 +461,9 @@ fn from_retention(error: RetentionError, site: &RetentionSite<'_>) -> ContentErr
                 format!("the staging parent is not trusted: {reason}"),
             ),
         },
-        RetentionError::SnapshotMismatch { kind } => ContentError::Io {
+        RetentionError::SnapshotMismatch { path, kind } => ContentError::Io {
             operation: IoOperation::WriteSnapshot,
-            path: None,
+            path: Some(path),
             source: io::Error::other(format!(
                 "the snapshot does not match what was written: {kind}"
             )),
