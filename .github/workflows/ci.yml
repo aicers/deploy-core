@@ -127,3 +127,26 @@ jobs:
       # changes what compiles. Run the suite under it as well.
       - name: Test (test-support)
         run: cargo test --features test-support
+
+  # The crypto provider builds AWS-LC from source, and the README states its
+  # prerequisites per platform. `check` and `test` cover Linux x86_64; this
+  # job keeps the claim for the other platforms downstream runners use
+  # checked: the suite on Linux aarch64, and a build of every target on macOS
+  # arm64.
+  platforms:
+    name: Platform (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            command: cargo test --features test-support
+          - os: macos-latest
+            command: cargo build --all-targets --features test-support
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build or test
+        run: ${{ matrix.command }}

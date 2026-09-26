@@ -29,3 +29,16 @@ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
 
 and is `p256-explicit-params.pem`: a P-256 key whose curve is spelled out as
 explicit parameters rather than named.
+
+`rsa-2047.pem` is the exception: OpenSSL splits a 2047-bit modulus into
+1024- and 1023-bit primes, and this key needs two 1024-bit primes whose
+product is 2047 bits long. It was built once with a short Python script that
+drew both primes from [2^1023, √2 · 2^1023) with `random.SystemRandom` and a
+Miller–Rabin test, took e = 65537, d = e⁻¹ mod lcm(p − 1, q − 1) and the CRT
+values from them, and wrote the result as DER by hand.
+`openssl pkey -check` reports it valid. `rsa-2047-cert.pem` is its
+self-signed certificate, from
+
+```sh
+openssl req -x509 -key rsa-2047.pem -subj /CN=rsa-2047 -days 36500 -sha256
+```

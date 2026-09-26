@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use tar::{Builder, EntryType, Header};
 use zstd::Encoder;
 

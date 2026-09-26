@@ -99,7 +99,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::path::Path;
 
-use ring::signature::{ED25519, UnparsedPublicKey};
+use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
 
 use crate::image::{
     ImageArchitecture, ImageDeclaration, NormalizedReference, RUNTIME_ALIAS_REGISTRY,
@@ -2092,8 +2092,8 @@ fn check_owners(
 mod tests {
     use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
-    use ring::rand::SystemRandom;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
     use tar::{Builder, EntryType, Header};
     use zstd::Encoder;
 
@@ -4963,7 +4963,8 @@ mod tests {
     /// A raw manifest block, checked in byte for byte.
     const KNOWN_ANSWER_MANIFEST: &[u8] =
         include_bytes!("../assets/test-fixtures/ed25519-known-answer/manifest.json");
-    /// The signature ring produced over [`KNOWN_ANSWER_MANIFEST`] under the
+    /// The signature the previous crypto backend produced (see the README
+    /// beside it) over [`KNOWN_ANSWER_MANIFEST`] under the
     /// RFC 8032 TEST 1 key, in hex. Ed25519 is deterministic, so any correct
     /// implementation reproduces it from the same seed and message.
     const KNOWN_ANSWER_SIGNATURE: &str =

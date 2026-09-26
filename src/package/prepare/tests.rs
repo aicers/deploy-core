@@ -2,7 +2,7 @@ use std::io::{Cursor, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use ring::rand::SecureRandom;
+use aws_lc_rs::rand::SecureRandom;
 use sha2::{Digest, Sha256};
 
 use super::super::bounded::seam as bounded_seam;
@@ -70,7 +70,7 @@ fn natives() -> Vec<Art> {
 
 fn random_bytes(len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
-    ring::rand::SystemRandom::new()
+    aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut bytes)
         .expect("random bytes");
     bytes

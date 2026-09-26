@@ -16,8 +16,8 @@
 //! No key material is committed to the repository and none is read from a fixed
 //! path: every fixture key pair is minted afresh from the system RNG.
 
-use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use tar::{Builder, EntryType, Header};
 use zstd::Encoder;
 

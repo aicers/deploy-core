@@ -5,7 +5,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ring::signature::Ed25519KeyPair;
+use aws_lc_rs::signature::Ed25519KeyPair;
 use serde_json::{Value, json};
 
 use super::super::contents::tests::fixture::{Art, COMMIT, COMPONENT, NAMESPACE, VERSION};

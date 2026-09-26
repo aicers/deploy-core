@@ -2074,7 +2074,7 @@ mod tests {
     use std::mem::{Discriminant, discriminant};
     use std::path::{Path, PathBuf};
 
-    use ring::signature::Ed25519KeyPair;
+    use aws_lc_rs::signature::Ed25519KeyPair;
     use tempfile::TempDir;
 
     use super::{

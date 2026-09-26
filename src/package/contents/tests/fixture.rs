@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::io::Write as _;
 
-use ring::signature::Ed25519KeyPair;
+use aws_lc_rs::signature::Ed25519KeyPair;
 use serde_json::Value;
 use tar::{EntryType, Header};
 

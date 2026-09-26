@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ring::rand::SecureRandom;
+use aws_lc_rs::rand::SecureRandom;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
@@ -336,7 +336,7 @@ fn random_hex() -> io::Result<String> {
         return Ok(to_hex(&forced));
     }
     let mut bytes = [0u8; 16];
-    ring::rand::SystemRandom::new()
+    aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| io::Error::other("system random source failed"))?;
     Ok(to_hex(&bytes))
