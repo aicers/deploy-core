@@ -548,7 +548,6 @@ fn retained_disk_counts_the_prepared_archive() {
         high,
         "the finalization scope gets what the prepared archive leaves"
     );
-    assert!(need < 2 * need);
     drop(finalized);
 
     // One byte less refuses, although the finalization alone would fit.
@@ -921,6 +920,8 @@ fn a_package_limit_the_tail_would_cross_is_refused() {
     let case = Case::new();
     let blocks =
         case.package().binding().manifest_length() + case.package().binding().archive_length();
+    let container = blocks + 128 + FOOTER_SIZE as u64;
+    // M and A fit, and the signature, key ID and footer cross.
     let tight = limits(LimitResource::Package, blocks + 100);
     let error = case.refused(finalize(
         case.package(),
@@ -932,7 +933,7 @@ fn a_package_limit_the_tail_would_cross_is_refused() {
     assert_eq!(limit_of(&error), (LimitResource::Package, blocks + 100));
 
     // Exactly the container's length fits.
-    let exact = limits(LimitResource::Package, blocks + 201);
+    let exact = limits(LimitResource::Package, container);
     finalize(
         case.package(),
         &case.signed(),
