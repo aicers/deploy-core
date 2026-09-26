@@ -1,13 +1,19 @@
 //! Characterization of the outcomes the chain check and the key match give per
 //! key type and per key encoding.
 //!
-//! Every expectation here was pinned against the ring backend the module was
-//! first written on, and the provider switch keeps them unchanged: which chain
-//! signatures are accepted, which PKCS#8 encodings `key_matches_cert` reads,
-//! and exactly which of them it refuses as [`TrustError::UnsupportedKey`].
-//! The encoding cases are the ones where AWS-LC's parser and ring's disagree,
-//! each rebuilt from a freshly generated key so a case accepted by mistake
-//! shows up as `Ok(true)` rather than as a quiet mismatch.
+//! Every expectation here was pinned against the crypto backend the module
+//! was first written on, and the provider switch keeps them unchanged: which
+//! chain signatures are accepted, which PKCS#8 encodings `key_matches_cert`
+//! reads, and exactly which of them it refuses as
+//! [`TrustError::UnsupportedKey`]. The encoding cases are the ones where
+//! AWS-LC's parser and that backend's disagree, each rebuilt from a freshly
+//! generated key so a case accepted by mistake shows up as `Ok(true)` rather
+//! than as a quiet mismatch.
+//!
+//! The last section covers the RSA keys AWS-LC refuses and that backend
+//! matched: one whose private exponent or CRT exponents are inconsistent with
+//! the public exponent, and one whose modulus is 2047 bits long. They keep
+//! that backend's outcome, and so do the refusals it made on the same values.
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -29,6 +35,11 @@ const RSA_8192: &str = include_str!("../../../assets/test-fixtures/roxyd-trust/r
 const RSA_2048_E3: &str = include_str!("../../../assets/test-fixtures/roxyd-trust/rsa-2048-e3.pem");
 const RSA_2048_E_OVER_33_BITS: &str =
     include_str!("../../../assets/test-fixtures/roxyd-trust/rsa-2048-e-over-33-bits.pem");
+/// A 2047-bit RSA key over two 1024-bit primes, and its self-signed
+/// certificate; built by hand, since OpenSSL splits such a modulus unevenly.
+const RSA_2047: &str = include_str!("../../../assets/test-fixtures/roxyd-trust/rsa-2047.pem");
+const RSA_2047_CERT: &str =
+    include_str!("../../../assets/test-fixtures/roxyd-trust/rsa-2047-cert.pem");
 const P256_EXPLICIT_PARAMS: &str =
     include_str!("../../../assets/test-fixtures/roxyd-trust/p256-explicit-params.pem");
 
@@ -261,7 +272,7 @@ impl EcKey {
         out
     }
 
-    /// The canonical encoding ring itself produces: PKCS#8 v1, a named curve,
+    /// The canonical encoding the first backend produced: PKCS#8 v1, a named curve,
     /// no `[0]` parameters, and the uncompressed public key.
     fn canonical(&self) -> Vec<u8> {
         let inner = ec_private_key(1, &self.scalar, None, Some(&self.point));
@@ -631,6 +642,142 @@ fn rsa_pkcs8_encodings_keep_their_outcomes() {
     ];
     for (der, case) in refused {
         assert_unsupported(&der, &cert, case);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where the provider is stricter
+// ---------------------------------------------------------------------------
+
+/// The fields of a two-prime `RSAPrivateKey`: version, n, e, d, p, q, dP, dQ,
+/// qInv.
+const RSA_P: usize = 4;
+const RSA_Q: usize = 5;
+const RSA_DP: usize = 6;
+const RSA_DQ: usize = 7;
+const RSA_QINV: usize = 8;
+
+/// The PKCS#8 `RSA_2048_LEAF` with field `index` of its `RSAPrivateKey`
+/// replaced by `field`, a whole `INTEGER`.
+fn rsa_leaf_with(index: usize, field: &[u8]) -> Vec<u8> {
+    let der = pem_der(RSA_2048_LEAF);
+    let info = private_key_info(&der);
+    let (tag, body, rest) = split_tlv(info.private_key);
+    assert_eq!((tag, rest.len()), (TAG_SEQUENCE, 0), "one RSAPrivateKey");
+    let mut fields = elements(body);
+    assert_eq!(fields.len(), 9, "a two-prime RSAPrivateKey");
+    fields[index] = field;
+    pkcs8(0, info.algorithm, &sequence(&fields), &[])
+}
+
+/// Field `index` of `RSA_2048_LEAF`'s `RSAPrivateKey`, as a whole `INTEGER`.
+fn rsa_leaf_field(index: usize) -> Vec<u8> {
+    let der = pem_der(RSA_2048_LEAF);
+    let info = private_key_info(&der);
+    let (_, body, _) = split_tlv(info.private_key);
+    elements(body)[index].to_vec()
+}
+
+/// `integer` with the bits of `mask` flipped in its last octet.
+fn with_low_bits_flipped(integer: &[u8], mask: u8) -> Vec<u8> {
+    let mut value = contents_of(integer).to_vec();
+    *value.last_mut().expect("a non-empty integer") ^= mask;
+    tlv(TAG_INTEGER, &value)
+}
+
+/// The DER `INTEGER` of a non-negative big-endian value.
+fn big_integer(value: &[u8]) -> Vec<u8> {
+    let start = value
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(value.len() - 1);
+    let value = &value[start..];
+    if value[0] & 0x80 == 0 {
+        tlv(TAG_INTEGER, value)
+    } else {
+        tlv(TAG_INTEGER, &[&[0], value].concat())
+    }
+}
+
+/// AWS-LC relates `d`, `dP` and `dQ` to the public exponent and refuses a
+/// key inconsistent there; the previous backend never validated `d`, and
+/// checked only that `dP` and `dQ` were odd and below their primes, so such a
+/// key matched its certificate. It still does, and still does not match
+/// another key's.
+#[test]
+fn rsa_keys_with_an_inconsistent_private_exponent_keep_their_outcome() {
+    let cert = self_signed_cert(&KeyPair::from_pem(RSA_2048_LEAF).expect("an RSA key"));
+    let other = self_signed_cert(&KeyPair::from_pem(RSA_2048_CA).expect("an RSA key"));
+    for (index, case) in [(3, "d"), (RSA_DP, "dP"), (RSA_DQ, "dQ")] {
+        // Flipping bit 1 keeps the value's length and parity, so it stays in
+        // the range the previous backend checked.
+        let key = rsa_leaf_with(index, &with_low_bits_flipped(&rsa_leaf_field(index), 0x02));
+        assert_matches(&key, &cert, case);
+        match matches(&key, &other) {
+            Ok(false) => {}
+            result => panic!("{case} against another key: expected Ok(false), got {result:?}"),
+        }
+    }
+}
+
+/// aws-lc-rs refuses every RSA private key below 2048 bits in each
+/// constructor it offers. The previous backend compared the modulus length
+/// with its 2048-bit minimum after rounding it up to whole bytes, so a
+/// consistent key whose two 1024-bit primes multiply to a 2047-bit modulus
+/// matched its certificate. It still does, and still does not match another
+/// key's.
+#[test]
+fn rsa_keys_with_a_2047_bit_modulus_keep_their_outcome() {
+    let key = pem_der(RSA_2047);
+    assert_matches(&key, &pem_der(RSA_2047_CERT), "its own certificate");
+    let other = self_signed_cert(&KeyPair::from_pem(RSA_2048_LEAF).expect("an RSA key"));
+    match matches(&key, &other) {
+        Ok(false) => {}
+        result => panic!("another key's certificate: expected Ok(false), got {result:?}"),
+    }
+}
+
+/// The relations the previous backend did check between an RSA key's values
+/// still refuse a key that breaks one, each on its own: the primes multiply
+/// to the modulus, `dP` and `dQ` are odd and below their primes, and `qInv`
+/// is below `p` and inverts `q` modulo `p`.
+#[test]
+fn rsa_keys_breaking_a_checked_relation_are_unsupported() {
+    let cert = self_signed_cert(&KeyPair::from_pem(RSA_2048_LEAF).expect("an RSA key"));
+    let p = rsa_leaf_field(RSA_P);
+    let q = rsa_leaf_field(RSA_Q);
+    let q_inv = rsa_leaf_field(RSA_QINV);
+    // `qInv + p` still inverts `q` modulo `p`, and fails only the range check.
+    let q_inv_plus_p = num_bigint::BigUint::from_bytes_be(contents_of(&q_inv))
+        + num_bigint::BigUint::from_bytes_be(contents_of(&p));
+
+    let cases: [(usize, Vec<u8>, &str); 7] = [
+        (RSA_Q, with_low_bits_flipped(&q, 0x02), "p * q is not n"),
+        (
+            RSA_DP,
+            with_low_bits_flipped(&rsa_leaf_field(RSA_DP), 0x01),
+            "an even dP",
+        ),
+        (
+            RSA_DQ,
+            with_low_bits_flipped(&rsa_leaf_field(RSA_DQ), 0x01),
+            "an even dQ",
+        ),
+        (RSA_DP, p.clone(), "dP equal to p"),
+        (RSA_DQ, q, "dQ equal to q"),
+        (
+            RSA_QINV,
+            with_low_bits_flipped(&q_inv, 0x02),
+            "a qInv that does not invert q",
+        ),
+        (
+            RSA_QINV,
+            big_integer(&q_inv_plus_p.to_bytes_be()),
+            "qInv + p in place of qInv",
+        ),
+    ];
+    for (index, field, case) in cases {
+        assert_unsupported(&rsa_leaf_with(index, &field), &cert, case);
     }
 }
 

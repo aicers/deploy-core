@@ -46,17 +46,18 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use ring::signature::{
-    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, KeyPair,
-    RsaKeyPair,
+use aws_lc_rs::signature::{
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair,
+    EcdsaSigningAlgorithm, KeyPair, RsaKeyPair,
 };
+use base64::Engine as _;
 use rustls_pki_types::{CertificateDer, SignatureVerificationAlgorithm, UnixTime};
 use webpki::{EndEntityCert, KeyUsage};
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use x509_parser::time::ASN1Time;
 
+use self::key_profile::ProfiledKey;
 use crate::generation::{GenerationError, GenerationFile, GenerationTree, activate_generation};
 // The generation engine owns these primitives now; this module's own tests still
 // reach them through `super::`, which is why the imports are here rather than in the
@@ -64,17 +65,24 @@ use crate::generation::{GenerationError, GenerationFile, GenerationTree, activat
 #[cfg(test)]
 use crate::generation::{make_dir_0700, parse_generation, write_file_0600};
 
+mod key_profile;
+
 /// The signature algorithms the chain check accepts. bootroot issues ECDSA P-256
 /// leaves today (rcgen's default), but P-384 and RSA are listed so a future CA
 /// profile change does not silently fail closed.
+///
+/// Exactly these seven: ECDSA over P-256 and P-384, each with SHA-256 and
+/// SHA-384, and RSA PKCS#1 v1.5 with a 2048- to 8192-bit modulus and SHA-256,
+/// SHA-384 or SHA-512. The provider module offers more (P-521, Ed25519,
+/// RSA-PSS, the 3072-bit-minimum RSA variants); none of them is accepted.
 static SUPPORTED_SIG_ALGS: &[&dyn SignatureVerificationAlgorithm] = &[
-    webpki::ring::ECDSA_P256_SHA256,
-    webpki::ring::ECDSA_P256_SHA384,
-    webpki::ring::ECDSA_P384_SHA256,
-    webpki::ring::ECDSA_P384_SHA384,
-    webpki::ring::RSA_PKCS1_2048_8192_SHA256,
-    webpki::ring::RSA_PKCS1_2048_8192_SHA384,
-    webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+    webpki::aws_lc_rs::ECDSA_P256_SHA256,
+    webpki::aws_lc_rs::ECDSA_P256_SHA384,
+    webpki::aws_lc_rs::ECDSA_P384_SHA256,
+    webpki::aws_lc_rs::ECDSA_P384_SHA384,
+    webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA256,
+    webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA384,
+    webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA512,
 ];
 
 /// The PEM label of an X.509 certificate.
@@ -431,22 +439,46 @@ fn require_client_auth(leaf: &X509Certificate<'_>) -> Result<(), TrustError> {
 }
 
 /// Returns whether the PKCS#8 private key `key_der` corresponds to the public key in
-/// `cert`. ECDSA P-256/P-384 and RSA are supported; the derived public key
-/// (uncompressed EC point, or DER `RSAPublicKey`) is compared to the certificate's
-/// `SubjectPublicKeyInfo` subject public key, which carries the same encoding.
+/// `cert`. ECDSA P-256/P-384 and RSA are supported, tried in that order; the derived
+/// public key (uncompressed EC point, or DER `RSAPublicKey`) is compared to the
+/// certificate's `SubjectPublicKeyInfo` subject public key, which carries the same
+/// encoding.
+///
+/// Which keys are read is fixed by [`key_profile`]: a key outside it is
+/// [`TrustError::UnsupportedKey`] even where the provider's parser would take it, and
+/// an RSA key inside it is compared by its own public key where the provider refuses
+/// it. An EC key's embedded public key must also be the provider's own uncompressed
+/// encoding of the point derived from the private scalar.
 fn key_matches_cert(key_der: &[u8], cert: &X509Certificate<'_>) -> Result<bool, TrustError> {
     let cert_spki = cert.public_key().subject_public_key.data.as_ref();
-    let rng = ring::rand::SystemRandom::new();
-    if let Ok(kp) = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, key_der, &rng) {
-        return Ok(kp.public_key().as_ref() == cert_spki);
-    }
-    if let Ok(kp) = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, key_der, &rng) {
-        return Ok(kp.public_key().as_ref() == cert_spki);
-    }
-    if let Ok(kp) = RsaKeyPair::from_pkcs8(key_der) {
-        return Ok(kp.public_key().as_ref() == cert_spki);
+    match key_profile::classify(key_der) {
+        Some(ProfiledKey::EcP256 { public_key }) => {
+            if ec_key_derives(&ECDSA_P256_SHA256_ASN1_SIGNING, key_der, public_key) {
+                return Ok(public_key == cert_spki);
+            }
+        }
+        Some(ProfiledKey::EcP384 { public_key }) => {
+            if ec_key_derives(&ECDSA_P384_SHA384_ASN1_SIGNING, key_der, public_key) {
+                return Ok(public_key == cert_spki);
+            }
+        }
+        Some(ProfiledKey::Rsa(key)) => {
+            return Ok(match RsaKeyPair::from_pkcs8(key_der) {
+                Ok(kp) => kp.public_key().as_ref() == cert_spki,
+                // The profile has already checked the key as the previous backend
+                // did; AWS-LC refuses some keys that pass, so compare its own.
+                Err(_) => key.public_key_is(cert_spki),
+            });
+        }
+        None => {}
     }
     Err(TrustError::UnsupportedKey)
+}
+
+/// Reports whether the provider parses `key_der` as an `alg` key whose public point,
+/// derived from its private scalar, is exactly `embedded`.
+fn ec_key_derives(alg: &'static EcdsaSigningAlgorithm, key_der: &[u8], embedded: &[u8]) -> bool {
+    EcdsaKeyPair::from_pkcs8(alg, key_der).is_ok_and(|kp| kp.public_key().as_ref() == embedded)
 }
 
 /// Cryptographically verifies that `leaf_der` chains to `anchor_der` for TLS client

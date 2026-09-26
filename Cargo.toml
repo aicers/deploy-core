@@ -5,15 +5,25 @@ edition = "2024"
 repository = "https://github.com/aicers/deploy-core"
 
 [dependencies]
+# Ed25519 package signatures, the roxyd key match and the chain check's
+# signature algorithms, and system randomness. It replaces the previous crypto
+# backend because the project owner selected aws-lc-rs as this project's crypto
+# backend (bootler RFC 0001, "Cryptographic provider transition"). Only the
+# non-FIPS AWS-LC backend is enabled.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.22"
 # Inflates gzip-compressed image layers. Neither std nor any other dependency
 # here provides a DEFLATE decoder, and a hand-written codec is not an option;
 # the pure-Rust backend avoids a C toolchain dependency.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hostname = "0.4"
-ring = "0.17"
+# Re-checks the RSA key relations the previous crypto backend checked, where
+# aws-lc-rs is stricter, so the roxyd key match keeps that backend's outcomes.
+# aws-lc-rs exposes no big-integer arithmetic; x509-parser already links this
+# crate through der-parser, so the graph gains nothing.
+num-bigint = "0.4.5"
 rustls-pki-types = "1"
-rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,7 +44,7 @@ zstd = "0.13"
 test-support = []
 
 [dev-dependencies]
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 time = "0.3"
 
 # Writes and classifies synthetic image archives through the public

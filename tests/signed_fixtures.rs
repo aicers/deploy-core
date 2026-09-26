@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use deploy_core::image::test_support::{
     LayerCompression, SyntheticImageArchiveBuilder, SyntheticLayer,
 };
@@ -27,8 +29,6 @@ use deploy_core::payload::{ArtifactInput, Signed};
 use deploy_core::verify::{
     ImageVerifyError, TRUST_TARGET, TrustAnchor, TrustSet, VerifyError, VerifyRequest, key_id,
 };
-use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair};
 use tempfile::TempDir;
 
 const COMPONENT: &str = "example-app";

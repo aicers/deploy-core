@@ -23,6 +23,8 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use deploy_core::image::test_support::{
     LayerCompression, SyntheticImageArchiveBuilder, SyntheticLayer,
 };
@@ -34,8 +36,6 @@ use deploy_core::manifest::{ArtifactKind, Disposition, TargetArch};
 use deploy_core::package::{ContentLimits, VerifiedImages, verify_contents};
 use deploy_core::payload::{ArtifactInput, FOOTER_SIZE, Signed, append_trailer_signed};
 use deploy_core::verify::{TrustAnchor, TrustSet, VerifyRequest, key_id};
-use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair};
 
 const COMPONENT: &str = "example-app";
 const VERSION: &str = "1.0.0";

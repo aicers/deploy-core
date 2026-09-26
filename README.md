@@ -113,6 +113,52 @@ It carries no product concept — no component catalog, no per-component
 renderers — so both the installer and the per-machine root daemon depend
 on it and share one implementation.
 
+## Build requirements
+
+The package signature check, the roxyd key and chain checks, and the random
+names of retained files go through `aws-lc-rs`, the crypto backend the
+project owner selected for this stack (bootler RFC 0001, "Cryptographic
+provider transition"). It is resolved as `aws-lc-rs` 1.18.1 over
+`aws-lc-sys` 0.45.0, with only its non-FIPS AWS-LC backend enabled. Unless
+it links an AWS-LC installation it finds on the host (see below),
+`aws-lc-sys` compiles AWS-LC from C source as part of every clean build. A
+host that builds this crate — or `bootler`, roxyd or anything else that
+links it — from source therefore needs:
+
+| Platform | Target | Prerequisites |
+| --- | --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | C compiler, libc headers |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` | C compiler, libc headers |
+| macOS arm64 | `aarch64-apple-darwin` | Xcode Command Line Tools |
+
+On Debian and Ubuntu the Linux prerequisites are `build-essential`, or just
+`gcc` and `libc6-dev`; `zstd-sys` needs the same C compiler. CMake, Go,
+NASM, Perl and libclang are **not** needed on these three platforms:
+`aws-lc-sys` ships pregenerated bindings for them and compiles AWS-LC
+through the `cc` crate, so no bindgen or CMake step runs. That changes if a
+build asks for it:
+
+- `AWS_LC_SYS_CMAKE_BUILDER=1` selects the CMake build, which needs CMake.
+- `AWS_LC_SYS_NO_ASM=1` selects the CMake build too, unless
+  `AWS_LC_SYS_CMAKE_BUILDER=0` is also set. The `cc` build then honours it
+  at `opt-level` 2 or below, and fails at 3, the release default.
+- `aws-lc-sys`'s `bindgen` feature generates the bindings, which needs
+  libclang.
+
+A target outside the table may need them too. The
+[aws-lc-rs user guide](https://aws.github.io/aws-lc-rs/) lists what each of
+those needs. The FIPS backend is not used, and its extra requirements (Go
+among them) do not apply.
+
+`aws-lc-sys` looks for an AWS-LC installation through `OPENSSL_DIR`,
+`OPENSSL_INCLUDE_DIR` and `OPENSSL_LIB_DIR`, then pkg-config, and links one
+it finds instead of building its own copy; an OpenSSL installation found
+there is skipped. Set `AWS_LC_SYS_USE_SYSTEM=0` to always build from
+source, as the table above assumes.
+
+CI builds the Linux x86_64 row in its `check` and `test` jobs and the other
+two in its `platforms` job.
+
 ## Testing
 
 ```sh

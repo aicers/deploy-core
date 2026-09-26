@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use deploy_core::image::test_support::{
     LayerCompression, SyntheticImageArchiveBuilder, SyntheticLayer,
 };
@@ -26,8 +28,6 @@ use deploy_core::verify::{
     ImageReferences, ImageVerifyError, InvalidArchiveReason, TRUST_TARGET, TarFault, TrustAnchor,
     TrustSet, VerifyError, VerifyRequest, key_id, verify_package,
 };
-use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
