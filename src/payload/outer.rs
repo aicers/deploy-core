@@ -14,11 +14,14 @@
 //! The legacy caller passes no [`OuterLimits`] and sees exactly the walk it
 //! always had. A caller that passes them also gets every zstd frame's window
 //! checked before that frame is decoded, the member count bounded, and every
-//! decoded byte metered: member data against `OuterUncompressedTotal`, and
-//! the framing between the members — headers, extension records, padding and
-//! the end marker — against a fixed allowance per member slot, reported
-//! against that same resource, so an extension record cannot grow into a
-//! buffer the size of the archive.
+//! decoded byte metered: the data of admitted members against
+//! `OuterUncompressedTotal`, and the framing between the members — headers,
+//! extension records, padding and the end marker — against a private
+//! allowance per member slot, so an extension record cannot grow into a
+//! buffer the size of the archive. The framing is no member data and never
+//! reported as that resource: passing its allowance is a container verdict,
+//! and an extension record too large for it is refused for what it
+//! overrides, as [`framing`] describes.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +33,10 @@ use zstd::Decoder;
 use super::{PayloadError, admitted_member_path, compare_member_list, reject_trailing_bytes};
 use crate::manifest::{ArchiveMember, PayloadArtifact, PayloadManifest};
 use crate::package::LimitResource;
+
+mod framing;
+
+use framing::{Framing, OversizedExtension, SCAN_CHUNK};
 
 /// The magic number opening a standard zstd frame, little-endian.
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
@@ -163,6 +170,7 @@ pub(crate) fn walk_outer<'m, R: Read, S: MemberSink<'m>>(
         inner: decoder,
         counters: &counters,
         copy_buffer: limits.copy_buffer,
+        framing: Framing::new(),
     };
     walk_entries(metered, manifest, Some(&counters), sink)
 }
@@ -274,16 +282,46 @@ fn walk_entries<'m, D: Read, S: MemberSink<'m>>(
 }
 
 /// Classifies a failure reading the archive: a limit a [`Meter`] enforced
-/// becomes [`WalkError::Limit`], and anything else is the
-/// [`PayloadError::Io`] the legacy walk reports. Only the payload's type
-/// decides.
+/// becomes [`WalkError::Limit`], an extension record refused for what it
+/// overrides becomes the [`PayloadError`] naming that override, and anything
+/// else — the framing allowance among it — is the [`PayloadError::Io`] the
+/// legacy walk reports. Only the payload's type decides.
 fn stream_error<E>(error: io::Error) -> WalkError<E> {
-    match OuterLimitFault::recover(error) {
-        Ok(fault) => WalkError::Limit {
-            resource: fault.resource,
-            limit: fault.limit,
-        },
+    let error = match take_payload::<OuterLimitFault>(error) {
+        Ok(fault) => {
+            return WalkError::Limit {
+                resource: fault.resource,
+                limit: fault.limit,
+            };
+        }
+        Err(error) => error,
+    };
+    match take_payload::<OversizedExtension>(error) {
+        Ok(refusal) => WalkError::Payload(refusal.into_payload()),
         Err(error) => WalkError::Payload(PayloadError::Io(error)),
+    }
+}
+
+/// Recovers the `T` `error` carries as its payload, or returns `error`
+/// unchanged.
+fn take_payload<T: std::error::Error + Send + Sync + 'static>(
+    error: io::Error,
+) -> Result<T, io::Error> {
+    let carries = error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<T>);
+    if !carries {
+        return Err(error);
+    }
+    let kind = error.kind();
+    match error
+        .into_inner()
+        .map(<dyn std::error::Error + Send + Sync>::downcast)
+    {
+        Some(Ok(payload)) => Ok(*payload),
+        // Unreachable: the payload was just seen to be this type.
+        Some(Err(inner)) => Err(io::Error::new(kind, inner)),
+        None => Err(io::Error::from(kind)),
     }
 }
 
@@ -308,27 +346,18 @@ impl OuterLimitFault {
     fn into_io(self) -> io::Error {
         io::Error::other(self)
     }
+}
 
-    /// Recovers the fault `error` carries as its payload, or returns `error`
-    /// unchanged.
-    fn recover(error: io::Error) -> Result<OuterLimitFault, io::Error> {
-        let carries = error
-            .get_ref()
-            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<OuterLimitFault>);
-        if !carries {
-            return Err(error);
-        }
-        let kind = error.kind();
-        match error
-            .into_inner()
-            .map(<dyn std::error::Error + Send + Sync>::downcast)
-        {
-            Some(Ok(fault)) => Ok(*fault),
-            // Unreachable: the payload was just seen to be this type.
-            Some(Err(inner)) => Err(io::Error::new(kind, inner)),
-            None => Err(io::Error::from(kind)),
-        }
-    }
+/// Returns the private allowance of framing bytes a bounded walk admitting
+/// `members` members holds the decoded stream to: every header, extension
+/// record, padding block and end marker that is no member's data.
+pub(crate) fn framing_allowance(members: u64) -> u64 {
+    // `OuterMembers` never exceeds its default, so this cannot overflow; if it
+    // could, the allowance would still be finite.
+    members
+        .checked_add(FRAMING_EXTRA_SLOTS)
+        .and_then(|slots| slots.checked_mul(FRAMING_PER_SLOT))
+        .unwrap_or(u64::MAX)
 }
 
 /// What a bounded walk has read so far, shared by the [`Meter`] under the tar
@@ -350,34 +379,51 @@ impl OuterCounters {
             member_bytes: Cell::new(0),
             framing_bytes: Cell::new(0),
             member_limit: limits.uncompressed_total,
-            framing_limit: limits
-                .members
-                .saturating_add(FRAMING_EXTRA_SLOTS)
-                .saturating_mul(FRAMING_PER_SLOT),
+            framing_limit: framing_allowance(limits.members),
             members_limit: limits.members,
         }
     }
+
+    /// Returns the framing bytes left of the allowance.
+    fn framing_room(&self) -> u64 {
+        self.framing_limit.saturating_sub(self.framing_bytes.get())
+    }
+
+    /// Charges `len` bytes to `counter`, which the caller has checked the
+    /// allowance holds, so the sum stays at or below a `u64` limit.
+    fn charge(counter: &Cell<u64>, len: u64) {
+        counter.set(counter.get().saturating_add(len));
+    }
 }
 
-/// Meters every decoded byte of a bounded walk: member data against
-/// `OuterUncompressedTotal`, and everything else against the framing
-/// allowance. No request exceeds the copy buffer, and none reaches more than
-/// one byte past the allowance: a byte arriving beyond it is the fault.
+/// Meters every decoded byte of a bounded walk: the data an admitted member's
+/// sink reads against `OuterUncompressedTotal`, and everything else against
+/// the private framing allowance, whose structure [`Framing`] follows. No
+/// request exceeds the copy buffer, and none reaches more than one byte past
+/// either allowance: a byte arriving beyond it is the fault. An extension
+/// record the framing allowance cannot hold is read here, past the archive
+/// reader, and refused for what it overrides.
 struct Meter<'c, R> {
     inner: R,
     counters: &'c OuterCounters,
     copy_buffer: usize,
+    framing: Framing,
 }
 
 impl<R: Read> Read for Meter<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let counters = self.counters;
-        let (counter, limit) = if counters.in_member.get() {
+        if self.framing.scanning() {
+            return Err(self.refuse_extension()?);
+        }
+        let in_member = counters.in_member.get();
+        let (counter, limit) = if in_member {
             (&counters.member_bytes, counters.member_limit)
         } else {
             (&counters.framing_bytes, counters.framing_limit)
         };
         let allowance = limit.saturating_sub(counter.get());
+        let room = counters.framing_room();
         let want =
             crate::content::chunk_len(buf.len().min(self.copy_buffer), allowance.saturating_add(1));
         let Some(window) = buf.get_mut(..want) else {
@@ -386,14 +432,46 @@ impl<R: Read> Read for Meter<'_, R> {
         let read = self.inner.read(window)?;
         let read_len = crate::content::widen(read);
         if read_len > allowance {
-            return Err(OuterLimitFault {
-                resource: LimitResource::OuterUncompressedTotal,
-                limit: counters.member_limit,
-            }
-            .into_io());
+            return Err(if in_member {
+                OuterLimitFault {
+                    resource: LimitResource::OuterUncompressedTotal,
+                    limit: counters.member_limit,
+                }
+                .into_io()
+            } else {
+                framing::exceeded(counters.framing_limit)
+            });
         }
-        counter.set(counter.get().saturating_add(read_len));
+        OuterCounters::charge(counter, read_len);
+        self.framing
+            .advance(window.get(..read).unwrap_or_default(), room);
         Ok(read)
+    }
+}
+
+impl<R: Read> Meter<'_, R> {
+    /// Reads the extension record [`Framing`] is scanning, within what is
+    /// left of the framing allowance and never into the archive reader's
+    /// buffer, and returns its refusal. Only a failure of the stream itself
+    /// is returned as `Err`, unclassified, as any other read's would be.
+    fn refuse_extension(&mut self) -> io::Result<io::Error> {
+        let counters = self.counters;
+        let mut scratch = [0u8; SCAN_CHUNK];
+        let chunk = SCAN_CHUNK.min(self.copy_buffer);
+        loop {
+            let wanted = self.framing.wanted().min(counters.framing_room());
+            let want = crate::content::chunk_len(chunk, wanted);
+            let Some(window) = scratch.get_mut(..want).filter(|window| !window.is_empty()) else {
+                break;
+            };
+            let read = self.inner.read(window)?;
+            if read == 0 {
+                break;
+            }
+            OuterCounters::charge(&counters.framing_bytes, crate::content::widen(read));
+            self.framing.feed(window.get(..read).unwrap_or_default());
+        }
+        Ok(self.framing.conclude(counters.framing_limit))
     }
 }
 

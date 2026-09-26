@@ -98,6 +98,8 @@ use crate::package::{LimitResource, RetainedIoFault};
 
 mod outer;
 
+#[cfg(test)]
+pub(crate) use outer::framing_allowance;
 pub(crate) use outer::{MemberSink, OuterLimits, SinkFault, WalkError, walk_outer};
 
 /// Magic bytes at the start of the footer, identifying a bootler payload.
@@ -372,6 +374,12 @@ pub enum PayloadError {
     /// the member an ordinary regular file. Two readers that disagree about
     /// which of the two names is the member's are enough to make the manifest
     /// bind one occurrence while extraction writes another.
+    ///
+    /// Where [`crate::package::verify_contents`] refuses an extension record
+    /// too large to read within its bound, the member's own header lies past
+    /// the record unread: `header_name` is then the extension header's name,
+    /// and `resolved_name` at most a 256-byte prefix of the name the record
+    /// carries, ending in `…` when cut.
     #[error("archive member name `{resolved_name}` overrides header name `{header_name}`")]
     NameOverridingHeader {
         /// Name recorded in the raw `ustar` header block.
@@ -390,6 +398,11 @@ pub enum PayloadError {
     /// to this one. That is the divergence
     /// [`PayloadError::NameOverridingHeader`] rejects, reached through the
     /// other field an extension header can override.
+    ///
+    /// Where [`crate::package::verify_contents`] refuses an extension record
+    /// too large to read within its bound, the member's own header lies past
+    /// the record unread: `path` and `header_size` are then the extension
+    /// header's own name and size.
     #[error(
         "archive member `{path}` resolves to size {resolved_size}, overriding header size {header_size}"
     )]

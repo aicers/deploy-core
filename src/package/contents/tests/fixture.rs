@@ -266,12 +266,37 @@ pub(crate) enum Entry<'a> {
     },
     /// A regular file whose size a PAX `size` record overrides.
     PaxSize(&'a str, &'a [u8]),
+    /// A regular file whose size a PAX `size` record overrides, that record
+    /// followed in the same extension by a `comment` record of `comment`
+    /// bytes.
+    PaxSizeCommented {
+        path: &'a str,
+        data: &'a [u8],
+        comment: usize,
+    },
+    /// A regular file preceded by a PAX extension holding nothing but a
+    /// `comment` record of `comment` bytes, which overrides nothing.
+    PaxCommented {
+        path: &'a str,
+        data: &'a [u8],
+        comment: usize,
+    },
+    /// A regular file `path` whose raw header states `size` and which carries
+    /// `data`, preceded by a PAX extension holding exactly `records`.
+    PaxRecords {
+        path: &'a str,
+        size: u64,
+        data: &'a [u8],
+        records: &'a [u8],
+    },
     /// A regular file named by a GNU long-name entry.
     GnuLongName {
         header: &'a str,
         path: &'a str,
         data: &'a [u8],
     },
+    /// A symbolic link at `header` whose target a GNU long-link entry names.
+    GnuLongLink { header: &'a str, target: &'a str },
     /// A symbolic link.
     Symlink(&'a str),
     /// A regular file whose header name field holds `name` verbatim.
@@ -292,7 +317,7 @@ fn header(name: &[u8], size: u64, kind: EntryType) -> Header {
     header
 }
 
-fn pax_record(key: &str, value: &str) -> Vec<u8> {
+pub(crate) fn pax_record(key: &str, value: &str) -> Vec<u8> {
     let body = format!(" {key}={value}\n");
     let mut len = body.len();
     loop {
@@ -309,6 +334,15 @@ fn padded(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
     let pad = (512 - data.len() % 512) % 512;
     out.extend(std::iter::repeat_n(0u8, pad));
+}
+
+/// Appends a PAX extension holding `records`, then a regular file `name`
+/// whose raw header states `size` and which carries `data`.
+fn extended(out: &mut Vec<u8>, records: &[u8], name: &str, size: u64, data: &[u8]) {
+    out.extend_from_slice(header(b"pax", len_u64(records), EntryType::XHeader).as_bytes());
+    padded(out, records);
+    out.extend_from_slice(header(name.as_bytes(), size, EntryType::Regular).as_bytes());
+    padded(out, data);
 }
 
 /// An uncompressed tar of `entries` with its end-of-archive marker.
@@ -337,27 +371,51 @@ pub(crate) fn tar_unfinished(entries: &[Entry<'_>]) -> Vec<u8> {
                 header: name,
                 path,
                 data,
-            } => {
-                let record = pax_record("path", path);
-                out.extend_from_slice(
-                    header(b"pax", len_u64(&record), EntryType::XHeader).as_bytes(),
-                );
-                padded(&mut out, &record);
-                out.extend_from_slice(
-                    header(name.as_bytes(), len_u64(data), EntryType::Regular).as_bytes(),
-                );
-                padded(&mut out, data);
-            }
+            } => extended(
+                &mut out,
+                &pax_record("path", path),
+                name,
+                len_u64(data),
+                data,
+            ),
             Entry::PaxSize(name, data) => {
                 let record = pax_record("size", &data.len().to_string());
+                extended(&mut out, &record, name, len_u64(data) + 1, data);
+            }
+            Entry::PaxSizeCommented {
+                path,
+                data,
+                comment,
+            } => {
+                let mut record = pax_record("size", &data.len().to_string());
+                record.extend(pax_record("comment", &"c".repeat(*comment)));
+                extended(&mut out, &record, path, len_u64(data) + 1, data);
+            }
+            Entry::PaxCommented {
+                path,
+                data,
+                comment,
+            } => {
+                let record = pax_record("comment", &"c".repeat(*comment));
+                extended(&mut out, &record, path, len_u64(data), data);
+            }
+            Entry::PaxRecords {
+                path,
+                size,
+                data,
+                records,
+            } => extended(&mut out, records, path, *size, data),
+            Entry::GnuLongLink {
+                header: name,
+                target,
+            } => {
+                let mut long = target.as_bytes().to_vec();
+                long.push(0);
                 out.extend_from_slice(
-                    header(b"pax", len_u64(&record), EntryType::XHeader).as_bytes(),
+                    header(b"././@LongLink", len_u64(&long), EntryType::GNULongLink).as_bytes(),
                 );
-                padded(&mut out, &record);
-                out.extend_from_slice(
-                    header(name.as_bytes(), len_u64(data) + 1, EntryType::Regular).as_bytes(),
-                );
-                padded(&mut out, data);
+                padded(&mut out, &long);
+                out.extend_from_slice(header(name.as_bytes(), 0, EntryType::Symlink).as_bytes());
             }
             Entry::GnuLongName {
                 header: name,
