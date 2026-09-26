@@ -96,6 +96,8 @@ use crate::manifest::{
 use crate::module_spec::ModuleSpec;
 use crate::package::{LimitResource, RetainedIoFault};
 
+#[cfg(test)]
+mod golden;
 mod outer;
 
 #[cfg(test)]
@@ -1191,6 +1193,8 @@ where
             image: input.image.clone(),
         });
     }
+    #[cfg(test)]
+    golden::between_passes();
     // Taken off the member list itself, so the number the header states below
     // is the very one the manifest binds rather than a second measurement of
     // the same file.
