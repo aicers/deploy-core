@@ -4936,6 +4936,116 @@ mod tests {
         ));
     }
 
+    // ---- Ed25519 known answers --------------------------------------------
+
+    /// The RFC 8032 §7.1 test vectors: secret key (the seed), public key,
+    /// message and signature, all in hex. Public test data, not key material.
+    const RFC8032_VECTORS: [(&str, &str, &str, &str); 3] = [
+        (
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "",
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+        ),
+        (
+            "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            "72",
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+        ),
+        (
+            "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+            "af82",
+            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+        ),
+    ];
+    /// A raw manifest block, checked in byte for byte.
+    const KNOWN_ANSWER_MANIFEST: &[u8] =
+        include_bytes!("../assets/test-fixtures/ed25519-known-answer/manifest.json");
+    /// The signature ring produced over [`KNOWN_ANSWER_MANIFEST`] under the
+    /// RFC 8032 TEST 1 key, in hex. Ed25519 is deterministic, so any correct
+    /// implementation reproduces it from the same seed and message.
+    const KNOWN_ANSWER_SIGNATURE: &str =
+        include_str!("../assets/test-fixtures/ed25519-known-answer/signature.hex");
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(hex.get(at..at + 2).expect("even-length hex"), 16))
+            .collect::<Result<_, _>>()
+            .expect("hex")
+    }
+
+    fn key_from_hex(hex: &str) -> [u8; 32] {
+        decode_hex(hex).try_into().expect("a 32-byte key")
+    }
+
+    /// Flips the lowest bit of the first byte of `bytes`.
+    fn flipped(bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        *out.first_mut().expect("non-empty") ^= 1;
+        out
+    }
+
+    #[test]
+    fn the_rfc_8032_vectors_are_reproduced_and_verify() {
+        for (seed, public_key, message, signature) in RFC8032_VECTORS {
+            let pair = Ed25519KeyPair::from_seed_unchecked(&decode_hex(seed)).expect("a seed");
+            let public_key = key_from_hex(public_key);
+            assert_eq!(public_key_of(&pair), public_key);
+            let message = decode_hex(message);
+            let signature = decode_hex(signature);
+            assert_eq!(pair.sign(&message).as_ref(), signature.as_slice());
+
+            let anchor = TrustAnchor::new(public_key, false);
+            assert!(anchor.verifies(&message, &signature));
+            assert!(!anchor.verifies(&message, &flipped(&signature)));
+            assert!(!anchor.verifies(b"another message", &signature));
+        }
+    }
+
+    #[test]
+    fn the_known_answer_signature_is_reproduced_byte_for_byte_and_verifies() {
+        let (seed, public_key, _, _) = RFC8032_VECTORS[0];
+        let pair = Ed25519KeyPair::from_seed_unchecked(&decode_hex(seed)).expect("a seed");
+        let public_key = key_from_hex(public_key);
+        let signature = decode_hex(KNOWN_ANSWER_SIGNATURE.trim());
+        assert_eq!(len_u64(&signature), ED25519_SIGNATURE_LEN);
+        assert_eq!(
+            pair.sign(KNOWN_ANSWER_MANIFEST).as_ref(),
+            signature.as_slice()
+        );
+
+        let anchor = TrustAnchor::new(public_key, false);
+        assert!(anchor.verifies(KNOWN_ANSWER_MANIFEST, &signature));
+
+        // Through the verifier, from a package around exactly those bytes.
+        let hint = key_id(&public_key);
+        let package = assemble(
+            FORMAT_VERSION,
+            KNOWN_ANSWER_MANIFEST,
+            &default_archive(),
+            Some(&signature),
+            Some(hint.as_bytes()),
+        );
+        let trust = trust_of(vec![anchor]);
+        let verified = accepted(&package, &trust);
+        assert_eq!(verified.manifest().artifacts().len(), 1);
+
+        let tampered = assemble(
+            FORMAT_VERSION,
+            KNOWN_ANSWER_MANIFEST,
+            &default_archive(),
+            Some(&flipped(&signature)),
+            Some(hint.as_bytes()),
+        );
+        assert!(matches!(
+            refusal(&tampered, &trust),
+            VerifyError::BadSignature
+        ));
+    }
+
     // ---- The statement checks as one unit --------------------------------
 
     mod statements {
