@@ -22,7 +22,8 @@ use super::{
 use crate::manifest::{PayloadManifest, TargetArch};
 use crate::payload::{
     ArtifactInput, ED25519_SIGNATURE_LEN, FOOTER_SIZE, FORMAT_VERSION, KEY_ID_HEX_LEN,
-    MemberLength, MemberLengthFault, PayloadError, derive_manifest, to_hex, write_archive_block,
+    MemberLength, MemberLengthFault, PayloadError, SignerError, derive_manifest, to_hex,
+    write_archive_block,
 };
 use crate::retain::{PublishedFileName, RetentionError, RetentionScope, publish_directory, step};
 use crate::verify::{VerifyRequest, check_statements, map_manifest_error};
@@ -153,15 +154,25 @@ pub(super) fn new_scope(
     limits: &ContentLimits,
     staging_parent: &Path,
 ) -> Result<RetentionScope, PackageWriteError> {
+    scope_with_budget(
+        limits,
+        limits.get(LimitResource::RetainedDisk),
+        staging_parent,
+    )
+}
+
+/// Creates a retention scope under `staging_parent` whose disk budget is
+/// `disk_budget` rather than the whole configured `RetainedDisk`, for an
+/// operation that shares that limit with storage it does not own.
+pub(super) fn scope_with_budget(
+    limits: &ContentLimits,
+    disk_budget: u64,
+    staging_parent: &Path,
+) -> Result<RetentionScope, PackageWriteError> {
     // `CopyBuffer` is never zero; the fallback only keeps that invariant out
     // of a panic.
     let copy_buffer = NonZeroUsize::new(limits.copy_buffer_len()).unwrap_or(NonZeroUsize::MIN);
-    RetentionScope::new(
-        staging_parent,
-        limits.get(LimitResource::RetainedDisk),
-        copy_buffer,
-    )
-    .map_err(|error| {
+    RetentionScope::new(staging_parent, disk_budget, copy_buffer).map_err(|error| {
         retention(
             error,
             &RetentionSite {
@@ -250,6 +261,8 @@ fn build_manifest(
             allowance: package_allowance,
         },
     ]);
+    #[cfg(test)]
+    crate::payload::counters::count_manifest_serialization();
     serde_json::to_writer(&mut buffer, &manifest).map_err(serialize_error)?;
     Ok(Arc::from(buffer.into_inner()))
 }
@@ -516,10 +529,7 @@ impl PreparedPackage {
     }
 
     /// Returns the retained disk this package keeps alive: the archive block
-    /// alone.
-    // Finalization accounts for this storage; until that lands only the
-    // tests read it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// alone. Finalization subtracts it from the operation's `RetainedDisk`.
     pub(crate) fn retained_disk_bytes(&self) -> u64 {
         self.archive.len()
     }
@@ -618,7 +628,10 @@ impl PreparedPackage {
 }
 
 /// Maps a failure streaming bytes into a snapshot through a limit.
-fn snapshot_write_error(error: io::Error, site: &RetentionSite<'_>) -> PackageWriteError {
+pub(super) fn snapshot_write_error(
+    error: io::Error,
+    site: &RetentionSite<'_>,
+) -> PackageWriteError {
     let error = match LimitFault::recover(error) {
         Ok(fault) => return limit_fault(fault),
         Err(error) => error,
@@ -641,7 +654,7 @@ impl fmt::Debug for PreparedPackage {
     }
 }
 
-/// Why preparing, persisting or reopening a package failed.
+/// Why preparing, persisting, reopening or finalizing a package failed.
 #[derive(Debug, thiserror::Error)]
 pub enum PackageWriteError {
     /// A content verdict, a resource limit or an I/O failure, exactly as the
@@ -655,9 +668,16 @@ pub enum PackageWriteError {
 
     /// Deriving the manifest, serializing it, or laying out the archive
     /// block failed: an undeclared image input, an archive path a `tar`
-    /// header cannot hold, and so on.
+    /// header cannot hold, and so on — or, at finalization, a signature or
+    /// key ID whose framing the container cannot carry.
     #[error(transparent)]
     Payload(PayloadError),
+
+    /// The signing callback given to
+    /// [`prepare_sign_finalize`](super::prepare_sign_finalize) failed; its
+    /// error verbatim.
+    #[error("the signer failed: {0}")]
+    Signer(#[source] SignerError),
 
     /// The preparation, the request or the architecture disagrees with the
     /// expected binding in `field`, the first differing one in record order.

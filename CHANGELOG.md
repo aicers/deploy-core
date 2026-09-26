@@ -37,56 +37,73 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   arm for `VerifyError::Image` and the new `ManifestError` variants to
   exhaustive matches. This build still reads formats 3–5, while a build
   predating it refuses a format-6 package for its version alone.
-- `package::ContentLimits`, the finite resource policy the full-content package
-  and image APIs will enforce: one ceiling per `package::LimitResource` — stored
-  and decoded bytes, entries, path lengths, JSON document sizes and nesting,
-  disk and buffers — each starting at a generous library default. A caller may
-  lower any of them with `with_limit` and never raise one; a value above the
-  default, a zero copy buffer, JSON depth or zstd window, and a zstd window
-  below 1 KiB are refused as a `package::ContentLimitsError`.
-  `package::verify_contents` enforces it.
-- `package::verify_contents`, which turns a signed component package into
-  immutable, fully checked evidence for one requested `TargetArch`. It copies
-  the package once into private retained storage, authenticates that copy
-  with exactly the verdicts `verify::verify_package` gives, refuses a
-  manifest or archive block over its limit before reading it, refuses any
-  artifact built for another architecture and any legacy undeclared image,
-  extracts and hashes every outer member, and only then holds each image
-  archive to its signed declaration. The returned
+- Full-content package evidence and a detached-signing package writer.
+  `package::verify_contents` turns a signed component package into immutable,
+  fully checked evidence for one requested `TargetArch`: it copies the package
+  once into private retained storage, authenticates that copy with exactly the
+  verdicts `verify::verify_package` gives, refuses any artifact built for
+  another architecture and any legacy undeclared image, extracts and hashes
+  every outer member, and then holds each image archive to its signed
+  declaration. One image form is accepted, the supported docker-save profile:
+  an OCI-layout, single-image `docker save` tar with a Docker compatibility
+  `manifest.json` and uncompressed or gzip layers, whose tags, config,
+  platform and layers must all agree with the declaration. The returned
   `package::VerifiedContents` exposes the authenticated manifest, every
-  artifact's bytes as a `package::VerifiedArtifact`, the images as
+  artifact as a `package::VerifiedArtifact`, the images as
   `package::VerifiedImages`, and the exact package bytes, all as read-only
-  `package::RetainedBytes` that later changes to the original cannot reach;
-  `publish_package` writes the package to a new path without ever replacing
-  an existing entry and returns a `package::PublishedPackage` receipt.
-  Failures are a `package::ContentError`: a `verify::VerifyError` unchanged,
-  an architecture mismatch, a named `package::LimitResource`, or an I/O
-  failure naming its `package::IoOperation`. `verify_package` and
-  `extract_to` are unchanged and remain metadata and legacy interfaces.
-- `package::prepare_package`, which prepares an unsigned standalone package for
-  a separate signing step. It copies each input once into private retained
-  storage and builds exactly one raw manifest block and one compressed archive
-  block from those copies — so a source changed afterwards cannot put bytes
-  into the archive the manifest does not declare — and checks them with the
-  same content checks `verify_contents` runs and the statement checks that
-  need no trust set, refusing every byte that would cross a
-  `package::ContentLimits` ceiling before it is written. The returned
-  `package::PreparedPackage` is unsigned and untrusted for installation: it
-  decides no signature, trust floor, withdrawal or epoch. Its
-  `package::PreparationBinding` records the blocks' digests and lengths, the
-  requested build, architecture, namespace and trust epoch, round-trips
-  through a canonical JSON record with `to_record_bytes` and
-  `from_record_bytes`, and is data to correlate signing requests with, never
-  a capability. `persist` writes the manifest, the archive and the record as a
-  new three-file directory without replacing an existing entry, and
-  `package::reopen_prepared` turns one back into a package only against a
-  binding the caller saved itself, refusing symbolic links, non-regular,
-  extra, missing and group- or other-writable entries and any file swapped
-  while it was opened, then copying and revalidating everything. Failures are
-  a `package::PackageWriteError` naming a `package::BindingField`,
-  `package::PreparationFile`, `package::DirectoryFault`,
-  `package::PreparationFault` or `package::RecordFault`, and an I/O failure
-  reaching a persisted preparation names `package::IoOperation::OpenPreparation`.
+  `package::RetainedBytes` that later changes to the original cannot reach.
+  Every step is bounded by `package::ContentLimits`, one ceiling per
+  `package::LimitResource` — stored and decoded bytes, entries, path lengths,
+  JSON sizes and nesting, disk and buffers — each starting at a generous
+  default that a caller may lower with `with_limit` and never raise.
+  `package::prepare_package` prepares an unsigned standalone package for a
+  separate signing job: it copies each input once, builds exactly one raw
+  manifest block and one compressed archive block from those copies, and runs
+  the same content checks. The returned `package::PreparedPackage` is
+  unsigned and untrusted for installation; its `package::PreparationBinding`
+  records the blocks' digests and lengths and the requested build,
+  architecture, namespace and trust epoch as data to correlate signing
+  requests with, never a capability. `persist` writes it as a new three-file
+  directory and `package::reopen_prepared` turns one back into a package only
+  against a binding the caller saved itself. `package::finalize_package`
+  takes a prepared package and a detached Ed25519 signature over its raw
+  manifest block, holds both blocks to the saved binding again, assembles the
+  signed container from exactly those bytes without holding a key, and runs
+  the full `verify_contents` pipeline over it under the caller's trust; its
+  disk budget is `RetainedDisk` less what the prepared package still holds.
+  The resulting `package::FinalizedPackage` is what direct installation and
+  store publication both consume, and `FinalizedPackage::publish`, like
+  `VerifiedContents::publish_package`, writes a new file without ever
+  replacing an existing entry and returns a `package::PublishedPackage`
+  receipt that is not evidence. `package::prepare_sign_finalize` composes
+  preparation, one signing callback and finalization, validating identically,
+  and with the `test-support` feature's
+  `image::test_support::SyntheticImageArchiveBuilder`, which writes
+  deterministic image archives of the supported profile and exposes the config
+  digest before any tag is chosen, it builds genuinely signed format-6
+  fixtures for a consumer's tests; `image::test_support::check_image_archive`
+  holds any archive to a declaration. `verify_package`, `extract_to` and the
+  low-level `payload` writers are unchanged, and bytes those writers assemble
+  are not a finalized package. Consumers migrate by adding arms for the new
+  `verify::ImageVerifyError` variants — `LegacyImageEvidence`,
+  `UnsupportedArchive`, `InvalidArchive`, `UndeclaredReference`,
+  `MissingReference`, `ConfigDigestMismatch`, `ConfigPlatformMismatch` and
+  `LayerMismatch` — to exhaustive matches. The new public error enums are
+  `package::ContentError`, `package::ContentLimitsError`,
+  `package::PublicationError`, `package::PackageWriteError`,
+  `package::PreparationFault`, `package::RecordFault`,
+  `image::test_support::SyntheticImageError` and
+  `image::test_support::ArchiveCheckError`, with the detail enums they carry:
+  `package::IoOperation`, `package::PublicationOperation`,
+  `package::CopyMismatchKind`, `package::DirectoryTrustReason`,
+  `package::DirectoryFault`, `package::PreparationFile`,
+  `package::BindingField` and `package::LimitResource`, and in `verify` the
+  image-archive fault types `UnsupportedArchiveFeature`, `TarFeature`,
+  `ExtensionField`, `InvalidArchiveReason`, `TarFault`, `TarHeaderField`,
+  `PaxKey`, `GzipFault`, `GzipHeaderFault`, `JsonFault`, `LayoutFile`,
+  `ImageDocument`, `BlobRole`, `BlobMismatchKind`, `InvalidConfigReason`,
+  `ConfigField`, `ReferenceSource`, `PlatformLocation`, `PlatformFacet` and
+  `LayerMismatchKind`.
 - `roxyd_selfupdate_contract`, the frozen on-disk contract the roxyd self-update
   rollback supervisor coordinates through: the record directory, the file names,
   the canonical roxyd binary path, the decision subcommand and its three

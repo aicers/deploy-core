@@ -68,6 +68,12 @@ required-features = ["test-support"]
 name = "verify_contents"
 required-features = ["test-support"]
 
+# Builds genuinely signed format-6 fixtures from synthetic images through
+# `package::prepare_sign_finalize`, so it exists only under `test-support`.
+[[test]]
+name = "signed_fixtures"
+required-features = ["test-support"]
+
 [lints.clippy]
 pedantic = "warn"
 unwrap_used = "warn"

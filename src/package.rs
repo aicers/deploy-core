@@ -1,6 +1,7 @@
 //! Whole-package content verification, the evidence it returns, unsigned
-//! package preparation, the resource policy both enforce, and the retained
-//! bytes and publication they read and write through.
+//! package preparation and detached finalization, the resource policy they
+//! enforce, and the retained bytes and publication they read and write
+//! through.
 //!
 //! # Full-content verification
 //!
@@ -105,6 +106,26 @@
 //! Bytes the low-level [`payload`](crate::payload) writers assemble are not a
 //! finalized package, and neither is a prepared one.
 //!
+//! # Detached finalization
+//!
+//! An independently authorized signer signs the raw manifest block and
+//! returns a [`Signed`](crate::payload::Signed); the caller correlates that
+//! response with its request before going further. [`finalize_package`] then
+//! holds the prepared package to the caller's saved binding again, rehashes
+//! both blocks, assembles the signed standalone container from exactly those
+//! bytes — never reserializing or recompressing anything — and runs the full
+//! [`verify_contents`] pipeline over it under the trust, request and
+//! architecture the caller supplies. It holds no key. The
+//! [`FinalizedPackage`] it returns is what direct installation and store
+//! publication both consume, and [`FinalizedPackage::publish`] writes it
+//! without clobbering. [`prepare_sign_finalize`] composes preparation, one
+//! signing callback and finalization for tests that need genuinely signed
+//! fixtures, validating identically.
+//!
+//! Finalization's disk budget is what the configured `RetainedDisk` leaves
+//! once the prepared package's live storage is counted, and a failure
+//! removes only the storage the call itself created.
+//!
 //! # Blocking
 //!
 //! Everything here is synchronous: it starts no task or thread, never sleeps,
@@ -142,6 +163,7 @@ use crate::retain::Charge;
 mod binding;
 mod bounded;
 mod contents;
+mod finalize;
 mod prepare;
 #[cfg(test)]
 mod prepare_fixture;
@@ -149,15 +171,11 @@ mod reopen;
 mod source;
 
 pub use binding::{BindingField, PreparationBinding, RecordFault};
-// The unsigned-content core and the retained entry point, which detached
-// finalization reuses. Preparation calls the core through its own module path,
-// so until finalization lands nothing uses these re-exports.
-#[allow(unused_imports)]
-pub(crate) use contents::{CheckedContents, check_contents, verify_retained};
 pub use contents::{
     ContentError, IoOperation, VerifiedArtifact, VerifiedContents, VerifiedImage, VerifiedImageSet,
     VerifiedImages, verify_contents,
 };
+pub use finalize::{FinalizedPackage, finalize_package, prepare_sign_finalize};
 pub use prepare::{
     DirectoryFault, PackageWriteError, PreparationFault, PreparationFile, PreparedPackage,
     prepare_package,

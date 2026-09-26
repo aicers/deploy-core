@@ -67,6 +67,7 @@ fn describe_error(error: &PackageWriteError) -> String {
         PackageWriteError::Content(error) => describe_content(error),
         PackageWriteError::Publication(error) => describe_publication(error),
         PackageWriteError::Payload(error) => format!("Payload {}", describe_payload(error)),
+        PackageWriteError::Signer(error) => format!("Signer {error}"),
         PackageWriteError::BindingMismatch { field } => {
             format!("BindingMismatch {}", describe_field(*field))
         }

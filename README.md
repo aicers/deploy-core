@@ -56,6 +56,14 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   blocks and the binding record as a new three-file directory, and
   `reopen_prepared` turns one back into a package only against an
   independently saved binding, after fresh copies and full revalidation.
+  Detached finalization closes the loop without holding a key:
+  `finalize_package` holds a prepared package to the caller's saved binding,
+  rehashes both blocks, assembles the signed container from exactly those
+  bytes and an Ed25519 signature over the raw manifest, and runs the full
+  `verify_contents` pipeline over it under the caller's own trust, returning
+  the `FinalizedPackage` that direct installation and store publication both
+  consume. `prepare_sign_finalize` composes the three steps with one signing
+  callback, validating identically.
 - **trust_set** — the generation document that verifier's injected material is
   delivered as, and the reader that refuses a malformed one rather than
   repairing it: a version gate, a structural decode that admits no unknown
@@ -116,9 +124,12 @@ The `test-support` feature exposes test-only account fixtures
 `payload::widen_envelope_blocks`, and `image::test_support` — a builder for
 synthetic image archives the image validator accepts, and a classifier that
 holds any image archive against a declaration — so a **dependent** crate's
-tests can construct them across the crate boundary. Enable it only as a
-`[dev-dependencies]` feature — never under normal `[dependencies]` — so the
-fixtures stay absent from every release build.
+tests can construct them across the crate boundary. With
+`package::prepare_sign_finalize` and a test key minted per test, those
+archives become genuinely signed format-6 packages that pass every final
+check; `tests/signed_fixtures.rs` builds one through the public API alone.
+Enable it only as a `[dev-dependencies]` feature — never under normal
+`[dependencies]` — so the fixtures stay absent from every release build.
 
 The checked-in image archive fixtures, and how each one is regenerated, are
 described in `assets/test-fixtures/images/INVENTORY.md`. The manual Docker
