@@ -28,8 +28,9 @@
 //!    an admitted legacy manifest can carry, is refused as
 //!    [`ImageVerifyError::LegacyImageEvidence`](crate::verify::ImageVerifyError::LegacyImageEvidence)
 //!    and never reported as no images;
-//! 5. **outer extraction** — the whole archive block is decoded under a capped
-//!    zstd window and walked, member by member, into private snapshots, with
+//! 5. **outer extraction** — the whole archive block is decoded, every zstd
+//!    frame's declared window held to `ZstdWindow` before that frame is
+//!    decoded, and walked, member by member, into private snapshots, with
 //!    every rule the legacy extraction applies — the same walk, not a copy of
 //!    it — and `OuterMembers` and `OuterUncompressedTotal` enforced on what is
 //!    actually read; every member and the archive's end are checked before

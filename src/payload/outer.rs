@@ -12,16 +12,17 @@
 //! what an admissible archive is.
 //!
 //! The legacy caller passes no [`OuterLimits`] and sees exactly the walk it
-//! always had. A caller that passes them also gets the zstd window checked
-//! before decoding, the member count bounded, and every decoded byte metered:
-//! member data against `OuterUncompressedTotal`, and the framing between the
-//! members — headers, extension records, padding and the end marker — against
-//! a fixed allowance per member slot, reported against that same resource, so
-//! an extension record cannot grow into a buffer the size of the archive.
+//! always had. A caller that passes them also gets every zstd frame's window
+//! checked before that frame is decoded, the member count bounded, and every
+//! decoded byte metered: member data against `OuterUncompressedTotal`, and
+//! the framing between the members — headers, extension records, padding and
+//! the end marker — against a fixed allowance per member slot, reported
+//! against that same resource, so an extension record cannot grow into a
+//! buffer the size of the archive.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufReader, Cursor, Read};
+use std::io::{self, BufReader, Read};
 
 use tar::Archive;
 use zstd::Decoder;
@@ -32,6 +33,22 @@ use crate::package::LimitResource;
 
 /// The magic number opening a standard zstd frame, little-endian.
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+/// The bytes of a skippable frame's magic number above its low nibble,
+/// little-endian: `0x184D2A5?`.
+const ZSTD_SKIPPABLE_MAGIC_HIGH: [u8; 3] = [0x2a, 0x4d, 0x18];
+/// The frame descriptor bit marking a single-segment frame.
+const ZSTD_SINGLE_SEGMENT: u8 = 0x20;
+/// The frame descriptor bit a conforming frame leaves clear.
+const ZSTD_RESERVED_DESCRIPTOR_BIT: u8 = 0x08;
+/// The frame descriptor bit announcing a content checksum.
+const ZSTD_CHECKSUM_FLAG: u8 = 0x04;
+/// The longest header a standard frame carries after its descriptor: a window
+/// descriptor, a four-byte dictionary ID and an eight-byte content size.
+const ZSTD_MAX_FIELD_LEN: usize = 13;
+/// A block header's length.
+const ZSTD_BLOCK_HEADER_LEN: usize = 3;
+/// A frame content checksum's length.
+const ZSTD_CHECKSUM_LEN: u64 = 4;
 /// The smallest window exponent a zstd window descriptor encodes.
 const ZSTD_WINDOW_LOG_BASE: u32 = 10;
 /// How much the two-byte frame content size field is offset by.
@@ -122,7 +139,7 @@ pub(crate) trait MemberSink<'m> {
 /// the variant the legacy walk has always reported; [`WalkError::Limit`] when a
 /// bounded walk passes a limit; and [`WalkError::Sink`] for a sink failure.
 pub(crate) fn walk_outer<'m, R: Read, S: MemberSink<'m>>(
-    mut archive: R,
+    archive: R,
     manifest: &'m PayloadManifest,
     limits: Option<&OuterLimits>,
     sink: &mut S,
@@ -131,8 +148,7 @@ pub(crate) fn walk_outer<'m, R: Read, S: MemberSink<'m>>(
         let decoder = Decoder::new(archive).map_err(stream_error)?;
         return walk_entries(decoder, manifest, None, sink);
     };
-    let peeked = check_zstd_window(&mut archive, limits.zstd_window)?;
-    let buffered = BufReader::with_capacity(limits.copy_buffer, Cursor::new(peeked).chain(archive));
+    let buffered = BufReader::with_capacity(limits.copy_buffer, WindowGuard::new(archive, limits));
     let mut decoder = Decoder::with_buffer(buffered).map_err(stream_error)?;
     // `ZstdWindow` is never below 1 KiB; the floor only keeps a zero out of
     // `ilog2`'s panic.
@@ -400,92 +416,261 @@ impl<R: Read> Read for MemberStream<'_, '_, R> {
     }
 }
 
-/// Reads the first zstd frame header off `archive` and refuses a declared
-/// window above `limit`, before any byte is decoded. Returns the bytes read,
-/// which the decoder is handed first.
-///
-/// A stream that does not open with a standard frame — a skippable frame, or
-/// no frame at all — is left to the decoder, whose own window cap still
-/// applies. So is every frame after the first: one declaring a larger window
-/// is still never decoded, but is refused by the decoder as a
-/// [`PayloadError::Io`] rather than named as the limit.
-fn check_zstd_window<R: Read, E>(archive: &mut R, limit: u64) -> Result<Vec<u8>, WalkError<E>> {
-    let mut peeked = Vec::new();
-    let head = take(archive, &mut peeked, ZSTD_FRAME_MAGIC.len() + 1)?;
-    let (Some(magic), Some(&descriptor)) = (head.get(..ZSTD_FRAME_MAGIC.len()), head.get(4)) else {
-        return Ok(peeked);
-    };
-    if magic != ZSTD_FRAME_MAGIC {
-        return Ok(peeked);
+/// A frame the [`WindowGuard`] cannot read the window of before the decoder
+/// would act on it, carried as an [`io::Error`] payload.
+#[derive(Debug, thiserror::Error)]
+#[error("the archive block holds a zstd frame whose window cannot be read before decoding")]
+struct UnreadableFrame;
+
+impl UnreadableFrame {
+    fn into_io() -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, UnreadableFrame)
     }
-    let fcs_flag = descriptor >> 6;
-    let single_segment = descriptor & 0x20 != 0;
-    let window = if single_segment {
-        let dictionary_len = match descriptor & 0x03 {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            _ => 4,
+}
+
+/// A zstd structure the [`WindowGuard`] collects whole before acting on it.
+#[derive(Clone, Copy, Debug)]
+enum Field {
+    /// A frame's magic number.
+    Magic,
+    /// A standard frame's descriptor.
+    Descriptor,
+    /// The rest of a standard frame's header, which `descriptor` lays out.
+    Header { descriptor: u8 },
+    /// A block header, in a frame that does or does not end in a checksum.
+    Block { checksum: bool },
+    /// A skippable frame's length.
+    SkippableLength,
+}
+
+impl Field {
+    /// Returns how many bytes the field spans, never zero.
+    fn len(self) -> usize {
+        match self {
+            Field::Magic | Field::SkippableLength => ZSTD_FRAME_MAGIC.len(),
+            Field::Descriptor => 1,
+            Field::Header { descriptor } => {
+                let window_descriptor = usize::from(descriptor & ZSTD_SINGLE_SEGMENT == 0);
+                window_descriptor + dictionary_len(descriptor) + content_size_len(descriptor)
+            }
+            Field::Block { .. } => ZSTD_BLOCK_HEADER_LEN,
+        }
+    }
+}
+
+/// Where a [`WindowGuard`] stands in the compressed stream.
+#[derive(Debug)]
+enum Scan {
+    /// Collecting `field`, of which the first `have` bytes are in `bytes`.
+    Collect {
+        field: Field,
+        bytes: [u8; ZSTD_MAX_FIELD_LEN],
+        have: usize,
+    },
+    /// Passing `remaining` bytes of block content, checksum or skippable
+    /// payload, then collecting `next`.
+    Skip { remaining: u64, next: Field },
+}
+
+impl Scan {
+    fn collect(field: Field) -> Scan {
+        Scan::Collect {
+            field,
+            bytes: [0; ZSTD_MAX_FIELD_LEN],
+            have: 0,
+        }
+    }
+
+    fn skip(remaining: u64, next: Field) -> Scan {
+        if remaining == 0 {
+            Scan::collect(next)
+        } else {
+            Scan::Skip { remaining, next }
+        }
+    }
+}
+
+/// The compressed archive block as the decoder reads it, with every frame's
+/// declared window checked against `ZstdWindow` before the decoder is handed
+/// the header that declares it.
+///
+/// The guard follows the stream's structure as the bytes pass — frame
+/// headers, block headers, block content, checksums and skippable frames —
+/// without decoding any of it, so the first frame and every later one are
+/// held to the same limit and named by it. A frame whose window it cannot
+/// read — a legacy zstd format, or a reserved descriptor bit or block type —
+/// is refused as [`UnreadableFrame`] rather than left to a decoder that might
+/// size a window for it. The decoder's own window cap, set from the same
+/// limit, stays underneath. No request exceeds the copy buffer, and nothing
+/// but the current field, at most a frame header's worth, is held.
+#[derive(Debug)]
+struct WindowGuard<R> {
+    inner: R,
+    limit: u64,
+    copy_buffer: usize,
+    scan: Scan,
+}
+
+impl<R> WindowGuard<R> {
+    fn new(inner: R, limits: &OuterLimits) -> WindowGuard<R> {
+        WindowGuard {
+            inner,
+            limit: limits.zstd_window,
+            copy_buffer: limits.copy_buffer,
+            scan: Scan::collect(Field::Magic),
+        }
+    }
+
+    /// Follows the stream over a prefix of `input` and returns its length,
+    /// which is nonzero for a nonempty `input`.
+    fn advance(&mut self, input: &[u8]) -> io::Result<usize> {
+        match &mut self.scan {
+            Scan::Skip { remaining, next } => {
+                let used = crate::content::chunk_len(input.len(), *remaining);
+                *remaining = remaining.saturating_sub(crate::content::widen(used));
+                if *remaining == 0 {
+                    self.scan = Scan::collect(*next);
+                }
+                Ok(used)
+            }
+            Scan::Collect { field, bytes, have } => {
+                let need = field.len();
+                let used = need.saturating_sub(*have).min(input.len());
+                let end = have.saturating_add(used);
+                if let (Some(slot), Some(taken)) = (bytes.get_mut(*have..end), input.get(..used)) {
+                    slot.copy_from_slice(taken);
+                }
+                *have = end;
+                if end >= need {
+                    let (field, bytes) = (*field, *bytes);
+                    self.scan = complete(field, bytes.get(..need).unwrap_or_default(), self.limit)?;
+                }
+                Ok(used)
+            }
+        }
+    }
+}
+
+impl<R: Read> Read for WindowGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let want = buf.len().min(self.copy_buffer);
+        let Some(window) = buf.get_mut(..want) else {
+            return Ok(0);
         };
-        let fcs_len = match fcs_flag {
-            0 => 1,
-            1 => 2,
-            2 => 4,
-            _ => 8,
-        };
-        let field = take(archive, &mut peeked, dictionary_len + fcs_len)?;
-        let Some(fcs) = field.get(dictionary_len..) else {
-            return Ok(peeked);
-        };
-        let mut value = [0u8; 8];
-        let Some(slot) = value.get_mut(..fcs.len()) else {
-            return Ok(peeked);
-        };
-        slot.copy_from_slice(fcs);
-        let value = u64::from_le_bytes(value);
-        if fcs_len == 2 {
+        let read = self.inner.read(window)?;
+        let mut rest = window.get(..read).unwrap_or_default();
+        while !rest.is_empty() {
+            let used = self.advance(rest)?;
+            rest = rest.get(used..).unwrap_or_default();
+        }
+        Ok(read)
+    }
+}
+
+/// Acts on a field [`WindowGuard`] has collected whole, returning what comes
+/// next.
+fn complete(field: Field, bytes: &[u8], limit: u64) -> io::Result<Scan> {
+    match field {
+        Field::Magic => {
+            if bytes == ZSTD_FRAME_MAGIC {
+                Ok(Scan::collect(Field::Descriptor))
+            } else if is_skippable_magic(bytes) {
+                Ok(Scan::collect(Field::SkippableLength))
+            } else {
+                Err(UnreadableFrame::into_io())
+            }
+        }
+        Field::Descriptor => match bytes.first() {
+            Some(&descriptor) if descriptor & ZSTD_RESERVED_DESCRIPTOR_BIT == 0 => {
+                Ok(Scan::collect(Field::Header { descriptor }))
+            }
+            _ => Err(UnreadableFrame::into_io()),
+        },
+        Field::Header { descriptor } => {
+            if frame_window(descriptor, bytes) > limit {
+                return Err(OuterLimitFault {
+                    resource: LimitResource::ZstdWindow,
+                    limit,
+                }
+                .into_io());
+            }
+            Ok(Scan::collect(Field::Block {
+                checksum: descriptor & ZSTD_CHECKSUM_FLAG != 0,
+            }))
+        }
+        Field::Block { checksum } => {
+            let header = le_u64(bytes);
+            let size = header >> 3;
+            let content = match (header >> 1) & 0x03 {
+                // Raw and compressed blocks carry `size` bytes; an RLE block
+                // carries the one byte it repeats.
+                0 | 2 => size,
+                1 => 1,
+                _ => return Err(UnreadableFrame::into_io()),
+            };
+            if header & 1 == 0 {
+                Ok(Scan::skip(content, Field::Block { checksum }))
+            } else {
+                let trailer = if checksum { ZSTD_CHECKSUM_LEN } else { 0 };
+                Ok(Scan::skip(content.saturating_add(trailer), Field::Magic))
+            }
+        }
+        Field::SkippableLength => Ok(Scan::skip(le_u64(bytes), Field::Magic)),
+    }
+}
+
+/// Returns whether `magic` opens a skippable frame, `0x184D2A5?`.
+fn is_skippable_magic(magic: &[u8]) -> bool {
+    matches!(magic, [low, rest @ ..] if low & 0xf0 == 0x50 && rest == ZSTD_SKIPPABLE_MAGIC_HIGH)
+}
+
+/// Returns the window a standard frame declares, from its descriptor and the
+/// header fields after it.
+fn frame_window(descriptor: u8, fields: &[u8]) -> u64 {
+    if descriptor & ZSTD_SINGLE_SEGMENT == 0 {
+        let window_descriptor = fields.first().copied().unwrap_or_default();
+        let window_log = ZSTD_WINDOW_LOG_BASE + u32::from(window_descriptor >> 3);
+        let base = 1u64.checked_shl(window_log).unwrap_or(u64::MAX);
+        base.saturating_add((base / 8).saturating_mul(u64::from(window_descriptor & 0x07)))
+    } else {
+        // A single-segment frame's window is its content size.
+        let size = fields.get(dictionary_len(descriptor)..).unwrap_or_default();
+        let value = le_u64(size);
+        if size.len() == 2 {
             value.saturating_add(ZSTD_FCS_TWO_BYTE_OFFSET)
         } else {
             value
         }
-    } else {
-        let field = take(archive, &mut peeked, 1)?;
-        let Some(&descriptor) = field.first() else {
-            return Ok(peeked);
-        };
-        let window_log = ZSTD_WINDOW_LOG_BASE + u32::from(descriptor >> 3);
-        let base = 1u64.checked_shl(window_log).unwrap_or(u64::MAX);
-        base.saturating_add((base / 8).saturating_mul(u64::from(descriptor & 0x07)))
-    };
-    if window > limit {
-        return Err(WalkError::Limit {
-            resource: LimitResource::ZstdWindow,
-            limit,
-        });
     }
-    Ok(peeked)
 }
 
-/// Appends up to `n` more bytes of `source` to `peeked` and returns what was
-/// appended, which is shorter only at the end of the stream.
-fn take<'p, R: Read, E>(
-    source: &mut R,
-    peeked: &'p mut Vec<u8>,
-    n: usize,
-) -> Result<&'p [u8], WalkError<E>> {
-    let start = peeked.len();
-    let mut chunk = [0u8; 16];
-    while peeked.len() - start < n {
-        let want = (n - (peeked.len() - start)).min(chunk.len());
-        let Some(window) = chunk.get_mut(..want) else {
-            break;
-        };
-        match source.read(window) {
-            Ok(0) => break,
-            Ok(read) => peeked.extend_from_slice(window.get(..read).unwrap_or(window)),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(stream_error(error)),
-        }
+/// Returns the length of the dictionary ID a frame descriptor announces.
+fn dictionary_len(descriptor: u8) -> usize {
+    match descriptor & 0x03 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
     }
-    Ok(peeked.get(start..).unwrap_or_default())
 }
+
+/// Returns the length of the content size a frame descriptor announces.
+fn content_size_len(descriptor: u8) -> usize {
+    match descriptor >> 6 {
+        0 => usize::from(descriptor & ZSTD_SINGLE_SEGMENT != 0),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    }
+}
+
+/// Reads up to eight bytes as a little-endian integer.
+fn le_u64(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .rev()
+        .fold(0, |value, &byte| (value << 8) | u64::from(byte))
+}
+
+#[cfg(test)]
+mod tests;

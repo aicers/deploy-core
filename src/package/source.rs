@@ -103,6 +103,8 @@ impl Read for RetainedSource<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         #[cfg(test)]
         seam::hit(self.role, seam::Op::Read).map_err(RetainedIoFault::wrap)?;
+        #[cfg(test)]
+        seam::request(self.role, buf.len());
         let result = self.reader.read(buf);
         #[cfg(test)]
         seam::observe(self.role, seam::Op::Read, &result);
@@ -161,6 +163,7 @@ pub(crate) mod seam {
         faults: Vec<(SourceRole, Op, usize, io::ErrorKind)>,
         counts: HashMap<(SourceRole, Op), usize>,
         observed: Vec<Observed>,
+        largest_requests: HashMap<SourceRole, usize>,
         before_images: Option<ImageHook>,
     }
 
@@ -217,6 +220,26 @@ pub(crate) mod seam {
                 .map(|seam| seam.observed.clone())
                 .unwrap_or_default()
         })
+    }
+
+    /// Returns the largest buffer a read of a `role` source asked for.
+    pub(crate) fn largest_request(role: SourceRole) -> usize {
+        SEAM.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|seam| seam.largest_requests.get(&role).copied())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Records the size of a read's buffer.
+    pub(super) fn request(role: SourceRole, len: usize) {
+        SEAM.with(|slot| {
+            if let Some(seam) = slot.borrow_mut().as_mut() {
+                let largest = seam.largest_requests.entry(role).or_insert(0);
+                *largest = (*largest).max(len);
+            }
+        });
     }
 
     /// Counts this `op` and returns the failure arranged for it, if any.

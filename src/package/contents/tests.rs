@@ -956,6 +956,70 @@ fn a_zstd_window_above_its_limit_is_refused_before_decoding() {
 }
 
 #[test]
+fn a_later_zstd_frame_above_the_window_is_named_as_the_limit() {
+    let signer = Signer::new();
+    let arts = vec![
+        Art::native("bin/first", b"first"),
+        Art::native("bin/second", b"second"),
+    ];
+    let outer = tar(&[
+        Entry::File("bin/first", b"first"),
+        Entry::File("bin/second", b"second"),
+    ]);
+    // The tar split across two frames, the second declaring the larger
+    // window; the decoder joins their output.
+    let (head, tail) = outer.split_at(outer.len() / 2);
+    let mut block = zstd_window(head, 19);
+    block.extend(zstd_window(tail, 20));
+    let bytes = signer.container(&manifest_bytes(&arts), &block);
+    verify_limited(&bytes, &signer, &limits(LimitResource::ZstdWindow, 1 << 20))
+        .expect("verifies at the window limit");
+    let error = verify_limited(&bytes, &signer, &limits(LimitResource::ZstdWindow, 1 << 19))
+        .expect_err("refused");
+    assert_eq!(limit_of(&error), (LimitResource::ZstdWindow, 1 << 19));
+
+    // Behind a skippable frame, which the decoder passes over, too.
+    let mut block = vec![0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 0, 0, 0, 0];
+    block.extend(zstd_window(&outer, 20));
+    let bytes = signer.container(&manifest_bytes(&arts), &block);
+    verify_limited(&bytes, &signer, &limits(LimitResource::ZstdWindow, 1 << 20))
+        .expect("verifies at the window limit");
+    let error = verify_limited(&bytes, &signer, &limits(LimitResource::ZstdWindow, 1 << 19))
+        .expect_err("refused");
+    assert_eq!(limit_of(&error), (LimitResource::ZstdWindow, 1 << 19));
+
+    // A frame in a legacy zstd format, whose window the walk cannot read
+    // before the decoder would size one, is a container refusal.
+    let mut block = zstd(&outer);
+    block[0] = 0x27;
+    let bytes = signer.container(&manifest_bytes(&arts), &block);
+    let error = verify_limited(&bytes, &signer, &ContentLimits::default()).expect_err("refused");
+    assert!(
+        matches!(
+            error,
+            ContentError::Verify(VerifyError::Payload(PayloadError::Io(_)))
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn no_archive_read_exceeds_the_copy_buffer() {
+    let signer = Signer::new();
+    let arts = vec![Art::native("bin/tool", b"a small native tool")];
+    let bytes = package(&signer, &arts);
+    let guard = seam::install(Seam::new());
+    let contents = verify_limited(&bytes, &signer, &limits(LimitResource::CopyBuffer, 1))
+        .expect("verifies a byte at a time");
+    assert_eq!(seam::largest_request(SourceRole::Archive), 1);
+    drop(guard);
+    assert_eq!(
+        read_all(contents.artifacts()[0].bytes()),
+        b"a small native tool"
+    );
+}
+
+#[test]
 fn retained_disk_holds_at_the_high_water_mark() {
     let signer = Signer::new();
     let arts = mixed();
@@ -1357,11 +1421,11 @@ fn every_retained_read_and_seek_failure_is_read_snapshot() {
         // The archive-block copy: its seek and its first read.
         (SourceRole::ArchiveCopy, Op::Seek, 1),
         (SourceRole::ArchiveCopy, Op::Read, 1),
-        // The outer walk: its seek, the frame-header read, and a read under
-        // the zstd decoder.
+        // The outer walk: its seek, its first read, and the read that meets
+        // the end of the block, both under the zstd decoder.
         (SourceRole::Archive, Op::Seek, 1),
         (SourceRole::Archive, Op::Read, 1),
-        (SourceRole::Archive, Op::Read, 3),
+        (SourceRole::Archive, Op::Read, 2),
         // Image validation: the first read and seek, and a later read.
         (SourceRole::Image, Op::Read, 1),
         (SourceRole::Image, Op::Seek, 1),
