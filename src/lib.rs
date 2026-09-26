@@ -21,8 +21,10 @@
 //! installer and the on-host agent both write — the bootroot command wrapper,
 //! service registration, the on-host trust-material activation, the
 //! full-content verification that turns a signed package into immutable
-//! evidence, and the read-only retained bytes and no-clobber publication
-//! receipts that verified package content is read and published through. It
+//! evidence, the unsigned preparation that builds a package's manifest and
+//! archive blocks for a separate signing step and persists and reopens them
+//! across a job boundary, and the read-only retained bytes and no-clobber
+//! publication receipts that package content is read and published through. It
 //! carries **no** product concept — no component catalog, no per-component
 //! renderers — so both the installer and the per-machine root daemon depend on
 //! it and share a single implementation rather than shelling out to a CLI.

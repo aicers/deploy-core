@@ -39,6 +39,23 @@ pub(crate) enum Step {
     RemoveTemporary,
     SyncStagingDirectory,
     SyncParent,
+    /// Preparation opening an input's source file.
+    OpenInput,
+    /// Preparation reading an input's source file.
+    ReadInput,
+    /// Reopen opening `/` or a component of the preparation directory.
+    OpenPreparationComponent,
+    /// Reopen naming a component it could not open.
+    InspectPreparationComponent,
+    /// Reopen checking the preparation directory's or its parent's mode.
+    InspectPreparationDirectory,
+    ListPreparation,
+    /// Reopen's `statat` of a preparation file.
+    StatPreparationFile,
+    OpenPreparationFile,
+    /// Reopen's `fstat` of an opened preparation file.
+    InspectPreparationFile,
+    ReadPreparationFile,
 }
 
 /// How a publication temporary is damaged just before it is verified.
@@ -48,6 +65,13 @@ pub(crate) enum Corruption {
     FlipFirstByte,
     /// Drops the last byte.
     TruncateOne,
+}
+
+/// A callback run just before one occurrence of a step.
+struct Hook {
+    step: Step,
+    occurrence: usize,
+    callback: Box<dyn FnOnce()>,
 }
 
 struct Fault {
@@ -65,6 +89,7 @@ pub(crate) struct Seam {
     write_fail_at: Option<(u64, io::ErrorKind)>,
     corruption: Option<Corruption>,
     before_publish: Option<Box<dyn FnOnce()>>,
+    hooks: Vec<Hook>,
     record: Vec<Step>,
     counts: HashMap<Step, usize>,
 }
@@ -111,6 +136,22 @@ impl Seam {
         self
     }
 
+    /// Runs `callback` just before the `n`th (1-based) occurrence of `step`,
+    /// before any fault arranged for it.
+    pub(crate) fn before(
+        mut self,
+        step: Step,
+        n: usize,
+        callback: impl FnOnce() + 'static,
+    ) -> Self {
+        self.hooks.push(Hook {
+            step,
+            occurrence: n,
+            callback: Box::new(callback),
+        });
+        self
+    }
+
     /// Runs `callback` once, just before `linkat` or `renameat` publishes.
     pub(crate) fn before_publish(mut self, callback: impl FnOnce() + 'static) -> Self {
         self.before_publish = Some(Box::new(callback));
@@ -149,26 +190,40 @@ pub(crate) fn install(seam: Seam) -> SeamGuard {
     SeamGuard(())
 }
 
-/// Records `step` and returns the error arranged for this occurrence, if any.
+/// Records `step`, runs the callback arranged for this occurrence, and
+/// returns the error arranged for it, if any.
+///
+/// The callback runs with the seam released, so it may drive filesystem
+/// operations of its own.
 pub(crate) fn hit(step: Step) -> io::Result<()> {
-    SEAM.with(|slot| {
+    let (callback, result) = SEAM.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(seam) = slot.as_mut() else {
-            return Ok(());
+            return (None, Ok(()));
         };
         seam.record.push(step);
         let count = seam.counts.entry(step).or_insert(0);
         *count += 1;
         let count = *count;
-        match seam
+        let callback = seam
+            .hooks
+            .iter()
+            .position(|hook| hook.step == step && hook.occurrence == count)
+            .map(|at| seam.hooks.remove(at).callback);
+        let result = match seam
             .faults
             .iter()
             .find(|f| f.step == step && f.occurrence.is_none_or(|n| n == count))
         {
             Some(fault) => Err(io::Error::new(fault.kind, format!("injected {step:?}"))),
             None => Ok(()),
-        }
-    })
+        };
+        (callback, result)
+    });
+    if let Some(callback) = callback {
+        callback();
+    }
+    result
 }
 
 /// Returns the forced name for this draw, if the test arranged one.

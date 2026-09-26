@@ -643,6 +643,12 @@ impl VerifyRequest {
     pub fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
     }
+
+    /// Returns the delivered trust epoch this request carries: `Some` only
+    /// for a request built by [`VerifyRequest::for_trust`].
+    pub(crate) fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
 }
 
 /// Errors describing **the package being verified**.
@@ -1252,7 +1258,7 @@ impl From<PayloadError> for VerifyError {
 /// The last two arms reproduce exactly what [`payload::open`] does with a
 /// `ManifestError`, so a manifest that fails to decode reports identically
 /// whether it was read through `open` or through this verifier.
-fn map_manifest_error(error: ManifestError) -> VerifyError {
+pub(crate) fn map_manifest_error(error: ManifestError) -> VerifyError {
     match error {
         ManifestError::DuplicateArchivePath(path) => VerifyError::DuplicatePath(path),
         ManifestError::UnsafeArchivePath(path) => VerifyError::UnsafePath(path),

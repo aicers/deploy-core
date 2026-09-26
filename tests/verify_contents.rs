@@ -921,6 +921,7 @@ fn operation_name(operation: IoOperation) -> &'static str {
         IoOperation::CreateStaging => "CreateStaging",
         IoOperation::WriteSnapshot => "WriteSnapshot",
         IoOperation::ReadSnapshot => "ReadSnapshot",
+        IoOperation::OpenPreparation => "OpenPreparation",
     }
 }
 
@@ -933,6 +934,7 @@ fn every_error_variant_and_operation_is_nameable() {
         IoOperation::CreateStaging,
         IoOperation::WriteSnapshot,
         IoOperation::ReadSnapshot,
+        IoOperation::OpenPreparation,
     ];
     for operation in operations {
         let display = operation.to_string();

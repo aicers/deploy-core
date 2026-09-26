@@ -97,6 +97,8 @@ use crate::module_spec::ModuleSpec;
 use crate::package::{LimitResource, RetainedIoFault};
 
 #[cfg(test)]
+mod archive_block_tests;
+#[cfg(test)]
 mod golden;
 mod outer;
 
@@ -228,10 +230,10 @@ const MAX_END_OF_ARCHIVE_BYTES: usize = TAR_BLOCK_SIZE;
 const TAR_NAME_FIELD_LEN: usize = 100;
 
 /// Number of bytes an Ed25519 detached signature occupies.
-const ED25519_SIGNATURE_LEN: usize = 64;
+pub(crate) const ED25519_SIGNATURE_LEN: usize = 64;
 
 /// Number of lowercase hexadecimal ASCII characters in a `key_id`.
-const KEY_ID_HEX_LEN: usize = 64;
+pub(crate) const KEY_ID_HEX_LEN: usize = 64;
 
 /// A detached signature and its signer identifier for a payload manifest.
 #[derive(Debug)]
@@ -1171,39 +1173,15 @@ where
     // recorded `length` and the size written into its `tar` header below —
     // two reads of the same file can disagree, and the whole point of the
     // field is that they cannot.
-    let mut archive_members = Vec::with_capacity(inputs.len());
-    let mut artifacts = Vec::with_capacity(inputs.len());
+    let mut measured = Vec::with_capacity(inputs.len());
     for input in inputs {
         let source = std::fs::File::open(&input.source)?;
         let (sha256, length) = hash_copy(source, std::io::sink())?;
-        archive_members.push(ArchiveMember {
-            name: input.archive_path.clone(),
-            length,
-        });
-        artifacts.push(PayloadArtifact {
-            component: input.component.clone(),
-            version: input.version.clone(),
-            commit: Some(input.commit.clone()),
-            target_arch: input.target_arch,
-            kind: input.kind,
-            dispositions: input.dispositions.clone(),
-            archive_path: input.archive_path.clone(),
-            sha256,
-            spec: input.spec.clone(),
-            image: input.image.clone(),
-        });
+        measured.push((input, sha256, length));
     }
     #[cfg(test)]
     golden::between_passes();
-    // Taken off the member list itself, so the number the header states below
-    // is the very one the manifest binds rather than a second measurement of
-    // the same file.
-    let member_lengths: Vec<u64> = archive_members.iter().map(|member| member.length).collect();
-    let manifest = PayloadManifest::new(pinset.map(str::to_string), archive_members, artifacts)?;
-    let manifest = match trust_set {
-        Some(generation) => manifest.with_trust_set(generation)?,
-        None => manifest,
-    };
+    let manifest = derive_manifest(pinset, trust_set, &measured)?;
     let manifest_json = serde_json::to_vec(&manifest).map_err(PayloadError::ManifestSerialize)?;
     let signed = sign(&manifest_json).map_err(PayloadError::Signer)?;
     if let Some(signed) = signed.as_ref() {
@@ -1215,40 +1193,18 @@ where
     let manifest_len = manifest_json.len() as u64;
     let archive_offset = manifest_offset + manifest_len;
 
-    let archive_len = {
-        let mut counter = CountingWriter::new(&mut out);
-        let encoder = Encoder::new(&mut counter, ZSTD_LEVEL)?;
-        let mut builder = Builder::new(encoder);
-        // The header's size is the length the manifest now binds, not a second
-        // look at the source file's metadata: the two are required to be the
-        // same number, and the only way to guarantee that is for there to be
-        // one number.
-        for (input, length) in inputs.iter().zip(member_lengths) {
-            let source = std::fs::File::open(&input.source)?;
-            let mut header = Header::new_gnu();
-            // The name is written into the header block and the header is
-            // appended verbatim, because `Builder::append_data` falls back to a
-            // GNU long-name entry for a path the field cannot hold — and the
-            // reader refuses a member whose name comes from an extension header
-            // rather than from the block it applies to. Refusing the path is the
-            // only outcome that keeps the writer and the reader agreeing.
-            header
-                .set_path(&input.archive_path)
-                .map_err(|_| PayloadError::ArchivePathTooLong {
-                    path: input.archive_path.clone(),
-                    len: input.archive_path.len(),
-                })?;
-            header.set_size(length);
-            header.set_mode(0o644);
-            header.set_mtime(0);
-            header.set_entry_type(EntryType::Regular);
-            header.set_cksum();
-            builder.append(&header, source)?;
-        }
-        let encoder = builder.into_inner()?;
-        encoder.finish()?;
-        counter.count()
-    };
+    // The header's size is the length the manifest now binds, not a second
+    // look at the source file's metadata: the two are required to be the same
+    // number, and the only way to guarantee that is for there to be one
+    // number. Each source is reopened here, so a source that changed since
+    // the pre-pass is copied as it now is — the legacy behavior this writer
+    // keeps.
+    let members = measured.iter().map(|(input, _, length)| {
+        std::fs::File::open(&input.source)
+            .map(|source| (input.archive_path.as_str(), *length, source))
+            .map_err(PayloadError::from)
+    });
+    let archive_len = write_archive_block(members, &mut out, MemberLength::Legacy)?;
 
     let (signature_offset, signature_len, key_id_offset, key_id_len) = match signed {
         Some(signed) => {
@@ -1277,6 +1233,210 @@ where
     };
     out.write_all(&footer.encode())?;
     Ok(())
+}
+
+/// Derives the manifest a package of `members` binds: each input with the
+/// lowercase-hex SHA-256 and the length of the bytes that will be archived
+/// for it, in input order.
+///
+/// The ordered `archive_members` and the artifact entries both come from
+/// `members`, so the list the manifest binds is the one the archive writer is
+/// then handed. `trust_set`, when given, is stamped with
+/// [`PayloadManifest::with_trust_set`].
+///
+/// # Errors
+///
+/// [`PayloadError::InvalidManifest`] for whatever [`PayloadManifest::new`] or
+/// [`PayloadManifest::with_trust_set`] refuses.
+pub(crate) fn derive_manifest(
+    pinset: Option<&str>,
+    trust_set: Option<&[u8]>,
+    members: &[(&ArtifactInput, String, u64)],
+) -> Result<PayloadManifest, PayloadError> {
+    let mut archive_members = Vec::with_capacity(members.len());
+    let mut artifacts = Vec::with_capacity(members.len());
+    for (input, sha256, length) in members {
+        archive_members.push(ArchiveMember {
+            name: input.archive_path.clone(),
+            length: *length,
+        });
+        artifacts.push(PayloadArtifact {
+            component: input.component.clone(),
+            version: input.version.clone(),
+            commit: Some(input.commit.clone()),
+            target_arch: input.target_arch,
+            kind: input.kind,
+            dispositions: input.dispositions.clone(),
+            archive_path: input.archive_path.clone(),
+            sha256: sha256.clone(),
+            spec: input.spec.clone(),
+            image: input.image.clone(),
+        });
+    }
+    let manifest = PayloadManifest::new(pinset.map(str::to_string), archive_members, artifacts)?;
+    match trust_set {
+        Some(generation) => Ok(manifest.with_trust_set(generation)?),
+        None => Ok(manifest),
+    }
+}
+
+/// What [`write_archive_block`] does when a member's reader yields a different
+/// number of bytes from the length its header states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemberLength {
+    /// Copy whatever the reader yields and pad it to a block, as
+    /// [`tar::Builder::append`] does, with no error: the legacy writers'
+    /// behavior, kept byte for byte.
+    Legacy,
+    /// Refuse a reader that ends early or has a byte past its length, with a
+    /// [`MemberLengthFault`] payload; the extra byte is never written.
+    Exact,
+}
+
+/// Writes the zstd-compressed `tar` archive block of `members` to `out` and
+/// returns its compressed length.
+///
+/// Each item is an `archive_path`, the length its header states, and the
+/// reader its bytes come from. Items are pulled one at a time and each member
+/// is streamed before the next is pulled; nothing is collected. Every header
+/// is a GNU header named through its own name field, with the stated length,
+/// mode `0o644`, mtime 0 and a regular entry type.
+///
+/// # Errors
+///
+/// - A failing item, returned unchanged; no later item is pulled.
+/// - [`PayloadError::ArchivePathTooLong`] for a path the header's name field
+///   cannot hold, since naming it from an extension header would be refused
+///   by every reader.
+/// - [`PayloadError::Io`] for a failed read, write or compression step,
+///   carrying the original error — and under [`MemberLength::Exact`], an
+///   `UnexpectedEof` or `InvalidData` error carrying a [`MemberLengthFault`].
+pub(crate) fn write_archive_block<'a, W, R, I>(
+    members: I,
+    out: W,
+    policy: MemberLength,
+) -> Result<u64, PayloadError>
+where
+    W: Write,
+    R: Read,
+    I: IntoIterator<Item = Result<(&'a str, u64, R), PayloadError>>,
+{
+    let mut counter = CountingWriter::new(out);
+    let encoder = Encoder::new(&mut counter, ZSTD_LEVEL)?;
+    let mut builder = Builder::new(encoder);
+    for member in members {
+        let (archive_path, length, reader) = member?;
+        let mut header = Header::new_gnu();
+        // The name is written into the header block and the header is
+        // appended verbatim, because `Builder::append_data` falls back to a
+        // GNU long-name entry for a path the field cannot hold — and the
+        // reader refuses a member whose name comes from an extension header
+        // rather than from the block it applies to. Refusing the path is the
+        // only outcome that keeps the writer and the reader agreeing.
+        header
+            .set_path(archive_path)
+            .map_err(|_| PayloadError::ArchivePathTooLong {
+                path: archive_path.to_string(),
+                len: archive_path.len(),
+            })?;
+        header.set_size(length);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_entry_type(EntryType::Regular);
+        header.set_cksum();
+        match policy {
+            MemberLength::Legacy => builder.append(&header, reader)?,
+            MemberLength::Exact => builder.append(&header, ExactLength::new(reader, length))?,
+        }
+    }
+    let encoder = builder.into_inner()?;
+    encoder.finish()?;
+    Ok(counter.count())
+}
+
+/// Why a member's reader disagreed with its bound length under
+/// [`MemberLength::Exact`], carried as an [`std::io::Error`] payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemberLengthFault {
+    /// The reader ended after `read` of its `bound` bytes.
+    EndedEarly { bound: u64, read: u64 },
+    /// The reader had a byte past its `bound` bytes.
+    Overran { bound: u64 },
+}
+
+impl std::fmt::Display for MemberLengthFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EndedEarly { bound, read } => {
+                write!(f, "member ended after {read} of its {bound} bytes")
+            }
+            Self::Overran { bound } => write!(f, "member is longer than its {bound} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for MemberLengthFault {}
+
+/// A reader that yields exactly `bound` bytes of `inner` or fails with a
+/// [`MemberLengthFault`].
+///
+/// Once `bound` bytes have been delivered it probes the inner reader for one
+/// more byte before reporting the end; a byte found there is never delivered.
+struct ExactLength<R> {
+    inner: R,
+    bound: u64,
+    delivered: u64,
+    ended: bool,
+}
+
+impl<R: Read> ExactLength<R> {
+    fn new(inner: R, bound: u64) -> Self {
+        Self {
+            inner,
+            bound,
+            delivered: 0,
+            ended: false,
+        }
+    }
+}
+
+impl<R: Read> Read for ExactLength<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.ended {
+            return Ok(0);
+        }
+        let remaining = self.bound - self.delivered;
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => {
+                    self.ended = true;
+                    Ok(0)
+                }
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    MemberLengthFault::Overran { bound: self.bound },
+                )),
+            };
+        }
+        let want = usize::try_from(remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let window = buf
+            .get_mut(..want)
+            .expect("want never exceeds the buffer length");
+        let read = self.inner.read(window)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                MemberLengthFault::EndedEarly {
+                    bound: self.bound,
+                    read: self.delivered,
+                },
+            ));
+        }
+        let read = read.min(want);
+        self.delivered += u64::try_from(read).expect("a read within the window fits in u64");
+        Ok(read)
+    }
 }
 
 fn validate_signed(signed: &Signed) -> Result<(), PayloadError> {

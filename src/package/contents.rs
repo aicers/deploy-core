@@ -24,8 +24,9 @@ use crate::verify::{
     verify_package_bounded,
 };
 
+// The preparation tests reuse its signed-package fixtures.
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// Verifies the package in `source` in full and returns immutable evidence of
 /// what it holds.
@@ -105,6 +106,7 @@ pub fn verify_contents<R: Read + Seek>(
             error,
             &RetentionSite {
                 read_source: IoOperation::SourceRead,
+                source_path: None,
                 max_len: limits.resource_limit(LimitResource::Package),
                 staging_parent: Some(staging_parent),
             },
@@ -125,6 +127,7 @@ pub fn verify_contents<R: Read + Seek>(
                 error,
                 &RetentionSite {
                     read_source: IoOperation::SourceRead,
+                    source_path: None,
                     max_len: limits.resource_limit(LimitResource::Package),
                     staging_parent: None,
                 },
@@ -178,6 +181,7 @@ pub(crate) fn verify_retained(
                     error,
                     &RetentionSite {
                         read_source: IoOperation::ReadSnapshot,
+                        source_path: None,
                         max_len: limits.resource_limit(LimitResource::CompressedArchive),
                         staging_parent: None,
                     },
@@ -339,6 +343,7 @@ fn extract_members(
             error,
             &RetentionSite {
                 read_source: IoOperation::ReadSnapshot,
+                source_path: None,
                 max_len: limits.resource_limit(LimitResource::OuterUncompressedTotal),
                 staging_parent: None,
             },
@@ -423,7 +428,7 @@ fn from_payload(error: PayloadError) -> ContentError {
 
 /// Reports a failed read or seek of an already-retained snapshot, which has no
 /// path to name.
-fn read_snapshot(error: io::Error) -> ContentError {
+pub(super) fn read_snapshot(error: io::Error) -> ContentError {
     ContentError::Io {
         operation: IoOperation::ReadSnapshot,
         path: None,
@@ -432,18 +437,21 @@ fn read_snapshot(error: io::Error) -> ContentError {
 }
 
 /// What one retention call site knows that the retention error does not.
-struct RetentionSite<'a> {
+pub(super) struct RetentionSite<'a> {
     /// What a failed read of the snapshot's source is at this site.
-    read_source: IoOperation,
+    pub(super) read_source: IoOperation,
+    /// The concrete file the snapshot's source reads, when it is one: named
+    /// by a failed read of it.
+    pub(super) source_path: Option<&'a Path>,
     /// The resource and value this site passed as the snapshot's `max_len`.
-    max_len: crate::content::ResourceLimit,
+    pub(super) max_len: crate::content::ResourceLimit,
     /// The staging parent, at the one site that creates the private directory
     /// in it.
-    staging_parent: Option<&'a Path>,
+    pub(super) staging_parent: Option<&'a Path>,
 }
 
 /// Maps a retention failure onto a [`ContentError`] under what `site` knows.
-fn from_retention(error: RetentionError, site: &RetentionSite<'_>) -> ContentError {
+pub(super) fn from_retention(error: RetentionError, site: &RetentionSite<'_>) -> ContentError {
     match error {
         RetentionError::BudgetExceeded { limit } => ContentError::LimitExceeded {
             resource: LimitResource::RetainedDisk,
@@ -499,7 +507,7 @@ fn from_retention(error: RetentionError, site: &RetentionSite<'_>) -> ContentErr
                 RetentionOperation::ReadSource => {
                     return ContentError::Io {
                         operation: site.read_source,
-                        path: None,
+                        path: site.source_path.map(Path::to_path_buf),
                         source: RetainedIoFault::unwrap_or_same(source),
                     };
                 }
@@ -550,9 +558,13 @@ pub enum ContentError {
     /// An I/O operation failed.
     ///
     /// `path` is `Some` only for a concrete filesystem target of the failed
-    /// operation — the staging parent, the private directory or a snapshot
-    /// file — and `None` for the caller's source and for retained snapshots,
-    /// which have no path. `source` keeps the underlying error and its kind.
+    /// operation — the staging parent, the private directory, a snapshot file
+    /// while it is still linked, a preparation input's source file, or a
+    /// persisted preparation's directory, path component or file — and `None`
+    /// for a caller's reader and for retained snapshots, which have no path.
+    /// The target need not exist: a missing one is still named. `source`
+    /// keeps the underlying error and its kind, and a refusal the library
+    /// decides itself carries a fixed message and kind.
     #[error("{operation} failed{}: {source}", describe_path(.path.as_deref()))]
     Io {
         /// Where the failure happened.
@@ -619,6 +631,9 @@ pub enum IoOperation {
     WriteSnapshot,
     /// Reading or seeking an already-retained snapshot.
     ReadSnapshot,
+    /// Reaching, listing, inspecting, opening or reading a persisted
+    /// preparation's directory and files.
+    OpenPreparation,
 }
 
 impl fmt::Display for IoOperation {
@@ -630,6 +645,7 @@ impl fmt::Display for IoOperation {
             Self::CreateStaging => "creating private staging",
             Self::WriteSnapshot => "writing a snapshot",
             Self::ReadSnapshot => "reading a retained snapshot",
+            Self::OpenPreparation => "opening the persisted preparation",
         })
     }
 }

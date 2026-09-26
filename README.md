@@ -47,7 +47,15 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   library can change it between the check and the use. And the receipt and
   error types of no-clobber, durable publication, which never replaces an
   existing entry and reports a failure after the output became visible as
-  uncertain durability rather than as success.
+  uncertain durability rather than as success. Unsigned preparation builds
+  the other side: `prepare_package` copies each input once into private
+  storage and builds one raw manifest and one compressed archive block from
+  those copies, checked by the same content core, into a `PreparedPackage`
+  that is unsigned and untrusted for installation; its `PreparationBinding`
+  is the data a signing request is correlated by. `persist` writes the two
+  blocks and the binding record as a new three-file directory, and
+  `reopen_prepared` turns one back into a package only against an
+  independently saved binding, after fresh copies and full revalidation.
 - **trust_set** — the generation document that verifier's injected material is
   delivered as, and the reader that refuses a malformed one rather than
   repairing it: a version gate, a structural decode that admits no unknown
