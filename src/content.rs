@@ -37,14 +37,16 @@ mod gzip;
 pub(crate) mod json;
 mod walker;
 
-// The consumers' vocabulary. Unused outside the tests until the image-archive
-// validator and the package pipeline land on these primitives.
+// The consumers' vocabulary.
+// Unused outside the tests until the package writer lands on it.
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use counting::{Budget, CountingReader, alloc_len, charge_all};
-#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use counting::charge_all;
+pub(crate) use counting::{Budget, CountingReader, alloc_len};
 pub(crate) use gzip::GzipDecoder;
+pub(crate) use walker::{EntryKind, EntryPolicy, TarWalker};
+// Unused outside the tests until the package writer lands on them.
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use walker::{EntryKind, EntryPolicy, EntryReader, TarEntry, TarWalker};
+pub(crate) use walker::{EntryReader, TarEntry};
 
 /// One limit handed to a primitive: the resource it bounds and that resource's
 /// configured value.

@@ -67,10 +67,11 @@ mod publish;
 mod tests;
 pub(crate) mod trusted_dir;
 
+pub(crate) use publish::publish_file;
 // Re-exported for the preparation and finalization work that publishes
 // through them; until it lands only the tests use these paths.
 #[allow(unused_imports)]
-pub(crate) use publish::{PublishedFileName, publish_directory, publish_file};
+pub(crate) use publish::{PublishedFileName, publish_directory};
 use trusted_dir::{TrustedDir, TrustedDirError, open_trusted_dir};
 
 /// The prefix of the private directory a scope creates in its staging parent.

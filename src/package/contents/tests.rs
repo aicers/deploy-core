@@ -173,8 +173,7 @@ fn a_mixed_package_verifies_into_evidence() {
     let members: u64 = arts.iter().map(|art| art.bytes.len() as u64).sum();
     let scope = contents.scope_for_test();
     assert_eq!(scope.budget_used(), bytes.len() as u64 + members);
-    let (offset, len) = archive_block(&bytes);
-    let _ = offset;
+    let (_, len) = archive_block(&bytes);
     assert_eq!(
         scope.budget_high_water(),
         bytes.len() as u64 + len + members

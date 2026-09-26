@@ -31,15 +31,20 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   bytes, the trust anchors and withdrawn builds a caller injects, the
   namespace-scoped request a package declaring images is verified under, and
   the error taxonomy downstream repositories match on.
-- **package** — the finite resource policy the full-content package
-  verification and writer APIs will enforce: one ceiling per resource — stored
-  and decoded bytes, entries, path lengths, JSON documents and nesting, disk
-  and buffers — each starting at a generous library default that a caller may
-  lower and never raise. No existing API consults it yet. Beside it, the
-  read-only `RetainedBytes` handle that validated package content is read
-  through: a private, already unlinked copy the library made of an untrusted
-  source in one pass, exposing no path, file or descriptor, so nothing outside
-  the library can change it between the check and the use. And the receipt and
+- **package** — full-content verification: `verify_contents` copies a signed
+  package once into private retained storage, authenticates that copy with
+  exactly the verdicts **verify** gives, requires one requested architecture,
+  refuses legacy undeclared images, checks every outer member and then every
+  image archive against its signed declaration, and only then returns
+  `VerifiedContents` — the authenticated manifest, every artifact's bytes, the
+  image evidence and the exact package bytes. Every step runs under the finite
+  resource policy: one ceiling per resource — stored and decoded bytes,
+  entries, path lengths, JSON documents and nesting, disk and buffers — each
+  starting at a generous library default that a caller may lower and never
+  raise. The evidence is read through the read-only `RetainedBytes` handle: a
+  private, already unlinked copy the library made of an untrusted source in
+  one pass, exposing no path, file or descriptor, so nothing outside the
+  library can change it between the check and the use. And the receipt and
   error types of no-clobber, durable publication, which never replaces an
   existing entry and reports a failure after the output became visible as
   uncertain durability rather than as success.
