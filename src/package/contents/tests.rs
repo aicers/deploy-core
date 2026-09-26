@@ -1024,6 +1024,42 @@ fn an_oversized_record_reports_a_bounded_prefix_of_its_name() {
 }
 
 #[test]
+fn an_oversized_record_the_archive_reader_refuses_on_its_header_is_its_refusal() {
+    // The archive reader refuses a header whose checksum fails, and a second
+    // long name for one member, before it asks for the record's body, so the
+    // scan that would name an override never starts and the verdict is the
+    // archive reader's, as the legacy walk reports it.
+    let signer = Signer::new();
+    let arts = vec![Art::native("bin/tool", b"tool")];
+    let manifest = manifest_bytes(&arts);
+    let large = usize::try_from(2 * default_framing_allowance()).expect("fits");
+    let (_, long_name, _) = extension_archives(large).swap_remove(2);
+    let mut corrupt = long_name.clone();
+    // A mode digit changed under the header's recorded checksum.
+    corrupt[100] ^= 1;
+    let (_, small, _) = extension_archives(64).swap_remove(2);
+    let body = tar::Header::from_byte_slice(&small[..512])
+        .entry_size()
+        .expect("a size");
+    let small_record = 512 + usize::try_from(body.div_ceil(512) * 512).expect("fits");
+    let mut duplicate = small[..small_record].to_vec();
+    duplicate.extend_from_slice(&long_name);
+    for (name, outer) in [("checksum", corrupt), ("duplicate", duplicate)] {
+        let bytes = signer.container(&manifest, &zstd(&outer));
+        let legacy = legacy_verdict(&bytes, &signer.trust(), &plain_request());
+        let VerifyError::Payload(PayloadError::Io(_)) = &legacy else {
+            panic!("{name}: legacy {legacy:?}");
+        };
+        let bounded = payload_refusal(&bytes, &signer, &ContentLimits::default());
+        assert_eq!(
+            format!("{legacy:?}"),
+            format!("{:?}", VerifyError::Payload(bounded)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn a_lowered_member_count_never_reports_framing_as_member_data() {
     // One member slot leaves a few KiB of framing: every record below is
     // larger, and each is still its override, never `OuterUncompressedTotal`
@@ -1092,8 +1128,11 @@ fn framing_consumes_none_of_the_uncompressed_total() {
         .collect();
     for arts in [many[..1].to_vec(), many.clone()] {
         let bytes = package(&signer, &arts);
-        let total: u64 = arts.iter().map(|art| art.bytes.len() as u64).sum();
-        let count = arts.len() as u64;
+        let total: u64 = arts
+            .iter()
+            .map(|art| u64::try_from(art.bytes.len()).expect("fits"))
+            .sum();
+        let count = u64::try_from(arts.len()).expect("fits");
         let exact = limits(LimitResource::OuterMembers, count)
             .with_limit(LimitResource::OuterUncompressedTotal, total)
             .expect("lower limits");
