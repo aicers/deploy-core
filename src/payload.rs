@@ -98,6 +98,8 @@ use crate::package::{LimitResource, RetainedIoFault};
 
 mod outer;
 
+#[cfg(test)]
+pub(crate) use outer::framing_allowance;
 pub(crate) use outer::{MemberSink, OuterLimits, SinkFault, WalkError, walk_outer};
 
 /// Magic bytes at the start of the footer, identifying a bootler payload.

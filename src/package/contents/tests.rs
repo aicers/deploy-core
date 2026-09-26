@@ -895,29 +895,241 @@ fn a_zstd_bomb_is_refused_at_the_uncompressed_total() {
     );
 }
 
+/// The private framing allowance under the default `OuterMembers`: an
+/// extension record larger than it never reaches the archive reader.
+fn default_framing_allowance() -> u64 {
+    crate::payload::framing_allowance(ContentLimits::default().get(LimitResource::OuterMembers))
+}
+
+/// Which override a payload verdict names.
+type Overrides = fn(&PayloadError) -> bool;
+
+fn names(error: &PayloadError) -> bool {
+    matches!(error, PayloadError::NameOverridingHeader { .. })
+}
+
+fn sizes(error: &PayloadError) -> bool {
+    matches!(error, PayloadError::SizeOverridingHeader { .. })
+}
+
+fn links(error: &PayloadError) -> bool {
+    matches!(error, PayloadError::UnsupportedEntryType { .. })
+}
+
+/// The one-member outer tar of `tool`, broken by each extension record form
+/// with a record of about `len` bytes, and the verdict the shared rules give
+/// it.
+fn extension_archives(len: usize) -> Vec<(&'static str, Vec<u8>, Overrides)> {
+    let long = format!("bin/{}", "a".repeat(len));
+    vec![
+        (
+            "pax path",
+            tar(&[Entry::PaxPath {
+                header: "bin/tool",
+                path: &long,
+                data: b"tool",
+            }]),
+            names,
+        ),
+        (
+            "pax size",
+            tar(&[Entry::PaxSizeCommented {
+                path: "bin/tool",
+                data: b"tool",
+                comment: len,
+            }]),
+            sizes,
+        ),
+        (
+            "gnu long name",
+            tar(&[Entry::GnuLongName {
+                header: "bin/tool",
+                path: &long,
+                data: b"tool",
+            }]),
+            names,
+        ),
+        (
+            "gnu long link",
+            tar(&[Entry::GnuLongLink {
+                header: "bin/tool",
+                target: &long,
+            }]),
+            links,
+        ),
+    ]
+}
+
+/// Returns the payload verdict `verify_contents` gives `bytes` under
+/// `limits`, failing on any other refusal — a limit above all.
+#[track_caller]
+fn payload_refusal(bytes: &[u8], signer: &Signer, limits: &ContentLimits) -> PayloadError {
+    match verify_limited(bytes, signer, limits).expect_err("refused") {
+        ContentError::Verify(VerifyError::Payload(error)) => error,
+        other => panic!("expected a payload verdict, got {other:?}"),
+    }
+}
+
 #[test]
-fn an_extension_record_cannot_grow_past_the_framing_allowance() {
-    // A GNU long name the size of the whole allowance is refused while it is
-    // read, not buffered: the member count bounds the framing between
-    // members as the total bounds their data.
+fn an_extension_record_is_refused_for_what_it_overrides_at_any_size() {
+    // Small records reach the archive reader and are judged by the shared
+    // rules exactly as the legacy walk judges them. Records larger than the
+    // whole default framing allowance are read past it, never buffered, and
+    // refused with the same variant — not as member data they are not.
     let signer = Signer::new();
     let arts = vec![Art::native("bin/tool", b"tool")];
-    let long = "a/".repeat(4096);
-    let outer = tar(&[Entry::GnuLongName {
-        header: "bin/tool",
-        path: &long,
-        data: b"tool",
-    }]);
+    let manifest = manifest_bytes(&arts);
+    let large = usize::try_from(2 * default_framing_allowance()).expect("fits");
+    for len in [64, large] {
+        for (name, outer, expected) in extension_archives(len) {
+            let bytes = signer.container(&manifest, &zstd(&outer));
+            let VerifyError::Payload(legacy) =
+                legacy_verdict(&bytes, &signer.trust(), &plain_request())
+            else {
+                panic!("{name} ({len}): the legacy walk gives a payload verdict");
+            };
+            let bounded = payload_refusal(&bytes, &signer, &ContentLimits::default());
+            assert!(expected(&legacy), "{name} ({len}): legacy {legacy:?}");
+            assert!(expected(&bounded), "{name} ({len}): bounded {bounded:?}");
+            if len < large {
+                assert_eq!(format!("{legacy:?}"), format!("{bounded:?}"), "{name}");
+            } else {
+                // Only a bounded prefix of the record's name is reported.
+                assert!(format!("{bounded:?}").len() < 1024, "{name}: {bounded:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_oversized_record_reports_a_bounded_prefix_of_its_name() {
+    let signer = Signer::new();
+    let arts = vec![Art::native("bin/tool", b"tool")];
+    let large = usize::try_from(2 * default_framing_allowance()).expect("fits");
+    let (_, outer, _) = extension_archives(large).swap_remove(0);
     let bytes = signer.container(&manifest_bytes(&arts), &zstd(&outer));
-    let error = verify_limited(&bytes, &signer, &limits(LimitResource::OuterMembers, 1))
-        .expect_err("refused");
-    assert_eq!(limit_of(&error).0, LimitResource::OuterUncompressedTotal);
-    // Under the default member count the same archive is the ordinary
-    // override refusal, as the legacy walk reports it.
-    assert!(matches!(
-        same_verdict(&bytes, &signer.trust(), &plain_request()),
-        VerifyError::Payload(PayloadError::NameOverridingHeader { .. })
-    ));
+    let error = payload_refusal(&bytes, &signer, &ContentLimits::default());
+    let PayloadError::NameOverridingHeader {
+        header_name,
+        resolved_name,
+    } = error
+    else {
+        panic!("{error:?}");
+    };
+    // The member's own header lies past the record; the extension's is named.
+    assert_eq!(header_name, "pax");
+    assert!(resolved_name.starts_with("bin/aaaa"), "{resolved_name}");
+    assert!(resolved_name.ends_with('\u{2026}'), "{resolved_name}");
+    assert!(resolved_name.len() <= 256 + 3, "{}", resolved_name.len());
+}
+
+#[test]
+fn a_lowered_member_count_never_reports_framing_as_member_data() {
+    // One member slot leaves a few KiB of framing: every record below is
+    // larger, and each is still its override, never `OuterUncompressedTotal`
+    // — which the member's four bytes of data meet exactly.
+    let signer = Signer::new();
+    let arts = vec![Art::native("bin/tool", b"tool")];
+    let manifest = manifest_bytes(&arts);
+    let lowered = limits(LimitResource::OuterMembers, 1)
+        .with_limit(LimitResource::OuterUncompressedTotal, 4)
+        .expect("lower limits");
+    let len = usize::try_from(4 * crate::payload::framing_allowance(1)).expect("fits");
+    for (name, outer, expected) in extension_archives(len) {
+        let bytes = signer.container(&manifest, &zstd(&outer));
+        let bounded = payload_refusal(&bytes, &signer, &lowered);
+        assert!(expected(&bounded), "{name}: {bounded:?}");
+    }
+    verify_limited(&package(&signer, &arts), &signer, &lowered)
+        .expect("the honest archive verifies under the same limits");
+}
+
+#[test]
+fn an_oversized_record_overriding_nothing_is_a_container_verdict() {
+    // A PAX record carrying only a comment overrides nothing, and the legacy
+    // walk, which buffers it whole, accepts the archive. The bounded walk
+    // cannot hold it, and refuses it as a container verdict: the framing
+    // allowance is private, and passing it is no public limit.
+    let signer = Signer::new();
+    let arts = vec![Art::native("bin/tool", b"tool")];
+    let large = usize::try_from(2 * default_framing_allowance()).expect("fits");
+    for (len, bounded) in [(64, false), (large, true)] {
+        let outer = tar(&[Entry::PaxCommented {
+            path: "bin/tool",
+            data: b"tool",
+            comment: len,
+        }]);
+        let bytes = signer.container(&manifest_bytes(&arts), &zstd(&outer));
+        let mut verified = verify_package(Cursor::new(&bytes), &signer.trust(), &plain_request())
+            .expect("the legacy verifier");
+        let dir = staging();
+        verified
+            .extract_to(dir.path())
+            .expect("the legacy walk extracts");
+        let result = verify_limited(&bytes, &signer, &ContentLimits::default());
+        if bounded {
+            let error = payload_refusal(&bytes, &signer, &ContentLimits::default());
+            let PayloadError::Io(error) = error else {
+                panic!("{error:?}");
+            };
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("framing"), "{error}");
+        } else {
+            result.expect("a record the allowance holds verifies");
+        }
+    }
+}
+
+#[test]
+fn framing_consumes_none_of_the_uncompressed_total() {
+    // One and `OuterMembers` members, each archive verifying with the total
+    // set to exactly its member bytes: headers, padding and the end marker
+    // are not member data. A package of no members authenticates to nothing,
+    // so the walk's own tests hold the empty archive to a zero total.
+    let signer = Signer::new();
+    let many: Vec<Art> = (0..5)
+        .map(|index| Art::native(&format!("bin/tool{index}"), &vec![b'x'; 700 + index]))
+        .collect();
+    for arts in [many[..1].to_vec(), many.clone()] {
+        let bytes = package(&signer, &arts);
+        let total: u64 = arts.iter().map(|art| art.bytes.len() as u64).sum();
+        let count = arts.len() as u64;
+        let exact = limits(LimitResource::OuterMembers, count)
+            .with_limit(LimitResource::OuterUncompressedTotal, total)
+            .expect("lower limits");
+        verify_limited(&bytes, &signer, &exact).expect("verifies at the exact total");
+        let under = exact
+            .with_limit(LimitResource::OuterUncompressedTotal, total - 1)
+            .expect("a lower limit");
+        let error = verify_limited(&bytes, &signer, &under).expect_err("refused");
+        assert_eq!(
+            limit_of(&error),
+            (LimitResource::OuterUncompressedTotal, total - 1)
+        );
+    }
+}
+
+#[test]
+fn an_empty_archive_walks_under_a_zero_total_and_no_members() {
+    // No package of no members authenticates, so the content core is held to
+    // it directly: the end marker alone consumes no member byte and no slot.
+    let dir = staging();
+    let scope = RetentionScope::new(dir.path(), 1 << 30, NonZeroUsize::MIN).expect("a scope");
+    let block = scope
+        .snapshot_from(&mut zstd(&tar(&[])).as_slice(), u64::MAX)
+        .expect("a snapshot");
+    let zero = limits(LimitResource::OuterMembers, 0)
+        .with_limit(LimitResource::OuterUncompressedTotal, 0)
+        .expect("lower limits");
+    let checked = check_contents(
+        &fixture::manifest(&[]),
+        &block,
+        TargetArch::X86_64,
+        &zero,
+        &scope,
+    )
+    .expect("the empty archive walks");
+    assert!(checked.members.is_empty());
 }
 
 #[test]
