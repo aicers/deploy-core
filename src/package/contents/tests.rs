@@ -1117,6 +1117,93 @@ fn an_oversized_record_overriding_nothing_is_a_container_verdict() {
 }
 
 #[test]
+fn an_oversized_size_refusal_states_the_extension_header_it_read() {
+    // The member's own header lies past a record the bounded walk does not
+    // read, so the size refusal states the one raw header block it did read,
+    // the extension's: its name and its size, against the size the record
+    // resolves.
+    let signer = Signer::new();
+    let arts = vec![Art::native("bin/tool", b"tool")];
+    let large = usize::try_from(2 * default_framing_allowance()).expect("fits");
+    let (_, outer, _) = extension_archives(large).swap_remove(1);
+    let record = tar::Header::from_byte_slice(&outer[..512])
+        .entry_size()
+        .expect("a size");
+    let bytes = signer.container(&manifest_bytes(&arts), &zstd(&outer));
+    let error = payload_refusal(&bytes, &signer, &ContentLimits::default());
+    let PayloadError::SizeOverridingHeader {
+        path,
+        header_size,
+        resolved_size,
+    } = error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(path, "pax");
+    assert_eq!(header_size, record);
+    assert_eq!(resolved_size, 4);
+}
+
+#[test]
+fn an_oversized_record_is_judged_by_the_records_the_allowance_reaches() {
+    // A finite scan cannot see a record placed past the framing allowance. A
+    // `path` record behind more than the allowance of other records overrides
+    // the name for the legacy walk, which buffers the extension whole; the
+    // bounded walk judges the extension by what it reached — a `size` record
+    // ahead of the padding, or nothing — and never by a public limit.
+    let signer = Signer::new();
+    let arts = vec![Art::native("bin/tool", b"tool")];
+    let manifest = manifest_bytes(&arts);
+    let large = usize::try_from(2 * default_framing_allowance()).expect("fits");
+    let comment = fixture::pax_record("comment", &"c".repeat(large));
+    let late_path = fixture::pax_record("path", "bin/other");
+    let sized: Vec<u8> = [
+        fixture::pax_record("size", "4"),
+        comment.clone(),
+        late_path.clone(),
+    ]
+    .concat();
+    let bare: Vec<u8> = [comment, late_path].concat();
+    for (name, records, size) in [("sized", &sized, 5), ("bare", &bare, 4)] {
+        let outer = tar(&[Entry::PaxRecords {
+            path: "bin/tool",
+            size,
+            data: b"tool",
+            records,
+        }]);
+        let bytes = signer.container(&manifest, &zstd(&outer));
+        let legacy = legacy_verdict(&bytes, &signer.trust(), &plain_request());
+        assert!(
+            matches!(
+                &legacy,
+                VerifyError::Payload(PayloadError::NameOverridingHeader { resolved_name, .. })
+                    if resolved_name == "bin/other"
+            ),
+            "{name}: legacy {legacy:?}"
+        );
+        let bounded = payload_refusal(&bytes, &signer, &ContentLimits::default());
+        if name == "sized" {
+            assert!(
+                matches!(
+                    bounded,
+                    PayloadError::SizeOverridingHeader {
+                        resolved_size: 4,
+                        ..
+                    }
+                ),
+                "{name}: {bounded:?}"
+            );
+        } else {
+            let PayloadError::Io(error) = bounded else {
+                panic!("{name}: {bounded:?}");
+            };
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("framing"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn framing_consumes_none_of_the_uncompressed_total() {
     // One and `OuterMembers` members, each archive verifying with the total
     // set to exactly its member bytes: headers, padding and the end marker

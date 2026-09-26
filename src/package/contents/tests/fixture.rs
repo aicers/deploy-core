@@ -281,6 +281,14 @@ pub(crate) enum Entry<'a> {
         data: &'a [u8],
         comment: usize,
     },
+    /// A regular file `path` whose raw header states `size` and which carries
+    /// `data`, preceded by a PAX extension holding exactly `records`.
+    PaxRecords {
+        path: &'a str,
+        size: u64,
+        data: &'a [u8],
+        records: &'a [u8],
+    },
     /// A regular file named by a GNU long-name entry.
     GnuLongName {
         header: &'a str,
@@ -309,7 +317,7 @@ fn header(name: &[u8], size: u64, kind: EntryType) -> Header {
     header
 }
 
-fn pax_record(key: &str, value: &str) -> Vec<u8> {
+pub(crate) fn pax_record(key: &str, value: &str) -> Vec<u8> {
     let body = format!(" {key}={value}\n");
     let mut len = body.len();
     loop {
@@ -391,6 +399,12 @@ pub(crate) fn tar_unfinished(entries: &[Entry<'_>]) -> Vec<u8> {
                 let record = pax_record("comment", &"c".repeat(*comment));
                 extended(&mut out, &record, path, len_u64(data), data);
             }
+            Entry::PaxRecords {
+                path,
+                size,
+                data,
+                records,
+            } => extended(&mut out, records, path, *size, data),
             Entry::GnuLongLink {
                 header: name,
                 target,

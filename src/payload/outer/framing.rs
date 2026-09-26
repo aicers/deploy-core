@@ -17,9 +17,16 @@
 //! within what is left of the allowance and never buffered, and refused for
 //! what it overrides through the [`PayloadError`] variant the shared rules
 //! give that override. The member's own header lies past a record the walk
-//! will not read, so such a refusal names the header block the walk did read —
-//! the extension's — and reports at most [`REPORTED_NAME_MAX`] bytes of the
-//! name the record carries.
+//! will not read, so such a refusal states the header block the walk did read —
+//! the extension's name and size — and reports at most [`REPORTED_NAME_MAX`]
+//! bytes of the name the record carries.
+//!
+//! A PAX record is judged by the lines the allowance reaches: a `path` line
+//! among them names the member, and failing that a `size` line sizes it.
+//! Nothing past the allowance is read, so a `path` line placed there is never
+//! seen, and the record is refused for the `size` line ahead of it, or as
+//! framing that overrides nothing. The legacy walk, which buffers the record
+//! whole, refuses the same archive for its name.
 
 use std::io;
 
@@ -71,7 +78,9 @@ pub(super) enum OversizedExtension {
         header_name: String,
         resolved_name: String,
     },
-    /// A PAX `size` record: [`PayloadError::SizeOverridingHeader`].
+    /// A PAX `size` record: [`PayloadError::SizeOverridingHeader`]. The
+    /// member's header lies past the record unread, so `path` and
+    /// `header_size` are the extension header's own name and size.
     Size {
         path: String,
         header_size: u64,
