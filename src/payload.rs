@@ -99,8 +99,12 @@ use crate::package::{LimitResource, RetainedIoFault};
 #[cfg(test)]
 mod archive_block_tests;
 #[cfg(test)]
+pub(crate) mod counters;
+#[cfg(test)]
 mod golden;
 mod outer;
+#[cfg(test)]
+mod tail_tests;
 
 #[cfg(test)]
 pub(crate) use outer::framing_allowance;
@@ -1182,6 +1186,8 @@ where
     #[cfg(test)]
     golden::between_passes();
     let manifest = derive_manifest(pinset, trust_set, &measured)?;
+    #[cfg(test)]
+    counters::count_manifest_serialization();
     let manifest_json = serde_json::to_vec(&manifest).map_err(PayloadError::ManifestSerialize)?;
     let signed = sign(&manifest_json).map_err(PayloadError::Signer)?;
     if let Some(signed) = signed.as_ref() {
@@ -1191,7 +1197,6 @@ where
     let manifest_offset = std::io::copy(&mut base, &mut out)?;
     out.write_all(&manifest_json)?;
     let manifest_len = manifest_json.len() as u64;
-    let archive_offset = manifest_offset + manifest_len;
 
     // The header's size is the length the manifest now binds, not a second
     // look at the source file's metadata: the two are required to be the same
@@ -1206,20 +1211,79 @@ where
     });
     let archive_len = write_archive_block(members, &mut out, MemberLength::Legacy)?;
 
-    let (signature_offset, signature_len, key_id_offset, key_id_len) = match signed {
-        Some(signed) => {
+    write_standalone_tail(
+        out,
+        manifest_offset,
+        manifest_len,
+        archive_len,
+        signed.as_ref(),
+    )
+}
+
+/// Writes everything a standalone container holds after its archive block:
+/// the signature and key-ID blocks when `signed` is given, then the current
+/// [`FORMAT_VERSION`] footer.
+///
+/// `manifest_offset` is where the manifest block really starts — the base
+/// length for the legacy writers, `0` for a finalized package — and the
+/// archive, signature and key-ID offsets follow it adjacently, computed with
+/// checked arithmetic.
+///
+/// It validates before it writes: `signed` is held to the framing
+/// [`validate_signed`] enforces, every offset is computed, the container's
+/// total length is checked to fit a `u64`, and the footer is encoded, all
+/// before the first tail byte reaches `out`. A refusal therefore writes no
+/// tail byte. A failure of `out` itself leaves whatever `out` had already
+/// accepted, exactly as every other write of the legacy writers does.
+///
+/// # Errors
+///
+/// - [`PayloadError::InvalidSignatureLength`] or [`PayloadError::InvalidKeyId`]
+///   for a `signed` the container verifier cannot accept.
+/// - [`PayloadError::MalformedFooter`] when an offset, or the container's
+///   length, would overflow a `u64`.
+/// - [`PayloadError::Io`] when writing to `out` fails.
+pub(crate) fn write_standalone_tail<W: Write>(
+    mut out: W,
+    manifest_offset: u64,
+    manifest_len: u64,
+    archive_len: u64,
+    signed: Option<&Signed>,
+) -> Result<(), PayloadError> {
+    const OVERFLOW: PayloadError = PayloadError::MalformedFooter {
+        reason: "a block offset or the container length overflows a u64",
+    };
+
+    // Phase 1: validate and compute, writing nothing.
+    if let Some(signed) = signed {
+        validate_signed(signed)?;
+    }
+    let archive_offset = manifest_offset.checked_add(manifest_len).ok_or(OVERFLOW)?;
+    let archive_end = archive_offset.checked_add(archive_len).ok_or(OVERFLOW)?;
+    let (signature_offset, signature_len, key_id_offset, key_id_len, footer_start) = match signed {
+        Some(_) => {
             let signature_len = u64::try_from(ED25519_SIGNATURE_LEN)
                 .expect("the fixed signature length always fits the u64 footer field");
             let key_id_len = u64::try_from(KEY_ID_HEX_LEN)
                 .expect("the fixed key_id length always fits the u64 footer field");
-            let signature_offset = archive_offset + archive_len;
-            out.write_all(&signed.signature)?;
-            let key_id_offset = signature_offset + signature_len;
-            out.write_all(signed.key_id.as_bytes())?;
-            (signature_offset, signature_len, key_id_offset, key_id_len)
+            let signature_offset = archive_end;
+            let key_id_offset = signature_offset
+                .checked_add(signature_len)
+                .ok_or(OVERFLOW)?;
+            let footer_start = key_id_offset.checked_add(key_id_len).ok_or(OVERFLOW)?;
+            (
+                signature_offset,
+                signature_len,
+                key_id_offset,
+                key_id_len,
+                footer_start,
+            )
         }
-        None => (0, 0, 0, 0),
+        None => (0, 0, 0, 0, archive_end),
     };
+    let footer_size =
+        u64::try_from(FOOTER_SIZE).expect("the fixed footer size always fits a u64 length");
+    footer_start.checked_add(footer_size).ok_or(OVERFLOW)?;
     let footer = Footer {
         version: FORMAT_VERSION,
         manifest_offset,
@@ -1230,8 +1294,15 @@ where
         signature_len,
         key_id_offset,
         key_id_len,
-    };
-    out.write_all(&footer.encode())?;
+    }
+    .encode();
+
+    // Phase 2: write.
+    if let Some(signed) = signed {
+        out.write_all(&signed.signature)?;
+        out.write_all(signed.key_id.as_bytes())?;
+    }
+    out.write_all(&footer)?;
     Ok(())
 }
 
@@ -1322,6 +1393,8 @@ where
     I: IntoIterator<Item = Result<(&'a str, u64, R), PayloadError>>,
 {
     let mut counter = CountingWriter::new(out);
+    #[cfg(test)]
+    counters::count_zstd_encoder();
     let encoder = Encoder::new(&mut counter, ZSTD_LEVEL)?;
     let mut builder = Builder::new(encoder);
     for member in members {
@@ -1439,7 +1512,9 @@ impl<R: Read> Read for ExactLength<R> {
     }
 }
 
-fn validate_signed(signed: &Signed) -> Result<(), PayloadError> {
+/// Holds `signed` to the framing the container verifier accepts: a 64-byte
+/// signature and a 64-character lowercase-hex key ID.
+pub(crate) fn validate_signed(signed: &Signed) -> Result<(), PayloadError> {
     if signed.signature.len() != ED25519_SIGNATURE_LEN {
         return Err(PayloadError::InvalidSignatureLength {
             found: signed.signature.len(),

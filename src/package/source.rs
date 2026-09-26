@@ -86,6 +86,9 @@ pub(crate) enum SourceRole {
     Input,
     /// A reopened record's or manifest's snapshot, read into memory.
     Reopened,
+    /// A prepared package's archive block, while finalization rehashes it and
+    /// copies it into the container.
+    Prepared,
 }
 
 /// A [`Read`] + [`Seek`] adapter over a [`RetainedReader`] whose own errors

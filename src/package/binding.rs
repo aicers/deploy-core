@@ -352,6 +352,14 @@ impl PreparationBinding {
         out.write_str("}\n")
     }
 
+    /// Returns this binding with `schema` in place of its own, which no record
+    /// can carry, for the tests that need every field to differ.
+    #[cfg(test)]
+    pub(crate) fn with_schema_for_test(mut self, schema: u32) -> PreparationBinding {
+        self.schema = schema;
+        self
+    }
+
     /// Returns the first field, in record order, in which `self` and `other`
     /// differ.
     pub(crate) fn first_difference(&self, other: &PreparationBinding) -> Option<BindingField> {

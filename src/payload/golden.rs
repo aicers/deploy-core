@@ -18,9 +18,9 @@ use tar::{Builder, EntryType, Header};
 use zstd::Encoder;
 
 use super::{
-    ArtifactInput, CountingWriter, ED25519_SIGNATURE_LEN, FORMAT_VERSION, Footer, KEY_ID_HEX_LEN,
-    PayloadError, Signed, SignerError, ZSTD_LEVEL, append_trailer, append_trailer_signed,
-    hash_copy, rewrap_trailer, validate_signed,
+    ArtifactInput, CountingWriter, ED25519_SIGNATURE_LEN, FOOTER_SIZE, FORMAT_VERSION, Footer,
+    KEY_ID_HEX_LEN, MAGIC, PayloadError, Signed, SignerError, ZSTD_LEVEL, append_trailer,
+    append_trailer_signed, hash_copy, rewrap_trailer, validate_signed,
 };
 use crate::image::{
     ImageArchitecture, ImageDeclaration, ImageOs, ImageOwner, ImagePlatform, ImageProvenance,
@@ -267,40 +267,52 @@ fn cases() -> Vec<Case> {
 
 fn live(case: &Case, inputs: &[ArtifactInput]) -> Result<Vec<u8>, PayloadError> {
     let mut out = Vec::new();
+    live_into(case, inputs, &mut out)?;
+    Ok(out)
+}
+
+fn live_into<W: Write>(case: &Case, inputs: &[ArtifactInput], out: W) -> Result<(), PayloadError> {
     if case.signed {
         let pair = key();
         append_trailer_signed(
             Cursor::new(case.base),
-            &mut out,
+            out,
             case.pinset,
             case.trust_set,
             inputs,
             |manifest| Ok(stamp(&pair, manifest)),
-        )?;
+        )
     } else {
         append_trailer(
             Cursor::new(case.base),
-            &mut out,
+            out,
             case.pinset,
             case.trust_set,
             inputs,
-        )?;
+        )
     }
-    Ok(out)
 }
 
 fn reference(case: &Case, inputs: &[ArtifactInput]) -> Result<Vec<u8>, PayloadError> {
     let mut out = Vec::new();
+    reference_into(case, inputs, &mut out)?;
+    Ok(out)
+}
+
+fn reference_into<W: Write>(
+    case: &Case,
+    inputs: &[ArtifactInput],
+    out: W,
+) -> Result<(), PayloadError> {
     let pair = key();
     reference_append(
         Cursor::new(case.base),
-        &mut out,
+        out,
         case.pinset,
         case.trust_set,
         inputs,
         |manifest| Ok(case.signed.then(|| stamp(&pair, manifest))),
-    )?;
-    Ok(out)
+    )
 }
 
 #[test]
@@ -394,6 +406,130 @@ fn a_source_changing_length_between_passes_writes_what_it_always_did() {
             let actual = actual.expect("the legacy writer does not refuse");
             let expected = expected.expect("nor did the pre-refactor one");
             assert_eq!(actual, expected, "delta {delta}");
+        }
+    }
+}
+
+/// The footer's eight fields.
+fn footer_fields(bytes: &[u8]) -> [u64; 8] {
+    let footer = &bytes[bytes.len() - FOOTER_SIZE..];
+    assert_eq!(&footer[..MAGIC.len()], MAGIC);
+    assert_eq!(footer[MAGIC.len()], FORMAT_VERSION);
+    let mut fields = [0u64; 8];
+    for (at, field) in fields.iter_mut().enumerate() {
+        let start = MAGIC.len() + 1 + at * 8;
+        *field = u64::from_le_bytes(footer[start..start + 8].try_into().expect("8 bytes"));
+    }
+    fields
+}
+
+#[test]
+fn a_nonempty_base_puts_the_manifest_after_it() {
+    let dir = tempfile::tempdir().expect("a source directory");
+    let inputs = inputs(dir.path());
+    for case in cases() {
+        let output = live(&case, &inputs).expect("the writer writes");
+        let [
+            manifest_offset,
+            manifest_len,
+            archive_offset,
+            archive_len,
+            signature_offset,
+            _,
+            key_id_offset,
+            _,
+        ] = footer_fields(&output);
+        assert_eq!(manifest_offset, case.base.len() as u64);
+        assert_eq!(&output[..case.base.len()], case.base);
+        assert_eq!(archive_offset, manifest_offset + manifest_len);
+        if case.signed {
+            assert_eq!(signature_offset, archive_offset + archive_len);
+            assert_eq!(
+                key_id_offset,
+                signature_offset + ED25519_SIGNATURE_LEN as u64
+            );
+        } else {
+            assert_eq!((signature_offset, key_id_offset), (0, 0));
+        }
+    }
+}
+
+/// A writer that accepts its first `limit` bytes and fails every write after
+/// them.
+struct FailAfter {
+    accepted: Vec<u8>,
+    limit: usize,
+}
+
+impl FailAfter {
+    fn new(limit: u64) -> FailAfter {
+        FailAfter {
+            accepted: Vec::new(),
+            limit: usize::try_from(limit).expect("a small limit"),
+        }
+    }
+}
+
+impl Write for FailAfter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.limit - self.accepted.len();
+        if left == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected write failure",
+            ));
+        }
+        let take = left.min(buf.len());
+        self.accepted.extend_from_slice(&buf[..take]);
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[track_caller]
+fn io_kind(error: &PayloadError) -> std::io::ErrorKind {
+    match error {
+        PayloadError::Io(error) => error.kind(),
+        other => panic!("expected an I/O failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_writer_failing_partway_keeps_what_it_accepted_as_before() {
+    let dir = tempfile::tempdir().expect("a source directory");
+    let inputs = inputs(dir.path());
+    for case in cases() {
+        let full = live(&case, &inputs).expect("the writer writes");
+        let [
+            _,
+            _,
+            archive_offset,
+            archive_len,
+            signature_offset,
+            _,
+            key_id_offset,
+            _,
+        ] = footer_fields(&full);
+        let footer_start = (full.len() - FOOTER_SIZE) as u64;
+        let mut points = vec![archive_offset + archive_len / 2, footer_start + 5];
+        if case.signed {
+            points.extend([signature_offset + 10, key_id_offset + 10]);
+        }
+        for point in points {
+            let mut live_out = FailAfter::new(point);
+            let live_error =
+                live_into(&case, &inputs, &mut live_out).expect_err("the writer fails");
+            let mut reference_out = FailAfter::new(point);
+            let reference_error = reference_into(&case, &inputs, &mut reference_out)
+                .expect_err("the reference fails");
+            assert_eq!(io_kind(&live_error), io_kind(&reference_error));
+            assert_eq!(io_kind(&live_error), std::io::ErrorKind::BrokenPipe);
+            let point = usize::try_from(point).expect("small");
+            assert_eq!(live_out.accepted, &full[..point], "at {point}");
+            assert_eq!(reference_out.accepted, live_out.accepted, "at {point}");
         }
     }
 }
