@@ -646,6 +646,8 @@ fn file_name(path: &Path) -> std::ffi::OsString {
 
 #[cfg(test)]
 mod tests {
+    mod provider;
+
     use std::path::{Path, PathBuf};
 
     use rcgen::{

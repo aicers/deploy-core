@@ -1,0 +1,18 @@
+{
+  "format_version": 6,
+  "archive_members": [
+    { "name": "bin/app", "length": 14 }
+  ],
+  "artifacts": [
+    {
+      "component": "example",
+      "version": "1.0.0",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "target_arch": "x86_64",
+      "kind": "native-binary",
+      "dispositions": ["install"],
+      "archive_path": "bin/app",
+      "sha256": "4659fc0570122b0e0aa14f4ff7c261b1fe51795a01ba79963f462ebf40d7520d"
+    }
+  ]
+}
