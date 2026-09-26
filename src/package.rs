@@ -1,7 +1,6 @@
-//! Whole-package content verification, the evidence it returns, the resource
-//! policy it enforces, and the retained bytes and publication it reads and
-//! writes through. The package writer APIs, which reuse the same checks, will
-//! land here too.
+//! Whole-package content verification, the evidence it returns, unsigned
+//! package preparation, the resource policy both enforce, and the retained
+//! bytes and publication they read and write through.
 //!
 //! # Full-content verification
 //!
@@ -80,6 +79,32 @@
 //! but may leave a dot-prefixed `.deploy-core-publish-<hex>.tmp` sibling
 //! behind when its own removal fails; removing stale ones is the caller's job.
 //!
+//! # Unsigned preparation
+//!
+//! A package is built in one job and signed in another, and the signing job
+//! sees only the raw manifest block. [`prepare_package`] copies every input
+//! once into private retained storage and builds exactly one raw manifest
+//! block and one compressed archive block from those copies, then checks them
+//! with the same unsigned-content core [`verify_contents`] runs and the
+//! statement checks that need no trust set. The [`PreparedPackage`] it
+//! returns is **unsigned and untrusted for installation**: no signature,
+//! trust floor, withdrawal or epoch has been decided, and its existence
+//! promises nothing about whether a signer or a trust set will accept it.
+//!
+//! Its [`PreparationBinding`] — the blocks' digests and lengths, the requested
+//! build, architecture, namespace and trust epoch — is data a caller
+//! correlates signing requests with, never a capability.
+//! [`PreparedPackage::persist`] writes the blocks and the binding's record as
+//! a new three-file directory, and [`reopen_prepared`] turns one back into a
+//! package only against a binding the caller saved independently, through
+//! held no-follow handles, fresh private copies and full revalidation. A
+//! package that crosses a process or job boundary always loses its standing
+//! until it is reopened that way. Failures of all three are a
+//! [`PackageWriteError`].
+//!
+//! Bytes the low-level [`payload`](crate::payload) writers assemble are not a
+//! finalized package, and neither is a prepared one.
+//!
 //! # Blocking
 //!
 //! Everything here is synchronous: it starts no task or thread, never sleeps,
@@ -114,18 +139,30 @@ use crate::content::ResourceLimit;
 use crate::payload::to_hex;
 use crate::retain::Charge;
 
+mod binding;
+mod bounded;
 mod contents;
+mod prepare;
+#[cfg(test)]
+mod prepare_fixture;
+mod reopen;
 mod source;
 
-// The unsigned-content core and the retained entry point, which the package
-// preparation and detached finalization work reuses. Only `contents` itself
-// calls them until that work lands, so the re-export is unused until then.
+pub use binding::{BindingField, PreparationBinding, RecordFault};
+// The unsigned-content core and the retained entry point, which detached
+// finalization reuses. Preparation calls the core through its own module path,
+// so until finalization lands nothing uses these re-exports.
 #[allow(unused_imports)]
 pub(crate) use contents::{CheckedContents, check_contents, verify_retained};
 pub use contents::{
     ContentError, IoOperation, VerifiedArtifact, VerifiedContents, VerifiedImage, VerifiedImageSet,
     VerifiedImages, verify_contents,
 };
+pub use prepare::{
+    DirectoryFault, PackageWriteError, PreparationFault, PreparationFile, PreparedPackage,
+    prepare_package,
+};
+pub use reopen::reopen_prepared;
 pub(crate) use source::RetainedIoFault;
 
 const KIB: u64 = 1024;
@@ -201,20 +238,31 @@ struct Backing {
     len: u64,
     sha256: [u8; 32],
     /// Held for its drop: the budget charge for the bytes this inode holds
-    /// is released with the last handle.
-    _charge: Charge,
+    /// is released with the last handle. Only the live-snapshot count the
+    /// tests keep reads it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    charge: Charge,
+}
+
+#[cfg(test)]
+impl Drop for Backing {
+    fn drop(&mut self) {
+        self.charge.count_live_snapshot(false);
+    }
 }
 
 impl RetainedBytes {
     /// Wraps a finished snapshot: `file` is read-only, its name is gone, and
     /// `len` and `sha256` describe exactly the bytes written to it.
     pub(crate) fn new(file: File, len: u64, sha256: [u8; 32], charge: Charge) -> Self {
+        #[cfg(test)]
+        charge.count_live_snapshot(true);
         Self {
             backing: Arc::new(Backing {
                 file,
                 len,
                 sha256,
-                _charge: charge,
+                charge,
             }),
         }
     }

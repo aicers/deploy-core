@@ -11,7 +11,7 @@ use crate::package::source::seam::{self, Observed, Op, Seam};
 use crate::payload::PayloadError;
 use crate::verify::{VerifyError, verify_package};
 
-mod fixture;
+pub(crate) mod fixture;
 
 use fixture::{
     Art, COMMIT, COMPONENT, Entry, NAMESPACE, Signer, VERSION, archive, legacy_manifest_bytes,
@@ -1757,6 +1757,7 @@ fn a_snapshot_mismatch_is_write_snapshot_at_the_snapshot_name() {
             },
             &RetentionSite {
                 read_source: IoOperation::ReadSnapshot,
+                source_path: None,
                 max_len: ContentLimits::default().resource_limit(LimitResource::Package),
                 staging_parent: None,
             },

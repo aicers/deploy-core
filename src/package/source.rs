@@ -82,6 +82,10 @@ pub(crate) enum SourceRole {
     Archive,
     /// An image member's snapshot, during image validation.
     Image,
+    /// An input's snapshot, while preparation writes the archive block.
+    Input,
+    /// A reopened record's or manifest's snapshot, read into memory.
+    Reopened,
 }
 
 /// A [`Read`] + [`Seek`] adapter over a [`RetainedReader`] whose own errors

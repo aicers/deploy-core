@@ -59,6 +59,8 @@ macro_rules! step {
         }
     }};
 }
+// The preparation and reopen code in `package` goes through the same seam.
+pub(crate) use step;
 
 #[cfg(test)]
 pub(crate) mod fault;
@@ -220,6 +222,10 @@ struct BudgetState {
     limit: u64,
     used: AtomicU64,
     high_water: AtomicU64,
+    /// Finished snapshots charged to this budget and still alive, for the
+    /// tests that show which storage an operation keeps.
+    #[cfg(test)]
+    live_snapshots: AtomicU64,
 }
 
 impl DiskBudget {
@@ -229,6 +235,8 @@ impl DiskBudget {
                 limit,
                 used: AtomicU64::new(0),
                 high_water: AtomicU64::new(0),
+                #[cfg(test)]
+                live_snapshots: AtomicU64::new(0),
             }),
         }
     }
@@ -243,6 +251,12 @@ impl DiskBudget {
 
     pub(crate) fn high_water(&self) -> u64 {
         self.state.high_water.load(Ordering::Acquire)
+    }
+
+    /// Returns how many finished snapshots charged to this budget are alive.
+    #[cfg(test)]
+    pub(crate) fn live_snapshots(&self) -> u64 {
+        self.state.live_snapshots.load(Ordering::Acquire)
     }
 
     /// Returns a charge holding nothing yet.
@@ -284,6 +298,16 @@ impl Charge {
                 granted
             }
             Err(_) => 0,
+        }
+    }
+
+    /// Counts a finished snapshot holding this charge as alive, or no longer.
+    #[cfg(test)]
+    pub(crate) fn count_live_snapshot(&self, alive: bool) {
+        if alive {
+            self.state.live_snapshots.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.state.live_snapshots.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -508,6 +532,12 @@ impl RetentionScope {
     /// Returns the most bytes ever charged against the budget at once.
     pub(crate) fn budget_high_water(&self) -> u64 {
         self.budget.high_water()
+    }
+
+    /// Returns how many finished snapshots from this scope are alive.
+    #[cfg(test)]
+    pub(crate) fn live_snapshots(&self) -> u64 {
+        self.budget.live_snapshots()
     }
 
     /// Creates a new snapshot file in the private directory.

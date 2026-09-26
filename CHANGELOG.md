@@ -63,6 +63,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   an architecture mismatch, a named `package::LimitResource`, or an I/O
   failure naming its `package::IoOperation`. `verify_package` and
   `extract_to` are unchanged and remain metadata and legacy interfaces.
+- `package::prepare_package`, which prepares an unsigned standalone package for
+  a separate signing step. It copies each input once into private retained
+  storage and builds exactly one raw manifest block and one compressed archive
+  block from those copies — so a source changed afterwards cannot put bytes
+  into the archive the manifest does not declare — and checks them with the
+  same content checks `verify_contents` runs and the statement checks that
+  need no trust set, refusing every byte that would cross a
+  `package::ContentLimits` ceiling before it is written. The returned
+  `package::PreparedPackage` is unsigned and untrusted for installation: it
+  decides no signature, trust floor, withdrawal or epoch. Its
+  `package::PreparationBinding` records the blocks' digests and lengths, the
+  requested build, architecture, namespace and trust epoch, round-trips
+  through a canonical JSON record with `to_record_bytes` and
+  `from_record_bytes`, and is data to correlate signing requests with, never
+  a capability. `persist` writes the manifest, the archive and the record as a
+  new three-file directory without replacing an existing entry, and
+  `package::reopen_prepared` turns one back into a package only against a
+  binding the caller saved itself, refusing symbolic links, non-regular,
+  extra, missing and group- or other-writable entries and any file swapped
+  while it was opened, then copying and revalidating everything. Failures are
+  a `package::PackageWriteError` naming a `package::BindingField`,
+  `package::PreparationFile`, `package::DirectoryFault`,
+  `package::PreparationFault` or `package::RecordFault`, and an I/O failure
+  reaching a persisted preparation names `package::IoOperation::OpenPreparation`.
 - `roxyd_selfupdate_contract`, the frozen on-disk contract the roxyd self-update
   rollback supervisor coordinates through: the record directory, the file names,
   the canonical roxyd binary path, the decision subcommand and its three
