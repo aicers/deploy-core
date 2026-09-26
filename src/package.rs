@@ -1,13 +1,95 @@
-//! Whole-package content APIs, the resource policy they share, and the
-//! retained bytes and publication they read and write through.
+//! Whole-package content verification, the evidence it returns, the resource
+//! policy it enforces, and the retained bytes and publication it reads and
+//! writes through. The package writer APIs, which reuse the same checks, will
+//! land here too.
 //!
-//! This module will also host the package verification and writer APIs, which
-//! check and produce complete packages together with the container images they
-//! carry. What it holds today is what those APIs are built on.
+//! # Full-content verification
 //!
-//! [`ContentLimits`] is the policy they enforce: the finite ceilings on every
-//! resource reading a package's full content can consume — bytes stored and
-//! decoded, entries, path lengths, JSON documents and nesting, disk and
+//! [`verify_contents`] turns an authenticated component package into
+//! immutable, fully checked evidence. It is the one path image consumers
+//! reach image bytes they can load through, and native and Compose consumers
+//! get the same retained bytes to install from. It runs, in this order, and
+//! the first failure is the result:
+//!
+//! 1. **snapshot** — the caller's source is sought to its start and copied
+//!    exactly once into private retained storage, at most `Package` bytes;
+//!    nothing after this reads the source again;
+//! 2. **bounded authentication** — the footer is located and validated, its
+//!    manifest and archive lengths are held to `RawManifest` and
+//!    `CompressedArchive` before either block is read, and then the snapshot
+//!    goes through the pipeline [`verify_package`](crate::verify::verify_package)
+//!    runs: signature over the raw bytes, format and trust floor, typed parse,
+//!    then completeness, identifiers, withdrawal, target, epoch and the image
+//!    declaration passes, every verdict and its precedence unchanged;
+//! 3. **architecture** — every artifact must be built for the one requested
+//!    [`TargetArch`](crate::manifest::TargetArch); the host's is never
+//!    inferred;
+//! 4. **legacy refusal** — a container image without a declaration, which only
+//!    an admitted legacy manifest can carry, is refused as
+//!    [`ImageVerifyError::LegacyImageEvidence`](crate::verify::ImageVerifyError::LegacyImageEvidence)
+//!    and never reported as no images;
+//! 5. **outer extraction** — the whole archive block is decoded under a capped
+//!    zstd window and walked, member by member, into private snapshots, with
+//!    every rule the legacy extraction applies — the same walk, not a copy of
+//!    it — and `OuterMembers` and `OuterUncompressedTotal` enforced on what is
+//!    actually read; every member and the archive's end are checked before
+//!    any image is;
+//! 6. **images** — each image archive, in manifest order and one at a time,
+//!    against its signed declaration.
+//!
+//! Resource, framing and I/O refusals can come before the authentication
+//! verdicts: a package over a limit, or whose storage fails, is refused for
+//! that whatever its signature. No image semantics ever do. No success,
+//! handle or callback escapes before every step has passed, and on failure
+//! every snapshot the call made and its private directory are released.
+//!
+//! # Immutability and its boundary
+//!
+//! Validated content has to be read from bytes nothing outside this library
+//! can change between the check and the use. [`RetainedBytes`] is that: a
+//! read-only handle on a private, already unlinked copy the library made of
+//! an untrusted source, readable only through a [`RetainedReader`]. It exposes
+//! no path, file or descriptor, so caller writes, replaced pathnames and
+//! descriptors the caller kept open on the original cannot reach it. Every
+//! [`VerifiedContents`] accessor reads such bytes.
+//!
+//! The protection has a boundary. The caller supplies a trusted filesystem and
+//! process isolation; nothing here defends against root, against other
+//! processes running as the same user, against same-process memory access or
+//! same-user `/proc` descriptor access, or against a malicious filesystem or
+//! failing hardware. Retained copies are transient, not durable: the operating
+//! system reclaims them when their last handle drops or the process exits.
+//!
+//! # What is not evidence
+//!
+//! [`VerifiedPackage`](crate::verify::VerifiedPackage) is a metadata handle
+//! over authenticated statements, and
+//! [`extract_to`](crate::verify::VerifiedPackage::extract_to) writes files a
+//! caller can change afterwards; both remain legacy interfaces, and nothing
+//! turns either into evidence. Neither does a path, a claimed hash, an
+//! [`ExtractedArtifact`](crate::payload::ExtractedArtifact) or a document.
+//!
+//! Publishing retained bytes to a caller-chosen destination, through
+//! [`VerifiedContents::publish_package`], reports through [`PublishedPackage`]
+//! and [`PublicationError`]. A [`PublishedPackage`] is a receipt for a mutable
+//! path, not evidence. Publication never replaces an existing entry, and a
+//! failure after the output became visible is reported as
+//! [`PublicationError::PublishDurability`] rather than as success or as a
+//! clean failure. A failure before that point leaves the destination absent,
+//! but may leave a dot-prefixed `.deploy-core-publish-<hex>.tmp` sibling
+//! behind when its own removal fails; removing stale ones is the caller's job.
+//!
+//! # Blocking
+//!
+//! Everything here is synchronous: it starts no task or thread, never sleeps,
+//! and reaches no network or container runtime. An async consumer runs it on
+//! a blocking worker of its own and owns that worker's cancellation.
+//!
+//! # Resource policy
+//!
+//! [`ContentLimits`] is the policy every step enforces: the finite ceilings on
+//! every resource reading a package's full content can consume — bytes stored
+//! and decoded, entries, path lengths, JSON documents and nesting, disk and
 //! buffers — together with [`LimitResource`], which names each ceiling, and
 //! [`ContentLimitsError`], which reports a setting that was refused.
 //!
@@ -19,30 +101,6 @@
 //!
 //! These are operational ceilings only. They change neither the manifest
 //! versions a verifier accepts nor any trust floor.
-//!
-//! Validated package and image content has to be read from bytes nothing
-//! outside this library can change between the check and the use.
-//! [`RetainedBytes`] is that: a read-only handle on a private, already
-//! unlinked copy the library made of an untrusted source, readable only
-//! through a [`RetainedReader`]. It exposes no path, file or descriptor, so
-//! caller writes, replaced pathnames and descriptors the caller kept open on
-//! the original cannot reach it.
-//!
-//! The protection has a boundary. The caller supplies a trusted filesystem and
-//! process isolation; nothing here defends against root, against other
-//! processes running as the same user, against same-process memory access or
-//! same-user `/proc` descriptor access, or against a malicious filesystem or
-//! failing hardware. Retained copies are transient, not durable: the operating
-//! system reclaims them when their last handle drops or the process exits.
-//!
-//! Publishing retained bytes to a caller-chosen destination reports through
-//! [`PublishedPackage`] and [`PublicationError`]. Publication never replaces
-//! an existing entry, and a failure after the output became visible is
-//! reported as [`PublicationError::PublishDurability`] rather than as success
-//! or as a clean failure. A failure before that point leaves the destination
-//! absent, but may leave a dot-prefixed `.deploy-core-publish-<hex>.tmp`
-//! sibling behind when its own removal fails; removing stale ones is the
-//! caller's job.
 
 use std::fmt;
 use std::fs::File;
@@ -54,6 +112,19 @@ use std::sync::Arc;
 use crate::content::ResourceLimit;
 use crate::payload::to_hex;
 use crate::retain::Charge;
+
+mod contents;
+mod source;
+
+// The unsigned-content core and the retained entry point, which the package
+// preparation and detached finalization work reuses.
+#[allow(unused_imports)]
+pub(crate) use contents::{CheckedContents, check_contents, verify_retained};
+pub use contents::{
+    ContentError, IoOperation, VerifiedArtifact, VerifiedContents, VerifiedImage, VerifiedImageSet,
+    VerifiedImages, verify_contents,
+};
+pub(crate) use source::RetainedIoFault;
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -147,9 +218,6 @@ impl RetainedBytes {
     }
 
     /// Returns another handle on the same retained copy.
-    // Consumed by the verification and finalization work that lands after
-    // this storage core; until then only tests call it.
-    #[allow(dead_code)]
     pub(crate) fn share(&self) -> RetainedBytes {
         Self {
             backing: Arc::clone(&self.backing),
@@ -509,10 +577,6 @@ pub enum DirectoryTrustReason {
 impl DirectoryTrustReason {
     /// Returns the [`io::ErrorKind`] a consumer reporting this refusal as
     /// I/O uses.
-    // Consumed by the verification, preparation and finalization work that
-    // maps these refusals onto its own I/O errors; until then only tests call
-    // it.
-    #[allow(dead_code)]
     pub(crate) fn io_kind(self) -> io::ErrorKind {
         match self {
             Self::NotAbsolute
@@ -802,9 +866,6 @@ impl ContentLimits {
 
     /// Returns `resource` with its configured value, the form every primitive
     /// takes a per-item limit in, so each fault names the resource it hit.
-    // Consumed only by the tests until the image-archive validator and the
-    // package pipeline are built on these primitives.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resource_limit(&self, resource: LimitResource) -> ResourceLimit {
         ResourceLimit {
             resource,
@@ -813,9 +874,6 @@ impl ContentLimits {
     }
 
     /// Returns the configured `CopyBuffer` as a buffer length.
-    // Consumed only by the tests until the image-archive validator and the
-    // package pipeline are built on these primitives.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn copy_buffer_len(&self) -> usize {
         crate::content::alloc_len(
             self.get(LimitResource::CopyBuffer),

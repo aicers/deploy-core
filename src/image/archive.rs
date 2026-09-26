@@ -93,8 +93,9 @@ const IMPOSSIBLE_FAULT: &str = "a content primitive reported a fault its call si
 /// A summary of an image archive that passed validation, for the caller's
 /// bookkeeping. It is not evidence: the evidence is the declaration it was
 /// held against.
-// Consumed by package verification, whose wiring lands separately; until
-// then only the tests call it.
+// Package verification keeps one per image for the preparation and
+// finalization work that reports it; until that lands only the tests read
+// its fields.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ValidatedImageArchive {
@@ -109,8 +110,8 @@ pub(crate) struct ValidatedImageArchive {
 }
 
 /// Where one accepted regular file of the image tar lies.
-// Consumed by package verification, whose wiring lands separately; until
-// then only the tests call it.
+// Read only by the tests until the preparation and finalization work that
+// reports a validated archive lands.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecordedEntry {
@@ -125,9 +126,6 @@ pub(crate) struct RecordedEntry {
 }
 
 /// Why [`validate_image_archive`] refused an archive.
-// Consumed by package verification, whose wiring lands separately; until
-// then only the tests call it.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum ImageArchiveFault {
     /// The archive is excluded from the profile, malformed, or disagrees with
@@ -157,9 +155,6 @@ pub(crate) enum ImageArchiveFault {
 ///
 /// Returns the first verdict in phase order, as the module documentation
 /// states it.
-// Consumed by package verification, whose wiring lands separately; until
-// then only the tests call it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_image_archive<R: Read + Seek>(
     mut source: R,
     declaration: &ImageDeclaration,

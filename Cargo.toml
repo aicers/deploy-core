@@ -44,6 +44,14 @@ name = "write_synthetic_image"
 path = "examples/write_synthetic_image/main.rs"
 required-features = ["test-support"]
 
+# Generates a signed package fixture and measures `package::verify_contents`
+# over it; built on `image::test_support`, so it exists only under
+# `test-support`.
+[[example]]
+name = "measure_verify_contents"
+path = "examples/measure_verify_contents/main.rs"
+required-features = ["test-support"]
+
 [[test]]
 name = "synthetic_image_builder"
 required-features = ["test-support"]
@@ -54,6 +62,10 @@ required-features = ["test-support"]
 
 [[test]]
 name = "write_synthetic_image_cli"
+required-features = ["test-support"]
+
+[[test]]
+name = "verify_contents"
 required-features = ["test-support"]
 
 [lints.clippy]
