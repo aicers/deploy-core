@@ -763,9 +763,11 @@ fn retention_errors_round_trip_through_io() {
                 reason: DirectoryTrustReason::UntrustedOwner,
             },
             RetentionError::SnapshotMismatch {
+                path: PathBuf::from("/p/snap-0"),
                 kind: SnapshotMismatchKind::Identity,
             },
             RetentionError::SnapshotMismatch {
+                path: PathBuf::from("/p/snap-1"),
                 kind: SnapshotMismatchKind::Length {
                     expected: 3,
                     actual: 4,

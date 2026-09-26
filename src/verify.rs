@@ -109,9 +109,10 @@ use crate::manifest::{
     self, ArtifactKind, MAX_MANIFEST_FORMAT_VERSION, ManifestError, PayloadArtifact,
     PayloadManifest, TargetArch, is_safe_archive_path,
 };
+use crate::package::LimitResource;
 use crate::payload::{
-    self, EnvelopeBlock, EnvelopeBounds, ExtractedArtifact, Payload, PayloadError,
-    UnparsedContainer,
+    self, BoundedContainerError, ContainerBounds, EnvelopeBlock, EnvelopeBounds, ExtractedArtifact,
+    Payload, PayloadError, UnparsedContainer,
 };
 
 mod image_archive;
@@ -1410,8 +1411,90 @@ pub fn verify_package<R: Read + Seek>(
     //    use, because at this point nothing about the container is trusted yet.
     let container = payload::read_package_container(src, &ENVELOPE_BOUNDS)?;
 
+    let manifest = authenticate(&container, trust, request)?;
+    Ok(VerifiedPackage {
+        payload: container.into_payload(manifest),
+    })
+}
+
+/// What [`verify_package_bounded`] returns: the authenticated manifest and
+/// where the archive block lies, as the validated footer records it.
+#[derive(Debug)]
+pub(crate) struct BoundedVerified {
+    /// The manifest, authenticated and past every statement check.
+    pub(crate) manifest: PayloadManifest,
+    /// The archive block's offset within the container.
+    pub(crate) archive_offset: u64,
+    /// The archive block's length, at most the bound it was held to.
+    pub(crate) archive_len: u64,
+}
+
+/// Why [`verify_package_bounded`] refused a package.
+#[derive(Debug)]
+pub(crate) enum BoundedVerifyError {
+    /// A verdict, exactly as [`verify_package`] reports it.
+    Verify(VerifyError),
+    /// A block the footer advertises is longer than its ceiling.
+    LimitExceeded {
+        /// `RawManifest` or `CompressedArchive`.
+        resource: LimitResource,
+        /// That resource's configured value.
+        limit: u64,
+    },
+    /// Retained storage failed a read or a seek; the original error.
+    Io(std::io::Error),
+}
+
+/// Verifies a package exactly as [`verify_package`] does, with the footer's
+/// manifest and archive lengths held to `bounds` before either block is read,
+/// and retained-storage failures told apart from framing verdicts.
+///
+/// `src` is expected to be a retained snapshot read through a
+/// `RetainedSource`, whose own failures carry a `RetainedIoFault` payload; one
+/// is recovered, before anything else classifies the error, as
+/// [`BoundedVerifyError::Io`]. Every other verdict and its order is
+/// [`verify_package`]'s, since both share the framing, the envelope read and
+/// every check after it.
+///
+/// # Errors
+///
+/// Returns [`BoundedVerifyError::LimitExceeded`] naming `RawManifest` or
+/// `CompressedArchive`, [`BoundedVerifyError::Io`] for a retained-storage
+/// failure, and [`BoundedVerifyError::Verify`] carrying what
+/// [`verify_package`] would return.
+pub(crate) fn verify_package_bounded<R: Read + Seek>(
+    src: R,
+    trust: &TrustSet,
+    request: &VerifyRequest,
+    bounds: ContainerBounds,
+) -> Result<BoundedVerified, BoundedVerifyError> {
+    let container = payload::read_package_container_bounded(src, &ENVELOPE_BOUNDS, bounds)
+        .map_err(|error| match error {
+            BoundedContainerError::Payload(error) => BoundedVerifyError::Verify(error.into()),
+            BoundedContainerError::LimitExceeded { resource, limit } => {
+                BoundedVerifyError::LimitExceeded { resource, limit }
+            }
+            BoundedContainerError::RetainedIo(error) => BoundedVerifyError::Io(error),
+        })?;
+    let manifest = authenticate(&container, trust, request).map_err(BoundedVerifyError::Verify)?;
+    let (archive_offset, archive_len) = container.archive_block();
+    Ok(BoundedVerified {
+        manifest,
+        archive_offset,
+        archive_len,
+    })
+}
+
+/// Steps 2 onwards of the order this module states, over a container whose
+/// blocks have been read: the signature over the raw manifest bytes, the
+/// version floor, the typed parse, then [`check_statements`].
+fn authenticate<R: Read + Seek>(
+    container: &UnparsedContainer<R>,
+    trust: &TrustSet,
+    request: &VerifyRequest,
+) -> Result<PayloadManifest, VerifyError> {
     // 2. Authenticate the raw manifest bytes before anything parses them.
-    verify_signature(&container, trust)?;
+    verify_signature(container, trust)?;
 
     // 3. The version question, decided from stage one alone — before the body
     //    is decoded, so a manifest this build cannot make sense of is refused
@@ -1428,19 +1511,105 @@ pub fn verify_package<R: Read + Seek>(
     let manifest = PayloadManifest::parse(container.manifest_bytes(), container.footer_version())
         .map_err(map_manifest_error)?;
 
-    // 5-9. About the package first, about the request last.
-    check_completeness(&manifest)?;
-    check_identifiers(&manifest)?;
-    check_withdrawal(&manifest, trust)?;
-    check_target(&manifest, request)?;
-    check_epoch(request, trust)?;
+    // 5-15. The statements the authenticated manifest makes.
+    check_statements(&manifest, request, Some(trust))?;
 
-    // 10-15. The image declaration semantics, each a whole-manifest pass.
-    check_images(&manifest, request).map_err(VerifyError::Image)?;
+    Ok(manifest)
+}
 
-    Ok(VerifiedPackage {
-        payload: container.into_payload(manifest),
-    })
+/// Runs the post-parse statement checks — steps 5 through 15 — as one unit,
+/// in exactly this order and each at most once:
+///
+/// 1. completeness;
+/// 2. safe identifiers;
+/// 3. withdrawal, **only when `trust` is `Some`**;
+/// 4. the exact build target;
+/// 5. the reserved-target epoch, **only when `trust` is `Some`**;
+/// 6. the whole-manifest image passes, reported as [`VerifyError::Image`].
+///
+/// This is the one home of that sequence: [`verify_package`] makes a single
+/// call with `Some`, whose body is exactly the order it always had.
+///
+/// With `None`, withdrawal and the epoch are skipped — they are the two
+/// checks that read a verifier's [`TrustSet`] — and the other four run in the
+/// same relative order. **An `Ok` from a `None` call decides nothing about
+/// withdrawal, the epoch, the signature or the trust floor**: withdrawal and
+/// the epoch are decided only when a [`TrustSet`] is supplied, and the
+/// signature and trust floor only in the authenticated pipeline.
+pub(crate) fn check_statements(
+    manifest: &PayloadManifest,
+    request: &VerifyRequest,
+    trust: Option<&TrustSet>,
+) -> Result<(), VerifyError> {
+    // About the package first, about the request last.
+    statement(Statement::Completeness);
+    check_completeness(manifest)?;
+    statement(Statement::Identifiers);
+    check_identifiers(manifest)?;
+    if let Some(trust) = trust {
+        statement(Statement::Withdrawal);
+        check_withdrawal(manifest, trust)?;
+    }
+    statement(Statement::Target);
+    check_target(manifest, request)?;
+    if let Some(trust) = trust {
+        statement(Statement::Epoch);
+        check_epoch(request, trust)?;
+    }
+
+    // The image declaration semantics, each a whole-manifest pass.
+    statement(Statement::Images);
+    check_images(manifest, request).map_err(VerifyError::Image)
+}
+
+/// One statement check, as the test recorder names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Statement {
+    Completeness,
+    Identifiers,
+    Withdrawal,
+    Target,
+    Epoch,
+    Images,
+}
+
+/// Records that `check` is about to run, for the call-order tests. A release
+/// build records nothing.
+#[cfg(not(test))]
+fn statement(_check: Statement) {}
+
+#[cfg(test)]
+fn statement(check: Statement) {
+    statement_order::record(check);
+}
+
+/// The test-only call-order recorder of [`check_statements`].
+#[cfg(test)]
+pub(crate) mod statement_order {
+    use std::cell::RefCell;
+
+    use super::Statement;
+
+    thread_local! {
+        static RECORD: RefCell<Option<Vec<Statement>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(check: Statement) {
+        RECORD.with(|slot| {
+            if let Some(record) = slot.borrow_mut().as_mut() {
+                record.push(check);
+            }
+        });
+    }
+
+    /// Runs `body` with recording on, and returns what it returned with the
+    /// checks it started, in order.
+    pub(crate) fn recorded<T>(body: impl FnOnce() -> T) -> (T, Vec<Statement>) {
+        RECORD.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let result = body();
+        let record = RECORD.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+        (result, record)
+    }
 }
 
 /// Reads the container's `key_id` block as a selection hint, or reports that
@@ -4759,5 +4928,216 @@ mod tests {
             verify_err(SIGNED_V6_PACKAGE, &floor, &request),
             VerifyError::UnsupportedManifestFormat { found, .. } if found == IMAGE_DECLARATION_FORMAT_VERSION
         ));
+    }
+
+    // ---- The statement checks as one unit --------------------------------
+
+    mod statements {
+        use super::super::{Statement, check_statements, statement_order};
+        use super::{
+            ARTIFACT_BYTES, ARTIFACT_SHA256, COMMIT, COMPONENT, Ed25519KeyPair, ImagePlatform,
+            MEMBER, TRUST_TARGET, TrustAnchor, TrustSet, VERSION, VerifyError, VerifyRequest,
+            artifact_json, declaration, default_artifact, image_artifact_json, keypair, len_u64,
+            manifest_json, namespaced, public_key_of, signed_pkg, verify_err,
+        };
+        use crate::image::ImageArchitecture;
+        use crate::manifest::PayloadManifest;
+        use crate::payload::FORMAT_VERSION;
+
+        const ALL: [Statement; 6] = [
+            Statement::Completeness,
+            Statement::Identifiers,
+            Statement::Withdrawal,
+            Statement::Target,
+            Statement::Epoch,
+            Statement::Images,
+        ];
+
+        fn parse(manifest: &[u8]) -> PayloadManifest {
+            PayloadManifest::parse(manifest, FORMAT_VERSION).expect("the fixture parses")
+        }
+
+        fn trust(pair: &Ed25519KeyPair, withdrawn: &[(&str, &str, &str)], epoch: u64) -> TrustSet {
+            TrustSet::new(
+                vec![TrustAnchor::new(public_key_of(pair), false)],
+                withdrawn
+                    .iter()
+                    .map(|(a, b, c)| ((*a).to_string(), (*b).to_string(), (*c).to_string()))
+                    .collect(),
+                0,
+                epoch,
+            )
+            .expect("a trust set")
+        }
+
+        fn manifest_of(entries: &[String]) -> Vec<u8> {
+            let paths: Vec<String> = entries
+                .iter()
+                .enumerate()
+                .map(|(at, _)| format!("m{at}"))
+                .collect();
+            let entries: Vec<String> = entries
+                .iter()
+                .zip(&paths)
+                .map(|(entry, path)| entry.replace(MEMBER, path))
+                .collect();
+            let members: Vec<(&str, u64)> = paths
+                .iter()
+                .map(|path| (path.as_str(), len_u64(ARTIFACT_BYTES)))
+                .collect();
+            manifest_json(&members, &entries)
+        }
+
+        fn entry(component: &str, version: &str) -> String {
+            artifact_json(
+                component,
+                version,
+                COMMIT,
+                "native-binary",
+                MEMBER,
+                ARTIFACT_SHA256,
+            )
+        }
+
+        /// An image whose declared architecture is not its artifact's: an
+        /// image pass fault.
+        fn misdeclared_image() -> String {
+            let mut image = declaration("database", &["registry.example/db:1.0"]);
+            image.platform = ImagePlatform {
+                architecture: ImageArchitecture::Arm64,
+                ..image.platform
+            };
+            image_artifact_json(MEMBER, &image)
+        }
+
+        fn same_as_verify_package(
+            manifest: &[u8],
+            trust: &TrustSet,
+            request: &VerifyRequest,
+            pair: &Ed25519KeyPair,
+        ) -> VerifyError {
+            let direct = check_statements(&parse(manifest), request, Some(trust))
+                .expect_err("the statements are refused");
+            let package = signed_pkg(pair, manifest, &super::default_archive(), None);
+            let through = verify_err(&package, trust, request);
+            assert_eq!(format!("{direct:?}"), format!("{through:?}"));
+            direct
+        }
+
+        #[test]
+        fn with_a_trust_set_it_is_verify_packages_post_parse_verdict() {
+            let pair = keypair();
+            let plain = VerifyRequest::for_package(COMPONENT, VERSION, COMMIT).expect("a request");
+            let manifest = manifest_of(&[default_artifact()]);
+            let (result, order) = statement_order::recorded(|| {
+                check_statements(&parse(&manifest), &plain, Some(&trust(&pair, &[], 0)))
+            });
+            result.expect("the default fixture passes");
+            assert_eq!(order, ALL);
+
+            // Identifier before withdrawal.
+            let unsafe_version = manifest_of(&[entry(COMPONENT, "-1")]);
+            let withdrawn_unsafe = trust(&pair, &[(COMPONENT, "-1", COMMIT)], 0);
+            assert!(matches!(
+                same_as_verify_package(&unsafe_version, &withdrawn_unsafe, &plain, &pair),
+                VerifyError::UnsafeBuildIdentifier { .. }
+            ));
+
+            // Withdrawal before target.
+            let withdrawn = trust(&pair, &[(COMPONENT, VERSION, COMMIT)], 0);
+            let other = VerifyRequest::for_package(COMPONENT, "2.0.0", COMMIT).expect("a request");
+            let (error, order) = statement_order::recorded(|| {
+                same_as_verify_package(&manifest, &withdrawn, &other, &pair)
+            });
+            assert!(matches!(error, VerifyError::WithdrawnBuild { .. }));
+            assert_eq!(order.get(..3), Some(&ALL[..3]), "stops at withdrawal");
+
+            // Target before epoch, epoch before the image passes.
+            let trust_manifest = manifest_of(&[
+                entry(TRUST_TARGET, "8"),
+                misdeclared_image()
+                    .replace(COMPONENT, TRUST_TARGET)
+                    .replace(VERSION, "8"),
+            ]);
+            let active = trust(&pair, &[], 10);
+            let mismatch = VerifyRequest::for_trust("9", COMMIT, 5).expect("a request");
+            assert!(matches!(
+                same_as_verify_package(&trust_manifest, &active, &mismatch, &pair),
+                VerifyError::TargetMismatch { .. }
+            ));
+            let stale = VerifyRequest::for_trust("8", COMMIT, 5).expect("a request");
+            let (error, order) = statement_order::recorded(|| {
+                same_as_verify_package(&trust_manifest, &active, &stale, &pair)
+            });
+            assert!(matches!(error, VerifyError::StaleTrustSet { .. }));
+            assert_eq!(order.get(..5), Some(&ALL[..5]), "stops at the epoch");
+        }
+
+        #[test]
+        fn each_check_runs_once_in_order_and_a_failure_stops_the_rest() {
+            let pair = keypair();
+            let manifest = manifest_of(&[entry(COMPONENT, VERSION)]);
+            let other = VerifyRequest::for_package(COMPONENT, "2.0.0", COMMIT).expect("a request");
+            let (result, order) = statement_order::recorded(|| {
+                check_statements(&parse(&manifest), &other, Some(&trust(&pair, &[], 0)))
+            });
+            assert!(matches!(result, Err(VerifyError::TargetMismatch { .. })));
+            assert_eq!(order, ALL[..4]);
+        }
+
+        #[test]
+        fn without_a_trust_set_withdrawal_and_the_epoch_are_not_checked() {
+            let pair = keypair();
+            let manifest = manifest_of(&[entry(TRUST_TARGET, "8")]);
+            let withdrawn_and_active = trust(&pair, &[(TRUST_TARGET, "8", COMMIT)], 10);
+            let stale = VerifyRequest::for_trust("8", COMMIT, 5).expect("a request");
+            // With the trust set both are refused, withdrawal first...
+            assert!(matches!(
+                check_statements(&parse(&manifest), &stale, Some(&withdrawn_and_active)),
+                Err(VerifyError::WithdrawnBuild { .. })
+            ));
+            // ...and without one neither is checked at all.
+            let (result, order) =
+                statement_order::recorded(|| check_statements(&parse(&manifest), &stale, None));
+            result.expect("nothing trust-dependent is decided");
+            assert_eq!(
+                order,
+                [
+                    Statement::Completeness,
+                    Statement::Identifiers,
+                    Statement::Target,
+                    Statement::Images
+                ]
+            );
+        }
+
+        #[test]
+        fn without_a_trust_set_the_other_four_keep_their_order() {
+            // An unsafe identifier before a target mismatch.
+            let manifest = manifest_of(&[entry(COMPONENT, "-1")]);
+            let other = VerifyRequest::for_package(COMPONENT, "2.0.0", COMMIT).expect("a request");
+            assert!(matches!(
+                check_statements(&parse(&manifest), &other, None),
+                Err(VerifyError::UnsafeBuildIdentifier { .. })
+            ));
+            // A target mismatch before an image pass fault.
+            let manifest = manifest_of(&[misdeclared_image()]);
+            let other = VerifyRequest::for_namespaced_package(
+                COMPONENT,
+                "2.0.0",
+                COMMIT,
+                "example-product",
+            )
+            .expect("a request");
+            assert!(matches!(
+                check_statements(&parse(&manifest), &other, None),
+                Err(VerifyError::TargetMismatch { .. })
+            ));
+            // And the image pass fault once the target agrees.
+            assert!(matches!(
+                check_statements(&parse(&manifest), &namespaced(), None),
+                Err(VerifyError::Image(_))
+            ));
+        }
     }
 }

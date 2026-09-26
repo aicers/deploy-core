@@ -43,8 +43,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   disk and buffers — each starting at a generous library default. A caller may
   lower any of them with `with_limit` and never raise one; a value above the
   default, a zero copy buffer, JSON depth or zstd window, and a zstd window
-  below 1 KiB are refused as a `package::ContentLimitsError`. No existing API
-  consults it yet.
+  below 1 KiB are refused as a `package::ContentLimitsError`.
+  `package::verify_contents` enforces it.
+- `package::verify_contents`, which turns a signed component package into
+  immutable, fully checked evidence for one requested `TargetArch`. It copies
+  the package once into private retained storage, authenticates that copy
+  with exactly the verdicts `verify::verify_package` gives, refuses a
+  manifest or archive block over its limit before reading it, refuses any
+  artifact built for another architecture and any legacy undeclared image,
+  extracts and hashes every outer member, and only then holds each image
+  archive to its signed declaration. The returned
+  `package::VerifiedContents` exposes the authenticated manifest, every
+  artifact's bytes as a `package::VerifiedArtifact`, the images as
+  `package::VerifiedImages`, and the exact package bytes, all as read-only
+  `package::RetainedBytes` that later changes to the original cannot reach;
+  `publish_package` writes the package to a new path without ever replacing
+  an existing entry and returns a `package::PublishedPackage` receipt.
+  Failures are a `package::ContentError`: a `verify::VerifyError` unchanged,
+  an architecture mismatch, a named `package::LimitResource`, or an I/O
+  failure naming its `package::IoOperation`. `verify_package` and
+  `extract_to` are unchanged and remain metadata and legacy interfaces.
 - `roxyd_selfupdate_contract`, the frozen on-disk contract the roxyd self-update
   rollback supervisor coordinates through: the record directory, the file names,
   the canonical roxyd binary path, the decision subcommand and its three

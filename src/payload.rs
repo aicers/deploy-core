@@ -78,14 +78,14 @@
 //! manifest, a hash mismatch, an unsafe or unknown archive member) is a
 //! [`PayloadError`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
-use tar::{Archive, Builder, EntryType, Header};
+use tar::{Builder, EntryType, Header};
 use tempfile::Builder as TempBuilder;
-use zstd::{Decoder, Encoder};
+use zstd::Encoder;
 
 use crate::durability::sync_dir;
 use crate::image::ImageDeclaration;
@@ -94,6 +94,11 @@ use crate::manifest::{
     TargetArch, is_safe_archive_path,
 };
 use crate::module_spec::ModuleSpec;
+use crate::package::{LimitResource, RetainedIoFault};
+
+mod outer;
+
+pub(crate) use outer::{MemberSink, OuterLimits, SinkFault, WalkError, walk_outer};
 
 /// Magic bytes at the start of the footer, identifying a bootler payload.
 pub const MAGIC: [u8; 8] = *b"BTLRPYLD";
@@ -206,11 +211,12 @@ const TAR_BLOCK_SIZE: usize = 512;
 /// Most bytes allowed to remain in the decompressed archive block once the
 /// entry walk has stopped, and all of them must be zero.
 ///
-/// The end-of-archive marker is two zero blocks. [`Archive::entries`] reads the
-/// first of them, sees an all-zero header, and reports the end without touching
-/// the second, so a well-formed archive leaves exactly one block unread. That
-/// block is the whole allowance: a zero byte past it belongs to no marker, and
-/// tolerating it would admit padding the manifest cannot bind.
+/// The end-of-archive marker is two zero blocks. [`tar::Archive::entries`]
+/// reads the first of them, sees an all-zero header, and reports the end
+/// without touching the second, so a well-formed archive leaves exactly one
+/// block unread. That block is the whole allowance: a zero byte past it belongs
+/// to no marker, and tolerating it would admit padding the manifest cannot
+/// bind.
 const MAX_END_OF_ARCHIVE_BYTES: usize = TAR_BLOCK_SIZE;
 
 /// Width of the `tar` header's name field, and so the longest `archive_path`
@@ -1442,6 +1448,12 @@ impl<R: Read + Seek> UnparsedContainer<R> {
         &self.manifest_bytes
     }
 
+    /// Returns the archive block's offset and length within the container,
+    /// as the validated footer records them.
+    pub(crate) fn archive_block(&self) -> (u64, u64) {
+        (self.archive_offset, self.archive_len)
+    }
+
     /// Parses this container's unauthenticated manifest for metadata reporting.
     ///
     /// The returned manifest is not authenticated. A caller holding a
@@ -1593,10 +1605,26 @@ struct BoundedEnvelope {
 ///
 /// Returns [`PayloadError`] on the container-layer conditions [`open`]
 /// reports, minus the envelope and manifest ones it does not reach.
-fn read_container_head<R: Read + Seek>(
+fn read_container_head<R: Read + Seek>(src: R) -> Result<Option<ContainerHead<R>>, PayloadError> {
+    read_container_head_with(src, |_| Ok::<(), PayloadError>(()))
+}
+
+/// [`read_container_head`], with `check` run on the selected and validated
+/// footer before the manifest block is allocated or read.
+///
+/// The legacy readers pass a check that admits everything, so what they read
+/// and allocate is unchanged; the bounded read passes its resource ceilings.
+/// Either way the probe, the offsets check and the block-layout walk are this
+/// one implementation.
+fn read_container_head_with<R, E>(
     mut src: R,
-) -> Result<Option<ContainerHead<R>>, PayloadError> {
-    let file_len = src.seek(SeekFrom::End(0))?;
+    check: impl FnOnce(&Footer) -> Result<(), E>,
+) -> Result<Option<ContainerHead<R>>, E>
+where
+    R: Read + Seek,
+    E: From<PayloadError>,
+{
+    let file_len = src.seek(SeekFrom::End(0)).map_err(PayloadError::Io)?;
     let Located::Found {
         footer,
         footer_start,
@@ -1606,12 +1634,15 @@ fn read_container_head<R: Read + Seek>(
     };
 
     validate_footer(&footer, footer_start)?;
+    check(&footer)?;
 
     let manifest_len =
         usize::try_from(footer.manifest_len).map_err(|_| PayloadError::TruncatedTrailer)?;
-    src.seek(SeekFrom::Start(footer.manifest_offset))?;
+    src.seek(SeekFrom::Start(footer.manifest_offset))
+        .map_err(PayloadError::Io)?;
     let mut manifest_bytes = vec![0u8; manifest_len];
-    src.read_exact(&mut manifest_bytes)?;
+    src.read_exact(&mut manifest_bytes)
+        .map_err(PayloadError::Io)?;
 
     Ok(Some(ContainerHead {
         src,
@@ -1717,11 +1748,105 @@ pub fn read_package_container<R: Read + Seek>(
     src: R,
     bounds: &EnvelopeBounds,
 ) -> Result<UnparsedContainer<R>, PayloadError> {
+    let head = read_container_head(src)?.ok_or(PayloadError::NoTrailer)?;
+    finish_package_container(head, bounds)
+}
+
+/// The ceilings [`read_package_container_bounded`] holds a footer's block
+/// lengths to, checked once the footer is selected and validated and before
+/// either block is allocated or read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContainerBounds {
+    /// Longest manifest block admitted, the `RawManifest` limit.
+    pub(crate) max_manifest_len: u64,
+    /// Longest archive block admitted, the `CompressedArchive` limit.
+    pub(crate) max_archive_len: u64,
+}
+
+/// Why [`read_package_container_bounded`] refused a container.
+#[derive(Debug)]
+pub(crate) enum BoundedContainerError {
+    /// A container-layer verdict, exactly as [`read_package_container`]
+    /// reports it.
+    Payload(PayloadError),
+    /// A block the footer advertises is longer than its ceiling.
+    LimitExceeded {
+        /// The resource whose ceiling it passed.
+        resource: LimitResource,
+        /// That ceiling.
+        limit: u64,
+    },
+    /// Retained storage failed a read or a seek: the original error, recovered
+    /// from the [`RetainedIoFault`] payload it travelled in.
+    RetainedIo(std::io::Error),
+}
+
+impl From<PayloadError> for BoundedContainerError {
+    /// Recovers a retained-storage failure before anything else classifies
+    /// the error: an I/O error carrying a [`RetainedIoFault`] payload becomes
+    /// [`BoundedContainerError::RetainedIo`], and every other condition stays
+    /// the verdict the legacy read gives. Only the payload's type decides.
+    fn from(error: PayloadError) -> Self {
+        match error {
+            PayloadError::Io(error) => match RetainedIoFault::recover(error) {
+                Ok(original) => Self::RetainedIo(original),
+                Err(error) => Self::Payload(PayloadError::Io(error)),
+            },
+            other => Self::Payload(other),
+        }
+    }
+}
+
+/// Reads a `.pkg`'s container exactly as [`read_package_container`] does,
+/// except that the footer's manifest and archive lengths are held to
+/// `bounds` first.
+///
+/// The manifest length is checked before the manifest block is allocated, and
+/// then the archive length, both before anything else is read and so before
+/// any signature is checked. Past those two checks every framing verdict and
+/// its order is the legacy read's, because both go through one head reader.
+///
+/// # Errors
+///
+/// Returns [`BoundedContainerError::LimitExceeded`] naming `RawManifest` or
+/// `CompressedArchive`, [`BoundedContainerError::RetainedIo`] when the source
+/// fails with a [`RetainedIoFault`], and otherwise the [`PayloadError`]
+/// [`read_package_container`] returns.
+pub(crate) fn read_package_container_bounded<R: Read + Seek>(
+    src: R,
+    envelope: &EnvelopeBounds,
+    bounds: ContainerBounds,
+) -> Result<UnparsedContainer<R>, BoundedContainerError> {
+    let head = read_container_head_with(src, |footer| {
+        if footer.manifest_len > bounds.max_manifest_len {
+            return Err(BoundedContainerError::LimitExceeded {
+                resource: LimitResource::RawManifest,
+                limit: bounds.max_manifest_len,
+            });
+        }
+        if footer.archive_len > bounds.max_archive_len {
+            return Err(BoundedContainerError::LimitExceeded {
+                resource: LimitResource::CompressedArchive,
+                limit: bounds.max_archive_len,
+            });
+        }
+        Ok(())
+    })?
+    .ok_or(BoundedContainerError::Payload(PayloadError::NoTrailer))?;
+    finish_package_container(head, envelope).map_err(BoundedContainerError::from)
+}
+
+/// Reads the envelope blocks of a located container, each only at the length
+/// `bounds` states for it, and assembles the unparsed container.
+fn finish_package_container<R: Read + Seek>(
+    head: ContainerHead<R>,
+    bounds: &EnvelopeBounds,
+) -> Result<UnparsedContainer<R>, PayloadError> {
     let ContainerHead {
         mut src,
         footer,
         manifest_bytes,
-    } = read_container_head(src)?.ok_or(PayloadError::NoTrailer)?;
+    } = head;
     let envelope = read_bounded_envelope(&mut src, &footer, bounds)?;
 
     Ok(UnparsedContainer {
@@ -1852,14 +1977,7 @@ impl<R: Read + Seek> Payload<R> {
     /// ([`PayloadError::MemberListMismatch`]); or when the archive cannot be
     /// read, or a staged member cannot be written, flushed or published.
     pub fn extract_to(&mut self, dest: &Path) -> Result<Vec<ExtractedArtifact>, PayloadError> {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-        let manifest = &self.manifest;
-        let by_path: HashMap<&str, &PayloadArtifact> = manifest
-            .artifacts()
-            .iter()
-            .map(|artifact| (artifact.archive_path.as_str(), artifact))
-            .collect();
+        use std::os::unix::fs::PermissionsExt as _;
 
         // `dest` is created up front rather than incidentally by the first
         // member's parent directory, so how far the walk got before a rejection
@@ -1879,82 +1997,17 @@ impl<R: Read + Seek> Payload<R> {
 
         self.src.seek(SeekFrom::Start(self.archive_offset))?;
         let limited = (&mut self.src).take(self.archive_len);
-        let decoder = Decoder::new(limited)?;
-        let mut archive = Archive::new(decoder);
-
-        let mut staged: Vec<(PathBuf, &PayloadArtifact)> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        // What the archive actually turned out to hold, recorded member by
-        // member as it streams past and compared against the bound list only
-        // once the walk is over: count and order are not decidable before then.
-        let mut walked: Vec<ArchiveMember> = Vec::new();
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let member_path = admitted_member_path(&entry)?;
-            let Some(artifact) = by_path.get(member_path.as_str()).copied() else {
-                return Err(PayloadError::MemberNotInManifest(member_path));
-            };
-            if !seen.insert(artifact.archive_path.as_str()) {
-                return Err(PayloadError::DuplicateMember(member_path));
-            }
-
-            let relative = PathBuf::from(&member_path);
-            let staged_path = staging.path().join(&relative);
-            if let Some(parent) = staged_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            // Owner-only from the moment it is created, the mode the
-            // `NamedTempFile` this staging replaced gave a member's bytes: the
-            // artifact reaches its target path by rename, so this is the only
-            // moment its permissions are chosen.
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&staged_path)?;
-            let (digest, length) = hash_copy(&mut entry, &mut file)?;
-            if !digest.eq_ignore_ascii_case(&artifact.sha256) {
-                return Err(PayloadError::HashMismatch {
-                    path: artifact.archive_path.clone(),
-                });
-            }
-            // Protects the artifact's own bytes, which the publish step below
-            // does no more than rename into place. After the check, so a member
-            // about to be rejected does not buy a disk round trip, and here
-            // rather than at the publish, which holds no descriptor for this
-            // file and would have to reopen it to get one.
-            file.sync_all()?;
-            // The length recorded is the count of data bytes this reader
-            // consumed while hashing the member, never the size read back out
-            // of its `tar` header: the bound length has to be a property of the
-            // bytes that were hashed.
-            walked.push(ArchiveMember {
-                name: member_path,
-                length,
-            });
-            staged.push((relative, artifact));
-        }
-
-        reject_trailing_bytes(&mut archive.into_inner())?;
-
-        for artifact in manifest.artifacts() {
-            if !seen.contains(artifact.archive_path.as_str()) {
-                return Err(PayloadError::ArtifactMissingFromArchive(
-                    artifact.archive_path.clone(),
-                ));
-            }
-        }
-
-        // The walk against the list the manifest binds — an addition to every
-        // check above, never a replacement for one. It is compared against
-        // `archive_members` and never reconstructed from `artifacts`: deriving
-        // the expected sequence from the other field would leave the
-        // enumeration exactly as unstated as it was before it was recorded. A
-        // manifest read off the pre-versioned baseline path binds no list, so
-        // there is nothing to compare against and this check alone is skipped.
-        if let Some(bound) = manifest.archive_members() {
-            compare_member_list(bound, &walked)?;
-        }
+        // The walk is the one the full-content verification in
+        // `crate::package` shares: every rule about the archive lives there,
+        // and this caller passes no limits, so it enforces exactly what it
+        // always did.
+        let mut sink = StagingSink {
+            staging: staging.path(),
+            staged: Vec::new(),
+            current: None,
+        };
+        outer::walk_outer(limited, &self.manifest, None, &mut sink).map_err(outer::legacy_error)?;
+        let staged = sink.staged;
 
         // Publish. Every check has passed, so from here a failure may leave
         // already-verified members behind; each individual move is atomic, so
@@ -1986,6 +2039,64 @@ impl<R: Read + Seek> Payload<R> {
         }
 
         Ok(extracted)
+    }
+}
+
+/// The legacy extraction's [`MemberSink`]: each member is staged under the
+/// staging directory, owner-only, and synced once its digest has matched.
+struct StagingSink<'s, 'm> {
+    staging: &'s Path,
+    /// Every accepted member, relative to the staging directory, in archive
+    /// order.
+    staged: Vec<(PathBuf, &'m PayloadArtifact)>,
+    /// The member received last and not yet accepted.
+    current: Option<(std::fs::File, PathBuf, &'m PayloadArtifact)>,
+}
+
+impl<'m> MemberSink<'m> for StagingSink<'_, 'm> {
+    type Error = PayloadError;
+
+    fn receive(
+        &mut self,
+        artifact: &'m PayloadArtifact,
+        member_path: &str,
+        stream: &mut dyn Read,
+    ) -> Result<(String, u64), SinkFault<PayloadError>> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let relative = PathBuf::from(member_path);
+        let staged_path = self.staging.join(&relative);
+        if let Some(parent) = staged_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| SinkFault::Sink(e.into()))?;
+        }
+        // Owner-only from the moment it is created, the mode the
+        // `NamedTempFile` this staging replaced gave a member's bytes: the
+        // artifact reaches its target path by rename, so this is the only
+        // moment its permissions are chosen.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged_path)
+            .map_err(|e| SinkFault::Sink(e.into()))?;
+        let (digest, length) =
+            hash_copy(stream, &mut file).map_err(|e| SinkFault::Sink(e.into()))?;
+        self.current = Some((file, relative, artifact));
+        Ok((digest, length))
+    }
+
+    fn accept(&mut self) -> Result<(), PayloadError> {
+        let Some((file, relative, artifact)) = self.current.take() else {
+            return Ok(());
+        };
+        // Protects the artifact's own bytes, which the publish step does no
+        // more than rename into place. After the check, so a member about to
+        // be rejected does not buy a disk round trip, and here rather than at
+        // the publish, which holds no descriptor for this file and would have
+        // to reopen it to get one.
+        file.sync_all()?;
+        self.staged.push((relative, artifact));
+        Ok(())
     }
 }
 
@@ -2116,10 +2227,10 @@ fn admitted_member_path<R: Read>(entry: &tar::Entry<'_, R>) -> Result<String, Pa
 /// walk stopped — to its end, refusing anything but the one zero block the
 /// end-of-archive marker leaves unread.
 ///
-/// [`Archive::entries`] stops at that marker and reports nothing about what
-/// follows it, so a second archive appended past it is invisible to this reader
-/// and visible to one that keeps going. Draining the decoder is what makes the
-/// difference observable.
+/// [`tar::Archive::entries`] stops at that marker and reports nothing about
+/// what follows it, so a second archive appended past it is invisible to this
+/// reader and visible to one that keeps going. Draining the decoder is what
+/// makes the difference observable.
 ///
 /// # Errors
 ///
