@@ -10,10 +10,11 @@
 //! `six` is six small images with a Compose file and a native binary; `large`
 //! is one image whose uncompressed layer holds 64 MiB of incompressible bytes,
 //! with the same two files. Every layer is uncompressed: a gzip layer's
-//! manifest is not canonical, and verification refuses it. `generate` writes `package.pkg` and
-//! `public-key.hex` into `<dir>` and discards the private key. `verify` prints
-//! the elapsed time and the retained-disk high-water mark, which is the
-//! package snapshot plus the archive-block copy plus every member snapshot.
+//! manifest is not canonical, and verification refuses it. `generate` writes
+//! `package.pkg` and `public-key.hex` into `<dir>` and discards the private
+//! key. `verify` prints the elapsed time and the retained-disk high-water
+//! mark, which is the package snapshot plus the archive-block copy plus every
+//! member snapshot.
 //! Run `verify` under `/usr/bin/time -l` (macOS) or `/usr/bin/time -v`
 //! (Linux) for its peak resident set size. Build it with
 //! `--features test-support`, in release mode for representative figures.
@@ -67,11 +68,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn image(
-    dependency: &str,
-    layer: SyntheticLayer,
-    compression: LayerCompression,
-) -> Result<(Vec<u8>, ImageDeclaration), Failure> {
+fn image(dependency: &str, layer: SyntheticLayer) -> Result<(Vec<u8>, ImageDeclaration), Failure> {
     let platform = ImagePlatform {
         os: ImageOs::Linux,
         architecture: ImageArchitecture::for_target(TargetArch::X86_64),
@@ -79,7 +76,7 @@ fn image(
     };
     let refs = vec![format!("ghcr.io/example/{dependency}:{VERSION}")];
     let archive = SyntheticImageArchiveBuilder::new(platform.clone())?
-        .layer(layer, compression)?
+        .layer(layer, LayerCompression::Uncompressed)?
         .finish(&refs)?;
     let declaration = ImageDeclaration {
         schema: IMAGE_DECLARATION_SCHEMA,
@@ -120,8 +117,7 @@ fn generate(kind: &str, dir: &Path) -> Result<(), Failure> {
         "six" => {
             for dependency in ["web", "database", "worker", "cache", "api", "queue"] {
                 let layer = SyntheticLayer::new().file("app/run", format!("{dependency} binary"));
-                let (bytes, declaration) =
-                    image(dependency, layer, LayerCompression::Uncompressed)?;
+                let (bytes, declaration) = image(dependency, layer)?;
                 members.push((
                     format!("images/{dependency}.tar"),
                     ArtifactKind::ContainerImage,
@@ -132,7 +128,7 @@ fn generate(kind: &str, dir: &Path) -> Result<(), Failure> {
         }
         "large" => {
             let layer = SyntheticLayer::new().file("data.bin", incompressible(LARGE_LAYER_BYTES));
-            let (bytes, declaration) = image("bulk", layer, LayerCompression::Uncompressed)?;
+            let (bytes, declaration) = image("bulk", layer)?;
             members.push((
                 "images/bulk.tar".to_string(),
                 ArtifactKind::ContainerImage,
