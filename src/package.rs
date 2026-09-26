@@ -117,7 +117,8 @@ mod contents;
 mod source;
 
 // The unsigned-content core and the retained entry point, which the package
-// preparation and detached finalization work reuses.
+// preparation and detached finalization work reuses. Only `contents` itself
+// calls them until that work lands, so the re-export is unused until then.
 #[allow(unused_imports)]
 pub(crate) use contents::{CheckedContents, check_contents, verify_retained};
 pub use contents::{

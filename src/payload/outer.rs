@@ -406,7 +406,9 @@ impl<R: Read> Read for MemberStream<'_, '_, R> {
 ///
 /// A stream that does not open with a standard frame — a skippable frame, or
 /// no frame at all — is left to the decoder, whose own window cap still
-/// applies.
+/// applies. So is every frame after the first: one declaring a larger window
+/// is still never decoded, but is refused by the decoder as a
+/// [`PayloadError::Io`] rather than named as the limit.
 fn check_zstd_window<R: Read, E>(archive: &mut R, limit: u64) -> Result<Vec<u8>, WalkError<E>> {
     let mut peeked = Vec::new();
     let head = take(archive, &mut peeked, ZSTD_FRAME_MAGIC.len() + 1)?;
