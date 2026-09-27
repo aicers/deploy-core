@@ -51,6 +51,12 @@ pub(super) const SUPERVISOR_SHELL: &str = "/bin/sh";
 /// The `env` the supervisor clears the command's environment with. Its path is
 /// the one fixed location both Linux and macOS guarantee.
 const ENV: &str = "/usr/bin/env";
+/// The longest deadline [`supervisor_script`] hands `sleep`, `i32::MAX`
+/// seconds — some 68 years, which is no bound in practice. macOS's `sleep`
+/// refuses anything longer and exits at once, which the script would read as
+/// the command's deadline never arriving: the backstop would be gone, and the
+/// cancelling `kill` would be sent to a pid already reaped and free for reuse.
+const MAX_SLEEP_SECS: u64 = 2_147_483_647;
 
 /// How a run that must stop early stops its child.
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +196,8 @@ pub(super) enum Ended {
 pub(super) fn supervisor_script(sentinel: bool, timeout: Duration) -> String {
     let seconds = timeout
         .as_secs()
-        .saturating_add(u64::from(timeout.subsec_nanos() > 0));
+        .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+        .min(MAX_SLEEP_SECS);
     let announce = if sentinel {
         format!("printf '%s' '{SUDO_OK_SENTINEL}' >&2\n")
     } else {
@@ -651,7 +658,12 @@ fn timed_out(command: &str, limits: RunLimits) -> RunWithInputError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Framing, TIMEOUT_MARKER, partial_suffix, remote_code_suffix};
+    use std::time::Duration;
+
+    use super::{
+        Framing, MAX_SLEEP_SECS, TIMEOUT_MARKER, partial_suffix, remote_code_suffix,
+        supervisor_script,
+    };
     use crate::executor::{RC_MARKER, SUDO_OK_SENTINEL};
 
     const SUDO_SSH: Framing = Framing {
@@ -698,6 +710,33 @@ mod tests {
             SUDO_SSH.command_len(stderr.as_bytes()),
             stderr.len() - SUDO_OK_SENTINEL.len()
         );
+    }
+
+    #[test]
+    fn the_supervisor_deadline_is_whole_seconds_rounded_up_and_capped() {
+        let sleeps = |timeout| {
+            let script = supervisor_script(false, timeout);
+            let line = script
+                .lines()
+                .find(|line| line.starts_with("sleep "))
+                .expect("the deadline's sleep")
+                .to_string();
+            line.split_whitespace()
+                .nth(1)
+                .expect("a duration")
+                .parse::<u64>()
+                .expect("whole seconds")
+        };
+        assert_eq!(sleeps(Duration::from_secs(2)), 2);
+        assert_eq!(sleeps(Duration::from_millis(2001)), 3);
+        assert_eq!(sleeps(Duration::from_millis(1)), 1);
+        // A timeout past what every `sleep` accepts is held to the cap rather
+        // than handed on and refused.
+        assert_eq!(
+            sleeps(Duration::from_secs(MAX_SLEEP_SECS + 1)),
+            MAX_SLEEP_SECS
+        );
+        assert_eq!(sleeps(Duration::MAX), MAX_SLEEP_SECS);
     }
 
     #[test]

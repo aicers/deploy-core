@@ -489,8 +489,9 @@ Where the crate handles key material or secrets:
 `test-support` exists only to expose test-only fixtures across the
 crate boundary, since `cfg(test)` is invisible to dependents: the
 account fixtures (`Principal::Fixture`, `ServiceAccount::Fixture`),
-payload fixtures, and the synthetic image archive builder in
-`image::test_support`. Enable it in a dependent's `[dev-dependencies]`
+payload fixtures, the synthetic image archive builder in
+`image::test_support`, and the recording, scriptable executor in
+`executor::test_support`. Enable it in a dependent's `[dev-dependencies]`
 only — never under `[dependencies]`, so the fixtures stay out of every
 release build.
 

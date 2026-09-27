@@ -7074,6 +7074,23 @@ exec "$@"
             }
 
             #[test]
+            fn an_unbounded_timeout_runs_the_command_to_completion_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    timeout: Duration::MAX,
+                    ..ROOMY
+                };
+                for (label, exec, identity) in every_pair(&dir) {
+                    let output = exec
+                        .run_with_input(identity, "/bin/cat", &[], b"{}", limits)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(0), "{label}");
+                    assert_eq!(output.stdout, b"{}", "{label}");
+                    assert!(output.stderr.is_empty(), "{label}: {:?}", output.stderr);
+                }
+            }
+
+            #[test]
             fn a_command_that_closes_its_streams_is_still_held_to_the_timeout() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let limits = RunLimits {

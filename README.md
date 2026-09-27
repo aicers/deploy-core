@@ -169,8 +169,10 @@ The `test-support` feature exposes test-only account fixtures
 (`Principal::Fixture` / `ServiceAccount::Fixture`), payload fixtures such as
 `payload::widen_envelope_blocks`, and `image::test_support` — a builder for
 synthetic image archives the image validator accepts, and a classifier that
-holds any image archive against a declaration — so a **dependent** crate's
-tests can construct them across the crate boundary. With
+holds any image archive against a declaration — and
+`executor::test_support::RecordingExecutor`, which records every call it
+receives and answers each from a script, so a **dependent** crate's tests can
+construct them across the crate boundary. With
 `package::prepare_sign_finalize` and a test key minted per test, those
 archives become genuinely signed format-6 packages that pass every final
 check; `tests/signed_fixtures.rs` builds one through the public API alone.
