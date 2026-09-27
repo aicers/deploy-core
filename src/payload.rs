@@ -104,6 +104,8 @@ pub(crate) mod counters;
 mod golden;
 mod outer;
 #[cfg(test)]
+mod raw_block_tests;
+#[cfg(test)]
 mod tail_tests;
 
 #[cfg(test)]
@@ -987,6 +989,64 @@ pub fn widen_envelope_blocks(container: &[u8], advertised_len: u64) -> Vec<u8> {
     compact
 }
 
+/// Streams a version-1 container fixture onto `base`:
+/// `base ‖ manifest_block ‖ archive_block ‖ footer`, under the 41-byte
+/// version-1 footer that records no envelope pairs.
+///
+/// Every writer in this crate stamps the current [`FORMAT_VERSION`], so this is
+/// how a dependent crate's tests reach version-1 input through the real reader
+/// without hand-building a footer. Both blocks are written verbatim and
+/// neither is checked: a caller may pass a manifest that does not parse or an
+/// archive that is not one, and the container still frames them correctly.
+/// Passing an empty `base` (for example [`std::io::empty`]) writes a `.pkg`
+/// whose manifest block starts at offset `0`.
+///
+/// This test-support fixture is not compiled into a default-feature build.
+/// Enable `test-support` only under a dependent's `[dev-dependencies]`.
+///
+/// # Errors
+///
+/// Returns [`PayloadError::MalformedFooter`] when an offset, or the
+/// container's length, would overflow a `u64`, and [`PayloadError::Io`] when
+/// reading `base` or writing to `out` fails.
+#[cfg(any(test, feature = "test-support"))]
+pub fn append_version_1_trailer<B: Read, W: Write>(
+    mut base: B,
+    mut out: W,
+    manifest_block: &[u8],
+    archive_block: &[u8],
+) -> Result<(), PayloadError> {
+    const VERSION: u8 = 1;
+    const OVERFLOW: PayloadError = PayloadError::MalformedFooter {
+        reason: "a block offset or the container length overflows a u64",
+    };
+
+    let manifest_offset = std::io::copy(&mut base, &mut out)?;
+    let manifest_len = u64::try_from(manifest_block.len()).map_err(|_| OVERFLOW)?;
+    let archive_len = u64::try_from(archive_block.len()).map_err(|_| OVERFLOW)?;
+    let archive_offset = manifest_offset.checked_add(manifest_len).ok_or(OVERFLOW)?;
+    let footer_start = archive_offset.checked_add(archive_len).ok_or(OVERFLOW)?;
+    let footer = Footer {
+        version: VERSION,
+        manifest_offset,
+        manifest_len,
+        archive_offset,
+        archive_len,
+        signature_offset: 0,
+        signature_len: 0,
+        key_id_offset: 0,
+        key_id_len: 0,
+    }
+    .encode();
+    let footer_len = u64::try_from(footer.len()).map_err(|_| OVERFLOW)?;
+    footer_start.checked_add(footer_len).ok_or(OVERFLOW)?;
+
+    out.write_all(manifest_block)?;
+    out.write_all(archive_block)?;
+    out.write_all(&footer)?;
+    Ok(())
+}
+
 /// Computes the lowercase hex SHA-256 of `bytes`.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -1673,6 +1733,17 @@ where
 /// It is an added path, not a replacement: [`open`] reads the container
 /// through the same internal head reader this is built from, so the two cannot
 /// come to disagree about where a block is.
+///
+/// The raw accessors — [`container_version`](Self::container_version),
+/// [`raw_manifest_block`](Self::raw_manifest_block),
+/// [`archive_block_len`](Self::archive_block_len) and
+/// [`raw_archive_block`](Self::raw_archive_block), beside
+/// [`signature`](Self::signature) and [`key_id`](Self::key_id) — hand out the
+/// blocks exactly as the validated footer locates them, for a caller that
+/// hashes a container rather than trusting it. They answer whatever the
+/// envelope state and whether or not the manifest would parse: refusing a
+/// [`EnvelopeBlock::WrongLength`] block or an unparsable manifest is the
+/// caller's decision, not theirs.
 pub struct UnparsedContainer<R: Read + Seek> {
     src: R,
     footer_version: u8,
@@ -1686,18 +1757,58 @@ pub struct UnparsedContainer<R: Read + Seek> {
 impl<R: Read + Seek> UnparsedContainer<R> {
     /// Returns the container format version the selected footer recorded.
     ///
-    /// The manifest parse takes it, because only a reader that knows it can
-    /// evaluate the pre-versioned baseline conjunction.
-    pub(crate) fn footer_version(&self) -> u8 {
+    /// This is the footer's version — currently `1` or [`FORMAT_VERSION`] —
+    /// and not the manifest's own `format_version`, which versions the
+    /// manifest schema; no manifest parse is needed to answer it. The manifest
+    /// parse takes it, because only a reader that knows it can evaluate the
+    /// pre-versioned baseline conjunction.
+    #[must_use]
+    pub fn container_version(&self) -> u8 {
         self.footer_version
     }
 
-    /// Returns the manifest block exactly as it sits in the container.
+    /// Returns the manifest block exactly as it sits in the container:
+    /// unparsed, unauthenticated, and never re-serialized.
     ///
-    /// These are the bytes a signature is computed over, so they are handed
-    /// out unparsed and never re-serialized from a parsed manifest.
-    pub(crate) fn manifest_bytes(&self) -> &[u8] {
+    /// These are the bytes a signature is computed over, which is what they
+    /// are for: hashing them or checking a signature against them. Nothing
+    /// about them has been checked. Decode them through
+    /// [`parse_unverified_manifest`](Self::parse_unverified_manifest) or
+    /// [`crate::verify::verify_package`], never with `serde_json` directly,
+    /// which would skip every rule this crate's manifest parse enforces.
+    #[must_use]
+    pub fn raw_manifest_block(&self) -> &[u8] {
         &self.manifest_bytes
+    }
+
+    /// Returns the length in bytes of the raw, still compressed archive block,
+    /// as the validated footer records it.
+    #[must_use]
+    pub fn archive_block_len(&self) -> u64 {
+        self.archive_len
+    }
+
+    /// Returns a reader over exactly the raw archive block.
+    ///
+    /// The source is sought to the block's start once, here, and the reader
+    /// then yields exactly [`archive_block_len`](Self::archive_block_len)
+    /// bytes followed by end-of-file. It never reads outside the block, never
+    /// holds the block in memory and never decompresses it: the bytes are the
+    /// compressed block as the container carries it, for hashing, and nothing
+    /// in them has been checked. A source that ends before the recorded
+    /// length surfaces from [`Read::read`] as
+    /// [`std::io::ErrorKind::UnexpectedEof`], never as a short stream that
+    /// ends successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayloadError::Io`] when the seek fails.
+    pub fn raw_archive_block(&mut self) -> Result<RawArchiveBlock<'_, R>, PayloadError> {
+        self.src.seek(SeekFrom::Start(self.archive_offset))?;
+        Ok(RawArchiveBlock {
+            src: &mut self.src,
+            remaining: self.archive_len,
+        })
     }
 
     /// Returns the archive block's offset and length within the container,
@@ -1720,12 +1831,12 @@ impl<R: Read + Seek> UnparsedContainer<R> {
     /// decodable JSON, or [`PayloadError::InvalidManifest`] for every other
     /// manifest validation failure.
     pub fn parse_unverified_manifest(&self) -> Result<PayloadManifest, PayloadError> {
-        PayloadManifest::parse(self.manifest_bytes(), self.footer_version()).map_err(|error| {
-            match error {
+        PayloadManifest::parse(self.raw_manifest_block(), self.container_version()).map_err(
+            |error| match error {
                 ManifestError::Decode(source) => PayloadError::ManifestParse(source),
                 other => PayloadError::InvalidManifest(other),
-            }
-        })
+            },
+        )
     }
 
     /// Returns the detached signature block as the bounded read left it:
@@ -1796,6 +1907,54 @@ impl EnvelopeBlock {
             EnvelopeBlock::Present(bytes) => Some(bytes),
             EnvelopeBlock::Absent | EnvelopeBlock::WrongLength => None,
         }
+    }
+}
+
+/// Exactly one container's raw archive block, as
+/// [`UnparsedContainer::raw_archive_block`] hands it out.
+///
+/// It borrows the container's source, already positioned at the block's start,
+/// and reads no further than the block's recorded length. It is [`Read`] only:
+/// no [`Seek`], so it cannot be steered outside the block it was made for.
+pub struct RawArchiveBlock<'a, R> {
+    src: &'a mut R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for RawArchiveBlock<'_, R> {
+    /// Reads from the block, never past its end.
+    ///
+    /// Once the whole block has been read this returns `Ok(0)`. A source that
+    /// reports end-of-file while block bytes remain is a container shorter
+    /// than its validated footer said, which is an error rather than a short
+    /// stream: [`std::io::ErrorKind::UnexpectedEof`].
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        // A `remaining` no `usize` holds is larger than any buffer, so the
+        // buffer's own length is the cap.
+        let cap =
+            usize::try_from(self.remaining).map_or(buf.len(), |remaining| remaining.min(buf.len()));
+        let (window, _) = buf.split_at_mut(cap);
+        let read = self.src.read(window)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the source ended inside the archive block",
+            ));
+        }
+        // `read` is at most `cap`, which is at most `remaining`, so neither
+        // the conversion nor the subtraction can fail for a source keeping the
+        // `Read` contract; one that breaks it is refused rather than trusted.
+        let consumed = u64::try_from(read)
+            .ok()
+            .filter(|&consumed| read <= cap && consumed <= self.remaining)
+            .ok_or_else(|| {
+                std::io::Error::other("the source reported reading more than it was asked for")
+            })?;
+        self.remaining -= consumed;
+        Ok(read)
     }
 }
 
@@ -1991,6 +2150,9 @@ fn read_bounded_envelope<R: Read + Seek>(
 ///
 /// A package that carries no container is broken, not an ordinary file, so
 /// that condition is [`PayloadError::NoTrailer`] here exactly as it is there.
+/// That variant is also how a caller reading an installer rather than a
+/// package recognises an empty payload — an executable that carries no
+/// trailer at all — since [`open`]'s `Ok(None)` has no counterpart here.
 ///
 /// # Errors
 ///

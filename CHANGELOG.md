@@ -172,13 +172,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   compact malformed-envelope case for a dependent crate to write sparsely when
   testing bounded package reads without duplicating deploy-core's private
   footer layout.
+- `payload::append_version_1_trailer`, a `test-support` fixture that writes a
+  version-1 container around caller-supplied manifest and archive blocks, so a
+  dependent crate can test version-1 input through the real reader without
+  hand-building a footer.
 - `payload::UnparsedContainer::parse_unverified_manifest`, which lets a caller
   decode manifest metadata from `read_package_container` without reopening an
   untrusted package. The returned manifest is intentionally unauthenticated;
   callers with a `TrustSet` continue to use the verifying path.
 - `payload::read_package_container`, which reports a package's signature and
   `key_id` metadata under the release format's fixed envelope bounds without
-  allocating blocks advertised at another length.
+  allocating blocks advertised at another length. The container it returns
+  also hands out its raw blocks for hashing, whatever its envelope state and
+  whether or not its manifest parses: `container_version` reports the footer's
+  container version, `raw_manifest_block` the manifest block exactly as
+  written, unparsed and unauthenticated, `archive_block_len` the archive
+  block's length, and `raw_archive_block` a `payload::RawArchiveBlock` reader
+  that streams exactly that block, still compressed, and reports a source
+  ending inside it as `UnexpectedEof`. A file with no trailer is
+  `PayloadError::NoTrailer`.
 - `payload::append_trailer_signed`, which gives a caller-supplied signer the
   exact manifest bytes the writer emits and stamps its detached Ed25519
   signature and `key_id` into either a `.pkg` package or an installer payload.
