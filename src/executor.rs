@@ -41,6 +41,14 @@ use std::time::Duration;
 use crate::durability::sync_dir;
 use crate::transport::{HostKeyPolicy, Ssh};
 
+// The bounded, killable run behind `Executor::run_with_input`, shared by every
+// transport.
+mod bounded;
+// A scriptable, recording executor, for this crate's tests and for dependents
+// that enable `test-support` under `[dev-dependencies]`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 /// The `sudo` binary name used unless a test overrides it.
 const SUDO: &str = "sudo";
 /// Number of times a spawn is retried when the target reports `ETXTBSY`
@@ -623,6 +631,102 @@ impl CommandOutput {
     }
 }
 
+/// The bounds one [`Executor::run_with_input`] call runs under.
+///
+/// There is no `Default`: how much output a command may write and how long it
+/// may take are the caller's decisions about that command, not the executor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunLimits {
+    /// The most bytes the command may write to standard output.
+    pub max_stdout: usize,
+    /// The most bytes the command may write to standard error.
+    pub max_stderr: usize,
+    /// How long the command may run before it is killed.
+    pub timeout: Duration,
+}
+
+/// One of a command's two output streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+impl std::fmt::Display for OutputStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        })
+    }
+}
+
+/// Errors raised by [`Executor::run_with_input`].
+///
+/// A type of its own rather than more [`ExecutorError`] variants, because the
+/// variants below arise from this one method alone: a caller of
+/// [`Executor::run`] or any other primitive never has to consider them, and an
+/// exhaustive match over [`ExecutorError`] elsewhere stays exhaustive.
+#[derive(Debug, thiserror::Error)]
+pub enum RunWithInputError {
+    /// `command` is not an absolute path, or contains `=`, and was refused
+    /// before anything was spawned.
+    ///
+    /// The command runs with no `PATH`, so only an absolute path names one
+    /// binary. `=` is refused because the command is started through
+    /// `env -i` wherever a supervisor runs it, and `env` reads an operand
+    /// containing `=` as a variable assignment rather than the utility.
+    #[error("command `{command}` is not an absolute path free of `=`")]
+    InvalidCommand {
+        /// The command as the caller named it.
+        command: String,
+    },
+    /// The command wrote more than `limit` bytes to `stream`. It was killed
+    /// and waited for, or had already exited.
+    #[error("`{command}` wrote more than {limit} bytes to {stream}")]
+    OutputLimit {
+        /// The command that was run.
+        command: String,
+        /// The stream that passed its limit.
+        stream: OutputStream,
+        /// The limit it passed.
+        limit: usize,
+    },
+    /// The command was still running when `timeout` passed. It was killed
+    /// and waited for.
+    #[error("`{command}` did not finish within {timeout:?}")]
+    TimedOut {
+        /// The command that was run.
+        command: String,
+        /// The timeout it outlived.
+        timeout: Duration,
+    },
+    /// The executor does not implement [`Executor::run_with_input`].
+    ///
+    /// Only the trait's default body returns this. [`LocalExecutor`],
+    /// [`SshExecutor`] and [`InDaemonExecutor`] each implement the method, as
+    /// does the `RecordingExecutor` the `test-support` feature exposes.
+    #[error("this executor cannot run a command with bounded input")]
+    Unsupported,
+    /// Spawning, the transport or elevation failed, exactly as
+    /// [`Executor::run`] reports it.
+    #[error(transparent)]
+    Executor(#[from] ExecutorError),
+}
+
+/// Refuses a command [`Executor::run_with_input`] cannot run as named.
+fn check_bounded_command(command: &str) -> Result<(), RunWithInputError> {
+    if Path::new(command).is_absolute() && !command.contains('=') {
+        Ok(())
+    } else {
+        Err(RunWithInputError::InvalidCommand {
+            command: command.to_string(),
+        })
+    }
+}
+
 /// A service account bootler creates and runs components under (RFC 0003 §6).
 ///
 /// This is a closed enum rather than a wrapped string, and that is the whole
@@ -938,6 +1042,100 @@ pub trait Executor {
         command: &str,
         args: &[&str],
     ) -> Result<CommandOutput, ExecutorError>;
+
+    /// Runs `command` with `args` as `identity`, feeding it `input` on
+    /// standard input and holding it to `limits`.
+    ///
+    /// This is [`Executor::run`] for a command that is handed a request and
+    /// must answer within bounds:
+    ///
+    /// - **`command` must be an absolute path**, free of `=`. Anything else is
+    ///   [`RunWithInputError::InvalidCommand`], refused before anything is
+    ///   spawned.
+    /// - **`input` is written to the command's standard input**, which is then
+    ///   closed; an empty `input` closes it at once. The bytes pass through
+    ///   every transport verbatim.
+    /// - **The command runs with an empty environment** — no inherited
+    ///   variable, and so no `PATH` lookup. Where `sudo` or an SSH session
+    ///   stands between this process and the command, the environment either
+    ///   of them sets up is cleared again before the command starts.
+    /// - **Standard output and standard error are each read up to their
+    ///   limit.** One byte past either, or the command outliving
+    ///   `limits.timeout`, kills the command and waits for it, and is reported
+    ///   as [`RunWithInputError::OutputLimit`] or
+    ///   [`RunWithInputError::TimedOut`] — never as a [`CommandOutput`].
+    ///   The limits bound the command's own bytes: what `sudo` or `ssh`
+    ///   writes before the command starts is neither counted nor returned,
+    ///   so a refusal or a failed connection is reported as the error
+    ///   [`Executor::run`] reports for it however small `max_stderr` is.
+    ///   Where a supervising shell or the SSH exit-status line shares
+    ///   standard error with the command, a byte past `max_stderr` that could
+    ///   still be the start of that framing is given a second to become it
+    ///   before it counts, so a command that stops on such a byte is killed
+    ///   up to a second after it passed its limit.
+    /// - **A non-zero exit is a [`CommandOutput`]**, as it is from
+    ///   [`Executor::run`].
+    ///
+    /// `identity` resolves exactly as it does for [`Executor::run`], at the
+    /// same resolution site: no prefix for [`Identity::Operator`], `sudo` for
+    /// [`Identity::Root`] and `sudo -u <account>` for [`Identity::Service`] on
+    /// the elevating transports, with [`SudoAuth`] governing both; and inside
+    /// the root daemon, no prefix for root, a `sudo -u` descent that never
+    /// prompts for a service account, and a refusal for the operator.
+    ///
+    /// **What "killed" reaches depends on who may signal whom**, so the
+    /// transports get there differently:
+    ///
+    /// - A command this process spawns directly — [`Identity::Operator`] on
+    ///   [`LocalExecutor`], [`Identity::Root`] on [`InDaemonExecutor`] — runs
+    ///   in a process group of its own, which is killed with `SIGKILL`. Every
+    ///   descendant that stayed in the group dies with it.
+    /// - Where `sudo` stands in between, the command runs under a supervising
+    ///   shell that kills the command's process group from the inside, on the
+    ///   `SIGTERM` `sudo` relays to it and on a deadline of its own, so a
+    ///   command that ignores `SIGTERM` still dies even where this process may
+    ///   not signal it. Only after that is `sudo`'s own group killed.
+    /// - Over [`SshExecutor`], the local `ssh` process is killed at the
+    ///   deadline. No signal crosses the connection, so the remote command is
+    ///   ended by the same supervising shell on the remote host, at its own
+    ///   deadline — `limits.timeout` rounded up to a whole second, counted
+    ///   from when the remote side started — and this call does not wait to
+    ///   see it happen. A command whose stream passes its limit is ended the
+    ///   same way on the remote side: once `ssh` is gone its output pipes are
+    ///   closed, and the supervisor's deadline ends it if writing does not.
+    ///
+    /// A descendant that leaves the process group — a daemon that calls
+    /// `setsid` — is out of reach on every transport. A supervised command
+    /// that a signal kills reports `128 + signal` as its exit code rather than
+    /// none, and starts with `SIGINT` and `SIGQUIT` ignored, as any command a
+    /// shell runs in the background does.
+    ///
+    /// The command's process group is also not the caller's, so a signal the
+    /// caller's terminal generates does not reach the command; `limits` is
+    /// what bounds it.
+    ///
+    /// The default body refuses with [`RunWithInputError::Unsupported`], so an
+    /// existing implementation of this trait keeps compiling; every executor
+    /// this crate ships overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunWithInputError::InvalidCommand`] for a command that is not
+    /// an absolute path free of `=`, [`RunWithInputError::OutputLimit`] or
+    /// [`RunWithInputError::TimedOut`] for a command that was stopped, and
+    /// [`RunWithInputError::Executor`] carrying whatever [`Executor::run`]
+    /// would report for a spawn, transport or elevation failure.
+    fn run_with_input(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        input: &[u8],
+        limits: RunLimits,
+    ) -> Result<CommandOutput, RunWithInputError> {
+        let _ = (identity, command, args, input, limits);
+        Err(RunWithInputError::Unsupported)
+    }
 
     /// Writes `contents` to `dest` on the target with the owner, group and mode
     /// `meta` names (RFC 0003 §9.2).
@@ -2091,6 +2289,22 @@ impl LocalExecutor {
     ///   than elevating. The account name is passed as a discrete `Command`
     ///   argument, so it reaches `sudo` as exactly one word whatever it contains.
     fn resolve(&self, identity: Identity, command: &str, args: &[&str]) -> Resolved {
+        self.resolve_through(identity, SH, &sudo_sentinel_script(), command, args)
+    }
+
+    /// Resolves an `(identity, Local)` pair as [`LocalExecutor::resolve`]
+    /// does, with an elevated command run under `shell -c script` rather than
+    /// the sentinel script — the one knob [`Executor::run_with_input`] turns.
+    /// Whether `sudo` is involved, and with which flags and descent, is decided
+    /// here for both methods.
+    fn resolve_through(
+        &self,
+        identity: Identity,
+        shell: &str,
+        script: &str,
+        command: &str,
+        args: &[&str],
+    ) -> Resolved {
         let Some(elevation) = Elevation::of(identity) else {
             let mut cmd = Command::new(command);
             cmd.args(args);
@@ -2114,11 +2328,7 @@ impl LocalExecutor {
         if let Elevation::Descend(account) = elevation {
             cmd.arg("-u").arg(account.as_str());
         }
-        cmd.arg("sh")
-            .arg("-c")
-            .arg(sudo_sentinel_script())
-            .arg(command)
-            .args(args);
+        cmd.arg(shell).arg("-c").arg(script).arg(command).args(args);
         Resolved {
             command: cmd,
             password_line,
@@ -2154,6 +2364,59 @@ impl LocalExecutor {
         } else {
             Ok(output)
         }
+    }
+}
+
+impl LocalExecutor {
+    /// The local half of [`Executor::run_with_input`]: the command itself for
+    /// the operator, the supervisor under `sudo` otherwise.
+    fn run_bounded(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        input: &[u8],
+        limits: RunLimits,
+    ) -> Result<CommandOutput, RunWithInputError> {
+        let supervisor = bounded::Supervisor::new(limits.timeout)?;
+        let Resolved {
+            command: mut cmd,
+            password_line,
+            elevated,
+        } = self.resolve_through(
+            identity,
+            bounded::SUPERVISOR_SHELL,
+            supervisor.script(),
+            command,
+            args,
+        );
+        // A command spawned directly has its environment cleared here. `sudo`
+        // keeps the caller's, so it is found exactly as `run` finds it; the
+        // supervisor clears the command's after `sudo` has set up its own.
+        if !elevated {
+            cmd.env_clear();
+        }
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        let (framing, kill) = if elevated {
+            (supervisor.framing(false), bounded::Kill::Relay)
+        } else {
+            (bounded::Framing::DIRECT, bounded::Kill::Group)
+        };
+        let feed = match password_line {
+            Some(mut line) => {
+                line.extend_from_slice(input);
+                line
+            }
+            None => input.to_vec(),
+        };
+        let ended = bounded::run(cmd, &program, &feed, limits, framing, kill)?;
+        bounded::finish(ended, command, limits, framing, |output| {
+            if elevated {
+                classify_elevation(output, Some(&self.auth), &self.host)
+            } else {
+                Ok(output)
+            }
+        })
     }
 }
 
@@ -2205,6 +2468,18 @@ impl Executor for LocalExecutor {
         args: &[&str],
     ) -> Result<CommandOutput, ExecutorError> {
         self.spawn_resolved(self.resolve(identity, command, args), None)
+    }
+
+    fn run_with_input(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        input: &[u8],
+        limits: RunLimits,
+    ) -> Result<CommandOutput, RunWithInputError> {
+        check_bounded_command(command)?;
+        self.run_bounded(identity, command, args, input, limits)
     }
 
     fn put_file(&self, dest: &Path, contents: &[u8], meta: FileMeta) -> Result<(), ExecutorError> {
@@ -2338,7 +2613,19 @@ impl SshExecutor {
         let mut cmd = self.ssh_command();
         cmd.arg(wrap_with_rc_marker(remote));
         let program = self.ssh_bin.to_string_lossy().into_owned();
-        let mut output = spawn_capturing(cmd, &program, stdin)?;
+        let output = spawn_capturing(cmd, &program, stdin)?;
+        self.settle_remote_code(output)
+    }
+
+    /// Replaces `output`'s exit code with the remote command's own, read from
+    /// the [`RC_MARKER`] line, and removes that line from its stderr.
+    ///
+    /// A missing marker means the wrapper never ran — the transport failed
+    /// before the command started — and is an [`ExecutorError::Connection`].
+    fn settle_remote_code(
+        &self,
+        mut output: CommandOutput,
+    ) -> Result<CommandOutput, ExecutorError> {
         let Some((pos, code)) = extract_remote_code(&output.stderr) else {
             return Err(ExecutorError::Connection {
                 host: self.host.clone(),
@@ -2371,16 +2658,41 @@ impl SshExecutor {
     /// the target's login shell re-parses each as exactly one word without
     /// re-splitting argument boundaries.
     fn resolve(&self, identity: Identity, command: &str, args: &[&str]) -> ResolvedRemote {
-        let payload = std::iter::once(command).chain(args.iter().copied());
+        self.resolve_through(identity, SH, &sudo_sentinel_script(), None, command, args)
+    }
+
+    /// Resolves an `(identity, Ssh)` pair as [`SshExecutor::resolve`] does,
+    /// with an elevated command run under `shell -c script` rather than the
+    /// sentinel script, and — where `operator_script` is given — the
+    /// operator's command run under `shell -c operator_script` rather than
+    /// bare. Those are the knobs [`Executor::run_with_input`] turns; whether
+    /// `sudo` is involved, and with which flags and descent, is decided here
+    /// for both methods.
+    fn resolve_through(
+        &self,
+        identity: Identity,
+        shell: &str,
+        script: &str,
+        operator_script: Option<&str>,
+        command: &str,
+        args: &[&str],
+    ) -> ResolvedRemote {
         let Some(elevation) = Elevation::of(identity) else {
+            let remote = match operator_script {
+                Some(wrapper) => shell_join(
+                    [shell, "-c", wrapper, command]
+                        .into_iter()
+                        .chain(args.iter().copied()),
+                ),
+                None => shell_join(std::iter::once(command).chain(args.iter().copied())),
+            };
             return ResolvedRemote {
-                remote: shell_join(payload),
+                remote,
                 password_line: None,
                 elevated: false,
             };
         };
-        let script = sudo_sentinel_script();
-        let wrapped = ["sh", "-c", script.as_str(), command]
+        let wrapped = [shell, "-c", script, command]
             .into_iter()
             .chain(args.iter().copied())
             .collect::<Vec<_>>();
@@ -2435,6 +2747,61 @@ impl SshExecutor {
     }
 }
 
+impl SshExecutor {
+    /// The SSH half of [`Executor::run_with_input`]: the supervisor on the
+    /// remote host for every identity, since no signal to the local `ssh`
+    /// reaches the remote command.
+    fn run_bounded(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        input: &[u8],
+        limits: RunLimits,
+    ) -> Result<CommandOutput, RunWithInputError> {
+        let supervisor = bounded::Supervisor::new(limits.timeout)?;
+        let ResolvedRemote {
+            remote,
+            password_line,
+            elevated,
+        } = self.resolve_through(
+            identity,
+            bounded::SUPERVISOR_SHELL,
+            supervisor.script(),
+            Some(supervisor.script()),
+            command,
+            args,
+        );
+        let feed = match password_line {
+            Some(mut line) => {
+                line.extend_from_slice(input);
+                line
+            }
+            None => input.to_vec(),
+        };
+        let framing = supervisor.framing(true);
+        // `ssh` keeps the caller's environment: it needs `HOME` for its
+        // configuration and `SSH_AUTH_SOCK` for the agent. The remote
+        // supervisor clears the command's.
+        let mut cmd = self.ssh_command();
+        cmd.arg(wrap_with_rc_marker(&remote));
+        let program = self.ssh_bin.to_string_lossy().into_owned();
+        let ended = bounded::run(cmd, &program, &feed, limits, framing, bounded::Kill::Group)?;
+        bounded::finish(ended, command, limits, framing, |output| {
+            let mut output = self.settle_remote_code(output)?;
+            if elevated {
+                classify_elevation(output, Some(&self.auth), &self.host)
+            } else {
+                // The operator's supervisor announces itself too; with no
+                // `sudo` to have refused, its absence is only a supervisor
+                // that never ran, and the exit status says why.
+                take_sudo_sentinel(&mut output.stderr);
+                Ok(output)
+            }
+        })
+    }
+}
+
 /// A remote invocation resolved from an identity: the complete remote command
 /// line, the password line to feed ahead of any payload, and whether the sudo
 /// sentinel must be settled afterwards.
@@ -2452,6 +2819,18 @@ impl Executor for SshExecutor {
         args: &[&str],
     ) -> Result<CommandOutput, ExecutorError> {
         self.run_resolved(self.resolve(identity, command, args), None)
+    }
+
+    fn run_with_input(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        input: &[u8],
+        limits: RunLimits,
+    ) -> Result<CommandOutput, RunWithInputError> {
+        check_bounded_command(command)?;
+        self.run_bounded(identity, command, args, input, limits)
     }
 
     fn put_file(&self, dest: &Path, contents: &[u8], meta: FileMeta) -> Result<(), ExecutorError> {
@@ -2548,6 +2927,22 @@ impl InDaemonExecutor {
         command: &str,
         args: &[&str],
     ) -> Result<(Command, bool), ExecutorError> {
+        self.resolve_through(identity, SH, &sudo_sentinel_script(), command, args)
+    }
+
+    /// Resolves an `(identity, InDaemon)` pair as [`InDaemonExecutor::resolve`]
+    /// does, with a descended command run under `shell -c script` rather than
+    /// the sentinel script — the one knob [`Executor::run_with_input`] turns.
+    /// Which identities refuse, run bare or descend is decided here for both
+    /// methods.
+    fn resolve_through(
+        &self,
+        identity: Identity,
+        shell: &str,
+        script: &str,
+        command: &str,
+        args: &[&str],
+    ) -> Result<(Command, bool), ExecutorError> {
         match identity {
             Identity::Operator => Err(ExecutorError::NoOperatorIdentity {
                 host: self.host.clone(),
@@ -2561,9 +2956,9 @@ impl InDaemonExecutor {
                 let mut cmd = Command::new(&self.sudo_bin);
                 cmd.arg("-u")
                     .arg(account.as_str())
-                    .arg("sh")
+                    .arg(shell)
                     .arg("-c")
-                    .arg(sudo_sentinel_script())
+                    .arg(script)
                     .arg(command)
                     .args(args);
                 Ok((cmd, true))
@@ -2589,6 +2984,50 @@ impl InDaemonExecutor {
     }
 }
 
+impl InDaemonExecutor {
+    /// The in-daemon half of [`Executor::run_with_input`]: the command itself
+    /// for root, the supervisor under a `sudo -u` descent for a service
+    /// account.
+    fn run_bounded(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        input: &[u8],
+        limits: RunLimits,
+    ) -> Result<CommandOutput, RunWithInputError> {
+        let supervisor = bounded::Supervisor::new(limits.timeout)?;
+        let (mut cmd, elevated) = self.resolve_through(
+            identity,
+            bounded::SUPERVISOR_SHELL,
+            supervisor.script(),
+            command,
+            args,
+        )?;
+        // As on the local transport: root's command is cleared here, and a
+        // descended one by the supervisor, after `sudo` has run as it does
+        // for `run`.
+        if !elevated {
+            cmd.env_clear();
+        }
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        let (framing, kill) = if elevated {
+            (supervisor.framing(false), bounded::Kill::Relay)
+        } else {
+            (bounded::Framing::DIRECT, bounded::Kill::Group)
+        };
+        // No password line: descent from root never prompts.
+        let ended = bounded::run(cmd, &program, input, limits, framing, kill)?;
+        bounded::finish(ended, command, limits, framing, |output| {
+            if elevated {
+                classify_elevation(output, None, &self.host)
+            } else {
+                Ok(output)
+            }
+        })
+    }
+}
+
 impl Executor for InDaemonExecutor {
     fn run(
         &self,
@@ -2598,6 +3037,18 @@ impl Executor for InDaemonExecutor {
     ) -> Result<CommandOutput, ExecutorError> {
         let (cmd, elevated) = self.resolve(identity, command, args)?;
         self.spawn_resolved(cmd, elevated, None)
+    }
+
+    fn run_with_input(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        input: &[u8],
+        limits: RunLimits,
+    ) -> Result<CommandOutput, RunWithInputError> {
+        check_bounded_command(command)?;
+        self.run_bounded(identity, command, args, input, limits)
     }
 
     fn put_file(&self, dest: &Path, contents: &[u8], meta: FileMeta) -> Result<(), ExecutorError> {
@@ -6238,6 +6689,886 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     "and the temporary link must be cleaned up again"
                 );
                 assert!(strays(artifact.parent().expect("dir")).is_empty());
+            }
+        }
+
+        /// [`Executor::run_with_input`] on every `(identity, transport)` pair
+        /// that runs a command, against stub `sudo` and `ssh` programs.
+        ///
+        /// The stubs keep elevation and the connection out of the picture
+        /// while leaving everything this method adds in it: the supervisor
+        /// really runs under the `sudo` stub and on the far side of the `ssh`
+        /// stub, so the empty environment, the verbatim stdin, the stream
+        /// accounting around the transport's markers and the kill are all
+        /// exercised on each path.
+        mod bounded_runs {
+            use std::path::{Path, PathBuf};
+            use std::process::{Command, Stdio};
+            use std::time::{Duration, Instant};
+
+            use rustix::process::Pid;
+            use tempfile::TempDir;
+
+            use super::super::super::bounded::Supervisor;
+            use super::super::super::{
+                CommandOutput, Executor, ExecutorError, FileMeta, Identity, InDaemonExecutor,
+                LocalExecutor, OutputStream, RunLimits, RunWithInputError, ServiceAccount,
+                SshExecutor, SshPrompt, SudoAuth,
+            };
+            use super::{failing_ssh, fake_ssh, write_script};
+
+            /// Limits roomy enough for every test that is not about them.
+            const ROOMY: RunLimits = RunLimits {
+                max_stdout: 1 << 20,
+                max_stderr: 1 << 20,
+                timeout: Duration::from_secs(30),
+            };
+            /// The largest request the first consumer sends.
+            const REQUEST_MAX: usize = 65_536;
+            /// A command that ignores `SIGTERM`, records its own pid and a
+            /// `SIGTERM`-ignoring child's in the file named by `$1`, writes
+            /// `$2` bytes of stdout, and then waits on the child forever.
+            const STUBBORN: &str = r#"trap '' TERM
+/bin/sleep 300 &
+echo "$!" > "$1.tmp"
+echo "$$" >> "$1.tmp"
+/bin/mv "$1.tmp" "$1"
+/usr/bin/head -c "$2" /dev/zero
+wait"#;
+            /// How long a killed process may take to disappear from the
+            /// process table, reaped by whoever inherited it.
+            const REAP_WAIT: Duration = Duration::from_secs(10);
+
+            /// A `sudo` stub that drops its own flags, `-u <account>`
+            /// included, and execs the wrapped command.
+            fn descending_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "descending-sudo",
+                    r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p|-u) shift 2 ;;
+    -n|-S) shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+"#,
+                )
+            }
+
+            /// A `sudo` stub that insists on reading `s3cret` as its first
+            /// line of stdin, as `sudo -S` does, before execing the wrapped
+            /// command with the rest of the stream.
+            fn password_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "password-sudo",
+                    r#"#!/bin/sh
+IFS= read -r line
+[ "$line" = s3cret ] || { echo "sudo: wrong password: $line" >&2; exit 1; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p|-u) shift 2 ;;
+    -n|-S) shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+"#,
+                )
+            }
+
+            fn ssh_with(dir: &Path, sudo: &Path, auth: SudoAuth) -> SshExecutor {
+                let config = crate::transport::Ssh {
+                    user: "ops".to_string(),
+                    port: 22,
+                    key: PathBuf::from("/dev/null"),
+                    host_key: crate::transport::HostKeyPolicy::Strict,
+                };
+                SshExecutor::from_config("target", &config, "10.0.0.10", auth, SshPrompt::Deny)
+                    .with_ssh_bin(fake_ssh(dir))
+                    .with_remote_sudo(sudo.to_string_lossy().into_owned())
+            }
+
+            /// Every pair that runs a command, labelled for failure messages.
+            fn every_pair(dir: &TempDir) -> Vec<(&'static str, Box<dyn Executor>, Identity)> {
+                let sudo = descending_sudo(dir.path());
+                let service = Identity::Service(ServiceAccount::Security);
+                let local = || {
+                    LocalExecutor::new("seat", SudoAuth::NonInteractive).with_sudo_bin(sudo.clone())
+                };
+                let ssh = || ssh_with(dir.path(), &sudo, SudoAuth::NonInteractive);
+                let daemon = || InDaemonExecutor::new("seat").with_sudo_bin(sudo.clone());
+                vec![
+                    ("local operator", Box::new(local()), Identity::Operator),
+                    ("local root", Box::new(local()), Identity::Root),
+                    ("local service", Box::new(local()), service),
+                    ("ssh operator", Box::new(ssh()), Identity::Operator),
+                    ("ssh root", Box::new(ssh()), Identity::Root),
+                    ("ssh service", Box::new(ssh()), service),
+                    ("daemon root", Box::new(daemon()), Identity::Root),
+                    ("daemon service", Box::new(daemon()), service),
+                ]
+            }
+
+            /// Every byte value, repeated out to `len` bytes.
+            fn pattern(len: usize) -> Vec<u8> {
+                (0..=u8::MAX).cycle().take(len).collect()
+            }
+
+            /// Reads the pids [`STUBBORN`] recorded.
+            fn recorded_pids(path: &Path) -> Vec<Pid> {
+                let text = std::fs::read_to_string(path).expect("the command recorded its pids");
+                text.lines()
+                    .map(|line| {
+                        let raw: i32 = line.trim().parse().expect("a pid");
+                        Pid::from_raw(raw).expect("a positive pid")
+                    })
+                    .collect()
+            }
+
+            /// Waits until no process with any of `pids` exists any more.
+            ///
+            /// A killed process lingers as a zombie until whoever inherited it
+            /// reaps it, and `kill(pid, 0)` still finds a zombie, so this
+            /// awaits the condition rather than checking it once.
+            fn assert_gone(label: &str, pids: &[Pid]) {
+                let deadline = Instant::now() + REAP_WAIT;
+                for &pid in pids {
+                    while rustix::process::test_kill_process(pid).is_ok() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "{label}: process {pid:?} survived the kill"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+
+            #[test]
+            fn stdin_arrives_exactly_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                for input in [
+                    Vec::new(),
+                    pattern(REQUEST_MAX),
+                    b"{\"op\":\"snapshot\"}\n".to_vec(),
+                ] {
+                    for (label, exec, identity) in every_pair(&dir) {
+                        let output = exec
+                            .run_with_input(identity, "/bin/cat", &[], &input, ROOMY)
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        assert_eq!(output.code, Some(0), "{label}");
+                        assert!(
+                            output.stdout == input,
+                            "{label}: {} bytes in, {} bytes out",
+                            input.len(),
+                            output.stdout.len()
+                        );
+                        assert!(output.stderr.is_empty(), "{label}: {:?}", output.stderr);
+                    }
+                }
+            }
+
+            #[test]
+            fn a_password_line_is_consumed_before_the_input_on_the_elevating_transports() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = password_sudo(dir.path());
+                let auth = || SudoAuth::Password("s3cret".to_string());
+                let input = pattern(REQUEST_MAX);
+                let pairs: Vec<(&str, Box<dyn Executor>)> = vec![
+                    (
+                        "local",
+                        Box::new(LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone())),
+                    ),
+                    ("ssh", Box::new(ssh_with(dir.path(), &sudo, auth()))),
+                ];
+                for (label, exec) in pairs {
+                    for identity in [Identity::Root, Identity::Service(ServiceAccount::Roxyd)] {
+                        let output = exec
+                            .run_with_input(identity, "/bin/cat", &[], &input, ROOMY)
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        assert!(
+                            output.stdout == input,
+                            "{label}: the input must follow intact"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn the_command_sees_an_empty_environment_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                assert!(
+                    std::env::var_os("PATH").is_some(),
+                    "the test process must have an environment to withhold"
+                );
+                for (label, exec, identity) in every_pair(&dir) {
+                    let output = exec
+                        .run_with_input(identity, "/usr/bin/env", &[], b"", ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(0), "{label}");
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout),
+                        "",
+                        "{label}: no variable may reach the command"
+                    );
+                }
+            }
+
+            #[test]
+            fn a_command_that_is_not_an_absolute_path_is_refused_before_spawning() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let marker = dir.path().join("spawned");
+                let marker_arg = marker.to_string_lossy().into_owned();
+                for command in ["touch", "./touch", "/usr/bin/touch=x"] {
+                    for (label, exec, identity) in every_pair(&dir) {
+                        let error = exec
+                            .run_with_input(identity, command, &[&marker_arg], b"", ROOMY)
+                            .expect_err("the command must be refused");
+                        assert!(
+                            matches!(&error, RunWithInputError::InvalidCommand { command: named }
+                                if named == command),
+                            "{label}: got {error:?}"
+                        );
+                        assert!(!marker.exists(), "{label}: nothing may have run");
+                    }
+                }
+                // The refusal comes before the identity is looked at too.
+                let error = InDaemonExecutor::new("seat")
+                    .run_with_input(Identity::Operator, "cat", &[], b"", ROOMY)
+                    .expect_err("refused");
+                assert!(
+                    matches!(error, RunWithInputError::InvalidCommand { .. }),
+                    "{error:?}"
+                );
+            }
+
+            #[test]
+            fn a_nonzero_exit_is_a_command_output_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                for (label, exec, identity) in every_pair(&dir) {
+                    let output = exec
+                        .run_with_input(
+                            identity,
+                            "/bin/sh",
+                            &["-c", "printf out; printf err >&2; exit 7"],
+                            b"",
+                            ROOMY,
+                        )
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(7), "{label}");
+                    assert_eq!(output.stdout, b"out", "{label}");
+                    assert_eq!(output.stderr, b"err", "{label}: only the command's stderr");
+                }
+            }
+
+            #[test]
+            fn a_command_that_prints_a_timeout_marker_still_exits_on_every_pair() {
+                // The fixed marker earlier revisions announced a timeout with,
+                // and one shaped like the current marker with another run's
+                // nonce: a command that prints either and exits has exited,
+                // and each byte counts against its stderr limit.
+                let printed = "__BOOTLER_TIMEOUT__\
+                               __BOOTLER_TIMEOUT_00112233445566778899aabbccddeeff__";
+                let exact = RunLimits {
+                    max_stderr: printed.len(),
+                    ..ROOMY
+                };
+                let under = RunLimits {
+                    max_stderr: printed.len() - 1,
+                    ..ROOMY
+                };
+                let dir = tempfile::tempdir().expect("tempdir");
+                for (label, exec, identity) in every_pair(&dir) {
+                    let args = ["-c", "printf '%s' \"$0\" >&2", printed];
+                    let output = exec
+                        .run_with_input(identity, "/bin/sh", &args, b"", exact)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(0), "{label}");
+                    assert_eq!(output.stderr, printed.as_bytes(), "{label}");
+                    let error = exec
+                        .run_with_input(identity, "/bin/sh", &args, b"", under)
+                        .expect_err("one byte over");
+                    assert!(
+                        matches!(
+                            error,
+                            RunWithInputError::OutputLimit {
+                                stream: OutputStream::Stderr,
+                                ..
+                            }
+                        ),
+                        "{label}: {error:?}"
+                    );
+                }
+            }
+
+            #[test]
+            fn a_byte_over_the_limit_that_could_open_a_marker_kills_a_running_command_on_every_pair()
+             {
+                // `_` could open the timeout marker and a newline the SSH
+                // exit-status line, but a command still running after either
+                // wrote it itself, and one byte over is one byte over.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    max_stderr: 0,
+                    ..ROOMY
+                };
+                // Written only once the pids are recorded, since a direct
+                // run is stopped at the byte.
+                let flood = "/usr/bin/head -c \"$2\" /dev/zero";
+                assert!(STUBBORN.contains(flood));
+                let script = STUBBORN.replace(flood, "printf '%s' \"$3\" >&2");
+                for (fragment, name) in [("_", "underscore"), ("\n", "newline")] {
+                    for (index, (label, exec, identity)) in every_pair(&dir).into_iter().enumerate()
+                    {
+                        let pids = dir.path().join(format!("{name}-{index}"));
+                        let started = Instant::now();
+                        let error = exec
+                            .run_with_input(
+                                identity,
+                                "/bin/sh",
+                                &["-c", &script, "sh", &pids.to_string_lossy(), "0", fragment],
+                                b"",
+                                limits,
+                            )
+                            .expect_err("the byte must be counted");
+                        assert!(
+                            matches!(
+                                error,
+                                RunWithInputError::OutputLimit {
+                                    stream: OutputStream::Stderr,
+                                    limit: 0,
+                                    ..
+                                }
+                            ),
+                            "{label} {name}: got {error:?}"
+                        );
+                        assert!(
+                            started.elapsed() < limits.timeout,
+                            "{label} {name}: the breach, not the timeout, must end the run"
+                        );
+                        assert_gone(label, &recorded_pids(&pids));
+                    }
+                }
+            }
+
+            #[test]
+            fn a_command_that_leaves_its_input_unread_still_reports_its_exit_on_every_pair() {
+                // More than a pipe buffer holds, so feeding it cannot finish
+                // before the command exits and the write meets a closed pipe.
+                let input = pattern(4 * REQUEST_MAX);
+                let dir = tempfile::tempdir().expect("tempdir");
+                for (label, exec, identity) in every_pair(&dir) {
+                    let output = exec
+                        .run_with_input(
+                            identity,
+                            "/bin/sh",
+                            &["-c", "printf done; exit 3"],
+                            &input,
+                            ROOMY,
+                        )
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(3), "{label}");
+                    assert_eq!(output.stdout, b"done", "{label}");
+                    assert!(output.stderr.is_empty(), "{label}: {:?}", output.stderr);
+                }
+            }
+
+            #[test]
+            fn an_executor_that_does_not_implement_it_refuses_as_unsupported() {
+                struct RunOnly;
+                impl Executor for RunOnly {
+                    fn run(
+                        &self,
+                        _identity: Identity,
+                        command: &str,
+                        _args: &[&str],
+                    ) -> Result<CommandOutput, ExecutorError> {
+                        panic!("`{command}` must not be run through `run`")
+                    }
+                    fn put_file(
+                        &self,
+                        dest: &Path,
+                        _contents: &[u8],
+                        _meta: FileMeta,
+                    ) -> Result<(), ExecutorError> {
+                        panic!("`{}` must not be written", dest.display())
+                    }
+                }
+                let error = RunOnly
+                    .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", ROOMY)
+                    .expect_err("the default body refuses");
+                assert!(
+                    matches!(error, RunWithInputError::Unsupported),
+                    "got {error:?}"
+                );
+            }
+
+            #[test]
+            fn each_stream_may_reach_its_limit_but_not_pass_it_on_every_pair() {
+                const LIMIT: usize = 7;
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    max_stdout: LIMIT,
+                    max_stderr: LIMIT,
+                    timeout: ROOMY.timeout,
+                };
+                for (stream, script) in [
+                    (OutputStream::Stdout, "/bin/cat"),
+                    (OutputStream::Stderr, "/bin/cat >&2"),
+                ] {
+                    for (label, exec, identity) in every_pair(&dir) {
+                        let at_limit = pattern(LIMIT);
+                        let output = exec
+                            .run_with_input(identity, "/bin/sh", &["-c", script], &at_limit, limits)
+                            .unwrap_or_else(|error| panic!("{label} {stream}: {error:?}"));
+                        let captured = match stream {
+                            OutputStream::Stdout => &output.stdout,
+                            OutputStream::Stderr => &output.stderr,
+                        };
+                        assert_eq!(captured, &at_limit, "{label} {stream}");
+
+                        let error = exec
+                            .run_with_input(
+                                identity,
+                                "/bin/sh",
+                                &["-c", script],
+                                &pattern(LIMIT + 1),
+                                limits,
+                            )
+                            .expect_err("one byte over the limit is an error");
+                        match error {
+                            RunWithInputError::OutputLimit {
+                                command,
+                                stream: over,
+                                limit,
+                            } => {
+                                assert_eq!(command, "/bin/sh", "{label}");
+                                assert_eq!(over, stream, "{label}");
+                                assert_eq!(limit, LIMIT, "{label}");
+                            }
+                            other => {
+                                panic!("{label} {stream}: expected OutputLimit, got {other:?}")
+                            }
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn a_breach_kills_a_command_that_ignores_sigterm_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    max_stdout: 16,
+                    ..ROOMY
+                };
+                for (index, (label, exec, identity)) in every_pair(&dir).into_iter().enumerate() {
+                    let pids = dir.path().join(format!("breach-{index}"));
+                    let started = Instant::now();
+                    let error = exec
+                        .run_with_input(
+                            identity,
+                            "/bin/sh",
+                            &["-c", STUBBORN, "sh", &pids.to_string_lossy(), "4096"],
+                            b"",
+                            limits,
+                        )
+                        .expect_err("the flood must be stopped");
+                    assert!(
+                        matches!(
+                            error,
+                            RunWithInputError::OutputLimit {
+                                stream: OutputStream::Stdout,
+                                ..
+                            }
+                        ),
+                        "{label}: got {error:?}"
+                    );
+                    assert!(
+                        started.elapsed() < limits.timeout,
+                        "{label}: the breach, not the timeout, must end the run"
+                    );
+                    assert_gone(label, &recorded_pids(&pids));
+                }
+            }
+
+            #[test]
+            fn a_timeout_kills_a_command_that_ignores_sigterm_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    timeout: Duration::from_secs(2),
+                    ..ROOMY
+                };
+                for (index, (label, exec, identity)) in every_pair(&dir).into_iter().enumerate() {
+                    let pids = dir.path().join(format!("timeout-{index}"));
+                    let error = exec
+                        .run_with_input(
+                            identity,
+                            "/bin/sh",
+                            &["-c", STUBBORN, "sh", &pids.to_string_lossy(), "0"],
+                            b"",
+                            limits,
+                        )
+                        .expect_err("the command outlives its timeout");
+                    match error {
+                        RunWithInputError::TimedOut { command, timeout } => {
+                            assert_eq!(command, "/bin/sh", "{label}");
+                            assert_eq!(timeout, limits.timeout, "{label}");
+                        }
+                        other => panic!("{label}: expected TimedOut, got {other:?}"),
+                    }
+                    assert_gone(label, &recorded_pids(&pids));
+                }
+            }
+
+            #[test]
+            fn an_unbounded_timeout_runs_the_command_to_completion_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    timeout: Duration::MAX,
+                    ..ROOMY
+                };
+                for (label, exec, identity) in every_pair(&dir) {
+                    let output = exec
+                        .run_with_input(identity, "/bin/cat", &[], b"{}", limits)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(0), "{label}");
+                    assert_eq!(output.stdout, b"{}", "{label}");
+                    assert!(output.stderr.is_empty(), "{label}: {:?}", output.stderr);
+                }
+            }
+
+            #[test]
+            fn a_command_that_closes_its_streams_is_still_held_to_the_timeout() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    timeout: Duration::from_millis(500),
+                    ..ROOMY
+                };
+                let pids = dir.path().join("closed");
+                let script = format!(
+                    "exec >/dev/null 2>&1 </dev/null; {}",
+                    STUBBORN.replace("\"$2\"", "0")
+                );
+                let error = LocalExecutor::default()
+                    .run_with_input(
+                        Identity::Operator,
+                        "/bin/sh",
+                        &["-c", &script, "sh", &pids.to_string_lossy()],
+                        b"",
+                        limits,
+                    )
+                    .expect_err("closing its pipes does not end the command");
+                assert!(
+                    matches!(error, RunWithInputError::TimedOut { .. }),
+                    "got {error:?}"
+                );
+                assert_gone("closed streams", &recorded_pids(&pids));
+            }
+
+            // One table of failures across every transport, each checked under
+            // both limits; split up, the shared stubs would be built per part.
+            #[allow(clippy::too_many_lines)]
+            #[test]
+            fn elevation_and_transport_failures_are_reported_as_run_reports_them() {
+                // Under no stderr allowance at all, too: what `sudo` or `ssh`
+                // writes when it fails is not the command's output, so it
+                // cannot pass the command's limit before it is classified.
+                let tight = RunLimits {
+                    max_stdout: 0,
+                    max_stderr: 0,
+                    ..ROOMY
+                };
+                let dir = tempfile::tempdir().expect("tempdir");
+                let refusing = write_script(
+                    dir.path(),
+                    "refusing-sudo",
+                    "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
+                );
+                let denying = write_script(
+                    dir.path(),
+                    "denying-sudo",
+                    "#!/bin/sh\necho 'ops is not in the sudoers file.' >&2\nexit 1\n",
+                );
+                let config = crate::transport::Ssh {
+                    user: "ops".to_string(),
+                    port: 22,
+                    key: PathBuf::from("/dev/null"),
+                    host_key: crate::transport::HostKeyPolicy::Strict,
+                };
+                let unreachable = SshExecutor::from_config(
+                    "mgmt",
+                    &config,
+                    "10.0.0.10",
+                    SudoAuth::NonInteractive,
+                    SshPrompt::Deny,
+                )
+                .with_ssh_bin(failing_ssh(dir.path()));
+                let remote_refusing = SshExecutor::from_config(
+                    "mgmt",
+                    &config,
+                    "10.0.0.10",
+                    SudoAuth::NonInteractive,
+                    SshPrompt::Deny,
+                )
+                .with_ssh_bin(fake_ssh(dir.path()))
+                .with_remote_sudo(refusing.to_string_lossy().into_owned());
+                let password = password_sudo(dir.path());
+                let wrong_password =
+                    LocalExecutor::new("mgmt", SudoAuth::Password("wrong".to_string()))
+                        .with_sudo_bin(password);
+                for limits in [ROOMY, tight] {
+                    let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                        .with_sudo_bin(refusing.clone())
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("sudo refused");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
+                            if host == "mgmt"),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = wrong_password
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("sudo rejected the password");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::SudoRefused { reason, .. })
+                            if reason.contains("wrong password")),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = InDaemonExecutor::new("mgmt")
+                        .with_sudo_bin(denying.clone())
+                        .run_with_input(
+                            Identity::Service(ServiceAccount::Security),
+                            "/bin/cat",
+                            &[],
+                            b"{}",
+                            limits,
+                        )
+                        .expect_err("sudo refused");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::SudoRefused { reason, .. })
+                            if reason.contains("sudoers")),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = unreachable
+                        .run_with_input(Identity::Operator, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("the host is unreachable");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::Connection { host, reason })
+                            if host == "mgmt" && reason.contains("Connection refused")),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = unreachable
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("the host is unreachable");
+                    assert!(
+                        matches!(
+                            &error,
+                            RunWithInputError::Executor(ExecutorError::Connection { .. })
+                        ),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = remote_refusing
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("the remote sudo refused");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
+                            if host == "mgmt"),
+                        "{limits:?}: got {error:?}"
+                    );
+                }
+
+                let error = InDaemonExecutor::new("mgmt")
+                    .run_with_input(Identity::Operator, "/bin/cat", &[], b"{}", ROOMY)
+                    .expect_err("no operator inside the daemon");
+                assert!(
+                    matches!(
+                        error,
+                        RunWithInputError::Executor(ExecutorError::NoOperatorIdentity { .. })
+                    ),
+                    "got {error:?}"
+                );
+            }
+
+            #[test]
+            fn a_transport_that_floods_stderr_before_the_command_starts_is_refused() {
+                // A `sudo` that never grants, writes far more than any real
+                // diagnostic, and then hangs: the run is abandoned well before
+                // the timeout, and still classifies as the refusal it is.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let flooding = write_script(
+                    dir.path(),
+                    "flooding-sudo",
+                    "#!/bin/sh\n/usr/bin/head -c 1048576 /dev/zero | /usr/bin/tr '\\0' x >&2\n\
+                     exec /bin/sleep 300\n",
+                );
+                let started = Instant::now();
+                let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(flooding)
+                    .run_with_input(Identity::Root, "/bin/cat", &[], b"", ROOMY)
+                    .expect_err("sudo never granted");
+                assert!(
+                    matches!(
+                        error,
+                        RunWithInputError::Executor(ExecutorError::SudoRefused { .. })
+                    ),
+                    "got {error:?}"
+                );
+                assert!(
+                    started.elapsed() < ROOMY.timeout,
+                    "abandoned, not timed out"
+                );
+            }
+
+            /// Spawns the supervisor the way a transport this process cannot
+            /// signal through would run it, in a process group of its own so
+            /// its `kill 0` stays inside it, over [`STUBBORN`]. Its `PATH`
+            /// names only the directory holding `pids`, where no utility lives,
+            /// so its deadline is shown to depend on no `PATH` lookup — an empty
+            /// environment would not show it, since a shell then falls back to
+            /// a default `PATH` of its own.
+            fn spawn_supervised(supervisor: &Supervisor, pids: &Path) -> std::process::Child {
+                use std::os::unix::process::CommandExt;
+
+                Command::new("/bin/sh")
+                    .env_clear()
+                    .env("PATH", pids.parent().expect("pids lives in a directory"))
+                    .arg("-c")
+                    .arg(supervisor.script())
+                    .args(["/bin/sh", "-c", STUBBORN, "sh"])
+                    .arg(pids)
+                    .arg("0")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn the supervisor")
+            }
+
+            #[test]
+            fn the_supervisor_kills_the_command_at_its_own_deadline() {
+                // What ends a command on the far side of an SSH connection,
+                // where no signal from here arrives: nothing signals the
+                // supervisor, and its own deadline still kills everything.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let pids = dir.path().join("pids");
+                let supervisor = Supervisor::new(Duration::from_millis(200)).expect("a supervisor");
+                let child = spawn_supervised(&supervisor, &pids);
+                let output = child.wait_with_output().expect("the supervisor ends");
+                assert!(!output.status.success());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(supervisor.timeout_marker()),
+                    "the deadline announces itself: {:?}",
+                    output.stderr
+                );
+                assert_gone("remote deadline", &recorded_pids(&pids));
+            }
+
+            #[test]
+            fn a_relayed_sigterm_makes_the_supervisor_kill_the_command() {
+                // What `sudo` relays when this process terminates it: a
+                // SIGTERM to the supervisor alone, which the command ignores,
+                // and which must still end the command.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let pids = dir.path().join("pids");
+                let supervisor = Supervisor::new(Duration::from_secs(300)).expect("a supervisor");
+                let mut child = spawn_supervised(&supervisor, &pids);
+                let deadline = Instant::now() + REAP_WAIT;
+                while !pids.exists() {
+                    assert!(Instant::now() < deadline, "the command never started");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let supervisor = Pid::from_child(&child);
+                rustix::process::kill_process(supervisor, rustix::process::Signal::TERM)
+                    .expect("signal the supervisor");
+                let status = child.wait().expect("the supervisor ends");
+                assert!(!status.success());
+                assert_gone("relayed SIGTERM", &recorded_pids(&pids));
+            }
+
+            #[test]
+            fn identities_resolve_through_sudo_exactly_as_run_resolves_them() {
+                // A stub `sudo` that prints its argv and grants, so the words
+                // ahead of the shell — the flags and the descent — can be
+                // compared between the two methods on each transport.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let recording = write_script(
+                    dir.path(),
+                    "recording-sudo",
+                    &format!(
+                        "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n\
+                         printf '%s' '{}' >&2\n",
+                        super::super::super::SUDO_OK_SENTINEL
+                    ),
+                );
+                let local = LocalExecutor::new("seat", SudoAuth::NonInteractive)
+                    .with_sudo_bin(recording.clone());
+                let ssh = ssh_with(dir.path(), &recording, SudoAuth::NonInteractive);
+                let daemon = InDaemonExecutor::new("seat").with_sudo_bin(recording.clone());
+                let prefix = |argv: &[u8], shell: &str| -> Vec<String> {
+                    String::from_utf8_lossy(argv)
+                        .lines()
+                        .take_while(|word| *word != shell)
+                        .map(str::to_string)
+                        .collect()
+                };
+                let pairs: Vec<(&str, &dyn Executor, Identity)> = vec![
+                    ("local root", &local, Identity::Root),
+                    (
+                        "local service",
+                        &local,
+                        Identity::Service(ServiceAccount::Insight),
+                    ),
+                    ("ssh root", &ssh, Identity::Root),
+                    (
+                        "ssh service",
+                        &ssh,
+                        Identity::Service(ServiceAccount::Insight),
+                    ),
+                    (
+                        "daemon service",
+                        &daemon,
+                        Identity::Service(ServiceAccount::Insight),
+                    ),
+                ];
+                for (label, exec, identity) in pairs {
+                    let run = exec
+                        .run(identity, "/usr/bin/printf", &["%s", "marker"])
+                        .expect("run");
+                    let bounded = exec
+                        .run_with_input(identity, "/usr/bin/printf", &["%s", "marker"], b"", ROOMY)
+                        .expect("run_with_input");
+                    let run_prefix = prefix(&run.stdout, "sh");
+                    assert!(!run_prefix.is_empty(), "{label}: sudo must be involved");
+                    assert_eq!(
+                        prefix(&bounded.stdout, "/bin/sh"),
+                        run_prefix,
+                        "{label}: the elevation must match run's"
+                    );
+                }
+                // The identities that involve no `sudo` run the command bare.
+                for (label, exec, identity) in [
+                    (
+                        "local operator",
+                        &local as &dyn Executor,
+                        Identity::Operator,
+                    ),
+                    ("ssh operator", &ssh, Identity::Operator),
+                    ("daemon root", &daemon, Identity::Root),
+                ] {
+                    let bounded = exec
+                        .run_with_input(identity, "/usr/bin/printf", &["%s", "marker"], b"", ROOMY)
+                        .expect("run_with_input");
+                    assert_eq!(
+                        bounded.stdout, b"marker",
+                        "{label}: no sudo may be involved"
+                    );
+                }
             }
         }
     }

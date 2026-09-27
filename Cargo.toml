@@ -24,7 +24,10 @@ hostname = "0.4"
 num-bigint = "0.4.5"
 rustls-pki-types = "1"
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
-rustix = { version = "1", features = ["fs", "process"] }
+# `event` adds `poll`, which `Executor::run_with_input` multiplexes the child's
+# stdin, stdout and stderr through so each is bounded and the child can be
+# killed at a deadline; std offers no readiness wait or read timeout on a pipe.
+rustix = { version = "1", features = ["event", "fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
