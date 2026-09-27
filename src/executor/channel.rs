@@ -1,8 +1,9 @@
 //! The long-lived channel behind [`Executor::open_channel`].
 //!
 //! [`open_started`] spawns a transport — `sudo`, or `ssh` — that runs the
-//! command under [`start_script`], and returns only once that script has
-//! announced the command's start with [`SUDO_OK_SENTINEL`]. [`open_direct`]
+//! command under a [`StartScript`], and returns only once that script has
+//! announced the command's start with [`SUDO_OK_SENTINEL`] and been handed
+//! standard input. [`open_direct`]
 //! spawns a command with nothing in between and returns at once. Either way
 //! the caller then owns standard input and standard output, while standard
 //! error stays with the [`Channel`] and is drained on a thread of its own for
@@ -23,11 +24,13 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use aws_lc_rs::rand::SecureRandom;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 
 use super::bounded::{
-    Deadline, ENV, KILL_GRACE, SUPERVISOR_SHELL, TRANSPORT_STDERR_LIMIT, find, reap_within,
+    Deadline, ENV, KILL_GRACE, SUPERVISOR_SHELL, TRANSPORT_STDERR_LIMIT, find, partial_suffix,
+    reap_within,
 };
 use super::{CommandOutput, ExecutorError, RC_MARKER, SUDO_OK_SENTINEL, spawn_retrying_text_busy};
 
@@ -36,9 +39,16 @@ use super::{CommandOutput, ExecutorError, RC_MARKER, SUDO_OK_SENTINEL, spawn_ret
 /// pipe open indefinitely; past this, what was read is what is returned, and
 /// the rest is noted as truncated.
 const STDERR_GRACE: Duration = Duration::from_secs(5);
-/// The shell [`start_script`] runs under, named absolutely so the start
+/// The shell a [`StartScript`] runs under, named absolutely so the start
 /// depends on no `PATH`.
 pub(super) const START_SHELL: &str = SUPERVISOR_SHELL;
+/// What opens every [`StartScript`]'s handoff line; the start's own random
+/// nonce follows it.
+const HANDOFF_PREFIX: &str = "__BOOTLER_STDIN_";
+/// What closes every [`StartScript`]'s handoff line.
+const HANDOFF_SUFFIX: &str = "__";
+/// Random bytes in a handoff line's nonce.
+const HANDOFF_NONCE_LEN: usize = 16;
 /// Bytes read from standard error per readiness.
 const READ_CHUNK: usize = 8192;
 /// Bytes at the end of an SSH channel's standard error held back from the
@@ -156,18 +166,82 @@ pub(super) fn check_command(command: &str) -> Result<(), ChannelError> {
     }
 }
 
-/// Returns the `sh -c` script a channel's command starts under wherever
-/// `sudo` or SSH stands in between: it announces the start on standard error
-/// with [`SUDO_OK_SENTINEL`], then replaces itself with the command, run with
-/// an empty environment. Invoked as `sh -c SCRIPT <command> <args…>`, so the
-/// command and every argument arrive positionally and are never spliced into
-/// the script text.
-pub(super) fn start_script() -> String {
-    format!("printf '%s' '{SUDO_OK_SENTINEL}' >&2; exec {ENV} -i \"$0\" \"$@\"")
+/// The `sh -c` script a channel's command starts under wherever `sudo` or SSH
+/// stands in between, with the handoff line of its one start.
+///
+/// Invoked as `sh -c SCRIPT <command> <args…>`, so the command and every
+/// argument arrive positionally and are never spliced into the script text.
+///
+/// - **It first announces the start** on standard error with
+///   [`SUDO_OK_SENTINEL`]: `sudo` has granted it, and has read standard input
+///   for the last time.
+/// - **It then takes standard input up to its handoff line**, which
+///   [`open_started`] writes only once the announcement has arrived, and
+///   discards it. Under [`SudoAuth::Password`] the password line comes first
+///   on standard input, and a `sudo` that did not ask for it — a `NOPASSWD`
+///   rule, or credentials it still has cached — leaves it unread; this is
+///   where it goes instead of to the command. A `sudo` that did ask has
+///   consumed it, and only the handoff line is left. A shell reads a pipe a
+///   byte at a time, so the command's standard input begins exactly after
+///   the handoff line, at the caller's first byte.
+/// - **It replaces itself with the command**, run through `env -i` with an
+///   empty environment. Standard input that ends before the handoff line
+///   means the transport broke, and the script exits `1` without starting it.
+///
+/// The handoff line shares standard input with what precedes it, so it is not
+/// a fixed string a password could happen to equal: it carries a nonce of
+/// [`HANDOFF_NONCE_LEN`] bytes drawn from the system's secure random source
+/// for this start alone.
+///
+/// [`SudoAuth::Password`]: super::SudoAuth::Password
+pub(super) struct StartScript {
+    script: String,
+    handoff: String,
+}
+
+impl StartScript {
+    /// Creates the script of one start, with a handoff line of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Spawn`] when the system's random source fails
+    /// to draw the handoff line's nonce: without it, nothing can be started
+    /// under this script.
+    pub(super) fn new() -> Result<Self, ExecutorError> {
+        let mut nonce = [0u8; HANDOFF_NONCE_LEN];
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| ExecutorError::Spawn {
+                command: START_SHELL.to_string(),
+                source: std::io::Error::other("system random source failed"),
+            })?;
+        let hex = crate::payload::to_hex(&nonce);
+        let handoff = format!("{HANDOFF_PREFIX}{hex}{HANDOFF_SUFFIX}");
+        let script = format!(
+            "printf '%s' '{SUDO_OK_SENTINEL}' >&2; \
+             while IFS= read -r line; do \
+             [ \"$line\" = '{handoff}' ] && exec {ENV} -i \"$0\" \"$@\"; \
+             done; exit 1"
+        );
+        Ok(Self { script, handoff })
+    }
+
+    /// Returns the script to run as `sh -c SCRIPT <command> <args…>`.
+    pub(super) fn script(&self) -> &str {
+        &self.script
+    }
+
+    /// Returns the line [`open_started`] writes once the start is announced,
+    /// newline included.
+    fn handoff_line(&self) -> Vec<u8> {
+        format!("{}\n", self.handoff).into_bytes()
+    }
 }
 
 /// What [`open_started`] needs to know beyond the command it spawns.
 pub(super) struct Start<'a> {
+    /// The script the transport runs the command under.
+    pub(super) script: &'a StartScript,
     /// The host the transport reaches, for the errors that name it.
     pub(super) host: &'a str,
     /// The line to write on standard input before anything else — `sudo -S`'s
@@ -179,16 +253,18 @@ pub(super) struct Start<'a> {
     pub(super) limits: ChannelLimits,
 }
 
-/// Spawns `command` — a transport running the command under
-/// [`start_script`] — and returns the channel once the start is proven.
+/// Spawns `command` — a transport running the command under `start.script` —
+/// and returns the channel once the start is proven.
 ///
 /// The password line, if any, is written first. Standard error is then read,
 /// and standard output never, until [`SUDO_OK_SENTINEL`] arrives; what follows
-/// it is the command's. A transport that ends first, or writes more than
-/// [`TRANSPORT_STDERR_LIMIT`] first, is killed and reaped, and what it wrote
-/// is handed to `refusal` to be classified as
-/// [`Executor::run`](super::Executor::run) classifies it. One that does
-/// neither within the elevation timeout is killed and reaped too.
+/// it is the command's. The script's handoff line is written then, so that
+/// standard input passes to the caller with nothing ahead of the caller's
+/// bytes. A transport that ends first, or writes more than
+/// [`TRANSPORT_STDERR_LIMIT`] ahead of the sentinel, is killed and reaped,
+/// and what it wrote ahead of the sentinel is handed to `refusal` to be
+/// classified as [`Executor::run`](super::Executor::run) classifies it. One
+/// that does neither within the elevation timeout is killed and reaped too.
 ///
 /// # Errors
 ///
@@ -208,7 +284,13 @@ pub(super) fn open_started(
         &mut spawned.stderr,
         start.password_line.as_deref(),
         start.limits.elevation_timeout,
-    );
+    )
+    .and_then(|settled| {
+        if matches!(settled, Settled::Started(_)) {
+            hand_off(&mut spawned.stdin, &start.script.handoff_line())?;
+        }
+        Ok(settled)
+    });
     let started = match settled {
         Ok(Settled::Started(started)) => started,
         Ok(Settled::Ended(stderr)) => {
@@ -307,7 +389,8 @@ enum Settled {
     /// the command's.
     Started(Vec<u8>),
     /// The transport's standard error ended, or passed
-    /// [`TRANSPORT_STDERR_LIMIT`], before the announcement: all of it.
+    /// [`TRANSPORT_STDERR_LIMIT`], before the announcement: all of it up to
+    /// the announcement.
     Ended(Vec<u8>),
     /// The elevation timeout passed first, with what had been written by then.
     TimedOut(Vec<u8>),
@@ -343,16 +426,12 @@ fn feed_and_settle(
     timeout: Duration,
 ) -> std::io::Result<Settled> {
     let deadline = Deadline::after(timeout);
-    let sentinel = SUDO_OK_SENTINEL.as_bytes();
     let mut written = 0;
     let mut read = Vec::new();
     let mut chunk = vec![0; READ_CHUNK];
     loop {
-        if let Some(at) = find(&read, sentinel) {
-            return Ok(Settled::Started(read.split_off(at + sentinel.len())));
-        }
-        if read.len() > TRANSPORT_STDERR_LIMIT {
-            return Ok(Settled::Ended(read));
+        if let Some(settled) = judge(&mut read, written >= unwritten.len()) {
+            return Ok(settled);
         }
         let Some(left) = deadline.remaining() else {
             return Ok(Settled::TimedOut(read));
@@ -393,6 +472,45 @@ fn feed_and_settle(
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+/// Returns what the standard error `read` so far says of the start, or `None`
+/// while it is still undecided. `fed` is whether the password line, if any,
+/// has been written in full.
+///
+/// What precedes the sentinel is the transport's, and is held to
+/// [`TRANSPORT_STDERR_LIMIT`] wherever the sentinel lands — in the same read
+/// that passes the limit included. Before the sentinel has arrived, only a
+/// trailing fragment that may still grow into it is not yet counted.
+fn judge(read: &mut Vec<u8>, fed: bool) -> Option<Settled> {
+    let sentinel = SUDO_OK_SENTINEL.as_bytes();
+    match find(read, sentinel) {
+        Some(at) if at > TRANSPORT_STDERR_LIMIT => {
+            read.truncate(at);
+            Some(Settled::Ended(std::mem::take(read)))
+        }
+        // A password `sudo` did not read is still written in full first, so
+        // that the start script can discard it as one whole line.
+        Some(at) if fed => Some(Settled::Started(read.split_off(at + sentinel.len()))),
+        None if read.len() - partial_suffix(read, sentinel) > TRANSPORT_STDERR_LIMIT => {
+            Some(Settled::Ended(std::mem::take(read)))
+        }
+        Some(_) | None => None,
+    }
+}
+
+/// Writes the start script's handoff line, after which standard input is the
+/// caller's.
+///
+/// Nothing is left in the pipe but, at most, a password line `sudo` did not
+/// read, so the line fits and the write does not block. A transport that has
+/// closed standard input since announcing the start is not a failure here:
+/// [`Channel::wait`] reports how it ended.
+fn hand_off(stdin: &mut ChildStdin, line: &[u8]) -> std::io::Result<()> {
+    match stdin.write_all(line) {
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+        written => written,
     }
 }
 
@@ -785,7 +903,55 @@ fn split_status_line(tail: &[u8]) -> Option<(usize, i32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RC_MARKER, Sink, split_status_line};
+    use super::{
+        RC_MARKER, SUDO_OK_SENTINEL, Settled, Sink, TRANSPORT_STDERR_LIMIT, judge,
+        split_status_line,
+    };
+
+    /// `before` bytes of the transport's, then `after`.
+    fn preamble(before: usize, after: &str) -> Vec<u8> {
+        let mut read = vec![b'x'; before];
+        read.extend_from_slice(after.as_bytes());
+        read
+    }
+
+    #[test]
+    fn the_transport_limit_holds_wherever_the_sentinel_lands() {
+        let mut read = preamble(TRANSPORT_STDERR_LIMIT, &format!("{SUDO_OK_SENTINEL}own"));
+        assert!(
+            matches!(judge(&mut read, true), Some(Settled::Started(own)) if own == b"own"),
+            "the limit itself is not passed"
+        );
+
+        // The sentinel arriving in the read that passes the limit does not
+        // excuse what precedes it.
+        let mut read = preamble(
+            TRANSPORT_STDERR_LIMIT + 1,
+            &format!("{SUDO_OK_SENTINEL}own"),
+        );
+        assert!(
+            matches!(judge(&mut read, true),
+                Some(Settled::Ended(ended)) if ended == vec![b'x'; TRANSPORT_STDERR_LIMIT + 1]),
+            "only the transport's bytes are kept for classification"
+        );
+
+        let mut read = preamble(TRANSPORT_STDERR_LIMIT + 1, "");
+        assert!(matches!(judge(&mut read, true), Some(Settled::Ended(_))));
+
+        // A fragment that may still become the sentinel is not yet counted.
+        let fragment = SUDO_OK_SENTINEL
+            .get(..SUDO_OK_SENTINEL.len() - 1)
+            .expect("the sentinel is longer than one byte");
+        let mut read = preamble(TRANSPORT_STDERR_LIMIT, fragment);
+        assert!(judge(&mut read, true).is_none());
+    }
+
+    #[test]
+    fn the_start_waits_for_the_password_to_be_written_in_full() {
+        let mut read = preamble(0, SUDO_OK_SENTINEL);
+        assert!(judge(&mut read, false).is_none());
+        assert!(matches!(judge(&mut read, true), Some(Settled::Started(own)) if own.is_empty()));
+    }
 
     #[test]
     fn the_status_line_is_read_only_at_the_end_of_the_stream() {

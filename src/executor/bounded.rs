@@ -719,7 +719,7 @@ pub(super) fn contains(haystack: &[u8], needle: &str) -> bool {
 
 /// Returns the length of the longest proper prefix of `marker` that `bytes`
 /// ends with: a marker that may still be arriving.
-fn partial_suffix(bytes: &[u8], marker: &[u8]) -> usize {
+pub(super) fn partial_suffix(bytes: &[u8], marker: &[u8]) -> usize {
     let longest = bytes.len().min(marker.len().saturating_sub(1));
     (1..=longest)
         .rev()

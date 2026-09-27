@@ -1167,14 +1167,18 @@ pub trait Executor {
     ///   stands in between — [`Identity::Root`] and [`Identity::Service`] on
     ///   [`LocalExecutor`], every identity on [`SshExecutor`] — the command
     ///   starts under a fixed `sh -c` script that announces the start on
-    ///   standard error and then replaces itself with the command. Under
-    ///   [`SudoAuth::Password`] the password line is written first, and
-    ///   standard input then stays open for the caller, so the command's first
-    ///   byte of input is the caller's first byte. Standard error is read until
-    ///   the announcement, and standard output not at all. A transport that
-    ///   ends first, or writes more than 64 KiB first, is killed and classified
-    ///   as [`Executor::run`] classifies that output; one that does neither
-    ///   within `limits.elevation_timeout` is killed and reaped. The operator on
+    ///   standard error, reads standard input up to a line written after the
+    ///   announcement, and then replaces itself with the command. Under
+    ///   [`SudoAuth::Password`] the password line is written first; a `sudo`
+    ///   that does not ask for it — a `NOPASSWD` rule, or credentials it still
+    ///   has cached — leaves it for the script, which discards it. Either way
+    ///   standard input then stays open for the caller, and the command's
+    ///   first byte of input is the caller's first byte. Standard error is
+    ///   read until the announcement, and standard output not at all. A
+    ///   transport that ends first, or writes more than 64 KiB ahead of the
+    ///   announcement, is killed and classified as [`Executor::run`]
+    ///   classifies that output; one that does neither within
+    ///   `limits.elevation_timeout` is killed and reaped. The operator on
     ///   [`LocalExecutor`] is spawned directly, and this returns at once.
     /// - **Standard error stays with the channel**, drained for its whole
     ///   life so the command never blocks on it: the first
@@ -1192,13 +1196,6 @@ pub trait Executor {
     /// spawned in the caller's process group, as [`Executor::run`] spawns it,
     /// so a passphrase prompt [`SshPrompt::Allow`] permits still reaches the
     /// terminal.
-    ///
-    /// Under [`SudoAuth::Password`], a `sudo` that does not ask for the
-    /// password — a `NOPASSWD` rule, or credentials it still has cached —
-    /// leaves the password line unread, and the command reads it as its first
-    /// line of input. This is `sudo`'s choice, and the same one
-    /// [`Executor::run_with_input`] meets; [`SudoAuth::NonInteractive`] is
-    /// the setting for a host where `sudo` does not ask.
     ///
     /// [`Channel`] states what ending the channel reaches: the local
     /// transport process, not a command started through `sudo` or over SSH,
@@ -2592,6 +2589,7 @@ impl Executor for LocalExecutor {
         limits: ChannelLimits,
     ) -> Result<Channel, ChannelError> {
         channel::check_command(command)?;
+        let script = channel::StartScript::new()?;
         let Resolved {
             command: mut cmd,
             password_line,
@@ -2599,7 +2597,7 @@ impl Executor for LocalExecutor {
         } = self.resolve_through(
             identity,
             channel::START_SHELL,
-            &channel::start_script(),
+            script.script(),
             command,
             args,
         );
@@ -2611,6 +2609,7 @@ impl Executor for LocalExecutor {
             return channel::open_direct(cmd, limits.max_stderr);
         }
         let start = channel::Start {
+            script: &script,
             host: &self.host,
             password_line,
             remote_code: false,
@@ -2980,7 +2979,7 @@ impl Executor for SshExecutor {
         limits: ChannelLimits,
     ) -> Result<Channel, ChannelError> {
         channel::check_command(command)?;
-        let script = channel::start_script();
+        let script = channel::StartScript::new()?;
         let ResolvedRemote {
             remote,
             password_line,
@@ -2988,8 +2987,8 @@ impl Executor for SshExecutor {
         } = self.resolve_through(
             identity,
             channel::START_SHELL,
-            &script,
-            Some(&script),
+            script.script(),
+            Some(script.script()),
             command,
             args,
         );
@@ -2998,6 +2997,7 @@ impl Executor for SshExecutor {
         let mut cmd = self.ssh_command();
         cmd.arg(wrap_with_rc_marker(&remote));
         let start = channel::Start {
+            script: &script,
             host: &self.host,
             password_line,
             remote_code: true,
@@ -7766,6 +7766,7 @@ exec "$@"
             use rustix::process::Pid;
             use tempfile::TempDir;
 
+            use super::super::super::bounded::TRANSPORT_STDERR_LIMIT;
             use super::super::super::{
                 Channel, ChannelError, ChannelLimits, CommandOutput, Executor, ExecutorError,
                 FileMeta, Identity, InDaemonExecutor, LocalExecutor, RC_MARKER, SUDO_OK_SENTINEL,
@@ -8194,16 +8195,23 @@ exec "$@"
             #[test]
             fn a_password_line_is_consumed_before_the_callers_bytes() {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let sudo = password_sudo(dir.path());
+                let asking = password_sudo(dir.path());
+                // A `NOPASSWD` rule, or cached credentials: `sudo` leaves the
+                // password line unread.
+                let not_asking = descending_sudo(dir.path());
                 let auth = || SudoAuth::Password("s3cret".to_string());
                 let input = pattern(ECHO_LEN);
-                let pairs: Vec<(&str, Box<dyn Executor>)> = vec![
-                    (
-                        "local",
+                let mut pairs: Vec<(String, Box<dyn Executor>)> = Vec::new();
+                for (how, sudo) in [("asking", &asking), ("not asking", &not_asking)] {
+                    pairs.push((
+                        format!("local, {how}"),
                         Box::new(LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone())),
-                    ),
-                    ("ssh", Box::new(ssh_with(dir.path(), &sudo, auth()))),
-                ];
+                    ));
+                    pairs.push((
+                        format!("ssh, {how}"),
+                        Box::new(ssh_with(dir.path(), sudo, auth())),
+                    ));
+                }
                 for (label, exec) in pairs {
                     for identity in [Identity::Root, Identity::Service(ServiceAccount::Roxyd)] {
                         let mut channel = exec
@@ -8406,6 +8414,47 @@ exec "$@"
             }
 
             #[test]
+            fn a_start_at_the_transport_limit_opens_and_one_past_it_is_refused() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                // Writes `$FLOOD` bytes, drops `-n`, and execs the start
+                // script, whose sentinel follows them directly.
+                let flooding_then_granting = |name: &str, flood: usize| {
+                    write_script(
+                        dir.path(),
+                        name,
+                        &format!(
+                            "#!/bin/sh\n/usr/bin/head -c {flood} /dev/zero | \
+                             /usr/bin/tr '\\0' x >&2\nshift\nexec \"$@\"\n"
+                        ),
+                    )
+                };
+                let at_limit = flooding_then_granting("at-limit-sudo", TRANSPORT_STDERR_LIMIT);
+                let mut channel = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(at_limit)
+                    .open_channel(Identity::Root, "/bin/cat", &[], ROOMY)
+                    .expect("the limit itself is not passed");
+                assert_eq!(echo(&mut channel, b"frame"), b"frame");
+                let exit = channel.wait().expect("wait");
+                assert_eq!(exit.code, Some(0));
+                assert!(exit.stderr.is_empty(), "{:?}", exit.stderr.len());
+
+                let past_limit =
+                    flooding_then_granting("past-limit-sudo", TRANSPORT_STDERR_LIMIT + 1);
+                let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(past_limit)
+                    .open_channel(Identity::Root, "/bin/cat", &[], ROOMY)
+                    .expect_err("the sentinel came one byte past the limit");
+                let ChannelError::Executor(ExecutorError::SudoRefused { reason, .. }) = &error
+                else {
+                    panic!("expected SudoRefused, got {error:?}");
+                };
+                assert!(
+                    !reason.contains(SUDO_OK_SENTINEL),
+                    "only the transport's own bytes are classified"
+                );
+            }
+
+            #[test]
             fn an_ssh_channel_that_loses_its_exit_status_has_no_code() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let lossy = write_script(
@@ -8413,6 +8462,7 @@ exec "$@"
                     "lossy-ssh",
                     &format!(
                         "#!/bin/sh\nprintf '%s' '{SUDO_OK_SENTINEL}' >&2\n\
+                         IFS= read -r handoff\n\
                          /bin/cat\necho 'Connection to 10.0.0.10 closed.' >&2\nexit 255\n"
                     ),
                 );
