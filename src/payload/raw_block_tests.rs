@@ -140,8 +140,8 @@ fn assert_blocks<R: Read + Seek>(
 }
 
 /// A current-format container over arbitrary blocks, with envelope blocks of
-/// whatever length is given, an empty one recorded absent: `base ‖ manifest ‖ archive ‖ signature ‖ key_id ‖
-/// footer`.
+/// whatever length is given and an empty one recorded absent:
+/// `base ‖ manifest ‖ archive ‖ signature ‖ key_id ‖ footer`.
 fn version_2(manifest: &[u8], archive: &[u8], signature: &[u8], key_id: &[u8]) -> Vec<u8> {
     let len = |bytes: &[u8]| u64::try_from(bytes.len()).expect("a fixture length fits a u64");
     let manifest_offset = len(BASE);
