@@ -167,9 +167,10 @@ cargo test
 
 The `test-support` feature exposes test-only account fixtures
 (`Principal::Fixture` / `ServiceAccount::Fixture`), payload fixtures such as
-`payload::widen_envelope_blocks`, and `image::test_support` — a builder for
-synthetic image archives the image validator accepts, and a classifier that
-holds any image archive against a declaration — and
+`payload::widen_envelope_blocks` and `payload::append_version_1_trailer`, and
+`image::test_support` — a builder for synthetic image archives the image
+validator accepts, and a classifier that holds any image archive against a
+declaration — and
 `executor::test_support::RecordingExecutor`, which records every call it
 receives and answers each from a script, so a **dependent** crate's tests can
 construct them across the crate boundary. With

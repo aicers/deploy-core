@@ -1507,15 +1507,18 @@ fn authenticate<R: Read + Seek>(
     //    for its version rather than as a generic decode error. The injected
     //    floor is checked here; the build's own range is stage one's, inside
     //    the parse below, and reaches this taxonomy mapped.
-    if let Some(found) =
-        manifest::parse_format_version(container.manifest_bytes()).map_err(map_manifest_error)?
+    if let Some(found) = manifest::parse_format_version(container.raw_manifest_block())
+        .map_err(map_manifest_error)?
     {
         check_format_version(found, trust.min_manifest_format_version)?;
     }
 
     // 4. Parse, mapping the two path faults and the version refusal.
-    let manifest = PayloadManifest::parse(container.manifest_bytes(), container.footer_version())
-        .map_err(map_manifest_error)?;
+    let manifest = PayloadManifest::parse(
+        container.raw_manifest_block(),
+        container.container_version(),
+    )
+    .map_err(map_manifest_error)?;
 
     // 5-15. The statements the authenticated manifest makes.
     check_statements(&manifest, request, Some(trust))?;
@@ -1671,7 +1674,7 @@ fn verify_signature<R: Read + Seek>(
         // is `UnknownKeyId` whatever the signature's length was.
         EnvelopeBlock::WrongLength => None,
     };
-    let message = container.manifest_bytes();
+    let message = container.raw_manifest_block();
     let hint = usable_hint(container.key_id());
     let verifies = |anchor: &TrustAnchor| {
         signature.is_some_and(|signature| anchor.verifies(message, signature))
@@ -2743,7 +2746,7 @@ mod tests {
             let container =
                 payload::read_package_container(Cursor::new(package.clone()), &ENVELOPE_BOUNDS)
                     .expect("the fixture container reads");
-            assert_eq!(container.footer_version(), 1, "{label}");
+            assert_eq!(container.container_version(), 1, "{label}");
             assert!(
                 matches!(container.signature(), EnvelopeBlock::Absent),
                 "{label}"
@@ -4877,7 +4880,7 @@ mod tests {
             payload::read_package_container(Cursor::new(SIGNED_V6_PACKAGE), &ENVELOPE_BOUNDS)
                 .expect("the fixture is a container");
         assert_eq!(
-            crate::manifest::parse_format_version(container.manifest_bytes())
+            crate::manifest::parse_format_version(container.raw_manifest_block())
                 .expect("a readable version"),
             Some(IMAGE_DECLARATION_FORMAT_VERSION)
         );
