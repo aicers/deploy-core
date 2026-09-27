@@ -41,7 +41,7 @@ const EXIT_POLL: Duration = Duration::from_millis(5);
 /// is relayed to it, before its process group is killed outright.
 const RELAY_GRACE: Duration = Duration::from_secs(5);
 /// How long a child is given to be reaped after `SIGKILL` reached its group.
-const KILL_GRACE: Duration = Duration::from_secs(5);
+pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
 /// How long stderr bytes that may yet prove to be framing — the start of a
 /// timeout marker, or of the SSH wrapper's exit-status line — are given to
 /// prove it, once counting them as the command's would pass `max_stderr`.
@@ -57,18 +57,18 @@ const TIMEOUT_MARKER_PREFIX: &str = "__BOOTLER_TIMEOUT_";
 const TIMEOUT_MARKER_SUFFIX: &str = "__";
 /// Random bytes in a timeout marker's nonce.
 const TIMEOUT_NONCE_LEN: usize = 16;
-/// The most stderr a supervised run's transport may write before the command
-/// starts — `sudo`'s refusal, `ssh`'s connection diagnostic. None of it is the
-/// command's, so `max_stderr` does not bound it; this does, so that memory
-/// stays bounded while the transport fails. Real diagnostics are a line or
-/// two.
-const TRANSPORT_STDERR_LIMIT: usize = 64 * 1024;
+/// The most stderr a supervised run's transport, or a channel's, may write
+/// before the command starts — `sudo`'s refusal, `ssh`'s connection
+/// diagnostic. None of it is the command's, so `max_stderr` does not bound it;
+/// this does, so that memory stays bounded while the transport fails. Real
+/// diagnostics are a line or two.
+pub(super) const TRANSPORT_STDERR_LIMIT: usize = 64 * 1024;
 /// The shell a [`Supervisor`] script runs under, named absolutely so the
 /// invocation depends on no `PATH`.
 pub(super) const SUPERVISOR_SHELL: &str = "/bin/sh";
 /// The `env` the supervisor clears the command's environment with. Its path is
 /// the one fixed location both Linux and macOS guarantee.
-const ENV: &str = "/usr/bin/env";
+pub(super) const ENV: &str = "/usr/bin/env";
 /// The `sleep` the supervisor's deadline runs, named absolutely for the same
 /// reason: one `PATH` could not resolve would exit at once, and the script
 /// would lose its deadline exactly as it would to a `sleep` that refused it.
@@ -673,7 +673,7 @@ fn await_unreaped(pid: Pid, grace: Duration) {
 }
 
 /// Waits up to `grace` for `child` to exit and reaps it.
-fn reap_within(child: &mut Child, grace: Duration) {
+pub(super) fn reap_within(child: &mut Child, grace: Duration) {
     let deadline = Deadline::after(grace);
     // An error is a child already reaped, or not ours to reap: nothing more
     // to wait for.
@@ -687,15 +687,15 @@ fn reap_within(child: &mut Child, grace: Duration) {
 
 /// When a run must end. `None` is a timeout too large to represent as an
 /// instant, which never passes.
-struct Deadline(Option<Instant>);
+pub(super) struct Deadline(Option<Instant>);
 
 impl Deadline {
-    fn after(timeout: Duration) -> Self {
+    pub(super) fn after(timeout: Duration) -> Self {
         Self(Instant::now().checked_add(timeout))
     }
 
     /// Returns the time left, or `None` once the deadline has passed.
-    fn remaining(&self) -> Option<Duration> {
+    pub(super) fn remaining(&self) -> Option<Duration> {
         match self.0 {
             Some(at) => at
                 .checked_duration_since(Instant::now())
@@ -706,7 +706,7 @@ impl Deadline {
 }
 
 /// Returns the position of the first occurrence of `needle` in `haystack`.
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(super) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)

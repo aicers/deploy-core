@@ -10,9 +10,14 @@
 //! process being spawned.
 //!
 //! It holds commands to the same rule the real transports do: a
-//! [`Executor::run_with_input`] call naming a command that is not an absolute
-//! path free of `=` is recorded and refused with
-//! [`RunWithInputError::InvalidCommand`], and consumes no scripted outcome.
+//! [`Executor::run_with_input`] or [`Executor::open_channel`] call naming a
+//! command that is not an absolute path free of `=` is recorded and refused
+//! with [`RunWithInputError::InvalidCommand`] or
+//! [`ChannelError::InvalidCommand`], and consumes no scripted outcome.
+//!
+//! [`Executor::open_channel`] is the one call that can start a process: a
+//! scripted [`ScriptedChannel::Spawn`] runs the program it names, so a test can
+//! drive a real [`Channel`] without any transport in between.
 //!
 //! This module is compiled only for this crate's tests and under the
 //! `test-support` feature. Enable that feature in a dependent's
@@ -21,11 +26,12 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::{
-    CommandOutput, Executor, ExecutorError, FileMeta, Identity, OutputStream, RunLimits,
-    RunWithInputError, check_bounded_command,
+    Channel, ChannelError, ChannelLimits, CommandOutput, Executor, ExecutorError, FileMeta,
+    Identity, OutputStream, RunLimits, RunWithInputError, channel, check_bounded_command,
 };
 
 /// One call a [`RecordingExecutor`] received.
@@ -53,6 +59,17 @@ pub enum RecordedCall {
         input: Vec<u8>,
         /// The limits the command was to run under.
         limits: RunLimits,
+    },
+    /// [`Executor::open_channel`].
+    OpenChannel {
+        /// Who the command was to run as.
+        identity: Identity,
+        /// The command.
+        command: String,
+        /// Every argument, in order.
+        args: Vec<String>,
+        /// The limits the channel was to open under.
+        limits: ChannelLimits,
     },
     /// [`Executor::put_file`].
     PutFile {
@@ -83,6 +100,22 @@ pub enum ScriptedRun {
     Error(RunWithInputError),
 }
 
+/// The outcome a test scripts for one [`Executor::open_channel`] call.
+#[derive(Debug)]
+pub enum ScriptedChannel {
+    /// Spawns `program` with `args` directly — no `sudo`, piped standard
+    /// streams, an empty environment — and returns it as the [`Channel`], in
+    /// place of the command the call named.
+    Spawn {
+        /// The program to spawn.
+        program: PathBuf,
+        /// Its arguments, in order.
+        args: Vec<String>,
+    },
+    /// Returns this error as it is.
+    Fail(ChannelError),
+}
+
 /// An [`Executor`] that records every call and answers from a script.
 ///
 /// Scripted outcomes are consumed first in, first out, one queue per method.
@@ -97,6 +130,7 @@ struct State {
     calls: Vec<RecordedCall>,
     runs: VecDeque<Result<CommandOutput, ExecutorError>>,
     bounded_runs: VecDeque<ScriptedRun>,
+    channels: VecDeque<ScriptedChannel>,
 }
 
 impl RecordingExecutor {
@@ -115,6 +149,12 @@ impl RecordingExecutor {
     /// [`Executor::run_with_input`] call.
     pub fn script_run_with_input(&self, outcome: ScriptedRun) {
         self.state().bounded_runs.push_back(outcome);
+    }
+
+    /// Queues the outcome of the next unanswered [`Executor::open_channel`]
+    /// call.
+    pub fn script_open_channel(&self, outcome: ScriptedChannel) {
+        self.state().channels.push_back(outcome);
     }
 
     /// Returns every call received so far, in order.
@@ -208,6 +248,55 @@ impl Executor for RecordingExecutor {
         }
     }
 
+    /// Records the call and answers it with the next scripted
+    /// [`ScriptedChannel`], after refusing a command the real transports
+    /// would refuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::InvalidCommand`] for a command that is not an
+    /// absolute path free of `=`, the scripted error for
+    /// [`ScriptedChannel::Fail`], and [`ExecutorError::Spawn`] when a
+    /// [`ScriptedChannel::Spawn`] program cannot be spawned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no outcome is scripted for a command that is not refused:
+    /// the test did not anticipate the call, and inventing an answer would
+    /// hide that.
+    fn open_channel(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        limits: ChannelLimits,
+    ) -> Result<Channel, ChannelError> {
+        let outcome = {
+            let mut state = self.state();
+            state.calls.push(RecordedCall::OpenChannel {
+                identity,
+                command: command.to_string(),
+                args: owned(args),
+                limits,
+            });
+            channel::check_command(command)?;
+            let Some(outcome) = state.channels.pop_front() else {
+                panic!(
+                    "RecordingExecutor: no outcome scripted for open_channel `{command}` {args:?}"
+                )
+            };
+            outcome
+        };
+        match outcome {
+            ScriptedChannel::Spawn { program, args } => {
+                let mut spawned = Command::new(program);
+                spawned.args(args).env_clear();
+                channel::open_direct(spawned, limits.max_stderr)
+            }
+            ScriptedChannel::Fail(error) => Err(error),
+        }
+    }
+
     fn put_file(&self, dest: &Path, contents: &[u8], meta: FileMeta) -> Result<(), ExecutorError> {
         self.state().calls.push(RecordedCall::PutFile {
             dest: dest.to_path_buf(),
@@ -220,18 +309,24 @@ impl Executor for RecordingExecutor {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{RecordedCall, RecordingExecutor, ScriptedRun};
+    use super::{RecordedCall, RecordingExecutor, ScriptedChannel, ScriptedRun};
     use crate::executor::{
-        CommandOutput, Executor, ExecutorError, Identity, OutputStream, RunLimits,
-        RunWithInputError, ServiceAccount,
+        ChannelError, ChannelLimits, CommandOutput, Executor, ExecutorError, Identity,
+        OutputStream, RunLimits, RunWithInputError, ServiceAccount,
     };
 
     const LIMITS: RunLimits = RunLimits {
         max_stdout: 65_536,
         max_stderr: 4_096,
         timeout: Duration::from_secs(30),
+    };
+    const CHANNEL: ChannelLimits = ChannelLimits {
+        elevation_timeout: Duration::from_secs(10),
+        max_stderr: 4_096,
     };
 
     fn output(code: i32, stdout: &[u8]) -> CommandOutput {
@@ -343,5 +438,66 @@ mod tests {
                 args: vec!["/etc/x".to_string()],
             }]
         );
+    }
+
+    #[test]
+    fn a_scripted_spawn_is_a_channel_to_that_program() {
+        let exec = RecordingExecutor::new();
+        exec.script_open_channel(ScriptedChannel::Spawn {
+            program: PathBuf::from("/bin/cat"),
+            args: Vec::new(),
+        });
+        let identity = Identity::Service(ServiceAccount::Roxyd);
+        let mut channel = exec
+            .open_channel(identity, "/usr/lib/helper", &["__attempt-launch"], CHANNEL)
+            .expect("the scripted spawn");
+        let mut stdin = channel.take_stdin().expect("stdin");
+        let mut stdout = channel.take_stdout().expect("stdout");
+        stdin.write_all(b"frame").expect("write");
+        drop(stdin);
+        let mut echoed = Vec::new();
+        stdout.read_to_end(&mut echoed).expect("read");
+        assert_eq!(echoed, b"frame");
+        let exit = channel.wait().expect("wait");
+        assert_eq!(exit.code, Some(0));
+        assert!(exit.stderr.is_empty());
+        assert_eq!(
+            exec.calls(),
+            vec![RecordedCall::OpenChannel {
+                identity,
+                command: "/usr/lib/helper".to_string(),
+                args: vec!["__attempt-launch".to_string()],
+                limits: CHANNEL,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_scripted_failure_is_returned_and_an_invalid_command_consumes_nothing() {
+        let exec = RecordingExecutor::new();
+        exec.script_open_channel(ScriptedChannel::Fail(ChannelError::Executor(
+            ExecutorError::Elevation {
+                host: "seat".to_string(),
+            },
+        )));
+        let error = exec
+            .open_channel(Identity::Root, "helper", &[], CHANNEL)
+            .expect_err("a relative command is refused");
+        assert!(
+            matches!(error, ChannelError::InvalidCommand { ref command } if command == "helper"),
+            "got: {error:?}"
+        );
+        assert_eq!(exec.calls().len(), 1, "the refused call is still recorded");
+        let error = exec
+            .open_channel(Identity::Root, "/usr/lib/helper", &[], CHANNEL)
+            .expect_err("the scripted failure");
+        assert!(
+            matches!(
+                error,
+                ChannelError::Executor(ExecutorError::Elevation { .. })
+            ),
+            "got: {error:?}"
+        );
+        assert_eq!(exec.calls().len(), 2);
     }
 }

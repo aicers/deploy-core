@@ -38,12 +38,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+pub use self::channel::{Channel, ChannelError, ChannelExit, ChannelLimits};
 use crate::durability::sync_dir;
 use crate::transport::{HostKeyPolicy, Ssh};
 
 // The bounded, killable run behind `Executor::run_with_input`, shared by every
 // transport.
 mod bounded;
+// The long-lived channel behind `Executor::open_channel`.
+mod channel;
 // A scriptable, recording executor, for this crate's tests and for dependents
 // that enable `test-support` under `[dev-dependencies]`.
 #[cfg(any(test, feature = "test-support"))]
@@ -716,9 +719,16 @@ pub enum RunWithInputError {
     Executor(#[from] ExecutorError),
 }
 
+/// Reports whether `command` is an absolute path free of `=`: the one form
+/// that names a single binary with no `PATH`, and that `env` cannot read as an
+/// assignment.
+fn is_absolute_and_plain(command: &str) -> bool {
+    Path::new(command).is_absolute() && !command.contains('=')
+}
+
 /// Refuses a command [`Executor::run_with_input`] cannot run as named.
 fn check_bounded_command(command: &str) -> Result<(), RunWithInputError> {
-    if Path::new(command).is_absolute() && !command.contains('=') {
+    if is_absolute_and_plain(command) {
         Ok(())
     } else {
         Err(RunWithInputError::InvalidCommand {
@@ -1135,6 +1145,90 @@ pub trait Executor {
     ) -> Result<CommandOutput, RunWithInputError> {
         let _ = (identity, command, args, input, limits);
         Err(RunWithInputError::Unsupported)
+    }
+
+    /// Starts `command` with `args` as `identity` and returns a [`Channel`]
+    /// to it that lives until the caller ends it.
+    ///
+    /// This is the long-lived counterpart of [`Executor::run_with_input`]:
+    /// where that call feeds a request and collects an answer within bounds,
+    /// this one hands the caller the command's standard input and standard
+    /// output for as long as it runs, with no size or time bound from this
+    /// crate.
+    ///
+    /// - **`command` must be an absolute path**, free of `=`. Anything else is
+    ///   [`ChannelError::InvalidCommand`], refused before anything is spawned.
+    ///   `args` stay discrete words on every transport.
+    /// - **The command runs with an empty environment** — no inherited
+    ///   variable, and so no `PATH` lookup. Where `sudo` or an SSH session
+    ///   stands between this process and the command, the environment either
+    ///   of them sets up is cleared again with `env -i` as the command starts.
+    /// - **The start is proven before this returns.** Where `sudo` or SSH
+    ///   stands in between — [`Identity::Root`] and [`Identity::Service`] on
+    ///   [`LocalExecutor`], every identity on [`SshExecutor`] — the command
+    ///   starts under a fixed `sh -c` script that announces the start on
+    ///   standard error and then replaces itself with the command. Under
+    ///   [`SudoAuth::Password`] the password line is written first, and
+    ///   standard input then stays open for the caller, so the command's first
+    ///   byte of input is the caller's first byte. Standard error is read until
+    ///   the announcement, and standard output not at all. A transport that
+    ///   ends first, or writes more than 64 KiB first, is killed and classified
+    ///   as [`Executor::run`] classifies that output; one that does neither
+    ///   within `limits.elevation_timeout` is killed and reaped. The operator on
+    ///   [`LocalExecutor`] is spawned directly, and this returns at once.
+    /// - **Standard error stays with the channel**, drained for its whole
+    ///   life so the command never blocks on it: the first
+    ///   `limits.max_stderr` bytes of the command's own standard error are
+    ///   kept for [`Channel::wait`], the rest discarded and noted. Over SSH the
+    ///   wrapper's trailing exit-status line is removed and supplies the exit
+    ///   code, so a remote `255` is the command's.
+    ///
+    /// `identity` resolves exactly as it does for [`Executor::run`], at the
+    /// same resolution site: no prefix for [`Identity::Operator`], `sudo` for
+    /// [`Identity::Root`] and `sudo -u <account>` for [`Identity::Service`],
+    /// with [`SudoAuth`] choosing `-n` or `-S -p ""`; over SSH, the same `ssh`
+    /// invocation — key, port, host-key policy, and `BatchMode=yes` under
+    /// [`SshPrompt::Deny`] — with no terminal requested. The transport is
+    /// spawned in the caller's process group, as [`Executor::run`] spawns it,
+    /// so a passphrase prompt [`SshPrompt::Allow`] permits still reaches the
+    /// terminal.
+    ///
+    /// Under [`SudoAuth::Password`], a `sudo` that does not ask for the
+    /// password — a `NOPASSWD` rule, or credentials it still has cached —
+    /// leaves the password line unread, and the command reads it as its first
+    /// line of input. This is `sudo`'s choice, and the same one
+    /// [`Executor::run_with_input`] meets; [`SudoAuth::NonInteractive`] is
+    /// the setting for a host where `sudo` does not ask.
+    ///
+    /// [`Channel`] states what ending the channel reaches: the local
+    /// transport process, not a command started through `sudo` or over SSH,
+    /// and never a descendant.
+    ///
+    /// The default body refuses with [`ChannelError::Unsupported`], so an
+    /// existing implementation of this trait keeps compiling. [`LocalExecutor`]
+    /// and [`SshExecutor`] override it; [`InDaemonExecutor`] does not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::InvalidCommand`] for a command that is not an
+    /// absolute path free of `=`, [`ChannelError::ElevationTimedOut`] for a
+    /// start not proven within `limits.elevation_timeout`, and
+    /// [`ChannelError::Executor`] carrying whatever [`Executor::run`] would
+    /// report for a spawn, transport or elevation failure —
+    /// [`ExecutorError::Connection`], [`ExecutorError::Elevation`] or
+    /// [`ExecutorError::SudoRefused`]. An SSH transport whose remote shell
+    /// ran but did not start the command is reported as
+    /// [`ExecutorError::SudoRefused`] carrying the remote diagnostic, for the
+    /// operator too.
+    fn open_channel(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        limits: ChannelLimits,
+    ) -> Result<Channel, ChannelError> {
+        let _ = (identity, command, args, limits);
+        Err(ChannelError::Unsupported)
     }
 
     /// Writes `contents` to `dest` on the target with the owner, group and mode
@@ -2241,15 +2335,23 @@ fn classify_elevation(
     if granted {
         return Ok(output);
     }
-    if matches!(auth, Some(SudoAuth::NonInteractive)) && sudo_needs_password(&output.stderr) {
-        return Err(ExecutorError::Elevation {
+    Err(elevation_refusal(&output.stderr, auth, host))
+}
+
+/// Classifies what `sudo` wrote on `stderr` when the sentinel never arrived,
+/// as [`classify_elevation`] reports it: [`ExecutorError::Elevation`] for a
+/// non-interactive `sudo` that wanted a password, [`ExecutorError::SudoRefused`]
+/// carrying the diagnostic otherwise.
+fn elevation_refusal(stderr: &[u8], auth: Option<&SudoAuth>, host: &str) -> ExecutorError {
+    if matches!(auth, Some(SudoAuth::NonInteractive)) && sudo_needs_password(stderr) {
+        return ExecutorError::Elevation {
             host: host.to_string(),
-        });
+        };
     }
-    Err(ExecutorError::SudoRefused {
+    ExecutorError::SudoRefused {
         host: host.to_string(),
-        reason: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+        reason: String::from_utf8_lossy(stderr).trim().to_string(),
+    }
 }
 
 /// An [`Executor`] that acts on the local (seat) machine.
@@ -2480,6 +2582,43 @@ impl Executor for LocalExecutor {
     ) -> Result<CommandOutput, RunWithInputError> {
         check_bounded_command(command)?;
         self.run_bounded(identity, command, args, input, limits)
+    }
+
+    fn open_channel(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        limits: ChannelLimits,
+    ) -> Result<Channel, ChannelError> {
+        channel::check_command(command)?;
+        let Resolved {
+            command: mut cmd,
+            password_line,
+            elevated,
+        } = self.resolve_through(
+            identity,
+            channel::START_SHELL,
+            &channel::start_script(),
+            command,
+            args,
+        );
+        // A command spawned directly has its environment cleared here. `sudo`
+        // keeps the caller's, so it is found exactly as `run` finds it; the
+        // start script clears the command's after `sudo` has set up its own.
+        if !elevated {
+            cmd.env_clear();
+            return channel::open_direct(cmd, limits.max_stderr);
+        }
+        let start = channel::Start {
+            host: &self.host,
+            password_line,
+            remote_code: false,
+            limits,
+        };
+        channel::open_started(cmd, &start, |output| {
+            elevation_refusal(&output.stderr, Some(&self.auth), &self.host)
+        })
     }
 
     fn put_file(&self, dest: &Path, contents: &[u8], meta: FileMeta) -> Result<(), ExecutorError> {
@@ -2833,6 +2972,49 @@ impl Executor for SshExecutor {
         self.run_bounded(identity, command, args, input, limits)
     }
 
+    fn open_channel(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+        limits: ChannelLimits,
+    ) -> Result<Channel, ChannelError> {
+        channel::check_command(command)?;
+        let script = channel::start_script();
+        let ResolvedRemote {
+            remote,
+            password_line,
+            elevated,
+        } = self.resolve_through(
+            identity,
+            channel::START_SHELL,
+            &script,
+            Some(&script),
+            command,
+            args,
+        );
+        // `ssh` keeps the caller's environment, as it does for `run`; the
+        // remote start script clears the command's.
+        let mut cmd = self.ssh_command();
+        cmd.arg(wrap_with_rc_marker(&remote));
+        let start = channel::Start {
+            host: &self.host,
+            password_line,
+            remote_code: true,
+            limits,
+        };
+        channel::open_started(cmd, &start, |output| {
+            match self.settle_remote_code(output) {
+                Err(connection) => connection,
+                // The remote shell ran and the command did not start: `sudo`
+                // refused it, or, for the operator, the shell could not.
+                Ok(output) => {
+                    elevation_refusal(&output.stderr, elevated.then_some(&self.auth), &self.host)
+                }
+            }
+        })
+    }
+
     fn put_file(&self, dest: &Path, contents: &[u8], meta: FileMeta) -> Result<(), ExecutorError> {
         // The identical script the local transport runs, shell-quoted word by
         // word so the remote login shell re-parses each as exactly one word.
@@ -2892,6 +3074,9 @@ impl Executor for SshExecutor {
 /// line. The sudo sentinel still wraps the invocation, because `sudo -u` can
 /// still refuse — an unknown or non-descendable account — and that refusal must
 /// classify as an elevation failure rather than a command failure.
+///
+/// It does not implement [`Executor::open_channel`]: that call returns the
+/// trait default's [`ChannelError::Unsupported`] here.
 #[derive(Debug, Clone)]
 pub struct InDaemonExecutor {
     host: String,
@@ -6741,7 +6926,7 @@ wait"#;
 
             /// A `sudo` stub that drops its own flags, `-u <account>`
             /// included, and execs the wrapped command.
-            fn descending_sudo(dir: &Path) -> PathBuf {
+            pub(super) fn descending_sudo(dir: &Path) -> PathBuf {
                 write_script(
                     dir,
                     "descending-sudo",
@@ -6762,7 +6947,7 @@ exec "$@"
             /// A `sudo` stub that insists on reading `s3cret` as its first
             /// line of stdin, as `sudo -S` does, before execing the wrapped
             /// command with the rest of the stream.
-            fn password_sudo(dir: &Path) -> PathBuf {
+            pub(super) fn password_sudo(dir: &Path) -> PathBuf {
                 write_script(
                     dir,
                     "password-sudo",
@@ -6782,7 +6967,7 @@ exec "$@"
                 )
             }
 
-            fn ssh_with(dir: &Path, sudo: &Path, auth: SudoAuth) -> SshExecutor {
+            pub(super) fn ssh_with(dir: &Path, sudo: &Path, auth: SudoAuth) -> SshExecutor {
                 let config = crate::transport::Ssh {
                     user: "ops".to_string(),
                     port: 22,
@@ -7568,6 +7753,802 @@ exec "$@"
                         bounded.stdout, b"marker",
                         "{label}: no sudo may be involved"
                     );
+                }
+            }
+        }
+
+        /// [`Executor::open_channel`] on every pair that implements it.
+        mod channels {
+            use std::io::{Read, Write};
+            use std::path::{Path, PathBuf};
+            use std::time::{Duration, Instant};
+
+            use rustix::process::Pid;
+            use tempfile::TempDir;
+
+            use super::super::super::{
+                Channel, ChannelError, ChannelLimits, CommandOutput, Executor, ExecutorError,
+                FileMeta, Identity, InDaemonExecutor, LocalExecutor, RC_MARKER, SUDO_OK_SENTINEL,
+                ServiceAccount, SshExecutor, SshPrompt, SudoAuth, spawn_retrying_text_busy,
+            };
+            use super::bounded_runs::{descending_sudo, password_sudo, ssh_with};
+            use super::{failing_ssh, fake_ssh, write_script};
+
+            /// Limits roomy enough for every test that is not about them.
+            const ROOMY: ChannelLimits = ChannelLimits {
+                elevation_timeout: Duration::from_secs(30),
+                max_stderr: 1 << 20,
+            };
+            /// More than any pipe buffer holds, so an echo of it cannot
+            /// complete unless both directions move at once.
+            const ECHO_LEN: usize = 256 * 1024;
+            /// How long a killed process may take to disappear from the
+            /// process table, reaped by whoever inherited it.
+            const REAP_WAIT: Duration = Duration::from_secs(10);
+
+            /// Every pair that implements the channel, labelled for failure
+            /// messages.
+            fn every_pair(dir: &TempDir) -> Vec<(&'static str, Box<dyn Executor>, Identity)> {
+                let sudo = descending_sudo(dir.path());
+                let service = Identity::Service(ServiceAccount::Security);
+                let local = || {
+                    LocalExecutor::new("seat", SudoAuth::NonInteractive).with_sudo_bin(sudo.clone())
+                };
+                let ssh = || ssh_with(dir.path(), &sudo, SudoAuth::NonInteractive);
+                vec![
+                    ("local operator", Box::new(local()), Identity::Operator),
+                    ("local root", Box::new(local()), Identity::Root),
+                    ("local service", Box::new(local()), service),
+                    ("ssh operator", Box::new(ssh()), Identity::Operator),
+                    ("ssh root", Box::new(ssh()), Identity::Root),
+                    ("ssh service", Box::new(ssh()), service),
+                ]
+            }
+
+            /// Every byte value, repeated out to `len` bytes.
+            fn pattern(len: usize) -> Vec<u8> {
+                (0..=u8::MAX).cycle().take(len).collect()
+            }
+
+            /// Writes `input` to the channel's standard input and closes it,
+            /// while reading its standard output to the end.
+            fn echo(channel: &mut Channel, input: &[u8]) -> Vec<u8> {
+                let mut stdin = channel.take_stdin().expect("stdin is the caller's");
+                let mut stdout = channel.take_stdout().expect("stdout is the caller's");
+                std::thread::scope(|scope| {
+                    let writer = scope.spawn(move || stdin.write_all(input));
+                    let mut echoed = Vec::new();
+                    stdout.read_to_end(&mut echoed).expect("read stdout");
+                    writer
+                        .join()
+                        .expect("the writer does not panic")
+                        .expect("write stdin");
+                    echoed
+                })
+            }
+
+            /// Reads a channel's standard output to the end, closing its
+            /// standard input first.
+            fn read_out(channel: &mut Channel) -> Vec<u8> {
+                echo(channel, b"")
+            }
+
+            /// Waits until `path` exists, then reads the pid written in it.
+            fn recorded_pid(path: &Path) -> Pid {
+                let deadline = Instant::now() + REAP_WAIT;
+                while !path.exists() {
+                    assert!(Instant::now() < deadline, "the command never started");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let text = std::fs::read_to_string(path).expect("the recorded pid");
+                pid(text.trim())
+            }
+
+            fn pid(text: &str) -> Pid {
+                Pid::from_raw(text.parse().expect("a pid")).expect("a positive pid")
+            }
+
+            /// Waits until no process with `pid` exists any more.
+            fn assert_gone(label: &str, pid: Pid) {
+                let deadline = Instant::now() + REAP_WAIT;
+                while rustix::process::test_kill_process(pid).is_ok() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{label}: process {pid:?} survived"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+
+            #[test]
+            fn bytes_pass_verbatim_both_ways_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let input = pattern(ECHO_LEN);
+                for (label, exec, identity) in every_pair(&dir) {
+                    let mut channel = exec
+                        .open_channel(identity, "/bin/cat", &[], ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    let echoed = echo(&mut channel, &input);
+                    assert!(
+                        echoed == input,
+                        "{label}: {} bytes in, {} bytes out",
+                        input.len(),
+                        echoed.len()
+                    );
+                    let exit = channel
+                        .wait()
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(exit.code, Some(0), "{label}");
+                    assert!(exit.stderr.is_empty(), "{label}: {:?}", exit.stderr);
+                    assert!(!exit.stderr_truncated, "{label}");
+                }
+            }
+
+            #[test]
+            fn stderr_is_drained_and_held_to_its_limit_while_the_echo_runs_on_every_pair() {
+                const KEPT: usize = 1000;
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = ChannelLimits {
+                    max_stderr: KEPT,
+                    ..ROOMY
+                };
+                let input = pattern(ECHO_LEN);
+                let flood = "/usr/bin/head -c 1048576 /dev/zero >&2 & /bin/cat; wait";
+                for (label, exec, identity) in every_pair(&dir) {
+                    let mut channel = exec
+                        .open_channel(identity, "/bin/sh", &["-c", flood], limits)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    let echoed = echo(&mut channel, &input);
+                    assert!(echoed == input, "{label}: the echo must complete intact");
+                    let exit = channel
+                        .wait()
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(exit.code, Some(0), "{label}");
+                    assert_eq!(exit.stderr, vec![0; KEPT], "{label}");
+                    assert!(exit.stderr_truncated, "{label}");
+                }
+            }
+
+            #[test]
+            fn the_commands_own_code_and_stderr_come_back_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                for code in [0, 3, 255] {
+                    let script = format!("printf err >&2; exit {code}");
+                    for (label, exec, identity) in every_pair(&dir) {
+                        let mut channel = exec
+                            .open_channel(identity, "/bin/sh", &["-c", &script], ROOMY)
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        assert!(read_out(&mut channel).is_empty(), "{label}");
+                        let exit = channel
+                            .wait()
+                            .unwrap_or_else(|error| panic!("{label} {code}: {error:?}"));
+                        assert_eq!(exit.code, Some(code), "{label}");
+                        assert_eq!(
+                            exit.stderr, b"err",
+                            "{label}: neither the sentinel nor the exit-status line"
+                        );
+                        assert!(!exit.stderr_truncated, "{label}");
+                    }
+                }
+            }
+
+            #[test]
+            fn the_command_sees_an_empty_environment_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                assert!(
+                    std::env::var_os("PATH").is_some(),
+                    "the test process must have an environment to withhold"
+                );
+                for (label, exec, identity) in every_pair(&dir) {
+                    let mut channel = exec
+                        .open_channel(identity, "/usr/bin/env", &[], ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    let printed = read_out(&mut channel);
+                    assert_eq!(
+                        String::from_utf8_lossy(&printed),
+                        "",
+                        "{label}: no variable may reach the command"
+                    );
+                    let exit = channel
+                        .wait()
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(exit.code, Some(0), "{label}");
+                }
+            }
+
+            #[test]
+            fn the_start_consumes_no_standard_output() {
+                // A transport that writes on stdout before the command starts:
+                // every byte of it is still there for the caller.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let early = write_script(
+                    dir.path(),
+                    "early-sudo",
+                    &format!(
+                        "#!/bin/sh\nprintf early\n{}",
+                        std::fs::read_to_string(descending_sudo(dir.path()))
+                            .expect("the stub")
+                            .trim_start_matches("#!/bin/sh\n")
+                    ),
+                );
+                let pairs: Vec<(&str, Box<dyn Executor>)> = vec![
+                    (
+                        "local",
+                        Box::new(
+                            LocalExecutor::new("seat", SudoAuth::NonInteractive)
+                                .with_sudo_bin(early.clone()),
+                        ),
+                    ),
+                    (
+                        "ssh",
+                        Box::new(ssh_with(dir.path(), &early, SudoAuth::NonInteractive)),
+                    ),
+                ];
+                for (label, exec) in pairs {
+                    let mut channel = exec
+                        .open_channel(Identity::Root, "/bin/cat", &[], ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(echo(&mut channel, b"-late"), b"early-late", "{label}");
+                    assert_eq!(channel.wait().expect("wait").code, Some(0), "{label}");
+                }
+            }
+
+            #[test]
+            fn identities_resolve_exactly_as_run_resolves_them() {
+                // A stub `sudo` that prints its argv and grants, so the words
+                // ahead of the shell — the flags and the descent — can be
+                // compared between the two methods on each transport.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let recording = write_script(
+                    dir.path(),
+                    "recording-sudo",
+                    &format!(
+                        "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n\
+                         printf '%s' '{SUDO_OK_SENTINEL}' >&2\n"
+                    ),
+                );
+                let local = LocalExecutor::new("seat", SudoAuth::NonInteractive)
+                    .with_sudo_bin(recording.clone());
+                let ssh = ssh_with(dir.path(), &recording, SudoAuth::NonInteractive);
+                let password = LocalExecutor::new("seat", SudoAuth::Password("pw".to_string()))
+                    .with_sudo_bin(recording.clone());
+                let prefix = |argv: &[u8], shell: &str| -> Vec<String> {
+                    String::from_utf8_lossy(argv)
+                        .lines()
+                        .take_while(|word| *word != shell)
+                        .map(str::to_string)
+                        .collect()
+                };
+                let service = Identity::Service(ServiceAccount::Insight);
+                let pairs: Vec<(&str, &dyn Executor, Identity)> = vec![
+                    ("local root", &local, Identity::Root),
+                    ("local service", &local, service),
+                    ("local root, password", &password, Identity::Root),
+                    ("local service, password", &password, service),
+                    ("ssh root", &ssh, Identity::Root),
+                    ("ssh service", &ssh, service),
+                ];
+                for (label, exec, identity) in pairs {
+                    let run = exec
+                        .run(identity, "/usr/bin/printf", &["%s", "marker"])
+                        .expect("run");
+                    let mut channel = exec
+                        .open_channel(identity, "/usr/bin/printf", &["%s", "marker"], ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    let argv = read_out(&mut channel);
+                    assert_eq!(channel.wait().expect("wait").code, Some(0), "{label}");
+                    let run_prefix = prefix(&run.stdout, "sh");
+                    assert!(!run_prefix.is_empty(), "{label}: sudo must be involved");
+                    assert_eq!(
+                        prefix(&argv, "/bin/sh"),
+                        run_prefix,
+                        "{label}: the elevation must match run's"
+                    );
+                    let words: Vec<&str> =
+                        std::str::from_utf8(&argv).expect("utf-8").lines().collect();
+                    let shell = words.iter().position(|word| *word == "/bin/sh");
+                    assert_eq!(
+                        shell.and_then(|at| words.get(at + 1..at + 2)),
+                        Some(&["-c"][..]),
+                        "{label}: {words:?}"
+                    );
+                    assert!(
+                        words.ends_with(&["/usr/bin/printf", "%s", "marker"]),
+                        "{label}: the command and its arguments stay discrete words: {words:?}"
+                    );
+                }
+                // The identity that involves no `sudo` runs the command bare.
+                for (label, exec) in [("local", &local as &dyn Executor), ("ssh", &ssh)] {
+                    let mut channel = exec
+                        .open_channel(
+                            Identity::Operator,
+                            "/usr/bin/printf",
+                            &["%s", "marker"],
+                            ROOMY,
+                        )
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(
+                        read_out(&mut channel),
+                        b"marker",
+                        "{label}: no sudo may be involved"
+                    );
+                    assert_eq!(channel.wait().expect("wait").code, Some(0), "{label}");
+                }
+            }
+
+            #[test]
+            fn the_ssh_invocation_is_run_s_with_no_terminal() {
+                // A stub `ssh` that prints its argv and answers as the remote
+                // start script and wrapper would, so both methods complete.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let recording = write_script(
+                    dir.path(),
+                    "channel-recording-ssh",
+                    &format!(
+                        "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n\
+                         printf '%s\\n{RC_MARKER}0\\n' '{SUDO_OK_SENTINEL}' >&2\n"
+                    ),
+                );
+                let config = crate::transport::Ssh {
+                    user: "ops".to_string(),
+                    port: 2222,
+                    key: PathBuf::from("/keys/id_ed25519"),
+                    host_key: crate::transport::HostKeyPolicy::AcceptNew,
+                };
+                for prompt in [SshPrompt::Deny, SshPrompt::Allow] {
+                    for identity in [
+                        Identity::Operator,
+                        Identity::Root,
+                        Identity::Service(ServiceAccount::Roxyd),
+                    ] {
+                        let exec = |bin: &Path| {
+                            SshExecutor::from_config(
+                                "target",
+                                &config,
+                                "10.0.0.10",
+                                SudoAuth::NonInteractive,
+                                prompt,
+                            )
+                            .with_ssh_bin(bin.to_path_buf())
+                        };
+                        let run = exec(&recording)
+                            .run(identity, "/bin/cat", &[])
+                            .expect("run over recording ssh");
+                        let mut channel = exec(&recording)
+                            .open_channel(identity, "/bin/cat", &[], ROOMY)
+                            .unwrap_or_else(|error| panic!("{prompt:?} {identity:?}: {error:?}"));
+                        let argv = read_out(&mut channel);
+                        assert_eq!(channel.wait().expect("wait").code, Some(0));
+                        let words = |argv: &[u8]| -> Vec<String> {
+                            let mut words: Vec<String> = String::from_utf8_lossy(argv)
+                                .lines()
+                                .map(str::to_string)
+                                .collect();
+                            // The remote command line, which differs by design,
+                            // spans the lines after the target.
+                            let target = words
+                                .iter()
+                                .position(|word| word == "ops@10.0.0.10")
+                                .expect("the target");
+                            words.truncate(target + 1);
+                            words
+                        };
+                        let channel_words = words(&argv);
+                        assert_eq!(
+                            channel_words,
+                            words(&run.stdout),
+                            "{prompt:?} {identity:?}: the ssh prefix must match run's"
+                        );
+                        assert_eq!(
+                            channel_words.iter().any(|word| word == "BatchMode=yes"),
+                            prompt == SshPrompt::Deny,
+                            "{prompt:?}: {channel_words:?}"
+                        );
+                        assert!(
+                            !channel_words
+                                .iter()
+                                .any(|word| word == "-t" || word == "-tt"),
+                            "no terminal is requested: {channel_words:?}"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn a_password_line_is_consumed_before_the_callers_bytes() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = password_sudo(dir.path());
+                let auth = || SudoAuth::Password("s3cret".to_string());
+                let input = pattern(ECHO_LEN);
+                let pairs: Vec<(&str, Box<dyn Executor>)> = vec![
+                    (
+                        "local",
+                        Box::new(LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone())),
+                    ),
+                    ("ssh", Box::new(ssh_with(dir.path(), &sudo, auth()))),
+                ];
+                for (label, exec) in pairs {
+                    for identity in [Identity::Root, Identity::Service(ServiceAccount::Roxyd)] {
+                        let mut channel = exec
+                            .open_channel(identity, "/bin/cat", &[], ROOMY)
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        let echoed = echo(&mut channel, &input);
+                        assert!(
+                            echoed == input,
+                            "{label}: the caller's first byte must be the command's first"
+                        );
+                        assert_eq!(channel.wait().expect("wait").code, Some(0), "{label}");
+                    }
+                }
+            }
+
+            #[test]
+            fn failures_before_the_start_are_reported_as_run_reports_them() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let refusing = write_script(
+                    dir.path(),
+                    "refusing-sudo",
+                    "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
+                );
+                let denying = write_script(
+                    dir.path(),
+                    "denying-sudo",
+                    "#!/bin/sh\necho 'ops is not in the sudoers file.' >&2\nexit 1\n",
+                );
+                let open = |exec: &dyn Executor, identity| {
+                    exec.open_channel(identity, "/bin/cat", &[], ROOMY)
+                        .expect_err("the start fails")
+                };
+
+                let error = open(
+                    &LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                        .with_sudo_bin(refusing.clone()),
+                    Identity::Root,
+                );
+                assert!(
+                    matches!(&error, ChannelError::Executor(ExecutorError::Elevation { host })
+                        if host == "mgmt"),
+                    "got {error:?}"
+                );
+                let error = open(
+                    &LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                        .with_sudo_bin(denying.clone()),
+                    Identity::Service(ServiceAccount::Security),
+                );
+                assert!(
+                    matches!(&error, ChannelError::Executor(ExecutorError::SudoRefused { host, reason })
+                        if host == "mgmt" && reason.contains("sudoers")),
+                    "got {error:?}"
+                );
+
+                let config = crate::transport::Ssh {
+                    user: "ops".to_string(),
+                    port: 22,
+                    key: PathBuf::from("/dev/null"),
+                    host_key: crate::transport::HostKeyPolicy::Strict,
+                };
+                let ssh = || {
+                    SshExecutor::from_config(
+                        "mgmt",
+                        &config,
+                        "10.0.0.10",
+                        SudoAuth::NonInteractive,
+                        SshPrompt::Deny,
+                    )
+                };
+                let unreachable = ssh().with_ssh_bin(failing_ssh(dir.path()));
+                for identity in [Identity::Operator, Identity::Root] {
+                    let error = open(&unreachable, identity);
+                    assert!(
+                        matches!(&error, ChannelError::Executor(ExecutorError::Connection { host, reason })
+                            if host == "mgmt" && reason.contains("Connection refused")),
+                        "{identity:?}: got {error:?}"
+                    );
+                }
+                let remote_refusing = ssh()
+                    .with_ssh_bin(fake_ssh(dir.path()))
+                    .with_remote_sudo(refusing.to_string_lossy().into_owned());
+                let error = open(&remote_refusing, Identity::Root);
+                assert!(
+                    matches!(&error, ChannelError::Executor(ExecutorError::Elevation { host })
+                        if host == "mgmt"),
+                    "got {error:?}"
+                );
+                let remote_denying = ssh()
+                    .with_ssh_bin(fake_ssh(dir.path()))
+                    .with_remote_sudo(denying.to_string_lossy().into_owned());
+                let error = open(&remote_denying, Identity::Root);
+                assert!(
+                    matches!(&error, ChannelError::Executor(ExecutorError::SudoRefused { reason, .. })
+                        if reason.contains("sudoers")),
+                    "got {error:?}"
+                );
+            }
+
+            #[test]
+            fn a_start_not_proven_in_time_is_killed_and_reaped() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let silent = write_script(
+                    dir.path(),
+                    "silent-sudo",
+                    "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n\
+                     printf 'sudo: pid %s\\n' \"$$\" >&2\nexec /bin/sleep 300\n",
+                );
+                // Run once first, so the first run of a fresh executable —
+                // which macOS scans — is not what the short timeout measures.
+                let warmed =
+                    spawn_retrying_text_busy(std::process::Command::new(&silent).arg("warm"))
+                        .and_then(|mut child| child.wait())
+                        .expect("warm the stub");
+                assert!(warmed.success());
+                let limits = ChannelLimits {
+                    elevation_timeout: Duration::from_millis(200),
+                    ..ROOMY
+                };
+                let started = Instant::now();
+                let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(silent)
+                    .open_channel(Identity::Root, "/bin/cat", &[], limits)
+                    .expect_err("the sentinel never arrives");
+                assert!(
+                    started.elapsed() < REAP_WAIT,
+                    "took {:?}",
+                    started.elapsed()
+                );
+                let ChannelError::ElevationTimedOut {
+                    host,
+                    timeout,
+                    diagnostic,
+                } = error
+                else {
+                    panic!("expected ElevationTimedOut, got {error:?}");
+                };
+                assert_eq!(host, "mgmt");
+                assert_eq!(timeout, limits.elevation_timeout);
+                let transport = diagnostic
+                    .strip_prefix("sudo: pid ")
+                    .unwrap_or_else(|| panic!("the preamble read so far: {diagnostic:?}"));
+                let transport = pid(transport);
+                assert!(
+                    rustix::process::test_kill_process(transport).is_err(),
+                    "the transport was reaped before the error returned"
+                );
+            }
+
+            #[test]
+            fn a_rejected_password_times_out_with_sudos_complaint() {
+                // `sudo -S` asks again rather than exiting on a wrong password.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let asking = write_script(
+                    dir.path(),
+                    "asking-sudo",
+                    "#!/bin/sh\nwhile IFS= read -r line; do\n  \
+                     [ \"$line\" = s3cret ] && exit 0\n  \
+                     echo 'Sorry, try again.' >&2\ndone\n",
+                );
+                let limits = ChannelLimits {
+                    elevation_timeout: Duration::from_millis(500),
+                    ..ROOMY
+                };
+                let error = LocalExecutor::new("mgmt", SudoAuth::Password("wrong".to_string()))
+                    .with_sudo_bin(asking)
+                    .open_channel(Identity::Root, "/bin/cat", &[], limits)
+                    .expect_err("the password was rejected");
+                assert!(
+                    matches!(&error, ChannelError::ElevationTimedOut { diagnostic, .. }
+                        if diagnostic.contains("Sorry, try again")),
+                    "got {error:?}"
+                );
+            }
+
+            #[test]
+            fn a_transport_that_floods_stderr_before_the_start_is_killed_and_classified() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let flooding = write_script(
+                    dir.path(),
+                    "flooding-sudo",
+                    "#!/bin/sh\n/usr/bin/head -c 1048576 /dev/zero | /usr/bin/tr '\\0' x >&2\n\
+                     exec /bin/sleep 300\n",
+                );
+                let started = Instant::now();
+                let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(flooding)
+                    .open_channel(Identity::Root, "/bin/cat", &[], ROOMY)
+                    .expect_err("sudo never granted");
+                assert!(
+                    matches!(
+                        error,
+                        ChannelError::Executor(ExecutorError::SudoRefused { .. })
+                    ),
+                    "got {error:?}"
+                );
+                assert!(
+                    started.elapsed() < ROOMY.elevation_timeout,
+                    "abandoned, not timed out"
+                );
+            }
+
+            #[test]
+            fn an_ssh_channel_that_loses_its_exit_status_has_no_code() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let lossy = write_script(
+                    dir.path(),
+                    "lossy-ssh",
+                    &format!(
+                        "#!/bin/sh\nprintf '%s' '{SUDO_OK_SENTINEL}' >&2\n\
+                         /bin/cat\necho 'Connection to 10.0.0.10 closed.' >&2\nexit 255\n"
+                    ),
+                );
+                let config = crate::transport::Ssh {
+                    user: "ops".to_string(),
+                    port: 22,
+                    key: PathBuf::from("/dev/null"),
+                    host_key: crate::transport::HostKeyPolicy::Strict,
+                };
+                let exec = SshExecutor::from_config(
+                    "mgmt",
+                    &config,
+                    "10.0.0.10",
+                    SudoAuth::NonInteractive,
+                    SshPrompt::Deny,
+                )
+                .with_ssh_bin(lossy);
+                let mut channel = exec
+                    .open_channel(Identity::Root, "/bin/cat", &[], ROOMY)
+                    .expect("the start was announced");
+                assert_eq!(echo(&mut channel, b"frame"), b"frame");
+                let error = channel.wait().expect_err("no exit-status line");
+                assert!(
+                    matches!(&error, ChannelError::ExitUnknown { host, reason }
+                        if host == "mgmt" && reason.contains("closed")),
+                    "got {error:?}"
+                );
+            }
+
+            /// A command that records its pid in the file named by `$1`, then
+            /// blocks on standard input.
+            const BLOCKING: &str =
+                "echo \"$$\" > \"$1.tmp\"; /bin/mv \"$1.tmp\" \"$1\"; exec /bin/cat";
+
+            #[test]
+            fn kill_and_drop_end_the_transport_and_the_command_sees_eof_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                for how in ["kill", "drop"] {
+                    for (index, (label, exec, identity)) in every_pair(&dir).into_iter().enumerate()
+                    {
+                        let pid_file = dir.path().join(format!("{how}-{index}"));
+                        let channel = exec
+                            .open_channel(
+                                identity,
+                                "/bin/sh",
+                                &["-c", BLOCKING, "sh", &pid_file.to_string_lossy()],
+                                ROOMY,
+                            )
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        let command = recorded_pid(&pid_file);
+                        let transport = pid(&channel.transport_pid().to_string());
+                        match how {
+                            "kill" => channel
+                                .kill()
+                                .unwrap_or_else(|error| panic!("{label}: {error:?}")),
+                            _ => drop(channel),
+                        }
+                        assert!(
+                            rustix::process::test_kill_process(transport).is_err(),
+                            "{label} {how}: the transport was reaped"
+                        );
+                        assert_gone(&format!("{label} {how}"), command);
+                    }
+                }
+            }
+
+            #[test]
+            fn wait_gives_stderr_a_grace_when_a_descendant_holds_it() {
+                // A descendant that outlives the command keeps stderr open;
+                // `wait` returns once the grace passes, and says so.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = LocalExecutor::new("seat", SudoAuth::NonInteractive)
+                    .with_sudo_bin(descending_sudo(dir.path()));
+                let started = Instant::now();
+                let channel = exec
+                    .open_channel(
+                        Identity::Operator,
+                        "/bin/sh",
+                        &["-c", "printf err >&2; /bin/sleep 8 >/dev/null & exit 4"],
+                        ROOMY,
+                    )
+                    .expect("open");
+                let exit = channel.wait().expect("wait");
+                let elapsed = started.elapsed();
+                assert_eq!(exit.code, Some(4));
+                assert_eq!(exit.stderr, b"err");
+                assert!(exit.stderr_truncated, "the stream had not ended");
+                assert!(
+                    elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(8),
+                    "waited {elapsed:?}"
+                );
+            }
+
+            #[test]
+            fn a_command_that_is_not_an_absolute_path_is_refused_before_spawning() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let marker = dir.path().join("spawned");
+                let marking = write_script(
+                    dir.path(),
+                    "marking-stub",
+                    &format!("#!/bin/sh\n: > '{}'\nexit 1\n", marker.display()),
+                );
+                let config = crate::transport::Ssh {
+                    user: "ops".to_string(),
+                    port: 22,
+                    key: PathBuf::from("/dev/null"),
+                    host_key: crate::transport::HostKeyPolicy::Strict,
+                };
+                let local = LocalExecutor::new("seat", SudoAuth::NonInteractive)
+                    .with_sudo_bin(marking.clone());
+                let ssh = SshExecutor::from_config(
+                    "target",
+                    &config,
+                    "10.0.0.10",
+                    SudoAuth::NonInteractive,
+                    SshPrompt::Deny,
+                )
+                .with_ssh_bin(marking);
+                for command in ["cat", "/bin/a=b"] {
+                    for exec in [&local as &dyn Executor, &ssh] {
+                        for identity in [
+                            Identity::Operator,
+                            Identity::Root,
+                            Identity::Service(ServiceAccount::Security),
+                        ] {
+                            let error = exec
+                                .open_channel(identity, command, &[], ROOMY)
+                                .expect_err("the command must be refused");
+                            assert!(
+                                matches!(&error, ChannelError::InvalidCommand { command: named }
+                                    if named == command),
+                                "{identity:?}: got {error:?}"
+                            );
+                            assert!(!marker.exists(), "nothing may have been spawned");
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn the_default_body_and_the_daemon_are_unsupported() {
+                struct RunOnly;
+                impl Executor for RunOnly {
+                    fn run(
+                        &self,
+                        _identity: Identity,
+                        command: &str,
+                        _args: &[&str],
+                    ) -> Result<CommandOutput, ExecutorError> {
+                        panic!("`{command}` must not be run through `run`")
+                    }
+                    fn put_file(
+                        &self,
+                        dest: &Path,
+                        _contents: &[u8],
+                        _meta: FileMeta,
+                    ) -> Result<(), ExecutorError> {
+                        panic!("`{}` must not be written", dest.display())
+                    }
+                }
+                for (label, exec) in [
+                    ("default", &RunOnly as &dyn Executor),
+                    ("daemon", &InDaemonExecutor::new("seat")),
+                ] {
+                    for identity in [Identity::Root, Identity::Service(ServiceAccount::Roxyd)] {
+                        let error = exec
+                            .open_channel(identity, "/bin/cat", &[], ROOMY)
+                            .expect_err("unsupported");
+                        assert!(
+                            matches!(error, ChannelError::Unsupported),
+                            "{label}: got {error:?}"
+                        );
+                    }
                 }
             }
         }
