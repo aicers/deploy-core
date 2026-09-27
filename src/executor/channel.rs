@@ -134,7 +134,9 @@ pub enum ChannelError {
     },
     /// The SSH transport ended without reporting the remote command's exit
     /// status, so the command's outcome is not known — the connection was
-    /// lost, or `ssh` was ended some other way. Never a guessed code.
+    /// lost, or `ssh` was ended some other way. An `ssh` that exits
+    /// unsuccessfully is this too, whatever its standard error ends with.
+    /// Never a guessed code.
     #[error("host `{host}`: the channel's exit status is unknown: {reason}")]
     ExitUnknown {
         /// The host whose command's outcome is unknown.
@@ -638,7 +640,8 @@ impl Channel {
     /// # Errors
     ///
     /// Returns [`ChannelError::ExitUnknown`] when an SSH channel ended without
-    /// its exit-status line, and [`ExecutorError::Spawn`] when waiting for the
+    /// its exit-status line, or when `ssh` itself exited unsuccessfully — the
+    /// wrapper exits zero once it reports, so a line then is not its — and [`ExecutorError::Spawn`] when waiting for the
     /// transport or reading standard error fails.
     pub fn wait(mut self) -> Result<ChannelExit, ChannelError> {
         self.stdin = None;
@@ -653,18 +656,26 @@ impl Channel {
             .map_err(|source| spawn_failed(&self.program, source))?;
         let code = match (&self.remote_host, drained.remote_code) {
             (None, _) => status.code(),
-            (Some(_), Some(code)) => Some(code),
-            (Some(host), None) => {
+            // The wrapper's last act is printing the line, which exits the
+            // remote shell zero, so only a successful `ssh` delivered it: a
+            // failed one leaves marker-shaped text the command wrote itself.
+            (Some(_), Some(code)) if status.success() => Some(code),
+            (Some(host), remote_code) => {
                 let ending = if drained.ended {
                     "standard error ended"
                 } else {
                     "standard error had not ended 5 seconds later"
                 };
+                let missing = if remote_code.is_some() {
+                    "after standard error ended on an exit-status line the wrapper did not \
+                     deliver"
+                } else {
+                    "without reporting the remote exit status"
+                };
                 return Err(ChannelError::ExitUnknown {
                     host: host.clone(),
                     reason: format!(
-                        "`{}` exited ({status}) without reporting the remote exit status; \
-                         {ending} with: {}",
+                        "`{}` exited ({status}) {missing}; {ending} with: {}",
                         self.program,
                         String::from_utf8_lossy(&drained.tail).trim()
                     ),

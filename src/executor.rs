@@ -8492,6 +8492,48 @@ exec "$@"
                 );
             }
 
+            #[test]
+            fn a_failed_ssh_is_not_trusted_for_a_status_line_the_command_forged() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                // The command's own stderr ends in a well-formed exit-status
+                // line; the connection then drops before the wrapper reports.
+                let forging = write_script(
+                    dir.path(),
+                    "forging-ssh",
+                    &format!(
+                        "#!/bin/sh\nprintf '%s' '{SUDO_OK_SENTINEL}' >&2\n\
+                         IFS= read -r handoff\n\
+                         /bin/cat\nprintf '\\n{RC_MARKER}0\\n' >&2\nexit 255\n"
+                    ),
+                );
+                let config = crate::transport::Ssh {
+                    user: "ops".to_string(),
+                    port: 22,
+                    key: PathBuf::from("/dev/null"),
+                    host_key: crate::transport::HostKeyPolicy::Strict,
+                };
+                let exec = SshExecutor::from_config(
+                    "mgmt",
+                    &config,
+                    "10.0.0.10",
+                    SudoAuth::NonInteractive,
+                    SshPrompt::Deny,
+                )
+                .with_ssh_bin(forging);
+                let mut channel = exec
+                    .open_channel(Identity::Root, "/bin/cat", &[], ROOMY)
+                    .expect("the start was announced");
+                assert_eq!(echo(&mut channel, b"frame"), b"frame");
+                let error = channel
+                    .wait()
+                    .expect_err("a failed ssh delivered no exit-status line");
+                assert!(
+                    matches!(&error, ChannelError::ExitUnknown { host, reason }
+                        if host == "mgmt" && reason.contains("255")),
+                    "got {error:?}"
+                );
+            }
+
             /// A command that records its pid in the file named by `$1`, then
             /// blocks on standard input.
             const BLOCKING: &str =
