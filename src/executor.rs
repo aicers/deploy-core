@@ -1068,6 +1068,11 @@ pub trait Executor {
     ///   writes before the command starts is neither counted nor returned,
     ///   so a refusal or a failed connection is reported as the error
     ///   [`Executor::run`] reports for it however small `max_stderr` is.
+    ///   Where a supervising shell or the SSH exit-status line shares
+    ///   standard error with the command, a byte past `max_stderr` that could
+    ///   still be the start of that framing is given a second to become it
+    ///   before it counts, so a command that stops on such a byte is killed
+    ///   up to a second after it passed its limit.
     /// - **A non-zero exit is a [`CommandOutput`]**, as it is from
     ///   [`Executor::run`].
     ///
@@ -6998,6 +7003,56 @@ exec "$@"
                         ),
                         "{label}: {error:?}"
                     );
+                }
+            }
+
+            #[test]
+            fn a_byte_over_the_limit_that_could_open_a_marker_kills_a_running_command_on_every_pair()
+             {
+                // `_` could open the timeout marker and a newline the SSH
+                // exit-status line, but a command still running after either
+                // wrote it itself, and one byte over is one byte over.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let limits = RunLimits {
+                    max_stderr: 0,
+                    ..ROOMY
+                };
+                // Written only once the pids are recorded, since a direct
+                // run is stopped at the byte.
+                let flood = "/usr/bin/head -c \"$2\" /dev/zero";
+                assert!(STUBBORN.contains(flood));
+                let script = STUBBORN.replace(flood, "printf '%s' \"$3\" >&2");
+                for (fragment, name) in [("_", "underscore"), ("\n", "newline")] {
+                    for (index, (label, exec, identity)) in every_pair(&dir).into_iter().enumerate()
+                    {
+                        let pids = dir.path().join(format!("{name}-{index}"));
+                        let started = Instant::now();
+                        let error = exec
+                            .run_with_input(
+                                identity,
+                                "/bin/sh",
+                                &["-c", &script, "sh", &pids.to_string_lossy(), "0", fragment],
+                                b"",
+                                limits,
+                            )
+                            .expect_err("the byte must be counted");
+                        assert!(
+                            matches!(
+                                error,
+                                RunWithInputError::OutputLimit {
+                                    stream: OutputStream::Stderr,
+                                    limit: 0,
+                                    ..
+                                }
+                            ),
+                            "{label} {name}: got {error:?}"
+                        );
+                        assert!(
+                            started.elapsed() < limits.timeout,
+                            "{label} {name}: the breach, not the timeout, must end the run"
+                        );
+                        assert_gone(label, &recorded_pids(&pids));
+                    }
                 }
             }
 

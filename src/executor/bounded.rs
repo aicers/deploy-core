@@ -42,6 +42,14 @@ const EXIT_POLL: Duration = Duration::from_millis(5);
 const RELAY_GRACE: Duration = Duration::from_secs(5);
 /// How long a child is given to be reaped after `SIGKILL` reached its group.
 const KILL_GRACE: Duration = Duration::from_secs(5);
+/// How long stderr bytes that may yet prove to be framing — the start of a
+/// timeout marker, or of the SSH wrapper's exit-status line — are given to
+/// prove it, once counting them as the command's would pass `max_stderr`.
+/// Framing is written whole, a line in one write with the stream closing
+/// right behind it, so it resolves within moments; this bounds only how long
+/// a command that wrote a look-alike fragment and went on running outlives
+/// its limit.
+const FRAMING_GRACE: Duration = Duration::from_secs(1);
 /// What opens every [`Supervisor`]'s timeout marker; the run's own random
 /// nonce follows it.
 const TIMEOUT_MARKER_PREFIX: &str = "__BOOTLER_TIMEOUT_";
@@ -105,8 +113,10 @@ pub(super) struct Framing<'a> {
 enum Attributed {
     /// The command has not started; this many bytes are the transport's.
     Transport(usize),
-    /// The command has started and has written this many bytes of its own.
-    Command(usize),
+    /// The command has started. `own` bytes are certainly its own; the
+    /// `pending` bytes after them are too, unless they turn out to be framing
+    /// still arriving.
+    Command { own: usize, pending: usize },
 }
 
 impl Framing<'static> {
@@ -125,15 +135,20 @@ impl Framing<'_> {
     /// connect, or the sentinel itself still arriving, and it is left for the
     /// transport's failure to be classified exactly as
     /// [`Executor::run`](super::Executor::run) classifies it. After the
-    /// sentinel, a timeout marker already seen in full is discounted, and so
-    /// is a trailing fragment that may still grow into it or into the
-    /// exit-status line — a stream is read in chunks, and a marker split
-    /// across two of them must not count against the limit while only its
-    /// first half has arrived. Nothing else is discounted, so a command that
-    /// writes one byte past its limit is caught at that byte.
+    /// sentinel, a timeout marker already seen in full is discounted: its
+    /// nonce makes it this run's alone. A trailing fragment that may still
+    /// grow into that marker, or that is or may grow into the exit-status
+    /// line, is left pending — a stream is read in chunks, a marker split
+    /// across two of them has arrived only in half, and the exit-status line
+    /// is a fixed string a command could print itself. Nothing else is
+    /// discounted or deferred, so a command that writes one byte past its
+    /// limit is caught at that byte unless the byte could still be framing.
     fn attribute(self, stderr: &[u8]) -> Attributed {
         let Some(marker) = self.timeout_marker else {
-            return Attributed::Command(stderr.len());
+            return Attributed::Command {
+                own: stderr.len(),
+                pending: 0,
+            };
         };
         let Some(at) = find(stderr, SUDO_OK_SENTINEL.as_bytes()) else {
             return Attributed::Transport(stderr.len());
@@ -151,7 +166,10 @@ impl Framing<'_> {
         if self.remote_code {
             pending = pending.max(remote_code_suffix(tail));
         }
-        Attributed::Command(tail.len().saturating_sub(framing + pending))
+        Attributed::Command {
+            own: tail.len().saturating_sub(framing + pending),
+            pending,
+        }
     }
 }
 
@@ -362,8 +380,12 @@ pub(super) fn run(
     let pumped = pump(&mut pipes, feed, limits, framing, &deadline);
     drop(pipes);
     match pumped {
-        Ok(Pumped::Closed { stdout, stderr }) => {
-            await_exit(child, kill, &deadline, stdout, stderr).map_err(failed)
+        Ok(Pumped::Closed {
+            stdout,
+            stderr,
+            undecided,
+        }) => {
+            await_exit(child, kill, &deadline, undecided.as_ref(), stdout, stderr).map_err(failed)
         }
         Ok(Pumped::Stopped(ended)) => {
             terminate(&mut child, kill);
@@ -406,8 +428,14 @@ impl Pipes {
 
 /// What [`pump`] stopped on.
 enum Pumped {
-    /// Every pipe closed, with what the child wrote on the two it reads.
-    Closed { stdout: Vec<u8>, stderr: Vec<u8> },
+    /// Every pipe closed, with what the child wrote on the two it reads, and
+    /// when stderr bytes that may be framing must have proved it, where
+    /// counting them as the command's passes the limit.
+    Closed {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        undecided: Option<Deadline>,
+    },
     /// The run must stop early; only an [`Ended::Abandoned`] returns what it
     /// captured.
     Stopped(Ended),
@@ -418,7 +446,10 @@ enum Pumped {
 /// The stderr limit is held against what [`Framing::attribute`] credits to the
 /// command; what the transport writes before the command starts is held to
 /// [`TRANSPORT_STDERR_LIMIT`] instead, and passing that abandons the run with
-/// the transport's output kept for classification.
+/// the transport's output kept for classification. Where only bytes still
+/// pending as possible framing pass the limit, they are given
+/// [`FRAMING_GRACE`] to become framing, and count as the command's once it
+/// runs out.
 fn pump(
     pipes: &mut Pipes,
     feed: &[u8],
@@ -430,10 +461,14 @@ fn pump(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut chunk = vec![0; READ_CHUNK];
+    let mut undecided: Option<Deadline> = None;
     while !pipes.is_empty() {
-        let Some(left) = deadline.remaining() else {
+        let Some(mut left) = deadline.remaining() else {
             return Ok(Pumped::Stopped(Ended::TimedOut));
         };
+        if let Some(grace) = &undecided {
+            left = left.min(grace.remaining().unwrap_or_default());
+        }
         // A time left too large for a `timespec` is no bound at all.
         let timeout = Timespec::try_from(left).ok();
         let ready = match wait_ready(pipes, timeout.as_ref()) {
@@ -469,8 +504,16 @@ fn pump(
             pipes.stderr = None;
         }
         match framing.attribute(&stderr) {
-            Attributed::Command(len) if len > limits.max_stderr => {
+            Attributed::Command { own, .. } if own > limits.max_stderr => {
                 return Ok(Pumped::Stopped(Ended::Breach(OutputStream::Stderr)));
+            }
+            Attributed::Command { own, pending }
+                if own.saturating_add(pending) > limits.max_stderr =>
+            {
+                let grace = undecided.get_or_insert_with(|| Deadline::after(FRAMING_GRACE));
+                if grace.remaining().is_none() {
+                    return Ok(Pumped::Stopped(Ended::Breach(OutputStream::Stderr)));
+                }
             }
             Attributed::Transport(len) if len > TRANSPORT_STDERR_LIMIT => {
                 return Ok(Pumped::Stopped(Ended::Abandoned(CommandOutput {
@@ -479,10 +522,14 @@ fn pump(
                     stderr,
                 })));
             }
-            Attributed::Command(_) | Attributed::Transport(_) => {}
+            Attributed::Command { .. } | Attributed::Transport(_) => undecided = None,
         }
     }
-    Ok(Pumped::Closed { stdout, stderr })
+    Ok(Pumped::Closed {
+        stdout,
+        stderr,
+        undecided,
+    })
 }
 
 /// Which pipes `poll(2)` reported ready.
@@ -550,15 +597,18 @@ fn is_transient(error: &std::io::Error) -> bool {
 }
 
 /// Waits for a child whose pipes have all closed to exit, killing it at the
-/// deadline.
+/// deadline — or, where stderr ended on bytes that pass the limit unless they
+/// are framing, at the end of their `undecided` grace.
 ///
 /// The pipes closing is not the child exiting: a command can close its
 /// standard streams and keep running, and nothing then remains to `poll(2)`
-/// on, so the exit is polled.
+/// on, so the exit is polled. Framing is followed by the exit at once, so a
+/// child still running when the grace runs out wrote those bytes itself.
 fn await_exit(
     mut child: Child,
     kill: Kill,
     deadline: &Deadline,
+    undecided: Option<&Deadline>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 ) -> std::io::Result<Ended> {
@@ -570,10 +620,17 @@ fn await_exit(
                 stderr,
             }));
         }
-        let Some(timeout) = deadline.remaining() else {
+        let Some(mut timeout) = deadline.remaining() else {
             terminate(&mut child, kill);
             return Ok(Ended::TimedOut);
         };
+        if let Some(grace) = undecided {
+            let Some(left) = grace.remaining() else {
+                terminate(&mut child, kill);
+                return Ok(Ended::Breach(OutputStream::Stderr));
+            };
+            timeout = timeout.min(left);
+        }
         std::thread::sleep(timeout.min(EXIT_POLL));
     }
 }
@@ -770,13 +827,17 @@ fn timed_out(command: &str, limits: RunLimits) -> RunWithInputError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use super::{
-        Attributed, CommandOutput, Ended, Framing, MAX_SLEEP_SECS, SLEEP, Supervisor,
-        TIMEOUT_MARKER_PREFIX, TIMEOUT_MARKER_SUFFIX, finish, partial_suffix, remote_code_suffix,
+        Attributed, CommandOutput, Ended, FRAMING_GRACE, Framing, Kill, MAX_SLEEP_SECS, SLEEP,
+        Supervisor, TIMEOUT_MARKER_PREFIX, TIMEOUT_MARKER_SUFFIX, finish, partial_suffix,
+        remote_code_suffix, run,
     };
-    use crate::executor::{RC_MARKER, RunLimits, RunWithInputError, SUDO_OK_SENTINEL};
+    use crate::executor::{
+        OutputStream, RC_MARKER, RunLimits, RunWithInputError, SUDO_OK_SENTINEL,
+    };
 
     const MARKER: &str = "__BOOTLER_TIMEOUT_00112233445566778899aabbccddeeff__";
     const SUDO_SSH: Framing<'static> = Framing {
@@ -816,16 +877,25 @@ mod tests {
         let stderr = format!("{SUDO_OK_SENTINEL}abc\n{RC_MARKER}0\n");
         assert_eq!(
             Framing::DIRECT.attribute(stderr.as_bytes()),
-            Attributed::Command(stderr.len())
+            Attributed::Command {
+                own: stderr.len(),
+                pending: 0
+            }
         );
     }
 
     #[test]
-    fn the_sentinel_and_the_exit_status_line_are_not_the_commands() {
-        let stderr = format!("{SUDO_OK_SENTINEL}abc\n{RC_MARKER}255\n");
+    fn the_sentinel_is_not_the_commands_and_the_exit_status_line_is_pending() {
+        // The exit-status line is a fixed string the command could print
+        // itself, so it is never discounted outright.
+        let line = format!("\n{RC_MARKER}255\n");
+        let stderr = format!("{SUDO_OK_SENTINEL}abc{line}");
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(3)
+            Attributed::Command {
+                own: 3,
+                pending: line.len()
+            }
         );
     }
 
@@ -848,7 +918,7 @@ mod tests {
         let stderr = format!("Warning: added host key\n{SUDO_OK_SENTINEL}abc");
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(3)
+            Attributed::Command { own: 3, pending: 0 }
         );
     }
 
@@ -857,12 +927,16 @@ mod tests {
         let stderr = format!("{SUDO_OK_SENTINEL}abc{MARKER}");
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(3)
+            Attributed::Command { own: 3, pending: 0 }
         );
-        let stderr = format!("{SUDO_OK_SENTINEL}abc{MARKER}\n{RC_MARKER}124\n");
+        let line = format!("\n{RC_MARKER}124\n");
+        let stderr = format!("{SUDO_OK_SENTINEL}abc{MARKER}{line}");
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(3)
+            Attributed::Command {
+                own: 3,
+                pending: line.len()
+            }
         );
     }
 
@@ -877,33 +951,39 @@ mod tests {
             ),
         ] {
             // A trailing byte, since a trailing `_` may still grow into
-            // this run's marker and is not counted until it cannot.
+            // this run's marker and is pending until it cannot.
             let stderr = format!("{SUDO_OK_SENTINEL}{other}.");
             assert_eq!(
                 SUDO_SSH.attribute(stderr.as_bytes()),
-                Attributed::Command(other.len() + 1),
+                Attributed::Command {
+                    own: other.len() + 1,
+                    pending: 0
+                },
                 "{other}"
             );
         }
     }
 
     #[test]
-    fn a_marker_still_arriving_is_not_counted_yet() {
+    fn a_marker_still_arriving_is_pending() {
         // Half an exit-status line after the command's own bytes.
         let stderr = format!("{SUDO_OK_SENTINEL}abc\n{}", &RC_MARKER[..4]);
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(3)
+            Attributed::Command { own: 3, pending: 5 }
         );
         let stderr = format!("{SUDO_OK_SENTINEL}abc\n{RC_MARKER}2");
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(3)
+            Attributed::Command {
+                own: 3,
+                pending: RC_MARKER.len() + 2
+            }
         );
         let stderr = format!("{SUDO_OK_SENTINEL}abc{}", &MARKER[..5]);
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(3)
+            Attributed::Command { own: 3, pending: 5 }
         );
     }
 
@@ -912,12 +992,18 @@ mod tests {
         let stderr = format!("{SUDO_OK_SENTINEL}abc\n{RC_MARKER}2x");
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(stderr.len() - SUDO_OK_SENTINEL.len())
+            Attributed::Command {
+                own: stderr.len() - SUDO_OK_SENTINEL.len(),
+                pending: 0
+            }
         );
         let stderr = format!("{SUDO_OK_SENTINEL}abc\n{RC_MARKER}2555");
         assert_eq!(
             SUDO_SSH.attribute(stderr.as_bytes()),
-            Attributed::Command(stderr.len() - SUDO_OK_SENTINEL.len())
+            Attributed::Command {
+                own: stderr.len() - SUDO_OK_SENTINEL.len(),
+                pending: 0
+            }
         );
     }
 
@@ -1022,6 +1108,62 @@ mod tests {
             MAX_SLEEP_SECS
         );
         assert_eq!(sleeps(Duration::MAX), MAX_SLEEP_SECS);
+    }
+
+    /// Runs `script` under `sh`, directly and in its own group, framed as a
+    /// supervised run over SSH and held to no stderr at all.
+    fn run_framed(script: &str) -> (Ended, Duration) {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script, "sh", SUDO_OK_SENTINEL]);
+        let limits = RunLimits {
+            max_stderr: 0,
+            timeout: Duration::from_secs(30),
+            ..LIMITS
+        };
+        let started = Instant::now();
+        let ended =
+            run(command, "/bin/sh", b"", limits, SUDO_SSH, Kill::Group).expect("the run completes");
+        (ended, started.elapsed())
+    }
+
+    #[test]
+    fn a_pending_fragment_past_the_limit_is_the_commands_once_its_grace_runs_out() {
+        // A byte that could open either marker, then a command that goes on
+        // running: with its streams open, and with them closed.
+        for fragment in ["_", "\\n"] {
+            for after in ["", "exec >&- 2>&-;"] {
+                let script = format!(
+                    "printf '%s{fragment}' \"$1\" >&2; {after} trap '' TERM; exec {SLEEP} 300"
+                );
+                let (ended, elapsed) = run_framed(&script);
+                assert!(
+                    matches!(ended, Ended::Breach(OutputStream::Stderr)),
+                    "{fragment:?} {after:?}: {ended:?}"
+                );
+                assert!(
+                    elapsed >= FRAMING_GRACE && elapsed < Duration::from_secs(10),
+                    "{fragment:?} {after:?}: ended after {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_fragment_that_becomes_framing_is_not_the_commands() {
+        // The exit-status line split across two writes, and the stream then
+        // closing: the command wrote nothing of its own.
+        let script =
+            format!("printf '%s\\n__BOOT' \"$1\" >&2; {SLEEP} 0.2; printf 'LER_RC__:0\\n' >&2");
+        assert_eq!(RC_MARKER, "__BOOTLER_RC__:");
+        let (ended, _) = run_framed(&script);
+        let Ended::Exited(output) = ended else {
+            panic!("the command exited: {ended:?}");
+        };
+        assert_eq!(output.code, Some(0));
+        assert_eq!(
+            output.stderr,
+            format!("{SUDO_OK_SENTINEL}\n{RC_MARKER}0\n").as_bytes()
+        );
     }
 
     #[test]
