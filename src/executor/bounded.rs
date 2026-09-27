@@ -689,6 +689,14 @@ mod tests {
     }
 
     #[test]
+    fn the_timeout_marker_is_not_the_commands() {
+        let stderr = format!("{SUDO_OK_SENTINEL}abc{TIMEOUT_MARKER}");
+        assert_eq!(SUDO_SSH.command_len(stderr.as_bytes()), 3);
+        let stderr = format!("{SUDO_OK_SENTINEL}abc{TIMEOUT_MARKER}\n{RC_MARKER}124\n");
+        assert_eq!(SUDO_SSH.command_len(stderr.as_bytes()), 3);
+    }
+
+    #[test]
     fn a_marker_still_arriving_is_not_counted_yet() {
         // Half a sentinel, before the command has written anything.
         let half = &SUDO_OK_SENTINEL[..7];
