@@ -517,3 +517,42 @@ fn a_file_without_a_trailer_is_no_trailer() {
         Err(PayloadError::NoTrailer)
     ));
 }
+
+/// A `Read + Seek` source whose seeks start failing once the test says so.
+struct SeekFailsLater {
+    inner: Cursor<Vec<u8>>,
+    fail: Rc<Cell<bool>>,
+}
+
+impl Read for SeekFailsLater {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for SeekFailsLater {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        if self.fail.get() {
+            return Err(io::Error::other("the seek fails"));
+        }
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn a_failed_seek_to_the_archive_block_is_an_io_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fail = Rc::new(Cell::new(false));
+    let source = SeekFailsLater {
+        inner: Cursor::new(unsigned(dir.path())),
+        fail: Rc::clone(&fail),
+    };
+    let mut container =
+        read_package_container(source, &ENVELOPE_BOUNDS).expect("the container reads");
+    fail.set(true);
+
+    assert!(matches!(
+        container.raw_archive_block(),
+        Err(PayloadError::Io(_))
+    ));
+}
