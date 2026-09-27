@@ -51,6 +51,10 @@ pub(super) const SUPERVISOR_SHELL: &str = "/bin/sh";
 /// The `env` the supervisor clears the command's environment with. Its path is
 /// the one fixed location both Linux and macOS guarantee.
 const ENV: &str = "/usr/bin/env";
+/// The `sleep` the supervisor's deadline runs, named absolutely for the same
+/// reason: one `PATH` could not resolve would exit at once, and the script
+/// would lose its deadline exactly as it would to a `sleep` that refused it.
+const SLEEP: &str = "/bin/sleep";
 /// The longest deadline [`supervisor_script`] hands `sleep`, `i32::MAX`
 /// seconds — some 68 years, which is no bound in practice. macOS's `sleep`
 /// refuses anything longer and exits at once, which the script would read as
@@ -206,7 +210,7 @@ pub(super) fn supervisor_script(sentinel: bool, timeout: Duration) -> String {
     format!(
         r#"trap 'kill -KILL 0' TERM HUP INT
 {announce}exec 3<&0 0</dev/null 4>&2 2>/dev/null
-sleep {seconds} </dev/null >/dev/null 3<&- 4>&- &
+{SLEEP} {seconds} </dev/null >/dev/null 3<&- 4>&- &
 nap=$!
 {{
   {ENV} -i "$0" "$@" 2>&4 4>&-
@@ -661,7 +665,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Framing, MAX_SLEEP_SECS, TIMEOUT_MARKER, partial_suffix, remote_code_suffix,
+        Framing, MAX_SLEEP_SECS, SLEEP, TIMEOUT_MARKER, partial_suffix, remote_code_suffix,
         supervisor_script,
     };
     use crate::executor::{RC_MARKER, SUDO_OK_SENTINEL};
@@ -718,7 +722,7 @@ mod tests {
             let script = supervisor_script(false, timeout);
             let line = script
                 .lines()
-                .find(|line| line.starts_with("sleep "))
+                .find(|line| line.starts_with(&format!("{SLEEP} ")))
                 .expect("the deadline's sleep")
                 .to_string();
             line.split_whitespace()

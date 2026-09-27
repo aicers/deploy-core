@@ -7242,11 +7242,17 @@ exec "$@"
 
             /// Spawns the supervisor the way a transport this process cannot
             /// signal through would run it, in a process group of its own so
-            /// its `kill 0` stays inside it, over [`STUBBORN`].
+            /// its `kill 0` stays inside it, over [`STUBBORN`]. Its `PATH`
+            /// names only the directory holding `pids`, where no utility lives,
+            /// so its deadline is shown to depend on no `PATH` lookup — an empty
+            /// environment would not show it, since a shell then falls back to
+            /// a default `PATH` of its own.
             fn spawn_supervised(timeout: Duration, pids: &Path) -> std::process::Child {
                 use std::os::unix::process::CommandExt;
 
                 Command::new("/bin/sh")
+                    .env_clear()
+                    .env("PATH", pids.parent().expect("pids lives in a directory"))
                     .arg("-c")
                     .arg(supervisor_script(false, timeout))
                     .args(["/bin/sh", "-c", STUBBORN, "sh"])
