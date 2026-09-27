@@ -35,7 +35,10 @@ use super::{CommandOutput, ExecutorError, RC_MARKER, SUDO_OK_SENTINEL, spawn_ret
 /// transport process has exited. A descendant of the command can hold the
 /// pipe open indefinitely; past this, what was read is what is returned, and
 /// the rest is noted as truncated.
-pub(super) const STDERR_GRACE: Duration = Duration::from_secs(5);
+const STDERR_GRACE: Duration = Duration::from_secs(5);
+/// The shell [`start_script`] runs under, named absolutely so the start
+/// depends on no `PATH`.
+pub(super) const START_SHELL: &str = SUPERVISOR_SHELL;
 /// Bytes read from standard error per readiness.
 const READ_CHUNK: usize = 8192;
 /// Bytes at the end of an SSH channel's standard error held back from the
@@ -162,10 +165,6 @@ pub(super) fn check_command(command: &str) -> Result<(), ChannelError> {
 pub(super) fn start_script() -> String {
     format!("printf '%s' '{SUDO_OK_SENTINEL}' >&2; exec {ENV} -i \"$0\" \"$@\"")
 }
-
-/// The shell [`start_script`] runs under, named absolutely so the start
-/// depends on no `PATH`.
-pub(super) const START_SHELL: &str = SUPERVISOR_SHELL;
 
 /// What [`open_started`] needs to know beyond the command it spawns.
 pub(super) struct Start<'a> {
@@ -327,11 +326,11 @@ fn settle_start(
     timeout: Duration,
 ) -> std::io::Result<Settled> {
     rustix::io::ioctl_fionbio(&*stderr, true)?;
-    if password.is_none() {
+    let Some(password) = password else {
         return feed_and_settle(stdin, stderr, b"", timeout);
-    }
+    };
     rustix::io::ioctl_fionbio(&*stdin, true)?;
-    let settled = feed_and_settle(stdin, stderr, password.unwrap_or_default(), timeout)?;
+    let settled = feed_and_settle(stdin, stderr, password, timeout)?;
     rustix::io::ioctl_fionbio(&*stdin, false)?;
     Ok(settled)
 }
@@ -531,8 +530,9 @@ impl Channel {
             Err(source) => return Err(spawn_failed(&self.program, source)),
         };
         self.ended = true;
-        let drained = self.stop_drain(STDERR_GRACE);
-        let drained = drained.map_err(|source| spawn_failed(&self.program, source))?;
+        let drained = self
+            .stop_drain(STDERR_GRACE)
+            .map_err(|source| spawn_failed(&self.program, source))?;
         let code = match (&self.remote_host, drained.remote_code) {
             (None, _) => status.code(),
             (Some(_), Some(code)) => Some(code),
