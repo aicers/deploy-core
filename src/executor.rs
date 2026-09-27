@@ -7933,6 +7933,43 @@ exec "$@"
             }
 
             #[test]
+            fn wait_closes_standard_input_that_was_never_taken_on_every_pair() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                for (label, exec, identity) in every_pair(&dir) {
+                    let channel = exec
+                        .open_channel(identity, "/bin/cat", &[], ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    let exit = channel
+                        .wait()
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(exit.code, Some(0), "{label}: `cat` saw end of input");
+                }
+            }
+
+            #[test]
+            fn a_local_transport_ended_by_a_signal_has_no_code() {
+                // Locally the stub `sudo` execs its way to the command, so the
+                // signal ends the local transport process itself. Over SSH the
+                // remote shell reports the signalled command's status as a code.
+                let dir = tempfile::tempdir().expect("tempdir");
+                for (label, exec, identity) in every_pair(&dir) {
+                    let mut channel = exec
+                        .open_channel(identity, "/bin/sh", &["-c", "kill -9 $$"], ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert!(read_out(&mut channel).is_empty(), "{label}");
+                    let exit = channel
+                        .wait()
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    let expected = if label.starts_with("local") {
+                        None
+                    } else {
+                        Some(128 + 9)
+                    };
+                    assert_eq!(exit.code, expected, "{label}");
+                }
+            }
+
+            #[test]
             fn the_command_sees_an_empty_environment_on_every_pair() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 assert!(
