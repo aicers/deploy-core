@@ -178,7 +178,10 @@ Enable it only as a `[dev-dependencies]` feature — never under normal
 `[dependencies]` — so the fixtures stay absent from every release build.
 
 The checked-in image archive fixtures, and how each one is regenerated, are
-described in `assets/test-fixtures/images/INVENTORY.md`. The manual Docker
+described in `assets/test-fixtures/images/INVENTORY.md`. The checked-in
+signed format-6 package whose images verify in full, and how it is
+regenerated, is described in
+`assets/test-fixtures/signed-v6-images/README.md`. The manual Docker
 interoperability procedure is `docs/image-archive-interoperability.md`.
 
 ## License

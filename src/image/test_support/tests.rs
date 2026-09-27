@@ -403,12 +403,20 @@ fn a_gzip_blob_has_the_fixed_header() {
 
 #[test]
 fn generated_documents_stay_within_their_bounds_at_the_maxima() {
+    // The gzip media type is the longer, so a refusal fixture's manifest is
+    // the larger; neither is ever refused for its size.
+    for compression in [LayerCompression::Uncompressed, LayerCompression::Gzip] {
+        documents_within_their_bounds(compression);
+    }
+}
+
+fn documents_within_their_bounds(compression: LayerCompression) {
     let mut builder = SyntheticImageArchiveBuilder::new(arm64(&long_variant())).unwrap();
     for at in 0..MAX_SYNTHETIC_LAYERS {
         builder = builder
             .layer(
                 SyntheticLayer::new().file(&format!("f{at}"), format!("{at}")),
-                LayerCompression::Gzip,
+                compression,
             )
             .unwrap();
     }
@@ -452,7 +460,22 @@ fn generated_documents_stay_within_their_bounds_at_the_maxima() {
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json_depth(&value) <= JSON_DEPTH_BOUND);
     }
-    classify(&archive, &public_refs).unwrap();
+    match compression {
+        LayerCompression::Uncompressed => classify(&archive, &public_refs).unwrap(),
+        LayerCompression::Gzip => assert_non_canonical(classify(&archive, &public_refs)),
+    }
+}
+
+/// Asserts the validator refused a builder archive as not canonical.
+#[track_caller]
+fn assert_non_canonical(result: Result<(), ArchiveCheckError>) {
+    match result {
+        Err(ArchiveCheckError::Image(ImageVerifyError::UnsupportedArchive {
+            feature: crate::verify::UnsupportedArchiveFeature::NonCanonicalManifest,
+            ..
+        })) => {}
+        other => panic!("expected a non-canonical manifest, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -789,12 +812,12 @@ fn every_document_has_exactly_the_stated_bytes() {
         .unwrap()
         .layer(
             SyntheticLayer::new().file("b.txt", "b"),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .unwrap()
         .layer(
             SyntheticLayer::new().file("b.txt", "b"),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .unwrap();
     assert_eq!(builder.blobs.len(), 2, "the repeated layer shares its blob");
@@ -811,6 +834,9 @@ fn every_document_has_exactly_the_stated_bytes() {
     let diff_ids = archive.diff_ids();
     assert_eq!(diff_ids.len(), 3);
     assert_eq!(diff_ids[1], diff_ids[2]);
+    // Uncompressed: each blob is its layer tar, named by its diff ID.
+    assert_eq!(diff_ids[0], format!("sha256:{a}"));
+    assert_eq!(diff_ids[1], format!("sha256:{b}"));
 
     let entries = image_entries(archive.bytes());
     let names: Vec<String> = entries
@@ -861,10 +887,26 @@ fn every_document_has_exactly_the_stated_bytes() {
         cfg = cfg,
         size = config.len(),
         l0 = layer("application/vnd.oci.image.layer.v1.tar", a, *a_size),
-        l1 = layer("application/vnd.oci.image.layer.v1.tar+gzip", b, *b_size),
-        l2 = layer("application/vnd.oci.image.layer.v1.tar+gzip", b, *b_size),
+        l1 = layer("application/vnd.oci.image.layer.v1.tar", b, *b_size),
+        l2 = layer("application/vnd.oci.image.layer.v1.tar", b, *b_size),
     );
     assert_eq!(document(3), manifest);
+    // It is the renderer's output, which the manifest digest names.
+    let rendered = canonical_image_manifest(
+        archive.config_digest(),
+        widen(config.len()),
+        &[
+            (diff_ids[0].as_str(), *a_size),
+            (diff_ids[1].as_str(), *b_size),
+            (diff_ids[2].as_str(), *b_size),
+        ],
+    )
+    .unwrap();
+    assert_eq!(document(3).as_bytes(), rendered.as_slice());
+    assert_eq!(
+        archive.manifest_digest(),
+        format!("sha256:{}", sha256_hex(&rendered))
+    );
     let descriptor = |reference: &str, tag: &str| {
         format!(
             concat!(
@@ -904,6 +946,63 @@ fn every_document_has_exactly_the_stated_bytes() {
 }
 
 #[test]
+fn a_gzip_layer_writes_a_refusal_fixture() {
+    let builder = SyntheticImageArchiveBuilder::new(amd64())
+        .unwrap()
+        .layer(
+            SyntheticLayer::new().file("a.txt", "a"),
+            LayerCompression::Uncompressed,
+        )
+        .unwrap()
+        .layer(hello(), LayerCompression::Gzip)
+        .unwrap();
+    let blobs: Vec<(String, u64)> = builder
+        .blobs
+        .iter()
+        .map(|blob| (blob.hex.clone(), blob.size()))
+        .collect();
+    let [(a, a_size), (g, g_size)] = blobs.as_slice() else {
+        panic!("two blobs");
+    };
+    let public_refs = refs(&["app:1"]);
+    let archive = builder.finish(&public_refs).unwrap();
+    let cfg = archive.config_digest().strip_prefix("sha256:").unwrap();
+    let man = archive.manifest_digest().strip_prefix("sha256:").unwrap();
+    let entries = image_entries(archive.bytes());
+    let manifest = entries
+        .iter()
+        .find(|(entry, _)| entry.name == format!("blobs/sha256/{man}").into_bytes())
+        .map(|(_, data)| String::from_utf8(data.clone()).unwrap())
+        .unwrap();
+    let config_size = entries
+        .iter()
+        .find(|(entry, _)| entry.name == format!("blobs/sha256/{cfg}").into_bytes())
+        .map(|(entry, _)| entry.data_len)
+        .unwrap();
+    // The canonical form, except that the gzip layer names its stored blob
+    // under the gzip media type.
+    assert_eq!(
+        manifest,
+        format!(
+            concat!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+                r#""config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{cfg}","size":{config_size}}},"#,
+                r#""layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{a}","size":{a_size}}},"#,
+                r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{g}","size":{g_size}}}]}}"#
+            ),
+            cfg = cfg,
+            config_size = config_size,
+            a = a,
+            a_size = a_size,
+            g = g,
+            g_size = g_size,
+        )
+    );
+    assert_ne!(archive.diff_ids()[1], format!("sha256:{g}"));
+    assert_non_canonical(classify(&archive, &public_refs));
+}
+
+#[test]
 fn a_scratch_image_has_empty_diff_ids_and_history_and_no_null_variant() {
     let builder = SyntheticImageArchiveBuilder::new(amd64()).unwrap();
     assert_eq!(
@@ -926,7 +1025,7 @@ fn a_limit_fault_maps_to_limit_exceeded_and_nothing_else() {
     let public_refs = refs(&["registry.example/app:1.0"]);
     let archive = SyntheticImageArchiveBuilder::new(amd64())
         .unwrap()
-        .layer(hello(), LayerCompression::Gzip)
+        .layer(hello(), LayerCompression::Uncompressed)
         .unwrap()
         .finish(&public_refs)
         .unwrap();

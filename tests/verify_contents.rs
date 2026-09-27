@@ -26,7 +26,7 @@ use deploy_core::payload::{
 };
 use deploy_core::verify::{
     ImageReferences, ImageVerifyError, InvalidArchiveReason, TRUST_TARGET, TarFault, TrustAnchor,
-    TrustSet, VerifyError, VerifyRequest, key_id, verify_package,
+    TrustSet, UnsupportedArchiveFeature, VerifyError, VerifyRequest, key_id, verify_package,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -118,6 +118,8 @@ struct Input {
     arch: TargetArch,
     bytes: Vec<u8>,
     image: Option<ImageDeclaration>,
+    /// The manifest digest the synthetic builder reported for an image.
+    manifest_digest: Option<String>,
 }
 
 fn platform(arch: TargetArch, variant: Option<&str>) -> ImagePlatform {
@@ -177,6 +179,7 @@ fn product_image(
         path,
         kind: ArtifactKind::ContainerImage,
         arch,
+        manifest_digest: Some(archive.manifest_digest().to_string()),
         bytes: archive.into_bytes(),
         image: Some(declaration),
     }
@@ -229,6 +232,7 @@ fn normalized_image(
         path,
         kind: ArtifactKind::ContainerImage,
         arch,
+        manifest_digest: Some(archive.manifest_digest().to_string()),
         bytes: archive.into_bytes(),
         image: Some(declaration),
     }
@@ -241,25 +245,33 @@ fn plain(path: &'static str, kind: ArtifactKind, arch: TargetArch, bytes: &[u8])
         arch,
         bytes: bytes.to_vec(),
         image: None,
+        manifest_digest: None,
     }
 }
 
 /// Six images and two deployment files for `arch`, covering both
-/// provenances, both lifecycles, canonical aliases, explicit and null
-/// variants, and gzip and uncompressed layers.
+/// provenances, both lifecycles, canonical aliases, and explicit and null
+/// variants. Every layer is uncompressed, so every image carries its
+/// canonical manifest.
 fn six_images(arch: TargetArch) -> Vec<Input> {
     let variant = match arch {
         TargetArch::X86_64 => "v3",
         TargetArch::Aarch64 => "v8",
     };
     vec![
-        product_image("images/web.tar", arch, "web", None, LayerCompression::Gzip),
+        product_image(
+            "images/web.tar",
+            arch,
+            "web",
+            None,
+            LayerCompression::Uncompressed,
+        ),
         normalized_image(
             "images/database.tar",
             arch,
             "database",
             None,
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         ),
         plain(
             "compose.yaml",
@@ -293,7 +305,7 @@ fn six_images(arch: TargetArch) -> Vec<Input> {
             arch,
             "queue",
             None,
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         ),
         plain(
             "bin/agent",
@@ -437,6 +449,33 @@ fn assemble(signer: &Signer, manifest: &[u8], archive: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Returns the `sha256:` digest of the image manifest blob `index.json` names
+/// in an image archive, computed from the blob's bytes, and the digest the
+/// index states.
+fn manifest_evidence(archive: &[u8]) -> (String, String) {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in tar::Archive::new(archive).entries().expect("a tar") {
+        let mut entry = entry.expect("an entry");
+        let name = entry.path().expect("a path").to_string_lossy().into_owned();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).expect("the entry reads");
+        files.insert(name, data);
+    }
+    let index: Value =
+        serde_json::from_slice(files.get("index.json").expect("an index")).expect("json");
+    let index_digest = index["manifests"][0]["digest"]
+        .as_str()
+        .expect("a digest")
+        .to_string();
+    let hex_name = index_digest
+        .strip_prefix("sha256:")
+        .expect("a sha256 digest");
+    let blob = files
+        .get(&format!("blobs/sha256/{hex_name}"))
+        .expect("the manifest blob");
+    (format!("sha256:{}", hex(&sha256(blob))), index_digest)
+}
+
 /// Rewrites a package's manifest JSON with `edit` and re-signs it.
 fn edited(signer: &Signer, package: &[u8], edit: impl FnOnce(&mut Value)) -> Vec<u8> {
     let (manifest, archive) = blocks(package);
@@ -493,6 +532,15 @@ fn a_six_image_package_verifies_into_complete_evidence_on_both_architectures() {
             assert_eq!(Some(image.declaration()), input.image.as_ref());
             assert_eq!(image.member_length(), input.bytes.len() as u64);
             assert_eq!(read_all(image.archive()), input.bytes);
+            // The manifest digest is the builder's, the stored manifest
+            // blob's SHA-256 and the `index.json` descriptor digest.
+            assert_eq!(
+                Some(image.manifest_digest()),
+                input.manifest_digest.as_deref()
+            );
+            let (blob_digest, index_digest) = manifest_evidence(&input.bytes);
+            assert_eq!(image.manifest_digest(), blob_digest);
+            assert_eq!(image.manifest_digest(), index_digest);
         }
         assert_eq!(read_all(contents.package_bytes()), bytes);
         assert_eq!(contents.package_bytes().sha256(), &sha256(&bytes));
@@ -568,6 +616,48 @@ fn the_wrong_build_namespace_or_architecture_is_refused() {
             assert_eq!(actual, TargetArch::X86_64);
         }
         other => panic!("expected an architecture mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_image_with_a_non_canonical_manifest_is_refused() {
+    // A gzip layer, whether in a product image or a normalized one: the
+    // signed declaration is valid, and only the manifest is not canonical.
+    for (path, input) in [
+        (
+            "images/web.tar",
+            product_image(
+                "images/web.tar",
+                TargetArch::X86_64,
+                "web",
+                None,
+                LayerCompression::Gzip,
+            ),
+        ),
+        (
+            "images/database.tar",
+            normalized_image(
+                "images/database.tar",
+                TargetArch::X86_64,
+                "database",
+                None,
+                LayerCompression::Gzip,
+            ),
+        ),
+    ] {
+        let signer = Signer::new();
+        let bytes = write(&signer, &[input], COMPONENT, COMMIT);
+        verify_package(Cursor::new(&bytes), &signer.trust(), &request())
+            .expect("the metadata verifier accepts it");
+        match verify(&bytes, &signer.trust(), &request(), TargetArch::X86_64).0 {
+            Err(ContentError::Verify(VerifyError::Image(
+                ImageVerifyError::UnsupportedArchive {
+                    archive_path,
+                    feature: UnsupportedArchiveFeature::NonCanonicalManifest,
+                },
+            ))) => assert_eq!(archive_path, path),
+            other => panic!("expected a non-canonical manifest, got {other:?}"),
+        }
     }
 }
 
@@ -706,7 +796,8 @@ fn an_undeclared_current_format_image_is_the_typed_parse_refusal() {
 
 #[test]
 fn the_checked_in_metadata_fixture_is_not_full_content_evidence() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/test-fixtures/signed-v6-images");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets/test-fixtures/signed-v6-placeholder-images");
     let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
     let key_hex = std::fs::read_to_string(dir.join("public-key.hex")).expect("its key");
     let key_hex = key_hex.trim();

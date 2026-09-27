@@ -31,6 +31,9 @@ use deploy_core::verify::{
 };
 use tempfile::TempDir;
 
+#[path = "../examples/write_signed_v6_fixture/fixture.rs"]
+mod fixture;
+
 const COMPONENT: &str = "example-app";
 const VERSION: &str = "1.0.0";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -158,7 +161,7 @@ fn own_image(arch: TargetArch) -> Artifact {
             SyntheticLayer::new()
                 .dir("app")
                 .file("app/run", b"#!/bin/sh\nexec app\n".to_vec()),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .expect("a valid layer")
         .finish(&refs)
@@ -191,7 +194,7 @@ fn managed_dependency(arch: TargetArch) -> (Artifact, String) {
         .expect("a valid platform")
         .layer(
             SyntheticLayer::new().file("etc/database.conf", b"port = 5432\n".to_vec()),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .expect("a valid layer")
         .layer(
@@ -275,7 +278,7 @@ fn product_dependency(arch: TargetArch) -> Artifact {
         .expect("a valid platform")
         .layer(
             SyntheticLayer::new().file("worker/run", b"worker binary".to_vec()),
-            LayerCompression::Gzip,
+            LayerCompression::Uncompressed,
         )
         .expect("a valid layer")
         .layer(
@@ -596,9 +599,12 @@ fn a_reserved_trust_package_finalizes_and_reverifies_under_its_epoch() {
     publish_and_reverify(&finalized, &signer.trust_at(4), &request, arch);
 }
 
-#[test]
-fn the_checked_in_placeholder_image_package_is_refused() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/test-fixtures/signed-v6-images");
+/// Reads the checked-in package under `assets/test-fixtures/<name>`, and the
+/// trust set anchoring only the public key kept beside it.
+fn checked_in(name: &str) -> (Vec<u8>, TrustSet) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets/test-fixtures")
+        .join(name);
     let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
     let key_hex = std::fs::read_to_string(dir.join("public-key.hex")).expect("its key");
     let key_hex = key_hex.trim();
@@ -613,6 +619,93 @@ fn the_checked_in_placeholder_image_package_is_refused() {
         0,
     )
     .expect("a trust set");
+    (package, trust)
+}
+
+/// The checked-in signed format-6 package the `write_signed_v6_fixture`
+/// example wrote verifies in full under its own key: its signed manifest is
+/// exactly what preparing the example's members gives, every member is the
+/// example's bytes, and each image's evidence names the canonical manifest
+/// the builder wrote.
+#[test]
+fn the_checked_in_signed_v6_package_verifies_in_full() {
+    let (package, trust) = checked_in("signed-v6-images");
+    let members = fixture::members().expect("the example's members");
+    let request = fixture::request().expect("the example's request");
+    let limits = ContentLimits::default();
+
+    let sources = Dir::new();
+    let inputs = fixture::inputs(&members, sources.path()).expect("the sources are written");
+    let staging = Dir::new();
+    let prepared = prepare_package(
+        &inputs,
+        None,
+        None,
+        &request,
+        fixture::TARGET,
+        &limits,
+        staging.path(),
+    )
+    .expect("the example's members prepare");
+    let manifest = prepared.manifest_bytes();
+    assert!(
+        package
+            .windows(manifest.len())
+            .any(|window| window == manifest),
+        "the signed manifest is the one the example prepares"
+    );
+
+    let staging = Dir::new();
+    let contents = verify_contents(
+        Cursor::new(&package),
+        &trust,
+        &request,
+        fixture::TARGET,
+        &limits,
+        staging.path(),
+    )
+    .expect("the checked-in package verifies in full");
+    assert_eq!(contents.artifacts().len(), members.len());
+    for (verified, member) in contents.artifacts().iter().zip(&members) {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut verified.bytes().reader(), &mut bytes).expect("reads");
+        assert_eq!(bytes, member.bytes, "{}", member.archive_path);
+    }
+
+    let VerifiedImages::Present(images) = contents.images() else {
+        panic!("the images are present");
+    };
+    let expected: Vec<(&ImageDeclaration, &str)> = members
+        .iter()
+        .filter_map(|member| Some((member.image.as_ref()?, member.manifest_digest.as_deref()?)))
+        .collect();
+    assert_eq!(images.len(), 2);
+    assert_eq!(expected.len(), 2);
+    for (verified, (declaration, digest)) in images.iter().zip(expected) {
+        assert_eq!(verified.declaration(), declaration);
+        assert_eq!(verified.manifest_digest(), digest);
+    }
+    let database = images
+        .iter()
+        .find(|image| image.declaration().dependency == "database")
+        .expect("the managed dependency");
+    assert_eq!(
+        database.declaration().public_refs,
+        [canonical_runtime_alias(
+            fixture::NAMESPACE,
+            fixture::COMPONENT,
+            "database",
+            &database.declaration().config_digest,
+        )
+        .expect("an alias")]
+    );
+}
+
+/// The #95 metadata-only package, kept as a negative case: its image members
+/// are placeholder bytes, not image archives.
+#[test]
+fn the_checked_in_placeholder_image_package_is_refused() {
+    let (package, trust) = checked_in("signed-v6-placeholder-images");
     let manifest = deploy_core::payload::open_package(Cursor::new(&package))
         .expect("the fixture opens")
         .manifest()

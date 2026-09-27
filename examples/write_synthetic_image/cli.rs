@@ -22,7 +22,7 @@ const USAGE_TEXT: &str = "usage:
   write_synthetic_image write <out.tar> <out.declaration.json> <amd64|arm64> <ref>...
   write_synthetic_image classify <archive.tar> <declaration.json>";
 
-/// The one file of the sample's one gzip layer.
+/// The one file of the sample's one uncompressed layer.
 const SAMPLE_PATH: &str = "etc/synthetic-sample.txt";
 const SAMPLE_CONTENT: &str = "a synthetic image written by deploy-core\n";
 
@@ -84,7 +84,7 @@ fn write(args: &[String], stderr: &mut dyn Write) -> u8 {
         .and_then(|builder| {
             builder.layer(
                 SyntheticLayer::new().file(SAMPLE_PATH, SAMPLE_CONTENT),
-                LayerCompression::Gzip,
+                LayerCompression::Uncompressed,
             )
         })
         .and_then(|builder| builder.finish(public_refs));

@@ -6,7 +6,7 @@
   },
   "dependency": "app",
   "public_refs": [
-    "registry.example/synthetic/gzip:1.0"
+    "registry.example/synthetic/layer-sources:1.0"
   ],
   "platform": {
     "os": "linux",

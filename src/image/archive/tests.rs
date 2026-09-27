@@ -1,4 +1,4 @@
-use std::io::{Cursor, ErrorKind, Read, Seek, Write};
+use std::io::{Cursor, ErrorKind, Read, Seek};
 
 use serde_json::{Value, json};
 
@@ -8,14 +8,15 @@ use super::assembly::{
     remove_entry,
 };
 use super::{
-    ImageArchiveFault, Site, ValidatedImageArchive, Verdict, convert, probe, seam,
-    validate_image_archive,
+    ImageArchiveFault, LayerBudgets, Site, Span, ValidatedImageArchive, Verdict, convert,
+    decode_layer, probe, seam, validate_image_archive,
 };
 use crate::content::{
     Budget, ContentFault, CountingReader, GzipHeaderFault as ContentGzipHeader, MalformedReason,
     PaxKey as ContentPaxKey, ResourceLimit, TarField, UnsupportedFeature,
 };
 use crate::image::ImageArchitecture;
+use crate::image::canonical_image_manifest;
 use crate::package::{ContentLimits, LimitResource};
 use crate::verify::{
     BlobMismatchKind, BlobRole, ConfigField, ExtensionField, GzipFault, GzipHeaderFault,
@@ -82,8 +83,8 @@ fn render(fault: &ImageArchiveFault) -> String {
 }
 
 #[track_caller]
-fn assert_fault(
-    result: Result<ValidatedImageArchive, ImageArchiveFault>,
+fn assert_fault<T: std::fmt::Debug>(
+    result: Result<T, ImageArchiveFault>,
     expected: &ImageArchiveFault,
 ) {
     match result {
@@ -121,6 +122,10 @@ fn unsupported(feature: UnsupportedArchiveFeature) -> ImageArchiveFault {
 
 fn limit(resource: LimitResource, limit: u64) -> ImageArchiveFault {
     ImageArchiveFault::LimitExceeded { resource, limit }
+}
+
+fn non_canonical() -> ImageArchiveFault {
+    unsupported(UnsupportedArchiveFeature::NonCanonicalManifest)
 }
 
 fn shape(document: ImageDocument) -> ImageArchiveFault {
@@ -199,6 +204,21 @@ fn rename_blob(entries: &mut [Entry], from: &str, to: &str) {
     std::mem::swap(&mut entry.header, &mut header);
 }
 
+/// Counts every phase-8 event, at any position.
+fn layer_events(events: &[seam::Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                seam::Event::LayerOpened(_)
+                    | seam::Event::LayerDecoded(_)
+                    | seam::Event::LayerRead { .. }
+            )
+        })
+        .count()
+}
+
 fn events_for(position: usize, events: &[seam::Event]) -> usize {
     events
         .iter()
@@ -275,27 +295,34 @@ fn a_scratch_image_is_accepted() {
 }
 
 #[test]
-fn uncompressed_gzip_and_mixed_layers_are_accepted() {
+fn uncompressed_layers_are_accepted_and_any_gzip_layer_is_not() {
     let a = layer_tar("a.txt", b"alpha");
     let b = layer_tar("b.txt", b"bravo");
     for layers in [
         vec![Layer::plain(&a)],
-        vec![Layer::gzip(&a)],
-        vec![Layer::plain(&a), Layer::gzip(&b)],
-        vec![Layer::gzip(&a), Layer::plain(&b)],
+        vec![Layer::plain(&a), Layer::plain(&b)],
     ] {
         let count = layers.len();
         let built = ImageBuilder::new().layers(layers).build();
         assert_eq!(accept(&built).layer_count, count);
     }
+    // Reclassified: gzip layers were accepted before canonical manifests.
+    for layers in [
+        vec![Layer::gzip(&a)],
+        vec![Layer::plain(&a), Layer::gzip(&b)],
+        vec![Layer::gzip(&a), Layer::plain(&b)],
+    ] {
+        let built = ImageBuilder::new().layers(layers).build();
+        assert_fault(run(&built), &non_canonical());
+    }
 }
 
 #[test]
-fn a_repeated_layer_position_is_decoded_and_charged_again() {
+fn a_repeated_layer_position_is_walked_and_charged_again() {
     let a = layer_tar("a.txt", b"alpha");
     let b = layer_tar("b.txt", b"bravo");
     let built = ImageBuilder::new()
-        .layers(vec![Layer::gzip(&a), Layer::plain(&b)])
+        .layers(vec![Layer::plain(&a), Layer::plain(&b)])
         .positions(&[0, 1, 0])
         .build();
     let limits = ContentLimits::default();
@@ -315,7 +342,8 @@ fn a_repeated_layer_position_is_decoded_and_charged_again() {
     let expected = 2 * a.len() + b.len();
     assert_eq!(operation.used(), u64::try_from(expected).unwrap());
     let events = seam::take();
-    // One inventory hash per distinct blob, one phase-7 decode per position.
+    // One inventory hash per distinct blob, one phase-8 walk per position,
+    // and no gzip decoder anywhere.
     let inventory = events
         .iter()
         .filter(|e| matches!(e, seam::Event::InventoryBlob(_)))
@@ -324,20 +352,19 @@ fn a_repeated_layer_position_is_decoded_and_charged_again() {
     for position in 0..3 {
         assert!(events.contains(&seam::Event::LayerOpened(position)));
     }
-    assert!(events.contains(&seam::Event::LayerDecoded(0)));
-    assert!(!events.contains(&seam::Event::LayerDecoded(1)));
-    assert!(events.contains(&seam::Event::LayerDecoded(2)));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, seam::Event::LayerDecoded(_)))
+    );
 }
 
+/// States `platform` on the index descriptor. A canonical manifest states
+/// none on its config descriptor.
 fn with_platforms(builder: ImageBuilder, platform: Value) -> ImageBuilder {
-    let for_index = platform.clone();
-    builder
-        .json(Doc::Index, move |index| {
-            index["manifests"][0]["platform"] = for_index;
-        })
-        .json(Doc::Manifest, move |manifest| {
-            manifest["config"]["platform"] = platform;
-        })
+    builder.json(Doc::Index, move |index| {
+        index["manifests"][0]["platform"] = platform;
+    })
 }
 
 #[test]
@@ -383,13 +410,23 @@ fn descriptors_may_state_a_null_variant_or_no_platform() {
             index["manifests"][0]["platform"] =
                 json!({"os": "linux", "architecture": "amd64", "variant": null});
         })
-        .json(Doc::Manifest, |manifest| {
-            manifest["config"]["platform"] = json!({"os": "linux", "architecture": "amd64"});
-        })
         .build();
     accept(&built);
     // No `platform` anywhere is the default.
     accept(&ImageBuilder::new().build());
+    // Reclassified: a matching config descriptor platform was accepted before
+    // canonical manifests, which state none.
+    for platform in [
+        json!({"os": "linux", "architecture": "amd64"}),
+        json!({"os": "linux", "architecture": "amd64", "variant": null}),
+    ] {
+        let built = ImageBuilder::new()
+            .json(Doc::Manifest, move |manifest| {
+                manifest["config"]["platform"] = platform;
+            })
+            .build();
+        assert_fault(run(&built), &non_canonical());
+    }
 }
 
 #[test]
@@ -476,9 +513,9 @@ fn layer_sources_may_be_absent_null_empty_or_complete() {
     }
     let a = layer_tar("a.txt", b"alpha");
     let b = layer_tar("b.txt", b"bravo");
-    let (la, lb) = (Layer::gzip(&a), Layer::plain(&b));
+    let (la, lb) = (Layer::plain(&a), Layer::plain(&b));
     let sources = json!({
-        la.diff_id.clone(): {"mediaType": LAYER_GZIP, "digest": digest(&la.blob), "size": la.blob.len()},
+        la.diff_id.clone(): {"mediaType": LAYER_TAR, "digest": digest(&la.blob), "size": la.blob.len()},
         lb.diff_id.clone(): {"mediaType": LAYER_TAR, "digest": digest(&lb.blob), "size": lb.blob.len()},
     });
     let built = ImageBuilder::new()
@@ -504,7 +541,7 @@ fn parent_may_be_absent_or_empty() {
 fn entry_order_header_forms_and_a_long_zero_tail_are_accepted() {
     let built = ImageBuilder::new()
         .layers(vec![
-            Layer::gzip(&layer_tar("a", b"a")),
+            Layer::plain(&layer_tar("a", b"a")),
             Layer::plain(&layer_tar("b", b"b")),
         ])
         .entries(|entries, _| entries.reverse())
@@ -535,8 +572,11 @@ fn entry_order_header_forms_and_a_long_zero_tail_are_accepted() {
     accept(&built);
 }
 
+/// Reclassified: the standard manifest annotations were accepted before
+/// canonical manifests, which carry none. Phase 2 still admits them, so they
+/// reach the canonical check.
 #[test]
-fn every_permitted_manifest_annotation_is_accepted() {
+fn every_permitted_manifest_annotation_is_not_canonical() {
     let built = ImageBuilder::new()
         .json(Doc::Manifest, |manifest| {
             let mut annotations = serde_json::Map::new();
@@ -564,7 +604,7 @@ fn every_permitted_manifest_annotation_is_accepted() {
             manifest["annotations"] = Value::Object(annotations);
         })
         .build();
-    accept(&built);
+    assert_fault(run(&built), &non_canonical());
 }
 
 /// A layer tar holding every entry kind the layer policy admits.
@@ -598,7 +638,8 @@ fn rich_layer() -> Vec<u8> {
 fn layers_hold_links_devices_fifos_whiteouts_pax_and_long_names() {
     let rich = rich_layer();
     let built = ImageBuilder::new()
-        .layers(vec![Layer::gzip(&rich), Layer::plain(&rich)])
+        .layers(vec![Layer::plain(&rich)])
+        .positions(&[0, 0])
         .build();
     assert_eq!(accept(&built).layer_count, 2);
 }
@@ -1053,8 +1094,8 @@ fn excluded_layer_media_types_are_refused_without_decoding() {
     ] {
         let built = ImageBuilder::new()
             .layers(vec![
-                Layer::gzip(&layer_tar("a", b"a")),
-                Layer::gzip(&layer_tar("b", b"b")),
+                Layer::plain(&layer_tar("a", b"a")),
+                Layer::plain(&layer_tar("b", b"b")),
             ])
             .json(Doc::Manifest, move |manifest| {
                 manifest["layers"][1]["mediaType"] = json!(media_type);
@@ -1066,7 +1107,7 @@ fn excluded_layer_media_types_are_refused_without_decoding() {
             &unsupported(UnsupportedArchiveFeature::LayerMediaType { position: 1 }),
         );
         let events = seam::take();
-        // The raw inventory hashed every blob; phase 7 never ran.
+        // The raw inventory hashed every blob; phase 8 never ran.
         assert_eq!(
             events
                 .iter()
@@ -1369,10 +1410,10 @@ fn every_compatibility_link_is_checked() {
     assert_fault(run(&path), &inconsistent);
     let a = layer_tar("a", b"a");
     let repeated = ImageBuilder::new()
-        .layers(vec![Layer::gzip(&a)])
+        .layers(vec![Layer::plain(&a)])
         .positions(&[0, 0])
         .json(Doc::Manifest, |m| {
-            m["layers"][1]["mediaType"] = json!(LAYER_TAR);
+            m["layers"][1]["mediaType"] = json!(LAYER_GZIP);
         })
         .build();
     assert_fault(run(&repeated), &inconsistent);
@@ -1392,7 +1433,7 @@ fn missing_and_unreferenced_blobs() {
     let a = layer_tar("a", b"a");
     let b = layer_tar("b", b"b");
     let layer = ImageBuilder::new()
-        .layers(vec![Layer::gzip(&a), Layer::gzip(&b)])
+        .layers(vec![Layer::plain(&a), Layer::plain(&b)])
         .positions(&[0, 1, 1])
         .entries(|entries, parts| remove_entry(entries, &blob_name(&parts.layer_hexes[1])))
         .build();
@@ -1931,43 +1972,309 @@ fn a_platform_mismatch_message_never_renders_the_observed_value() {
 // Phase 7
 // ---------------------------------------------------------------------------
 
+/// Returns the stored image manifest blob of `built`.
+fn manifest_blob(built: &Built) -> Vec<u8> {
+    let mut archive = tar::Archive::new(built.bytes.as_slice());
+    let name = blob_name(&built.parts.manifest_hex);
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().to_str() == Some(name.as_str()) {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            return bytes;
+        }
+    }
+    panic!("no manifest blob")
+}
+
 #[test]
-fn the_layer_count_must_match_the_diff_ids() {
-    let built = ImageBuilder::new()
-        .json(Doc::Config, |c| {
-            c["rootfs"]["diff_ids"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(format!("sha256:{FAKE_HEX}")));
-            c["history"].as_array_mut().unwrap().push(json!({}));
-        })
-        .build();
-    assert_fault(
-        run(&built),
-        &layer_mismatch(None, LayerMismatchKind::CountMismatch, "2", "1"),
+fn an_accepted_manifest_is_exactly_the_renderers_output() {
+    let a = layer_tar("a", b"alpha");
+    let b = layer_tar("b", b"bravo");
+    for (layers, positions) in [
+        (Vec::new(), Vec::new()),
+        (vec![Layer::plain(&a)], vec![0]),
+        (vec![Layer::plain(&a), Layer::plain(&b)], vec![0, 1, 0]),
+    ] {
+        let built = ImageBuilder::new()
+            .layers(layers.clone())
+            .positions(&positions)
+            .build();
+        let validated = accept(&built);
+        let stored = manifest_blob(&built);
+        let rendered: Vec<(&str, u64)> = positions
+            .iter()
+            .map(|at| (layers[*at].diff_id.as_str(), len(layers[*at].blob.len())))
+            .collect();
+        let canonical =
+            canonical_image_manifest(&built.config_digest, built_config_len(&built), &rendered)
+                .unwrap();
+        assert_eq!(stored, canonical);
+        // The reported digest is the stored blob's, which the index names.
+        assert_eq!(validated.manifest_digest, digest(&stored));
+        assert_eq!(validated.manifest_digest, built.manifest_digest);
+    }
+}
+
+/// Asserts `built` is refused as not canonical with no phase-8 event: no
+/// layer blob was opened, read again or decoded.
+#[track_caller]
+fn refused_before_any_layer(built: &Built) {
+    seam::take();
+    assert_fault(run(built), &non_canonical());
+    assert_eq!(layer_events(&seam::take()), 0);
+}
+
+#[test]
+// A table of every non-canonical form, one case each.
+#[allow(clippy::too_many_lines)]
+fn every_non_canonical_manifest_is_refused_before_any_layer_is_read() {
+    let a = layer_tar("a", b"alpha");
+    let b = layer_tar("b", b"bravo");
+    let two = || vec![Layer::plain(&a), Layer::plain(&b)];
+
+    // A gzip layer, alone or beside an uncompressed one.
+    refused_before_any_layer(&ImageBuilder::new().layers(vec![Layer::gzip(&a)]).build());
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .layers(vec![Layer::plain(&a), Layer::gzip(&b)])
+            .build(),
+    );
+    // A manifest annotation the document shape admits.
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .json(Doc::Manifest, |m| {
+                m["annotations"] = json!({"org.opencontainers.image.created": "1970-01-01"});
+            })
+            .build(),
+    );
+    // Keys in another order: serde's sorted order, and one swap.
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .layers(two())
+            .bytes(Doc::Manifest, |bytes| {
+                let value: Value = serde_json::from_slice(bytes).unwrap();
+                *bytes = serde_json::to_vec(&value).unwrap();
+            })
+            .build(),
+    );
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .bytes(Doc::Manifest, |bytes| {
+                let text = String::from_utf8(bytes.clone()).unwrap();
+                let swapped = text.replacen(
+                    r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+                    r#"{"mediaType":"application/vnd.oci.image.manifest.v1+json","schemaVersion":2,"#,
+                    1,
+                );
+                assert_ne!(swapped, text);
+                *bytes = swapped.into_bytes();
+            })
+            .build(),
+    );
+    // Whitespace: pretty-printed, a trailing newline, a leading space.
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .bytes(Doc::Manifest, |bytes| {
+                let value: Value = serde_json::from_slice(bytes).unwrap();
+                *bytes = serde_json::to_vec_pretty(&value).unwrap();
+            })
+            .build(),
+    );
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .bytes(Doc::Manifest, |bytes| bytes.push(b'\n'))
+            .build(),
+    );
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .bytes(Doc::Manifest, |bytes| bytes.insert(0, b' '))
+            .build(),
+    );
+    // A string written with an escape that decodes to the same value.
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .bytes(Doc::Manifest, |bytes| {
+                let text = String::from_utf8(bytes.clone()).unwrap();
+                *bytes = text
+                    .replacen(
+                        "application/vnd.oci.image.manifest",
+                        r"application\/vnd.oci.image.manifest",
+                        1,
+                    )
+                    .into_bytes();
+            })
+            .build(),
+    );
+    // An explicit default member: empty annotations.
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .json(Doc::Manifest, |m| m["annotations"] = json!({}))
+            .build(),
+    );
+    // A layer digest that is not the diff ID at its position: swapped
+    // layers, an uncompressed blob substituted for another, and a layer
+    // count short of the diff IDs.
+    let (da, db) = (digest(&a), digest(&b));
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .layers(two())
+            .json(Doc::Config, move |c| {
+                c["rootfs"]["diff_ids"] = json!([db, da]);
+            })
+            .build(),
+    );
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .layers(vec![Layer::raw(b.clone(), digest(&a), LAYER_TAR)])
+            .build(),
+    );
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .json(Doc::Config, |c| {
+                c["rootfs"]["diff_ids"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(format!("sha256:{FAKE_HEX}")));
+                c["history"].as_array_mut().unwrap().push(json!({}));
+            })
+            .build(),
+    );
+    // A layer size that is not its blob's length.
+    refused_before_any_layer(
+        &ImageBuilder::new()
+            .json(Doc::Manifest, |m| {
+                let size = m["layers"][0]["size"].as_u64().unwrap();
+                m["layers"][0]["size"] = json!(size - 1);
+            })
+            .build(),
     );
 }
 
 #[test]
-fn stored_layer_length_and_digest() {
-    let length = ImageBuilder::new()
+fn every_earlier_verdict_wins_over_a_non_canonical_manifest() {
+    let a = layer_tar("a", b"alpha");
+    let gzip_image = || ImageBuilder::new().layers(vec![Layer::gzip(&a)]);
+    refused_before_any_layer(&gzip_image().build());
+
+    // 1. Raw inventory.
+    let built = gzip_image()
+        .entries(|entries, _| entries.push(Entry::file("extra", b"x".to_vec())))
+        .build();
+    assert_fault(
+        run(&built),
+        &unsupported(UnsupportedArchiveFeature::ExtraFile),
+    );
+    // 2. Documents: a manifest annotation outside the standard set, a zstd
+    //    layer, and a manifest that is not JSON.
+    let built = gzip_image()
+        .json(Doc::Manifest, |m| m["annotations"] = json!({"x": "y"}))
+        .build();
+    assert_fault(
+        run(&built),
+        &unsupported(UnsupportedArchiveFeature::ManifestAnnotation),
+    );
+    let built = gzip_image()
         .json(Doc::Manifest, |m| {
-            let size = m["layers"][0]["size"].as_u64().unwrap();
-            m["layers"][0]["size"] = json!(size - 1);
+            m["layers"][0]["mediaType"] = json!("application/vnd.oci.image.layer.v1.tar+zstd");
         })
         .build();
     assert_fault(
-        run(&length),
-        &invalid(InvalidArchiveReason::BlobMismatch {
-            role: BlobRole::Layer { position: 0 },
-            kind: BlobMismatchKind::Length,
+        run(&built),
+        &unsupported(UnsupportedArchiveFeature::LayerMediaType { position: 0 }),
+    );
+    let built = gzip_image()
+        .bytes(Doc::Manifest, |bytes| bytes.push(b'x'))
+        .build();
+    assert_fault(
+        run(&built),
+        &invalid(InvalidArchiveReason::Json {
+            document: ImageDocument::ImageManifest,
+            fault: JsonFault::Syntax,
         }),
     );
+    // 3. Compatibility links.
+    let built = gzip_image()
+        .json(Doc::Compat, |c| c[0]["Layers"] = json!([]))
+        .build();
+    assert_fault(
+        run(&built),
+        &invalid(InvalidArchiveReason::InconsistentCompatibility),
+    );
+    // 4. Tags.
+    let built = gzip_image()
+        .json(Doc::Compat, |c| c[0]["RepoTags"] = json!(["other:1"]))
+        .build();
+    assert_fault(
+        run(&built),
+        &reference(true, "example.com/app:1.0", ReferenceSource::RepoTags),
+    );
+    // 5. Config: the declared digest, then the profile.
+    let mut built = gzip_image().build();
+    let actual = built.config_digest.clone();
+    built.declaration.config_digest = format!("sha256:{FAKE_HEX}");
+    assert_fault(
+        run(&built),
+        &image(ImageVerifyError::ConfigDigestMismatch {
+            archive_path: PATH.to_string(),
+            declared: format!("sha256:{FAKE_HEX}"),
+            actual,
+        }),
+    );
+    let built = gzip_image()
+        .json(Doc::Config, |c| {
+            c["history"][0]["empty_layer"] = json!(true);
+        })
+        .build();
+    assert_fault(
+        run(&built),
+        &config_reason(InvalidConfigReason::HistoryLayerCount),
+    );
+    // 6. Platform, in the config and on the config descriptor.
+    let built = gzip_image()
+        .json(Doc::Config, |c| c["os"] = json!("windows"))
+        .build();
+    assert_fault(
+        run(&built),
+        &platform_mismatch(
+            PlatformLocation::Config,
+            PlatformFacet::Os,
+            Some("linux"),
+            Some("windows"),
+        ),
+    );
+    let built = ImageBuilder::new()
+        .json(Doc::Manifest, |m| {
+            m["config"]["platform"] = json!({"os": "linux", "architecture": "arm64"});
+        })
+        .build();
+    assert_fault(
+        run(&built),
+        &platform_mismatch(
+            PlatformLocation::ConfigDescriptor,
+            PlatformFacet::Architecture,
+            Some("amd64"),
+            Some("arm64"),
+        ),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_stored_layer_blob_must_hash_to_its_name() {
+    // The config names `FAKE_HEX` as the diff ID, the canonical manifest
+    // names it too, and the blob stored under that name holds other bytes.
     let tar = layer_tar("a", b"a");
-    let layer = Layer::gzip(&tar);
-    let actual = digest(&layer.blob);
+    let actual = digest(&tar);
     let stored = ImageBuilder::new()
-        .layers(vec![layer])
+        .layers(vec![Layer::raw(
+            tar,
+            format!("sha256:{FAKE_HEX}"),
+            LAYER_TAR,
+        )])
         .json(Doc::Manifest, |m| {
             m["layers"][0]["digest"] = json!(format!("sha256:{FAKE_HEX}"));
         })
@@ -1987,113 +2294,11 @@ fn stored_layer_length_and_digest() {
     );
 }
 
-#[test]
-fn a_decoded_layer_must_hash_to_its_diff_id() {
-    let a = layer_tar("a", b"alpha");
-    let b = layer_tar("b", b"bravo");
-    // A substituted blob.
-    let substituted = ImageBuilder::new()
-        .layers(vec![Layer::raw(gzip(&b), digest(&a), LAYER_GZIP)])
-        .build();
-    assert_fault(
-        run(&substituted),
-        &layer_mismatch(Some(0), LayerMismatchKind::DiffId, &digest(&a), &digest(&b)),
-    );
-    // Swapped layers.
-    let (da, db) = (digest(&a), digest(&b));
-    let swapped = ImageBuilder::new()
-        .layers(vec![Layer::gzip(&a), Layer::gzip(&b)])
-        .json(Doc::Config, move |c| {
-            c["rootfs"]["diff_ids"] = json!([db, da]);
-        })
-        .build();
-    assert_fault(
-        run(&swapped),
-        &layer_mismatch(Some(0), LayerMismatchKind::DiffId, &digest(&b), &digest(&a)),
-    );
-    // An uncompressed layer.
-    let plain = ImageBuilder::new()
-        .layers(vec![Layer::raw(b.clone(), digest(&a), LAYER_TAR)])
-        .build();
-    assert_fault(
-        run(&plain),
-        &layer_mismatch(Some(0), LayerMismatchKind::DiffId, &digest(&a), &digest(&b)),
-    );
-}
-
-fn gzip_layer_fault(blob: Vec<u8>, tar: &[u8]) -> Result<ValidatedImageArchive, ImageArchiveFault> {
-    let built = ImageBuilder::new()
-        .layers(vec![Layer::raw(blob, digest(tar), LAYER_GZIP)])
-        .build();
-    run(&built)
-}
-
-fn gzip_fault(fault: GzipFault) -> ImageArchiveFault {
-    invalid(InvalidArchiveReason::Gzip { position: 0, fault })
-}
-
-/// A member with FHCRC set and a header CRC that does not match.
-fn bad_header_crc(tar: &[u8]) -> Vec<u8> {
-    let plain = gzip(tar);
-    let mut member = vec![0x1f, 0x8b, 8, 0x02, 0, 0, 0, 0, 0, 3, 0xde, 0xad];
-    member.extend_from_slice(&plain[10..]);
-    member
-}
-
-#[test]
-fn every_gzip_fault() {
-    let tar = layer_tar("a", b"alpha");
-    let good = gzip(&tar);
-    let edit = |f: &dyn Fn(&mut Vec<u8>)| {
-        let mut blob = good.clone();
-        f(&mut blob);
-        blob
-    };
-    let header = |fault| gzip_fault(GzipFault::Header { fault });
-    let len = good.len();
-    let cases: Vec<(Vec<u8>, ImageArchiveFault)> = vec![
-        (edit(&|b| b[1] = 0x8c), header(GzipHeaderFault::Magic)),
-        (edit(&|b| b[2] = 7), header(GzipHeaderFault::Method)),
-        (
-            edit(&|b| b[3] |= 0x20),
-            header(GzipHeaderFault::ReservedFlags),
-        ),
-        (bad_header_crc(&tar), header(GzipHeaderFault::HeaderCrc)),
-        // BFINAL with the reserved block type.
-        (edit(&|b| b[10] = 0x07), gzip_fault(GzipFault::Deflate)),
-        (edit(&|b| b[len - 8] ^= 1), gzip_fault(GzipFault::Crc32)),
-        (edit(&|b| b[len - 4] ^= 1), gzip_fault(GzipFault::Isize)),
-        (
-            edit(&|b| b.truncate(len - 3)),
-            gzip_fault(GzipFault::Truncated),
-        ),
-        (edit(&|b| b.truncate(12)), gzip_fault(GzipFault::Truncated)),
-        (edit(&|b| b.truncate(5)), gzip_fault(GzipFault::Truncated)),
-        (edit(&|b| b.push(0)), gzip_fault(GzipFault::TrailingData)),
-    ];
-    for (blob, expected) in cases {
-        assert_fault(gzip_layer_fault(blob, &tar), &expected);
-    }
-}
-
-#[test]
-fn a_concatenated_member_is_refused_without_inflating_it() {
-    let tar = layer_tar("a", b"alpha");
-    let mut blob = gzip(&tar);
-    // A second member whose body is garbage: inflating it would be a
-    // `Deflate` fault, so the verdict shows it was never inflated.
-    blob.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0x07, 0xff, 0xff]);
-    assert_fault(
-        gzip_layer_fault(blob, &tar),
-        &unsupported(UnsupportedArchiveFeature::ConcatenatedGzipMember { position: 0 }),
-    );
-}
-
 fn layer_tar_fault(tar: &[u8]) -> Result<ValidatedImageArchive, ImageArchiveFault> {
     let built = ImageBuilder::new()
         .layers(vec![
             Layer::plain(&layer_tar("ok", b"ok")),
-            Layer::gzip(tar),
+            Layer::plain(tar),
         ])
         .build();
     run(&built)
@@ -2141,7 +2346,7 @@ fn malformed_layer_tars() {
         layer_tar_fault(&symlink),
         &layer_fault(TarFault::NonRegularWithData),
     );
-    // A tar cut short inside a gzip member that is itself complete.
+    // A tar with no end marker: the walker's own truncation.
     let cut = Tar::new().file("x", b"x").unfinished();
     assert_fault(layer_tar_fault(&cut), &layer_fault(TarFault::Truncated));
     let checksum = Tar::new()
@@ -2156,7 +2361,7 @@ fn malformed_layer_tars() {
         layer_tar_fault(&pax_value),
         &layer_fault(TarFault::PaxValue { key: PaxKey::Size }),
     );
-    // Uncompressed: the walker's own truncation.
+    // At the first position too.
     let built = ImageBuilder::new()
         .layers(vec![Layer::plain(&Tar::new().file("x", b"x").unfinished())])
         .build();
@@ -2170,19 +2375,19 @@ fn malformed_layer_tars() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 8
+// Phase 9
 // ---------------------------------------------------------------------------
 
 fn with_layer_sources(edit: impl FnOnce(&mut Value, &Layer) + 'static) -> Built {
     let tar = layer_tar("a", b"alpha");
-    let layer = Layer::gzip(&tar);
+    let layer = Layer::plain(&tar);
     let for_edit = layer.clone();
     ImageBuilder::new()
         .layers(vec![layer])
         .json(Doc::Compat, move |c| {
             let mut sources = json!({
                 for_edit.diff_id.clone(): {
-                    "mediaType": LAYER_GZIP,
+                    "mediaType": LAYER_TAR,
                     "digest": digest(&for_edit.blob),
                     "size": for_edit.blob.len(),
                 },
@@ -2211,7 +2416,7 @@ fn every_layer_sources_rule_is_enforced() {
         },
         |s, l| s[&l.diff_id]["size"] = json!(1),
         |s, l| s[&l.diff_id]["digest"] = json!(format!("sha256:{FAKE_HEX}")),
-        |s, l| s[&l.diff_id]["mediaType"] = json!(LAYER_TAR),
+        |s, l| s[&l.diff_id]["mediaType"] = json!(LAYER_GZIP),
     ];
     for edit in cases {
         assert_fault(run(&with_layer_sources(*edit)), &inconsistent);
@@ -2299,7 +2504,7 @@ fn each_earlier_phase_wins_over_the_next() {
         run(&built),
         &config_reason(InvalidConfigReason::HistoryLayerCount),
     );
-    // 6. Platform before layers.
+    // 6. Platform before the canonical manifest.
     let a = layer_tar("a", b"a");
     let b = layer_tar("b", b"b");
     let built = ImageBuilder::new()
@@ -2315,15 +2520,27 @@ fn each_earlier_phase_wins_over_the_next() {
             Some("v2"),
         ),
     );
-    // 7. Layers before LayerSources.
-    let bad_blob = gzip(&b);
+    // 7. The canonical manifest before layers: the second layer's tar is
+    //    malformed, and is never read.
+    let bad = Tar::new()
+        .entry(Header::file("x", 1).wrong_checksum(), b"x")
+        .finish();
     let built = ImageBuilder::new()
-        .layers(vec![Layer::raw(bad_blob, digest(&a), LAYER_GZIP)])
+        .layers(vec![Layer::plain(&a), Layer::plain(&bad)])
+        .bytes(Doc::Manifest, |bytes| bytes.push(b'\n'))
+        .build();
+    refused_before_any_layer(&built);
+    // 8. Layers before LayerSources.
+    let built = ImageBuilder::new()
+        .layers(vec![Layer::plain(&a), Layer::plain(&bad)])
         .json(Doc::Compat, |c| c[0]["LayerSources"] = json!({"x": {}}))
         .build();
     assert_fault(
         run(&built),
-        &layer_mismatch(Some(0), LayerMismatchKind::DiffId, &digest(&a), &digest(&b)),
+        &invalid(InvalidArchiveReason::LayerTar {
+            position: 1,
+            fault: TarFault::Checksum,
+        }),
     );
 }
 
@@ -2509,59 +2726,21 @@ fn entry_order_never_changes_a_semantic_verdict() {
 }
 
 #[test]
-fn within_one_position_a_decode_fault_wins_over_the_diff_id() {
-    let a = layer_tar("a", b"alpha");
-    let b = layer_tar("b", b"bravo");
-    let mut corrupt = gzip(&b);
-    let len = corrupt.len();
-    corrupt[len - 8] ^= 1;
-    assert_fault(
-        gzip_layer_fault(corrupt.clone(), &a),
-        &gzip_fault(GzipFault::Crc32),
-    );
-    let built = ImageBuilder::new()
-        .layers(vec![Layer::raw(gzip(&b), digest(&a), LAYER_GZIP)])
-        .build();
-    let decoded = u64::try_from(b.len()).unwrap();
-    assert_fault(
-        run_with(
-            &built,
-            &limits(&[(LimitResource::DecodedLayer, decoded - 1)]),
-        ),
-        &limit(LimitResource::DecodedLayer, decoded - 1),
-    );
-    let built = ImageBuilder::new()
-        .layers(vec![Layer::raw(corrupt, digest(&b), LAYER_GZIP)])
-        .json(Doc::Manifest, |m| {
-            let size = m["layers"][0]["size"].as_u64().unwrap();
-            m["layers"][0]["size"] = json!(size + 1);
-        })
-        .build();
-    assert_fault(
-        run(&built),
-        &invalid(InvalidArchiveReason::BlobMismatch {
-            role: BlobRole::Layer { position: 0 },
-            kind: BlobMismatchKind::Length,
-        }),
-    );
-}
-
-#[test]
 fn no_later_position_is_read_after_a_verdict() {
     let a = layer_tar("a", b"alpha");
-    let b = layer_tar("b", b"bravo");
-    let mut corrupt = gzip(&b);
-    corrupt[10] = 0x07;
+    let bad = Tar::new()
+        .entry(Header::file("x", 1).wrong_checksum(), b"x")
+        .finish();
     let built = ImageBuilder::new()
-        .layers(vec![
-            Layer::raw(gzip(&b), digest(&a), LAYER_GZIP),
-            Layer::raw(corrupt, digest(&b), LAYER_GZIP),
-        ])
+        .layers(vec![Layer::plain(&bad), Layer::plain(&a)])
         .build();
     seam::take();
     assert_fault(
         run(&built),
-        &layer_mismatch(Some(0), LayerMismatchKind::DiffId, &digest(&a), &digest(&b)),
+        &invalid(InvalidArchiveReason::LayerTar {
+            position: 0,
+            fault: TarFault::Checksum,
+        }),
     );
     let events = seam::take();
     assert!(events_for(0, &events) > 0);
@@ -2573,20 +2752,16 @@ fn no_later_position_is_read_after_a_verdict() {
 
     // Positions reusing one blob: the verdict at position 1 stops position 2.
     let built = ImageBuilder::new()
-        .layers(vec![
-            Layer::plain(&a),
-            Layer::raw(gzip(&b), digest(&a), LAYER_GZIP),
-        ])
+        .layers(vec![Layer::plain(&a), Layer::plain(&bad)])
         .positions(&[0, 1, 0])
-        .json(Doc::Config, move |c| {
-            let da = c["rootfs"]["diff_ids"][0].clone();
-            c["rootfs"]["diff_ids"] = json!([da.clone(), da.clone(), da]);
-        })
         .build();
     seam::take();
     assert_fault(
         run(&built),
-        &layer_mismatch(Some(1), LayerMismatchKind::DiffId, &digest(&a), &digest(&b)),
+        &invalid(InvalidArchiveReason::LayerTar {
+            position: 1,
+            fault: TarFault::Checksum,
+        }),
     );
     let events = seam::take();
     assert!(events_for(0, &events) > 0);
@@ -2740,12 +2915,9 @@ fn layer_limits_at_each_site() {
             c["history"].as_array_mut().unwrap().push(json!({}));
         })
         .build();
-    boundary_refused(
-        &built,
-        LimitResource::LayersPerImage,
-        2,
-        &layer_mismatch(None, LayerMismatchKind::CountMismatch, "2", "1"),
-    );
+    // Reclassified: the count difference is now a non-canonical manifest,
+    // found before the layer count check it used to reach.
+    boundary_refused(&built, LimitResource::LayersPerImage, 2, &non_canonical());
 }
 
 #[test]
@@ -2781,13 +2953,11 @@ fn json_document_limits() {
 fn stored_and_decoded_layer_limits() {
     let a = layer_tar("a", &[7; 3000]);
     let b = layer_tar("b", &[9; 1000]);
-    let (la, lb) = (Layer::gzip(&a), Layer::gzip(&b));
+    let (la, lb) = (Layer::plain(&a), Layer::plain(&b));
     let stored = len(la.blob.len().max(lb.blob.len()));
     let built = ImageBuilder::new().layers(vec![la, lb]).build();
     accept(&built);
     boundary(&built, LimitResource::StoredLayerBlob, stored);
-    // Both members have the plain ten-byte header.
-    boundary(&built, LimitResource::GzipHeader, 10);
     boundary(&built, LimitResource::DecodedLayer, len(a.len()));
     boundary(
         &built,
@@ -2804,7 +2974,7 @@ fn stored_and_decoded_layer_limits() {
 #[test]
 fn the_operation_budget_is_shared_across_images() {
     let tar = layer_tar("a", b"alpha");
-    let built = ImageBuilder::new().layers(vec![Layer::gzip(&tar)]).build();
+    let built = ImageBuilder::new().layers(vec![Layer::plain(&tar)]).build();
     let limits = ContentLimits::default();
     let mut operation = Budget::new(crate::content::ResourceLimit {
         resource: LimitResource::DecodedLayersPerOperation,
@@ -2852,7 +3022,7 @@ fn layer_entry_and_extension_limits() {
         .file("y", b"y")
         .finish();
     let built = ImageBuilder::new()
-        .layers(vec![Layer::gzip(&first), Layer::plain(&second)])
+        .layers(vec![Layer::plain(&first), Layer::plain(&second)])
         .build();
     accept(&built);
     // Four headers in the first layer and two in the second.
@@ -2898,24 +3068,6 @@ fn a_size_of_u64_max_is_refused_without_overflow() {
             LimitResource::ImageManifestJson.default_limit(),
         ),
     );
-}
-
-#[test]
-fn a_high_ratio_layer_is_refused_under_each_decoded_budget() {
-    let tar = layer_tar("zeros", &vec![0; 4 << 20]);
-    let layer = Layer::gzip(&tar);
-    assert!(layer.blob.len() * 100 < tar.len());
-    let built = ImageBuilder::new().layers(vec![layer]).build();
-    for resource in [
-        LimitResource::DecodedLayer,
-        LimitResource::DecodedLayersPerImage,
-        LimitResource::DecodedLayersPerOperation,
-    ] {
-        assert_fault(
-            run_with(&built, &limits(&[(resource, 1 << 20)])),
-            &limit(resource, 1 << 20),
-        );
-    }
 }
 
 #[test]
@@ -3258,6 +3410,7 @@ fn reason_enums_display_fixed_lowercase_phrases() {
             kind: BlobMismatchKind::Length,
         }
         .to_string(),
+        UnsupportedArchiveFeature::NonCanonicalManifest.to_string(),
     ];
     for text in &rendered {
         assert_eq!(*text, text.to_lowercase());
@@ -3269,6 +3422,7 @@ fn reason_enums_display_fixed_lowercase_phrases() {
     assert!(rendered[4].contains("history entry 5"));
     assert!(rendered[5].contains("index descriptor 6"));
     assert!(rendered[6].contains("layer 8") && rendered[6].contains("length"));
+    assert!(rendered[7].contains("non-canonical image manifest"));
     let error = ImageVerifyError::LayerMismatch {
         archive_path: PATH.to_string(),
         position: Some(1),
@@ -3284,7 +3438,7 @@ fn reason_enums_display_fixed_lowercase_phrases() {
 #[test]
 fn the_checked_in_placeholder_image_is_refused() {
     const PACKAGE: &[u8] =
-        include_bytes!("../../../assets/test-fixtures/signed-v6-images/package.pkg");
+        include_bytes!("../../../assets/test-fixtures/signed-v6-placeholder-images/package.pkg");
     let mut payload = crate::payload::open_package(Cursor::new(PACKAGE)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let extracted = payload.extract_to(dir.path()).unwrap();
@@ -3325,49 +3479,22 @@ fn the_checked_in_placeholder_image_is_refused() {
 // Bounded memory
 // ---------------------------------------------------------------------------
 
-/// Streams a tar holding one `decoded`-byte file through a gzip encoder into
-/// `file`, returning the tar's digest. No buffer is the size of the layer.
-fn stream_large_layer(file: &mut std::fs::File, decoded: u64) -> String {
-    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
-    let mut write = |bytes: &[u8]| {
-        sha2::Digest::update(&mut hasher, bytes);
-        encoder.write_all(bytes).unwrap();
-    };
-    write(&Header::new(b'0', b"big.bin", decoded).build());
-    let mut block = [0u8; 4096];
-    for (i, byte) in block.iter_mut().enumerate() {
-        *byte = u8::try_from((i * 7 + i / 13) % 251).unwrap();
-    }
-    let mut left = decoded;
-    while left > 0 {
-        let n = usize::try_from(left.min(4096)).unwrap();
-        write(&block[..n]);
-        left -= len(n);
-    }
-    write(&[0; 1024]);
-    encoder.finish().unwrap();
-    format!(
-        "sha256:{}",
-        crate::payload::to_hex(&sha2::Digest::finalize(hasher))
-    )
+/// Returns a tar holding one `decoded`-byte file of patterned bytes.
+fn large_layer(decoded: usize) -> Vec<u8> {
+    let data: Vec<u8> = (0..decoded)
+        .map(|i| u8::try_from((i * 7 + i / 13) % 251).unwrap())
+        .collect();
+    Tar::new().file("big.bin", &data).finish()
 }
 
 #[test]
 fn a_large_layer_validates_from_a_file_within_bounded_buffers() {
-    const DECODED: u64 = 64 << 20;
+    const DECODED: usize = 16 << 20;
     let dir = tempfile::tempdir().unwrap();
-    let blob_path = dir.path().join("layer.gz");
-    let mut blob_file = std::fs::File::create(&blob_path).unwrap();
-    let diff_id = stream_large_layer(&mut blob_file, DECODED);
-    drop(blob_file);
-    // The compressed blob is small enough to assemble in memory; the decoded
-    // stream never exists anywhere but in the validator's bounded buffers.
-    let blob = std::fs::read(&blob_path).unwrap();
-    let blob_size = len(blob.len());
-    let built = ImageBuilder::new()
-        .layers(vec![Layer::raw(blob, diff_id, LAYER_GZIP)])
-        .build();
+    let tar = large_layer(DECODED);
+    let blob_size = len(tar.len());
+    let built = ImageBuilder::new().layers(vec![Layer::plain(&tar)]).build();
+    drop(tar);
     let archive_path = dir.path().join("image.tar");
     std::fs::write(&archive_path, &built.bytes).unwrap();
 
@@ -3388,7 +3515,7 @@ fn a_large_layer_validates_from_a_file_within_bounded_buffers() {
     let elapsed = started.elapsed();
     assert_summary(&validated, &built);
     assert_eq!(validated.layer_count, 1);
-    assert!(operation.used() >= DECODED);
+    assert!(operation.used() >= len(DECODED));
     let events = seam::take();
     // The only buffer the validator sizes itself is one copy buffer, and every
     // stored read stays within it.
@@ -3432,7 +3559,7 @@ fn limits_hold_on_the_bytes_actually_read() {
     // repeated position is charged again.
     let tar = layer_tar("a", &[5; 4000]);
     let built = ImageBuilder::new()
-        .layers(vec![Layer::gzip(&tar)])
+        .layers(vec![Layer::plain(&tar)])
         .positions(&[0, 0])
         .build();
     let decoded = len(tar.len());
@@ -3457,7 +3584,7 @@ fn limits_hold_on_the_bytes_actually_read() {
         assert!(operation.used() <= allowance);
     }
 
-    // Stored bytes: a phase-7 read never goes past the recorded blob.
+    // Stored bytes: a phase-8 read never goes past the recorded blob.
     seam::take();
     accept(&built);
     let stored: usize = seam::take()
@@ -3467,6 +3594,166 @@ fn limits_hold_on_the_bytes_actually_read() {
             _ => None,
         })
         .sum();
+    assert_eq!(stored, 2 * tar.len());
+}
+
+// ---------------------------------------------------------------------------
+// The gzip decoder, below the canonical check
+// ---------------------------------------------------------------------------
+//
+// No canonical manifest names a gzip layer, so no archive reaches phase 8's
+// gzip decoder any more: each archive below is refused as not canonical
+// before any layer is read. The decoder is still there, and is driven here
+// directly, as position 0 of an image whose only stored bytes are the blob.
+
+/// Decodes `blob` as a gzip layer at position 0, under `limits`, returning
+/// the decoded tar's `sha256:` digest.
+fn decode_gzip(blob: &[u8], limits: &ContentLimits) -> Result<String, ImageArchiveFault> {
+    let mut budgets = LayerBudgets::new(limits);
+    let mut operation =
+        Budget::new(limits.resource_limit(LimitResource::DecodedLayersPerOperation));
+    decode_layer(
+        &mut Cursor::new(blob),
+        Span {
+            offset: 0,
+            len: len(blob.len()),
+        },
+        true,
+        0,
+        limits,
+        limits.copy_buffer_len(),
+        &mut budgets,
+        &mut operation,
+    )
+    .map(|hex| format!("sha256:{hex}"))
+    .map_err(|verdict| verdict.into_fault(PATH))
+}
+
+/// Asserts the archive holding `blob` as a gzip layer over `tar` is refused
+/// as not canonical before any layer is read, then returns what the decoder
+/// makes of `blob`.
+fn gzip_layer_fault(blob: &[u8], tar: &[u8]) -> Result<String, ImageArchiveFault> {
+    let built = ImageBuilder::new()
+        .layers(vec![Layer::raw(blob.to_vec(), digest(tar), LAYER_GZIP)])
+        .build();
+    refused_before_any_layer(&built);
+    decode_gzip(blob, &ContentLimits::default())
+}
+
+fn gzip_fault(fault: GzipFault) -> ImageArchiveFault {
+    invalid(InvalidArchiveReason::Gzip { position: 0, fault })
+}
+
+/// A member with FHCRC set and a header CRC that does not match.
+fn bad_header_crc(tar: &[u8]) -> Vec<u8> {
+    let plain = gzip(tar);
+    let mut member = vec![0x1f, 0x8b, 8, 0x02, 0, 0, 0, 0, 0, 3, 0xde, 0xad];
+    member.extend_from_slice(&plain[10..]);
+    member
+}
+
+#[test]
+fn a_good_gzip_layer_decodes_to_its_diff_id() {
+    let tar = layer_tar("a", b"alpha");
+    assert_eq!(gzip_layer_fault(&gzip(&tar), &tar).unwrap(), digest(&tar));
+}
+
+#[test]
+fn every_gzip_fault() {
+    let tar = layer_tar("a", b"alpha");
+    let good = gzip(&tar);
+    let edit = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut blob = good.clone();
+        f(&mut blob);
+        blob
+    };
+    let header = |fault| gzip_fault(GzipFault::Header { fault });
+    let len = good.len();
+    let cases: Vec<(Vec<u8>, ImageArchiveFault)> = vec![
+        (edit(&|b| b[1] = 0x8c), header(GzipHeaderFault::Magic)),
+        (edit(&|b| b[2] = 7), header(GzipHeaderFault::Method)),
+        (
+            edit(&|b| b[3] |= 0x20),
+            header(GzipHeaderFault::ReservedFlags),
+        ),
+        (bad_header_crc(&tar), header(GzipHeaderFault::HeaderCrc)),
+        // BFINAL with the reserved block type.
+        (edit(&|b| b[10] = 0x07), gzip_fault(GzipFault::Deflate)),
+        (edit(&|b| b[len - 8] ^= 1), gzip_fault(GzipFault::Crc32)),
+        (edit(&|b| b[len - 4] ^= 1), gzip_fault(GzipFault::Isize)),
+        (
+            edit(&|b| b.truncate(len - 3)),
+            gzip_fault(GzipFault::Truncated),
+        ),
+        (edit(&|b| b.truncate(12)), gzip_fault(GzipFault::Truncated)),
+        (edit(&|b| b.truncate(5)), gzip_fault(GzipFault::Truncated)),
+        (edit(&|b| b.push(0)), gzip_fault(GzipFault::TrailingData)),
+    ];
+    for (blob, expected) in cases {
+        assert_fault(gzip_layer_fault(&blob, &tar), &expected);
+    }
+}
+
+#[test]
+fn a_concatenated_member_is_refused_without_inflating_it() {
+    let tar = layer_tar("a", b"alpha");
+    let mut blob = gzip(&tar);
+    // A second member whose body is garbage: inflating it would be a
+    // `Deflate` fault, so the verdict shows it was never inflated.
+    blob.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0x07, 0xff, 0xff]);
+    assert_fault(
+        gzip_layer_fault(&blob, &tar),
+        &unsupported(UnsupportedArchiveFeature::ConcatenatedGzipMember { position: 0 }),
+    );
+}
+
+#[test]
+fn a_tar_cut_short_inside_a_complete_gzip_member_is_the_walkers_fault() {
+    let tar = Tar::new().file("x", b"x").unfinished();
+    assert_fault(
+        gzip_layer_fault(&gzip(&tar), &tar),
+        &invalid(InvalidArchiveReason::LayerTar {
+            position: 0,
+            fault: TarFault::Truncated,
+        }),
+    );
+}
+
+#[test]
+fn the_gzip_header_and_decoded_limits_hold_in_the_decoder() {
+    let tar = layer_tar("a", &[7; 3000]);
     let blob = gzip(&tar);
-    assert_eq!(stored, 2 * blob.len());
+    // The member has the plain ten-byte header.
+    for (resource, value) in [
+        (LimitResource::GzipHeader, 10),
+        (LimitResource::DecodedLayer, len(tar.len())),
+        (LimitResource::DecodedLayersPerImage, len(tar.len())),
+        (LimitResource::DecodedLayersPerOperation, len(tar.len())),
+    ] {
+        assert_eq!(
+            decode_gzip(&blob, &limits(&[(resource, value)])).unwrap(),
+            digest(&tar)
+        );
+        assert_fault(
+            decode_gzip(&blob, &limits(&[(resource, value - 1)])),
+            &limit(resource, value - 1),
+        );
+    }
+}
+
+#[test]
+fn a_high_ratio_layer_is_refused_under_each_decoded_budget() {
+    let tar = layer_tar("zeros", &vec![0; 4 << 20]);
+    let blob = gzip(&tar);
+    assert!(blob.len() * 100 < tar.len());
+    for resource in [
+        LimitResource::DecodedLayer,
+        LimitResource::DecodedLayersPerImage,
+        LimitResource::DecodedLayersPerOperation,
+    ] {
+        assert_fault(
+            decode_gzip(&blob, &limits(&[(resource, 1 << 20)])),
+            &limit(resource, 1 << 20),
+        );
+    }
 }

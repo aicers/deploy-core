@@ -1,6 +1,7 @@
 //! The public `image::test_support` API, exercised from outside the crate the
 //! way a dependent's tests use it.
 
+use std::fmt::Write as _;
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
 
 use deploy_core::image::test_support::{
@@ -18,8 +19,9 @@ use deploy_core::image::{
 use deploy_core::package::LimitResource;
 use deploy_core::verify::{
     ImageVerifyError, InvalidArchiveReason, PlatformFacet, PlatformLocation, ReferenceSource,
-    TarFault,
+    TarFault, UnsupportedArchiveFeature,
 };
+use sha2::Digest as _;
 
 const ARCHIVE_PATH: &str = "images/app.tar";
 const REF: &str = "registry.example/synthetic/app:1.0";
@@ -195,17 +197,11 @@ fn every_supported_shape_is_accepted() {
     );
     accept(
         builder(amd64())
-            .layer(hello(), LayerCompression::Gzip)
-            .unwrap(),
-        &tagged,
-    );
-    accept(
-        builder(amd64())
             .layer(hello(), LayerCompression::Uncompressed)
             .unwrap()
             .layer(
                 SyntheticLayer::new().file("b.txt", "b"),
-                LayerCompression::Gzip,
+                LayerCompression::Uncompressed,
             )
             .unwrap(),
         &tagged,
@@ -214,21 +210,21 @@ fn every_supported_shape_is_accepted() {
     assert!(scratch.diff_ids().is_empty());
     let repeated = accept(
         builder(amd64())
-            .layer(hello(), LayerCompression::Gzip)
+            .layer(hello(), LayerCompression::Uncompressed)
             .unwrap()
             .layer(
                 SyntheticLayer::new().dir("etc"),
                 LayerCompression::Uncompressed,
             )
             .unwrap()
-            .layer(hello(), LayerCompression::Gzip)
+            .layer(hello(), LayerCompression::Uncompressed)
             .unwrap(),
         &tagged,
     );
     assert_eq!(repeated.diff_ids()[0], repeated.diff_ids()[2]);
     accept(
         builder(platform(ImageArchitecture::Arm64, Some("v8")))
-            .layer(hello(), LayerCompression::Gzip)
+            .layer(hello(), LayerCompression::Uncompressed)
             .unwrap(),
         &tagged,
     );
@@ -236,19 +232,19 @@ fn every_supported_shape_is_accepted() {
     assert_eq!(token.len(), 64);
     accept(
         builder(platform(ImageArchitecture::Amd64, Some(&token)))
-            .layer(hello(), LayerCompression::Gzip)
+            .layer(hello(), LayerCompression::Uncompressed)
             .unwrap(),
         &tagged,
     );
     accept(
         builder(platform(ImageArchitecture::Arm64, None))
-            .layer(hello(), LayerCompression::Gzip)
+            .layer(hello(), LayerCompression::Uncompressed)
             .unwrap(),
         &tagged,
     );
     accept(
         builder(amd64())
-            .layer(hello(), LayerCompression::Gzip)
+            .layer(hello(), LayerCompression::Uncompressed)
             .unwrap(),
         &refs(&[
             REF,
@@ -267,7 +263,7 @@ fn every_supported_shape_is_accepted() {
                     .symlink("etc/localtime", "/usr/share/zoneinfo/UTC")
                     .symlink("etc/release", "os-release")
                     .symlink("etc/up", "../usr/share"),
-                LayerCompression::Gzip,
+                LayerCompression::Uncompressed,
             )
             .unwrap(),
         &tagged,
@@ -289,21 +285,86 @@ fn edge_entries_the_builder_admits_are_accepted() {
                     .symlink("full", &full_target)
                     .symlink("utf8", "caf\u{e9}")
                     .symlink("climb", "../../../etc/passwd"),
-                LayerCompression::Gzip,
+                LayerCompression::Uncompressed,
             )
             .unwrap(),
         &tagged,
     );
-    // One layer stored both ways: two blobs sharing one diff ID.
-    let both = accept(
+}
+
+/// Asserts `archive` is refused as not canonical.
+#[track_caller]
+fn refuse_as_non_canonical(archive: &SyntheticImageArchive, public_refs: &[String]) {
+    match check(archive, &matching(archive, public_refs)) {
+        Err(ArchiveCheckError::Image(ImageVerifyError::UnsupportedArchive {
+            archive_path,
+            feature: UnsupportedArchiveFeature::NonCanonicalManifest,
+        })) => assert_eq!(archive_path, ARCHIVE_PATH),
+        other => panic!("expected a non-canonical manifest, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_gzip_layer_builds_a_refusal_fixture() {
+    let tagged = refs(&[REF]);
+    let gzip = builder(amd64())
+        .layer(hello(), LayerCompression::Gzip)
+        .unwrap()
+        .finish(&tagged)
+        .unwrap();
+    refuse_as_non_canonical(&gzip, &tagged);
+    // The same layer uncompressed is accepted: one config, two archives, and
+    // only the canonical one is the image.
+    let plain = accept(
         builder(amd64())
             .layer(hello(), LayerCompression::Uncompressed)
-            .unwrap()
-            .layer(hello(), LayerCompression::Gzip)
             .unwrap(),
         &tagged,
     );
+    assert_eq!(gzip.config_digest(), plain.config_digest());
+    assert_eq!(gzip.diff_ids(), plain.diff_ids());
+    assert_ne!(gzip.manifest_digest(), plain.manifest_digest());
+    // One layer stored both ways: two blobs sharing one diff ID.
+    let both = builder(amd64())
+        .layer(hello(), LayerCompression::Uncompressed)
+        .unwrap()
+        .layer(hello(), LayerCompression::Gzip)
+        .unwrap()
+        .finish(&tagged)
+        .unwrap();
     assert_eq!(both.diff_ids()[0], both.diff_ids()[1]);
+    refuse_as_non_canonical(&both, &tagged);
+}
+
+#[test]
+fn the_reported_manifest_digest_names_the_stored_manifest_blob() {
+    let tagged = refs(&[REF]);
+    let archive = accept(sample(), &tagged);
+    let mut manifest = None;
+    let mut index = None;
+    for entry in tar::Archive::new(archive.bytes()).entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        let hex = archive.manifest_digest().strip_prefix("sha256:").unwrap();
+        if name == format!("blobs/sha256/{hex}") {
+            manifest = Some(data);
+        } else if name == "index.json" {
+            index = Some(data);
+        }
+    }
+    let manifest = manifest.expect("the manifest blob");
+    let digest =
+        sha2::Sha256::digest(&manifest)
+            .iter()
+            .fold(String::from("sha256:"), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            });
+    assert_eq!(archive.manifest_digest(), digest);
+    let index: serde_json::Value = serde_json::from_slice(&index.expect("the index")).unwrap();
+    assert_eq!(index["manifests"][0]["digest"], archive.manifest_digest());
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +373,7 @@ fn edge_entries_the_builder_admits_are_accepted() {
 
 fn sample() -> SyntheticImageArchiveBuilder {
     builder(platform(ImageArchitecture::Arm64, Some("v8")))
-        .layer(hello(), LayerCompression::Gzip)
+        .layer(hello(), LayerCompression::Uncompressed)
         .expect("the first sample layer is accepted")
         .layer(
             SyntheticLayer::new().dir("etc"),
@@ -389,7 +450,7 @@ fn the_accessors_report_the_archive() {
 #[track_caller]
 fn refuse_layer(layer: SyntheticLayer) -> SyntheticImageError {
     builder(amd64())
-        .layer(layer, LayerCompression::Gzip)
+        .layer(layer, LayerCompression::Uncompressed)
         .expect_err("the layer is refused")
 }
 
@@ -700,7 +761,7 @@ fn a_failing_source_is_an_io_error_with_its_kind() {
 fn the_placeholder_image_of_the_signed_v6_fixture_is_refused() {
     let package = std::fs::File::open(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/test-fixtures/signed-v6-images/package.pkg"
+        "/assets/test-fixtures/signed-v6-placeholder-images/package.pkg"
     ))
     .unwrap();
     let mut payload = deploy_core::payload::open_package(package).unwrap();

@@ -3,8 +3,10 @@
 //! trailing bytes, and layer blobs in any encoding.
 //!
 //! Writing is not validating, so nothing here goes through the content
-//! primitives. The defaults build an archive the validator accepts; every
-//! test changes exactly the part it is about.
+//! primitives. The defaults build an archive the validator accepts — the
+//! image manifest is written in the canonical key order, so with uncompressed
+//! layers and no manifest edit it is the canonical manifest — and every test
+//! changes exactly the part it is about.
 
 use std::cell::RefCell;
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -31,6 +33,17 @@ pub(super) const LAYER_GZIP: &str = OCI_GZIP_LAYER_MEDIA_TYPE;
 pub(super) const MANIFEST_MEDIA_TYPE: &str = OCI_MANIFEST_MEDIA_TYPE;
 pub(super) const INDEX_MEDIA_TYPE: &str = OCI_INDEX_MEDIA_TYPE;
 
+/// The keys of the canonical manifest and its descriptors, in the order it
+/// writes them. Any other key follows them, sorted.
+const CANONICAL_KEY_ORDER: &[&str] = &[
+    "schemaVersion",
+    "mediaType",
+    "config",
+    "layers",
+    "digest",
+    "size",
+];
+
 /// Returns `sha256:<hex>` of `bytes`.
 pub(super) fn digest(bytes: &[u8]) -> String {
     format!("sha256:{}", to_hex(&Sha256::digest(bytes)))
@@ -39,6 +52,50 @@ pub(super) fn digest(bytes: &[u8]) -> String {
 /// Returns the hex of `bytes`' SHA-256.
 pub(super) fn hex(bytes: &[u8]) -> String {
     to_hex(&Sha256::digest(bytes))
+}
+
+/// Serializes `value` compactly, with every object's keys in
+/// [`CANONICAL_KEY_ORDER`] and then sorted.
+fn canonical_order(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_ordered(value, &mut out);
+    out
+}
+
+fn write_ordered(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Object(object) => {
+            let mut members: Vec<(&String, &Value)> = object.iter().collect();
+            members.sort_unstable_by_key(|(key, _)| {
+                let rank = CANONICAL_KEY_ORDER
+                    .iter()
+                    .position(|known| known == key)
+                    .unwrap_or(CANONICAL_KEY_ORDER.len());
+                (rank, key.as_str())
+            });
+            out.push(b'{');
+            for (at, (key, member)) in members.into_iter().enumerate() {
+                if at > 0 {
+                    out.push(b',');
+                }
+                out.extend(serde_json::to_vec(key).unwrap());
+                out.push(b':');
+                write_ordered(member, out);
+            }
+            out.push(b'}');
+        }
+        Value::Array(items) => {
+            out.push(b'[');
+            for (at, item) in items.iter().enumerate() {
+                if at > 0 {
+                    out.push(b',');
+                }
+                write_ordered(item, out);
+            }
+            out.push(b']');
+        }
+        other => out.extend(serde_json::to_vec(other).unwrap()),
+    }
 }
 
 /// Returns `data` as one gzip member.
@@ -336,11 +393,11 @@ impl Default for ImageBuilder {
 }
 
 impl ImageBuilder {
-    /// One tag, one gzip layer, amd64 with no variant.
+    /// One tag, one uncompressed layer, amd64 with no variant.
     pub(super) fn new() -> ImageBuilder {
         ImageBuilder {
             tags: vec!["example.com/app:1.0".to_string()],
-            layers: vec![Layer::gzip(&layer_tar("hello.txt", b"hello"))],
+            layers: vec![Layer::plain(&layer_tar("hello.txt", b"hello"))],
             positions: None,
             architecture: ImageArchitecture::Amd64,
             variant: None,
@@ -413,7 +470,11 @@ impl ImageBuilder {
         for (_, edit) in extract(&mut self.json_edits, doc) {
             edit(&mut value);
         }
-        let mut bytes = serde_json::to_vec(&value).unwrap();
+        let mut bytes = if doc == Doc::Manifest {
+            canonical_order(&value)
+        } else {
+            serde_json::to_vec(&value).unwrap()
+        };
         for (_, edit) in extract(&mut self.bytes_edits, doc) {
             edit(&mut bytes);
         }
