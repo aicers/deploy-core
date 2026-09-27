@@ -8449,17 +8449,27 @@ exec "$@"
                 let dir = tempfile::tempdir().expect("tempdir");
                 let exec = LocalExecutor::new("seat", SudoAuth::NonInteractive)
                     .with_sudo_bin(descending_sudo(dir.path()));
+                let pid_file = dir.path().join("descendant");
                 let started = Instant::now();
                 let channel = exec
                     .open_channel(
                         Identity::Operator,
                         "/bin/sh",
-                        &["-c", "printf err >&2; /bin/sleep 8 >/dev/null & exit 4"],
+                        &[
+                            "-c",
+                            "printf err >&2; /bin/sleep 8 >/dev/null & echo \"$!\" > \"$1\"; exit 4",
+                            "sh",
+                            &pid_file.to_string_lossy(),
+                        ],
                         ROOMY,
                     )
                     .expect("open");
                 let exit = channel.wait().expect("wait");
                 let elapsed = started.elapsed();
+                // The descendant is this test's to stop, not left to run out.
+                let descendant = recorded_pid(&pid_file);
+                let _ = rustix::process::kill_process(descendant, rustix::process::Signal::KILL);
+                assert_gone("the descendant", descendant);
                 assert_eq!(exit.code, Some(4));
                 assert_eq!(exit.stderr, b"err");
                 assert!(exit.stderr_truncated, "the stream had not ended");
