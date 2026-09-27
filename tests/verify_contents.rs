@@ -796,7 +796,8 @@ fn an_undeclared_current_format_image_is_the_typed_parse_refusal() {
 
 #[test]
 fn the_checked_in_metadata_fixture_is_not_full_content_evidence() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/test-fixtures/signed-v6-images");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets/test-fixtures/signed-v6-placeholder-images");
     let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
     let key_hex = std::fs::read_to_string(dir.join("public-key.hex")).expect("its key");
     let key_hex = key_hex.trim();

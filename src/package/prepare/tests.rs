@@ -397,7 +397,8 @@ fn a_placeholder_image_archive_is_the_verifiers_verdict() {
 /// full-content verifier refuses the package itself.
 #[test]
 fn the_checked_in_placeholder_images_are_the_verifiers_verdict() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/test-fixtures/signed-v6-images");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets/test-fixtures/signed-v6-placeholder-images");
     let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
     let key_hex = std::fs::read_to_string(dir.join("public-key.hex")).expect("its key");
     let key: Vec<u8> = (0..key_hex.trim().len())

@@ -4841,14 +4841,15 @@ mod tests {
     /// A signed format-6 component package checked in as raw bytes: a compose
     /// bundle and two declared images — a normalized third-party database
     /// under its canonical alias and a product-built web image under its own
-    /// tag — for `example-app` 1.0.0 in `example-product`.
+    /// tag — for `example-app` 1.0.0 in `example-product`. Its image members
+    /// are placeholder bytes: this stage reads no archive.
     const SIGNED_V6_PACKAGE: &[u8] =
-        include_bytes!("../assets/test-fixtures/signed-v6-images/package.pkg");
+        include_bytes!("../assets/test-fixtures/signed-v6-placeholder-images/package.pkg");
     /// The raw Ed25519 public key that signed it, in hex. Only this half was
     /// kept: the fixture is test trust and nothing else, and its private key
     /// was discarded once the package was written.
     const SIGNED_V6_PUBLIC_KEY: &str =
-        include_str!("../assets/test-fixtures/signed-v6-images/public-key.hex");
+        include_str!("../assets/test-fixtures/signed-v6-placeholder-images/public-key.hex");
 
     fn signed_v6_trust() -> TrustSet {
         let hex = SIGNED_V6_PUBLIC_KEY.trim();

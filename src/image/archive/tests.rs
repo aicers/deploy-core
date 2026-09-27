@@ -3438,7 +3438,7 @@ fn reason_enums_display_fixed_lowercase_phrases() {
 #[test]
 fn the_checked_in_placeholder_image_is_refused() {
     const PACKAGE: &[u8] =
-        include_bytes!("../../../assets/test-fixtures/signed-v6-images/package.pkg");
+        include_bytes!("../../../assets/test-fixtures/signed-v6-placeholder-images/package.pkg");
     let mut payload = crate::payload::open_package(Cursor::new(PACKAGE)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let extracted = payload.extract_to(dir.path()).unwrap();

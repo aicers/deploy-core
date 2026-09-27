@@ -761,7 +761,7 @@ fn a_failing_source_is_an_io_error_with_its_kind() {
 fn the_placeholder_image_of_the_signed_v6_fixture_is_refused() {
     let package = std::fs::File::open(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/assets/test-fixtures/signed-v6-images/package.pkg"
+        "/assets/test-fixtures/signed-v6-placeholder-images/package.pkg"
     ))
     .unwrap();
     let mut payload = deploy_core::payload::open_package(package).unwrap();
