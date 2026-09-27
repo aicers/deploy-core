@@ -6702,8 +6702,9 @@ exec sh -c "$script" _ "$source" "$dest""#;
 
             use super::super::super::bounded::{TIMEOUT_MARKER, supervisor_script};
             use super::super::super::{
-                Executor, ExecutorError, Identity, InDaemonExecutor, LocalExecutor, OutputStream,
-                RunLimits, RunWithInputError, ServiceAccount, SshExecutor, SshPrompt, SudoAuth,
+                CommandOutput, Executor, ExecutorError, FileMeta, Identity, InDaemonExecutor,
+                LocalExecutor, OutputStream, RunLimits, RunWithInputError, ServiceAccount,
+                SshExecutor, SshPrompt, SudoAuth,
             };
             use super::{failing_ssh, fake_ssh, write_script};
 
@@ -6954,6 +6955,58 @@ exec "$@"
                     assert_eq!(output.stdout, b"out", "{label}");
                     assert_eq!(output.stderr, b"err", "{label}: only the command's stderr");
                 }
+            }
+
+            #[test]
+            fn a_command_that_leaves_its_input_unread_still_reports_its_exit_on_every_pair() {
+                // More than a pipe buffer holds, so feeding it cannot finish
+                // before the command exits and the write meets a closed pipe.
+                let input = pattern(4 * REQUEST_MAX);
+                let dir = tempfile::tempdir().expect("tempdir");
+                for (label, exec, identity) in every_pair(&dir) {
+                    let output = exec
+                        .run_with_input(
+                            identity,
+                            "/bin/sh",
+                            &["-c", "printf done; exit 3"],
+                            &input,
+                            ROOMY,
+                        )
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(3), "{label}");
+                    assert_eq!(output.stdout, b"done", "{label}");
+                    assert!(output.stderr.is_empty(), "{label}: {:?}", output.stderr);
+                }
+            }
+
+            #[test]
+            fn an_executor_that_does_not_implement_it_refuses_as_unsupported() {
+                struct RunOnly;
+                impl Executor for RunOnly {
+                    fn run(
+                        &self,
+                        _identity: Identity,
+                        command: &str,
+                        _args: &[&str],
+                    ) -> Result<CommandOutput, ExecutorError> {
+                        panic!("`{command}` must not be run through `run`")
+                    }
+                    fn put_file(
+                        &self,
+                        dest: &Path,
+                        _contents: &[u8],
+                        _meta: FileMeta,
+                    ) -> Result<(), ExecutorError> {
+                        panic!("`{}` must not be written", dest.display())
+                    }
+                }
+                let error = RunOnly
+                    .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", ROOMY)
+                    .expect_err("the default body refuses");
+                assert!(
+                    matches!(error, RunWithInputError::Unsupported),
+                    "got {error:?}"
+                );
             }
 
             #[test]
