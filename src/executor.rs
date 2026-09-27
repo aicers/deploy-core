@@ -1064,6 +1064,10 @@ pub trait Executor {
     ///   `limits.timeout`, kills the command and waits for it, and is reported
     ///   as [`RunWithInputError::OutputLimit`] or
     ///   [`RunWithInputError::TimedOut`] — never as a [`CommandOutput`].
+    ///   The limits bound the command's own bytes: what `sudo` or `ssh`
+    ///   writes before the command starts is neither counted nor returned,
+    ///   so a refusal or a failed connection is reported as the error
+    ///   [`Executor::run`] reports for it however small `max_stderr` is.
     /// - **A non-zero exit is a [`CommandOutput`]**, as it is from
     ///   [`Executor::run`].
     ///
@@ -2369,12 +2373,18 @@ impl LocalExecutor {
         input: &[u8],
         limits: RunLimits,
     ) -> Result<CommandOutput, RunWithInputError> {
-        let script = bounded::supervisor_script(true, limits.timeout);
+        let supervisor = bounded::Supervisor::new(limits.timeout)?;
         let Resolved {
             command: mut cmd,
             password_line,
             elevated,
-        } = self.resolve_through(identity, bounded::SUPERVISOR_SHELL, &script, command, args);
+        } = self.resolve_through(
+            identity,
+            bounded::SUPERVISOR_SHELL,
+            supervisor.script(),
+            command,
+            args,
+        );
         // A command spawned directly has its environment cleared here. `sudo`
         // keeps the caller's, so it is found exactly as `run` finds it; the
         // supervisor clears the command's after `sudo` has set up its own.
@@ -2383,12 +2393,7 @@ impl LocalExecutor {
         }
         let program = cmd.get_program().to_string_lossy().into_owned();
         let (framing, kill) = if elevated {
-            let framing = bounded::Framing {
-                supervised: true,
-                sentinel: true,
-                remote_code: false,
-            };
-            (framing, bounded::Kill::Relay)
+            (supervisor.framing(false), bounded::Kill::Relay)
         } else {
             (bounded::Framing::DIRECT, bounded::Kill::Group)
         };
@@ -2749,8 +2754,7 @@ impl SshExecutor {
         input: &[u8],
         limits: RunLimits,
     ) -> Result<CommandOutput, RunWithInputError> {
-        let elevated_script = bounded::supervisor_script(true, limits.timeout);
-        let operator_script = bounded::supervisor_script(false, limits.timeout);
+        let supervisor = bounded::Supervisor::new(limits.timeout)?;
         let ResolvedRemote {
             remote,
             password_line,
@@ -2758,8 +2762,8 @@ impl SshExecutor {
         } = self.resolve_through(
             identity,
             bounded::SUPERVISOR_SHELL,
-            &elevated_script,
-            Some(&operator_script),
+            supervisor.script(),
+            Some(supervisor.script()),
             command,
             args,
         );
@@ -2770,11 +2774,7 @@ impl SshExecutor {
             }
             None => input.to_vec(),
         };
-        let framing = bounded::Framing {
-            supervised: true,
-            sentinel: elevated,
-            remote_code: true,
-        };
+        let framing = supervisor.framing(true);
         // `ssh` keeps the caller's environment: it needs `HOME` for its
         // configuration and `SSH_AUTH_SOCK` for the agent. The remote
         // supervisor clears the command's.
@@ -2783,10 +2783,14 @@ impl SshExecutor {
         let program = self.ssh_bin.to_string_lossy().into_owned();
         let ended = bounded::run(cmd, &program, &feed, limits, framing, bounded::Kill::Group)?;
         bounded::finish(ended, command, limits, framing, |output| {
-            let output = self.settle_remote_code(output)?;
+            let mut output = self.settle_remote_code(output)?;
             if elevated {
                 classify_elevation(output, Some(&self.auth), &self.host)
             } else {
+                // The operator's supervisor announces itself too; with no
+                // `sudo` to have refused, its absence is only a supervisor
+                // that never ran, and the exit status says why.
+                take_sudo_sentinel(&mut output.stderr);
                 Ok(output)
             }
         })
@@ -2987,9 +2991,14 @@ impl InDaemonExecutor {
         input: &[u8],
         limits: RunLimits,
     ) -> Result<CommandOutput, RunWithInputError> {
-        let script = bounded::supervisor_script(true, limits.timeout);
-        let (mut cmd, elevated) =
-            self.resolve_through(identity, bounded::SUPERVISOR_SHELL, &script, command, args)?;
+        let supervisor = bounded::Supervisor::new(limits.timeout)?;
+        let (mut cmd, elevated) = self.resolve_through(
+            identity,
+            bounded::SUPERVISOR_SHELL,
+            supervisor.script(),
+            command,
+            args,
+        )?;
         // As on the local transport: root's command is cleared here, and a
         // descended one by the supervisor, after `sudo` has run as it does
         // for `run`.
@@ -2998,12 +3007,7 @@ impl InDaemonExecutor {
         }
         let program = cmd.get_program().to_string_lossy().into_owned();
         let (framing, kill) = if elevated {
-            let framing = bounded::Framing {
-                supervised: true,
-                sentinel: true,
-                remote_code: false,
-            };
-            (framing, bounded::Kill::Relay)
+            (supervisor.framing(false), bounded::Kill::Relay)
         } else {
             (bounded::Framing::DIRECT, bounded::Kill::Group)
         };
@@ -6700,7 +6704,7 @@ exec sh -c "$script" _ "$source" "$dest""#;
             use rustix::process::Pid;
             use tempfile::TempDir;
 
-            use super::super::super::bounded::{TIMEOUT_MARKER, supervisor_script};
+            use super::super::super::bounded::Supervisor;
             use super::super::super::{
                 CommandOutput, Executor, ExecutorError, FileMeta, Identity, InDaemonExecutor,
                 LocalExecutor, OutputStream, RunLimits, RunWithInputError, ServiceAccount,
@@ -6958,6 +6962,46 @@ exec "$@"
             }
 
             #[test]
+            fn a_command_that_prints_a_timeout_marker_still_exits_on_every_pair() {
+                // The fixed marker earlier revisions announced a timeout with,
+                // and one shaped like the current marker with another run's
+                // nonce: a command that prints either and exits has exited,
+                // and each byte counts against its stderr limit.
+                let printed = "__BOOTLER_TIMEOUT__\
+                               __BOOTLER_TIMEOUT_00112233445566778899aabbccddeeff__";
+                let exact = RunLimits {
+                    max_stderr: printed.len(),
+                    ..ROOMY
+                };
+                let under = RunLimits {
+                    max_stderr: printed.len() - 1,
+                    ..ROOMY
+                };
+                let dir = tempfile::tempdir().expect("tempdir");
+                for (label, exec, identity) in every_pair(&dir) {
+                    let args = ["-c", "printf '%s' \"$0\" >&2", printed];
+                    let output = exec
+                        .run_with_input(identity, "/bin/sh", &args, b"", exact)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(output.code, Some(0), "{label}");
+                    assert_eq!(output.stderr, printed.as_bytes(), "{label}");
+                    let error = exec
+                        .run_with_input(identity, "/bin/sh", &args, b"", under)
+                        .expect_err("one byte over");
+                    assert!(
+                        matches!(
+                            error,
+                            RunWithInputError::OutputLimit {
+                                stream: OutputStream::Stderr,
+                                ..
+                            }
+                        ),
+                        "{label}: {error:?}"
+                    );
+                }
+            }
+
+            #[test]
             fn a_command_that_leaves_its_input_unread_still_reports_its_exit_on_every_pair() {
                 // More than a pipe buffer holds, so feeding it cannot finish
                 // before the command exits and the write meets a closed pipe.
@@ -7171,62 +7215,117 @@ exec "$@"
                 assert_gone("closed streams", &recorded_pids(&pids));
             }
 
+            // One table of failures across every transport, each checked under
+            // both limits; split up, the shared stubs would be built per part.
+            #[allow(clippy::too_many_lines)]
             #[test]
             fn elevation_and_transport_failures_are_reported_as_run_reports_them() {
+                // Under no stderr allowance at all, too: what `sudo` or `ssh`
+                // writes when it fails is not the command's output, so it
+                // cannot pass the command's limit before it is classified.
+                let tight = RunLimits {
+                    max_stdout: 0,
+                    max_stderr: 0,
+                    ..ROOMY
+                };
                 let dir = tempfile::tempdir().expect("tempdir");
                 let refusing = write_script(
                     dir.path(),
                     "refusing-sudo",
                     "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
                 );
-                let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
-                    .with_sudo_bin(refusing.clone())
-                    .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", ROOMY)
-                    .expect_err("sudo refused");
-                assert!(
-                    matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
-                        if host == "mgmt"),
-                    "got {error:?}"
+                let denying = write_script(
+                    dir.path(),
+                    "denying-sudo",
+                    "#!/bin/sh\necho 'ops is not in the sudoers file.' >&2\nexit 1\n",
                 );
-                let error = InDaemonExecutor::new("mgmt")
-                    .with_sudo_bin(refusing)
-                    .run_with_input(
-                        Identity::Service(ServiceAccount::Security),
-                        "/bin/cat",
-                        &[],
-                        b"{}",
-                        ROOMY,
-                    )
-                    .expect_err("sudo refused");
-                assert!(
-                    matches!(
-                        error,
-                        RunWithInputError::Executor(ExecutorError::SudoRefused { .. })
-                    ),
-                    "got {error:?}"
-                );
-
                 let config = crate::transport::Ssh {
                     user: "ops".to_string(),
                     port: 22,
                     key: PathBuf::from("/dev/null"),
                     host_key: crate::transport::HostKeyPolicy::Strict,
                 };
-                let error = SshExecutor::from_config(
+                let unreachable = SshExecutor::from_config(
                     "mgmt",
                     &config,
                     "10.0.0.10",
                     SudoAuth::NonInteractive,
                     SshPrompt::Deny,
                 )
-                .with_ssh_bin(failing_ssh(dir.path()))
-                .run_with_input(Identity::Operator, "/bin/cat", &[], b"{}", ROOMY)
-                .expect_err("the host is unreachable");
-                assert!(
-                    matches!(&error, RunWithInputError::Executor(ExecutorError::Connection { host, .. })
-                        if host == "mgmt"),
-                    "got {error:?}"
-                );
+                .with_ssh_bin(failing_ssh(dir.path()));
+                let remote_refusing = SshExecutor::from_config(
+                    "mgmt",
+                    &config,
+                    "10.0.0.10",
+                    SudoAuth::NonInteractive,
+                    SshPrompt::Deny,
+                )
+                .with_ssh_bin(fake_ssh(dir.path()))
+                .with_remote_sudo(refusing.to_string_lossy().into_owned());
+                let password = password_sudo(dir.path());
+                let wrong_password =
+                    LocalExecutor::new("mgmt", SudoAuth::Password("wrong".to_string()))
+                        .with_sudo_bin(password);
+                for limits in [ROOMY, tight] {
+                    let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                        .with_sudo_bin(refusing.clone())
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("sudo refused");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
+                            if host == "mgmt"),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = wrong_password
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("sudo rejected the password");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::SudoRefused { reason, .. })
+                            if reason.contains("wrong password")),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = InDaemonExecutor::new("mgmt")
+                        .with_sudo_bin(denying.clone())
+                        .run_with_input(
+                            Identity::Service(ServiceAccount::Security),
+                            "/bin/cat",
+                            &[],
+                            b"{}",
+                            limits,
+                        )
+                        .expect_err("sudo refused");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::SudoRefused { reason, .. })
+                            if reason.contains("sudoers")),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = unreachable
+                        .run_with_input(Identity::Operator, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("the host is unreachable");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::Connection { host, reason })
+                            if host == "mgmt" && reason.contains("Connection refused")),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = unreachable
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("the host is unreachable");
+                    assert!(
+                        matches!(
+                            &error,
+                            RunWithInputError::Executor(ExecutorError::Connection { .. })
+                        ),
+                        "{limits:?}: got {error:?}"
+                    );
+                    let error = remote_refusing
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                        .expect_err("the remote sudo refused");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
+                            if host == "mgmt"),
+                        "{limits:?}: got {error:?}"
+                    );
+                }
 
                 let error = InDaemonExecutor::new("mgmt")
                     .run_with_input(Identity::Operator, "/bin/cat", &[], b"{}", ROOMY)
@@ -7240,6 +7339,36 @@ exec "$@"
                 );
             }
 
+            #[test]
+            fn a_transport_that_floods_stderr_before_the_command_starts_is_refused() {
+                // A `sudo` that never grants, writes far more than any real
+                // diagnostic, and then hangs: the run is abandoned well before
+                // the timeout, and still classifies as the refusal it is.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let flooding = write_script(
+                    dir.path(),
+                    "flooding-sudo",
+                    "#!/bin/sh\n/usr/bin/head -c 1048576 /dev/zero | /usr/bin/tr '\\0' x >&2\n\
+                     exec /bin/sleep 300\n",
+                );
+                let started = Instant::now();
+                let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(flooding)
+                    .run_with_input(Identity::Root, "/bin/cat", &[], b"", ROOMY)
+                    .expect_err("sudo never granted");
+                assert!(
+                    matches!(
+                        error,
+                        RunWithInputError::Executor(ExecutorError::SudoRefused { .. })
+                    ),
+                    "got {error:?}"
+                );
+                assert!(
+                    started.elapsed() < ROOMY.timeout,
+                    "abandoned, not timed out"
+                );
+            }
+
             /// Spawns the supervisor the way a transport this process cannot
             /// signal through would run it, in a process group of its own so
             /// its `kill 0` stays inside it, over [`STUBBORN`]. Its `PATH`
@@ -7247,14 +7376,14 @@ exec "$@"
             /// so its deadline is shown to depend on no `PATH` lookup — an empty
             /// environment would not show it, since a shell then falls back to
             /// a default `PATH` of its own.
-            fn spawn_supervised(timeout: Duration, pids: &Path) -> std::process::Child {
+            fn spawn_supervised(supervisor: &Supervisor, pids: &Path) -> std::process::Child {
                 use std::os::unix::process::CommandExt;
 
                 Command::new("/bin/sh")
                     .env_clear()
                     .env("PATH", pids.parent().expect("pids lives in a directory"))
                     .arg("-c")
-                    .arg(supervisor_script(false, timeout))
+                    .arg(supervisor.script())
                     .args(["/bin/sh", "-c", STUBBORN, "sh"])
                     .arg(pids)
                     .arg("0")
@@ -7273,11 +7402,12 @@ exec "$@"
                 // supervisor, and its own deadline still kills everything.
                 let dir = tempfile::tempdir().expect("tempdir");
                 let pids = dir.path().join("pids");
-                let child = spawn_supervised(Duration::from_millis(200), &pids);
+                let supervisor = Supervisor::new(Duration::from_millis(200)).expect("a supervisor");
+                let child = spawn_supervised(&supervisor, &pids);
                 let output = child.wait_with_output().expect("the supervisor ends");
                 assert!(!output.status.success());
                 assert!(
-                    String::from_utf8_lossy(&output.stderr).contains(TIMEOUT_MARKER),
+                    String::from_utf8_lossy(&output.stderr).contains(supervisor.timeout_marker()),
                     "the deadline announces itself: {:?}",
                     output.stderr
                 );
@@ -7291,7 +7421,8 @@ exec "$@"
                 // and which must still end the command.
                 let dir = tempfile::tempdir().expect("tempdir");
                 let pids = dir.path().join("pids");
-                let mut child = spawn_supervised(Duration::from_secs(300), &pids);
+                let supervisor = Supervisor::new(Duration::from_secs(300)).expect("a supervisor");
+                let mut child = spawn_supervised(&supervisor, &pids);
                 let deadline = Instant::now() + REAP_WAIT;
                 while !pids.exists() {
                     assert!(Instant::now() < deadline, "the command never started");
