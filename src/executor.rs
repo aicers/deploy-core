@@ -9740,6 +9740,13 @@ done
             /// Ubuntu's default — moves the command into a session of its
             /// own. From a terminal, run it as
             /// `setsid -w cargo test -- --ignored descent_through_the_real_sudo`.
+            ///
+            /// The groups check tells `sudo`'s group-database groups apart
+            /// from none at all only when `nobody` belongs to a supplementary
+            /// group: stock `nobody` has only its primary group, which a
+            /// descent that dropped every supplementary group reports too.
+            /// Add one first (`usermod -aG users nobody`) for a run that
+            /// shows them arriving.
             #[cfg(target_os = "linux")]
             #[test]
             #[ignore = "runs the real sudo as root to a real account"]
