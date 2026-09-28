@@ -20,7 +20,7 @@ use crate::payload::{
 };
 use crate::retain::{RetentionError, RetentionOperation, RetentionScope, publish_file};
 use crate::verify::{
-    BoundedVerifyError, ImageVerifyError, TrustSet, VerifyError, VerifyRequest,
+    BoundedVerified, BoundedVerifyError, ImageVerifyError, TrustSet, VerifyError, VerifyRequest,
     verify_package_bounded,
 };
 
@@ -93,15 +93,33 @@ pub fn verify_contents<R: Read + Seek>(
     limits: &ContentLimits,
     staging_parent: &Path,
 ) -> Result<VerifiedContents, ContentError> {
+    let scope = open_scope(
+        staging_parent,
+        limits.get(LimitResource::RetainedDisk),
+        limits,
+    )?;
+    let package = snapshot_source(&scope, &mut source, limits)?;
+    drop(source);
+
+    verify_retained(scope, package, trust, request, target_arch, limits)
+}
+
+/// Opens the operation's private directory in `staging_parent`, under the
+/// directory trust policy, charging every snapshot to `disk_budget`.
+///
+/// # Errors
+///
+/// [`ContentError::Io`] with [`IoOperation::InspectStagingParent`] or
+/// [`IoOperation::CreateStaging`], as [`verify_contents`] documents.
+pub(super) fn open_scope(
+    staging_parent: &Path,
+    disk_budget: u64,
+    limits: &ContentLimits,
+) -> Result<RetentionScope, ContentError> {
     // `CopyBuffer` is never zero; the fallback only keeps that invariant out
     // of a panic.
     let copy_buffer = NonZeroUsize::new(limits.copy_buffer_len()).unwrap_or(NonZeroUsize::MIN);
-    let scope = RetentionScope::new(
-        staging_parent,
-        limits.get(LimitResource::RetainedDisk),
-        copy_buffer,
-    )
-    .map_err(|error| {
+    RetentionScope::new(staging_parent, disk_budget, copy_buffer).map_err(|error| {
         from_retention(
             error,
             &RetentionSite {
@@ -111,8 +129,23 @@ pub fn verify_contents<R: Read + Seek>(
                 staging_parent: Some(staging_parent),
             },
         )
-    })?;
+    })
+}
 
+/// Seeks `source` to its start and copies it, at most `Package` bytes, into
+/// one snapshot in `scope`.
+///
+/// # Errors
+///
+/// [`ContentError::Io`] with [`IoOperation::SourceSeek`] or
+/// [`IoOperation::SourceRead`], [`ContentError::LimitExceeded`] naming
+/// `Package` or `RetainedDisk`, and the retained-storage failures
+/// [`verify_contents`] documents.
+pub(super) fn snapshot_source<R: Read + Seek>(
+    scope: &RetentionScope,
+    source: &mut R,
+    limits: &ContentLimits,
+) -> Result<RetainedBytes, ContentError> {
     source
         .seek(SeekFrom::Start(0))
         .map_err(|source| ContentError::Io {
@@ -120,8 +153,8 @@ pub fn verify_contents<R: Read + Seek>(
             path: None,
             source,
         })?;
-    let package = scope
-        .snapshot_from(&mut source, limits.get(LimitResource::Package))
+    scope
+        .snapshot_from(source, limits.get(LimitResource::Package))
         .map_err(|error| {
             from_retention(
                 error,
@@ -132,10 +165,7 @@ pub fn verify_contents<R: Read + Seek>(
                     staging_parent: None,
                 },
             )
-        })?;
-    drop(source);
-
-    verify_retained(scope, package, trust, request, target_arch, limits)
+        })
 }
 
 /// Runs everything [`verify_contents`] does after its snapshot over
@@ -156,26 +186,58 @@ pub(crate) fn verify_retained(
     target_arch: TargetArch,
     limits: &ContentLimits,
 ) -> Result<VerifiedContents, ContentError> {
-    let bounds = ContainerBounds {
-        max_manifest_len: limits.get(LimitResource::RawManifest),
-        max_archive_len: limits.get(LimitResource::CompressedArchive),
-    };
     let verified = verify_package_bounded(
         RetainedSource::new(package.reader(), SourceRole::Package),
         trust,
         request,
-        bounds,
+        container_bounds(limits),
     )
     .map_err(ContentError::from_bounded)?;
+    verify_authenticated(scope, package, verified, target_arch, limits)
+}
 
+/// The block bounds bounded authentication holds a footer to.
+pub(super) fn container_bounds(limits: &ContentLimits) -> ContainerBounds {
+    ContainerBounds {
+        max_manifest_len: limits.get(LimitResource::RawManifest),
+        max_archive_len: limits.get(LimitResource::CompressedArchive),
+    }
+}
+
+/// Everything [`verify_contents`] does after the statement checks, over
+/// `package` and the manifest its caller authenticated and checked: the
+/// archive-block snapshot, then [`check_contents`] against `target_arch`.
+///
+/// The one post-authentication body, shared by [`verify_retained`] and the
+/// upload verifier. `verified.manifest` must have passed
+/// [`check_statements`](crate::verify::check_statements) with `Some(trust)`:
+/// nothing here re-checks it.
+///
+/// # Errors
+///
+/// As [`verify_contents`], from the architecture check onwards, and
+/// [`ContentError::LimitExceeded`] naming `RetainedDisk` or
+/// [`ContentError::Io`] for the archive-block snapshot.
+pub(super) fn verify_authenticated(
+    scope: RetentionScope,
+    package: RetainedBytes,
+    verified: BoundedVerified,
+    target_arch: TargetArch,
+    limits: &ContentLimits,
+) -> Result<VerifiedContents, ContentError> {
+    let BoundedVerified {
+        manifest,
+        archive_offset,
+        archive_len,
+    } = verified;
     let archive = {
         let mut reader = RetainedSource::new(package.reader(), SourceRole::ArchiveCopy);
         reader
-            .seek(SeekFrom::Start(verified.archive_offset))
+            .seek(SeekFrom::Start(archive_offset))
             .map_err(read_snapshot)?;
-        let mut block = reader.take(verified.archive_len);
+        let mut block = reader.take(archive_len);
         let archive = scope
-            .snapshot_from(&mut block, verified.archive_len)
+            .snapshot_from(&mut block, archive_len)
             .map_err(|error| {
                 from_retention(
                     error,
@@ -187,7 +249,7 @@ pub(crate) fn verify_retained(
                     },
                 )
             })?;
-        if archive.len() != verified.archive_len {
+        if archive.len() != archive_len {
             return Err(read_snapshot(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "the retained package ended inside its archive block",
@@ -196,14 +258,9 @@ pub(crate) fn verify_retained(
         archive
     };
 
-    let checked = check_contents(&verified.manifest, &archive, target_arch, limits, &scope)?;
+    let checked = check_contents(&manifest, &archive, target_arch, limits, &scope)?;
     drop(archive);
-    Ok(VerifiedContents::new(
-        scope,
-        package,
-        verified.manifest,
-        checked,
-    ))
+    Ok(VerifiedContents::new(scope, package, manifest, checked))
 }
 
 /// The unsigned-content core: steps 3 to 6 of [`verify_contents`] over an
@@ -575,6 +632,34 @@ pub enum ContentError {
         #[source]
         source: io::Error,
     },
+
+    /// [`verify_upload`](super::verify_upload) could not derive the build to
+    /// verify from an authenticated manifest.
+    ///
+    /// Reachable only from that entry point, and only after the signature has
+    /// verified.
+    #[error(transparent)]
+    Upload(UploadRefusal),
+}
+
+/// Why [`verify_upload`](super::verify_upload) refused an authenticated
+/// manifest before its statement checks: the build it would be verified as
+/// could not be taken from its first artifact entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum UploadRefusal {
+    /// The manifest carries no artifact entry, so it names no build.
+    #[error("the package's manifest carries no artifact, so it names no build to verify")]
+    NoArtifacts,
+
+    /// The first artifact entry names the reserved
+    /// [`TRUST_TARGET`](crate::verify::TRUST_TARGET): a trust generation is
+    /// never an upload, and has admission paths of its own in
+    /// [`release_trust`](crate::release_trust).
+    #[error(
+        "the package is a `{}` generation, which is never an upload",
+        crate::verify::TRUST_TARGET
+    )]
+    ReservedTarget,
 }
 
 impl From<VerifyError> for ContentError {
@@ -587,7 +672,7 @@ impl From<VerifyError> for ContentError {
 
 impl ContentError {
     /// Maps a bounded authentication failure one-to-one.
-    fn from_bounded(error: BoundedVerifyError) -> ContentError {
+    pub(super) fn from_bounded(error: BoundedVerifyError) -> ContentError {
         match error {
             BoundedVerifyError::Verify(error) => ContentError::Verify(error),
             BoundedVerifyError::LimitExceeded { resource, limit } => {
@@ -847,6 +932,26 @@ impl VerifiedContents {
         destination: &Path,
     ) -> Result<PublishedPackage, PublicationError> {
         publish_file(&self.package, destination, &self.scope)
+    }
+
+    /// Releases every retained snapshot and then removes the private
+    /// directory, returning the manifest alone.
+    ///
+    /// Removal is best effort, as the scope's `Drop` is: a failure is not
+    /// reported, and whatever it leaves is inside the private directory.
+    pub(super) fn release(self) -> PayloadManifest {
+        let VerifiedContents {
+            manifest,
+            artifacts,
+            images,
+            package,
+            scope,
+        } = self;
+        drop(images);
+        drop(artifacts);
+        drop(package);
+        let _ = scope.close();
+        manifest
     }
 
     /// Returns the scope, for the budget and staging tests.

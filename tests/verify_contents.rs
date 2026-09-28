@@ -19,7 +19,7 @@ use deploy_core::image::{
 use deploy_core::manifest::{ArtifactKind, Disposition, ManifestError, TargetArch};
 use deploy_core::package::{
     ContentError, ContentLimits, IoOperation, LimitResource, PublicationError, RetainedBytes,
-    VerifiedContents, VerifiedImages, verify_contents,
+    UploadRefusal, VerifiedContents, VerifiedImages, verify_contents,
 };
 use deploy_core::payload::{
     ArtifactInput, FORMAT_VERSION, MAGIC, PayloadError, Signed, append_trailer_signed,
@@ -1001,6 +1001,14 @@ fn describe(error: &ContentError) -> String {
             operation_name(*operation),
             source.kind()
         ),
+        ContentError::Upload(refusal) => format!("Upload {}", refusal_name(*refusal)),
+    }
+}
+
+fn refusal_name(refusal: UploadRefusal) -> &'static str {
+    match refusal {
+        UploadRefusal::NoArtifacts => "NoArtifacts",
+        UploadRefusal::ReservedTarget => "ReservedTarget",
     }
 }
 
@@ -1049,6 +1057,8 @@ fn every_error_variant_and_operation_is_nameable() {
             resource: LimitResource::Package,
             limit: 1,
         },
+        ContentError::Upload(UploadRefusal::NoArtifacts),
+        ContentError::Upload(UploadRefusal::ReservedTarget),
     ];
     for error in &errors {
         assert!(!describe(error).is_empty());

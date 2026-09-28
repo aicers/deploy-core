@@ -100,6 +100,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
+use sha2::{Digest, Sha256};
 
 use crate::image::{
     ImageArchitecture, ImageDeclaration, NormalizedReference, RUNTIME_ALIAS_REGISTRY,
@@ -398,8 +399,24 @@ impl TrustSet {
         &self.anchors
     }
 
-    /// Reports whether `(component, version, commit)` is a withdrawn build.
-    fn is_withdrawn(&self, component: &str, version: &str, commit: &str) -> bool {
+    /// Returns the epoch this set was built for: the active generation's, as
+    /// [`TrustSet::new`] received it.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Reports whether `(component, version, commit)` is one of this set's
+    /// withdrawn builds.
+    ///
+    /// The three parts are compared as exact strings against each withdrawn
+    /// `(package-id, version, commit)` triple, and a build is withdrawn only
+    /// when all three match one triple. This is the question the verifier's
+    /// withdrawal check asks of every manifest entry, exposed so a caller
+    /// holding a build it has already accepted can ask it again against the
+    /// same generation.
+    #[must_use]
+    pub fn is_withdrawn(&self, component: &str, version: &str, commit: &str) -> bool {
         self.withdrawn_builds
             .iter()
             .any(|(package_id, withdrawn_version, withdrawn_commit)| {
@@ -407,6 +424,53 @@ impl TrustSet {
                     && withdrawn_version == version
                     && withdrawn_commit == commit
             })
+    }
+}
+
+/// What an upload hop knows about a package before it has read it: the
+/// deployment namespace it is uploaded under, and nothing else.
+///
+/// A hop that receives a package learns its component, version, commit and
+/// architecture only from the manifest, and only once the signature over that
+/// manifest has verified, so none of them can be asked for in advance.
+/// [`package::verify_upload`](crate::package::verify_upload) takes this in
+/// place of a [`VerifyRequest`] and derives the request from the authenticated
+/// manifest.
+///
+/// The namespace is required: a package declaring container images has to be
+/// verified under one, and a package declaring none verifies exactly as it
+/// would without it, as under [`VerifyRequest::for_namespaced_package`].
+#[derive(Debug, Clone)]
+pub struct UploadRequest {
+    namespace: String,
+}
+
+impl UploadRequest {
+    /// Creates an upload request for packages deployed in `namespace`.
+    ///
+    /// `namespace` is the caller's own trusted ownership configuration, never
+    /// a value read off the package, and is held to exactly the rule
+    /// [`VerifyRequest::for_namespaced_package`] holds it to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError::InvalidNamespace`] when `namespace` is not a valid
+    /// identifier segment (see [`is_valid_segment`]). It never panics.
+    pub fn new(namespace: &str) -> Result<Self, InputError> {
+        if !is_valid_segment(namespace) {
+            return Err(InputError::InvalidNamespace {
+                namespace: namespace.to_string(),
+            });
+        }
+        Ok(Self {
+            namespace: namespace.to_string(),
+        })
+    }
+
+    /// Returns the deployment namespace.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 }
 
@@ -492,6 +556,24 @@ impl VerifyRequest {
         }
         request.namespace = Some(namespace.to_string());
         Ok(request)
+    }
+
+    /// Creates the namespaced request an upload hop derives from an
+    /// authenticated manifest: `target`, `version` and `commit` as the first
+    /// artifact entry names them, under `upload`'s namespace.
+    ///
+    /// The namespace was validated when `upload` was built, so the one refusal
+    /// left is [`VerifyRequest::for_package`]'s, and it is reported as `None`:
+    /// `None` exactly when `target` is [`TRUST_TARGET`].
+    pub(crate) fn for_upload(
+        target: &str,
+        version: &str,
+        commit: &str,
+        upload: &UploadRequest,
+    ) -> Option<Self> {
+        let mut request = Self::for_package(target, version, commit).ok()?;
+        request.namespace = Some(upload.namespace.clone());
+        Some(request)
     }
 
     /// Creates a request for the reserved [`TRUST_TARGET`], supplying the
@@ -1435,6 +1517,18 @@ pub(crate) struct BoundedVerified {
     pub(crate) archive_len: u64,
 }
 
+/// What [`authenticate_bounded`] returns: the authenticated manifest, before
+/// any statement check, and where the archive block lies.
+#[derive(Debug)]
+pub(crate) struct BoundedAuthenticated {
+    /// The manifest, the anchor that verified it and its raw block's digest.
+    pub(crate) authenticated: Authenticated,
+    /// The archive block's offset within the container.
+    pub(crate) archive_offset: u64,
+    /// The archive block's length, at most the bound it was held to.
+    pub(crate) archive_len: u64,
+}
+
 /// Why [`verify_package_bounded`] refused a package.
 #[derive(Debug)]
 pub(crate) enum BoundedVerifyError {
@@ -1474,6 +1568,35 @@ pub(crate) fn verify_package_bounded<R: Read + Seek>(
     request: &VerifyRequest,
     bounds: ContainerBounds,
 ) -> Result<BoundedVerified, BoundedVerifyError> {
+    let BoundedAuthenticated {
+        authenticated,
+        archive_offset,
+        archive_len,
+    } = authenticate_bounded(src, trust, bounds)?;
+    check_statements(&authenticated.manifest, request, Some(trust))
+        .map_err(BoundedVerifyError::Verify)?;
+    Ok(BoundedVerified {
+        manifest: authenticated.manifest,
+        archive_offset,
+        archive_len,
+    })
+}
+
+/// The first half of [`verify_package_bounded`]: the bounded container read
+/// and [`authenticate_manifest`], and no statement check.
+///
+/// It exists for the caller that learns the request from the authenticated
+/// manifest itself, and must run [`check_statements`] with that request
+/// before it trusts anything else the manifest says.
+///
+/// # Errors
+///
+/// As [`verify_package_bounded`], up to and including the typed parse.
+pub(crate) fn authenticate_bounded<R: Read + Seek>(
+    src: R,
+    trust: &TrustSet,
+    bounds: ContainerBounds,
+) -> Result<BoundedAuthenticated, BoundedVerifyError> {
     let container = payload::read_package_container_bounded(src, &ENVELOPE_BOUNDS, bounds)
         .map_err(|error| match error {
             BoundedContainerError::Payload(error) => BoundedVerifyError::Verify(error.into()),
@@ -1482,25 +1605,57 @@ pub(crate) fn verify_package_bounded<R: Read + Seek>(
             }
             BoundedContainerError::RetainedIo(error) => BoundedVerifyError::Io(error),
         })?;
-    let manifest = authenticate(&container, trust, request).map_err(BoundedVerifyError::Verify)?;
+    let authenticated =
+        authenticate_manifest(&container, trust).map_err(BoundedVerifyError::Verify)?;
     let (archive_offset, archive_len) = container.archive_block();
-    Ok(BoundedVerified {
-        manifest,
+    Ok(BoundedAuthenticated {
+        authenticated,
         archive_offset,
         archive_len,
     })
 }
 
 /// Steps 2 onwards of the order this module states, over a container whose
-/// blocks have been read: the signature over the raw manifest bytes, the
-/// version floor, the typed parse, then [`check_statements`].
+/// blocks have been read: [`authenticate_manifest`], then
+/// [`check_statements`].
 fn authenticate<R: Read + Seek>(
     container: &UnparsedContainer<R>,
     trust: &TrustSet,
     request: &VerifyRequest,
 ) -> Result<PayloadManifest, VerifyError> {
+    let Authenticated { manifest, .. } = authenticate_manifest(container, trust)?;
+
+    // 5-15. The statements the authenticated manifest makes.
+    check_statements(&manifest, request, Some(trust))?;
+
+    Ok(manifest)
+}
+
+/// A manifest past steps 2 to 4 of the order this module states — signature,
+/// format floor, typed parse — and before any statement check.
+#[derive(Debug)]
+pub(crate) struct Authenticated {
+    /// The parsed manifest.
+    pub(crate) manifest: PayloadManifest,
+    /// `key_id` of the anchor whose key verified the signature.
+    pub(crate) key_id: String,
+    /// SHA-256 of the raw manifest block, exactly as it was read and verified.
+    pub(crate) manifest_sha256: [u8; 32],
+}
+
+/// Steps 2 to 4 of the order this module states, over a container whose blocks
+/// have been read: the signature over the raw manifest bytes, the version
+/// floor, the typed parse.
+///
+/// **An `Ok` decides nothing about the statements the manifest makes**: a
+/// caller runs [`check_statements`] over the result before it relies on any
+/// of them.
+pub(crate) fn authenticate_manifest<R: Read + Seek>(
+    container: &UnparsedContainer<R>,
+    trust: &TrustSet,
+) -> Result<Authenticated, VerifyError> {
     // 2. Authenticate the raw manifest bytes before anything parses them.
-    verify_signature(container, trust)?;
+    let key_id = verify_signature(container, trust)?.to_string();
 
     // 3. The version question, decided from stage one alone — before the body
     //    is decoded, so a manifest this build cannot make sense of is refused
@@ -1520,10 +1675,11 @@ fn authenticate<R: Read + Seek>(
     )
     .map_err(map_manifest_error)?;
 
-    // 5-15. The statements the authenticated manifest makes.
-    check_statements(&manifest, request, Some(trust))?;
-
-    Ok(manifest)
+    Ok(Authenticated {
+        manifest,
+        key_id,
+        manifest_sha256: Sha256::digest(container.raw_manifest_block()).into(),
+    })
 }
 
 /// Runs the post-parse statement checks — steps 5 through 15 — as one unit,
@@ -1658,10 +1814,13 @@ fn usable_hint(block: &EnvelopeBlock) -> Option<&str> {
 /// going to be rejected regardless — which of two names the rejection carries.
 /// It can never change accept into reject: every non-revoked anchor is tried
 /// whatever the hint says.
-fn verify_signature<R: Read + Seek>(
+///
+/// On acceptance it returns the `key_id` of the anchor that verified, which is
+/// that anchor's and never the hint's.
+fn verify_signature<'t, R: Read + Seek>(
     container: &UnparsedContainer<R>,
-    trust: &TrustSet,
-) -> Result<(), VerifyError> {
+    trust: &'t TrustSet,
+) -> Result<&'t str, VerifyError> {
     let signature = match container.signature() {
         // An unsigned package is one this verifier cannot authenticate and
         // there is nothing to fall back to, so it is refused here.
@@ -1688,7 +1847,7 @@ fn verify_signature<R: Read + Seek>(
             .find(|anchor| !anchor.revoked && anchor.key_id == hint)
         && verifies(anchor)
     {
-        return Ok(());
+        return Ok(&anchor.key_id);
     }
 
     // 2. Otherwise, or if that failed, every other non-revoked anchor. Any one
@@ -1697,7 +1856,7 @@ fn verify_signature<R: Read + Seek>(
     //    keeps the fallback a single unconditional loop.
     for anchor in trust.anchors.iter().filter(|anchor| !anchor.revoked) {
         if verifies(anchor) {
-            return Ok(());
+            return Ok(&anchor.key_id);
         }
     }
 
@@ -5259,6 +5418,67 @@ mod tests {
                 check_statements(&parse(&manifest), &namespaced(), None),
                 Err(VerifyError::Image(_))
             ));
+        }
+    }
+
+    mod trust_set_queries {
+        use super::{InputError, TrustAnchor, TrustSet};
+        use crate::trust_fixture::{keypair, public_key_of};
+        use crate::verify::UploadRequest;
+
+        fn triple(component: &str, version: &str, commit: &str) -> (String, String, String) {
+            (
+                component.to_string(),
+                version.to_string(),
+                commit.to_string(),
+            )
+        }
+
+        #[test]
+        fn is_withdrawn_answers_from_the_sets_own_list_on_the_exact_triple() {
+            let trust = TrustSet::new(
+                vec![TrustAnchor::new(public_key_of(&keypair()), false)],
+                vec![
+                    triple("example", "1.0.0", "abc"),
+                    triple("other", "2.0.0", "def"),
+                ],
+                0,
+                7,
+            )
+            .expect("a trust set");
+            assert!(trust.is_withdrawn("example", "1.0.0", "abc"));
+            assert!(trust.is_withdrawn("other", "2.0.0", "def"));
+            // Any one part differing is not withdrawn, and neither is a mix of
+            // two listed triples.
+            assert!(!trust.is_withdrawn("examplf", "1.0.0", "abc"));
+            assert!(!trust.is_withdrawn("example", "1.0.1", "abc"));
+            assert!(!trust.is_withdrawn("example", "1.0.0", "abd"));
+            assert!(!trust.is_withdrawn("example", "2.0.0", "def"));
+            assert!(!trust.is_withdrawn("", "", ""));
+        }
+
+        #[test]
+        fn epoch_is_the_constructor_argument() {
+            for epoch in [0, 1, 4711, u64::MAX] {
+                let trust = TrustSet::new(Vec::new(), Vec::new(), 0, epoch).expect("a trust set");
+                assert_eq!(trust.epoch(), epoch);
+            }
+        }
+
+        #[test]
+        fn an_upload_request_holds_a_valid_namespace_and_refuses_any_other() {
+            let request = UploadRequest::new("clumit-security").expect("a valid namespace");
+            assert_eq!(request.namespace(), "clumit-security");
+            for namespace in ["", "a/b", "..", "UPPER", "with space"] {
+                assert!(
+                    matches!(
+                        UploadRequest::new(namespace),
+                        Err(InputError::InvalidNamespace { namespace: refused })
+                            if refused == namespace
+                    ),
+                    "{namespace:?} is refused"
+                );
+            }
         }
     }
 }

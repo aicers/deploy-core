@@ -44,6 +44,18 @@
 //! handle or callback escapes before every step has passed, and on failure
 //! every snapshot the call made and its private directory are released.
 //!
+//! # Upload verification
+//!
+//! A hop that receives packages knows only the namespace it deploys under
+//! before it reads one. [`verify_upload`] runs the same pipeline with the
+//! build and architecture taken from the manifest's first artifact entry once
+//! the signature over that manifest has verified — the statement checks and
+//! everything after them then hold every other entry to that build and
+//! architecture — and returns a [`VerifiedUpload`]: metadata only, with every
+//! retained byte released before it returns. Its disk budget is
+//! [`upload_staging_bound`] of the package's length, a number a caller can
+//! compute and reserve before the call.
+//!
 //! # Immutability and its boundary
 //!
 //! Validated content has to be read from bytes nothing outside this library
@@ -169,11 +181,12 @@ mod prepare;
 mod prepare_fixture;
 mod reopen;
 mod source;
+mod upload;
 
 pub use binding::{BindingField, PreparationBinding, RecordFault};
 pub use contents::{
-    ContentError, IoOperation, VerifiedArtifact, VerifiedContents, VerifiedImage, VerifiedImageSet,
-    VerifiedImages, verify_contents,
+    ContentError, IoOperation, UploadRefusal, VerifiedArtifact, VerifiedContents, VerifiedImage,
+    VerifiedImageSet, VerifiedImages, verify_contents,
 };
 pub use finalize::{FinalizedPackage, finalize_package, prepare_sign_finalize};
 pub use prepare::{
@@ -182,6 +195,7 @@ pub use prepare::{
 };
 pub use reopen::reopen_prepared;
 pub(crate) use source::RetainedIoFault;
+pub use upload::{VerifiedUpload, upload_staging_bound, verify_upload};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;

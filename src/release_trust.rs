@@ -117,14 +117,20 @@
 //! The two disagree on exactly the trees whose `active` is not a canonical
 //! symlink, and neither is wrong. They are separate functions so they cannot
 //! drift back together.
+//!
+//! [`generation_trust_set`] asks neither question: it never looks at `active`,
+//! and reads the one `gen-<n>` its caller names. A caller that resolves `active`
+//! once itself, decoding the target with [`parse_generation_name`], reads through
+//! it exactly the generation it resolved, however `active` moves in between.
 
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use crate::generation::{
     GenerationError, GenerationFile, GenerationTree, activate_generation, active_link,
-    parse_generation,
+    generation_dir, parse_generation,
 };
 use crate::layout::{JOIN_GENERATION_FILE, REQUIRE_TRUST_PIN_MARKER};
 use crate::payload;
@@ -615,11 +621,6 @@ fn active_epoch_record(root: &Path) -> PathBuf {
     active_link(root).join(EPOCH_RECORD_FILE)
 }
 
-/// The `trust-set.json` of the generation `active` resolves to.
-fn active_document(root: &Path) -> PathBuf {
-    active_link(root).join(TRUST_SET_MEMBER)
-}
-
 /// The delivered container of the generation `active` resolves to.
 fn active_package(root: &Path) -> PathBuf {
     active_link(root).join(GENERATION_PACKAGE_FILE)
@@ -632,7 +633,7 @@ fn active_package(root: &Path) -> PathBuf {
 /// call the namespace-based
 /// [`Layout::require_pin_marker`](crate::layout::Layout::require_pin_marker). The
 /// basename is spelled in that constant alone; this joins it, exactly as
-/// [`active_document`] joins its own.
+/// [`active_package`] joins its own.
 fn require_pin_marker(root: &Path) -> PathBuf {
     root.join(REQUIRE_TRUST_PIN_MARKER)
 }
@@ -777,8 +778,55 @@ pub fn active_trust_set(root: &Path) -> Result<TrustSet, ReleaseTrustError> {
     Ok(read_active_generation(root)?.trust)
 }
 
-/// Everything the active generation's two material reads yield, held together
-/// so nothing re-reads them.
+/// Turns generation `generation` of the release-trust tree into the injected
+/// [`TrustSet`] the package verifier takes, whichever generation `active`
+/// names.
+///
+/// `root` is the tree
+/// [`Layout::release_trust_dir`](crate::layout::Layout::release_trust_dir)
+/// resolves, and `generation` is the local `gen-<n>` directory index — not the
+/// epoch. It reads `trust-set.json` and `epoch` from `gen-<generation>/` only,
+/// with the same refusing reader, epoch-record grammar, epoch-agreement check
+/// and assembly as [`active_trust_set`], and never reads, stats or resolves
+/// `active`. A caller that resolves `active` itself, once, and decodes its
+/// target with [`parse_generation_name`] reads the one generation it resolved
+/// through this, so an activation in between cannot pair two generations.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::Io`] when either file cannot be read — with a
+/// source of kind [`NotFound`](std::io::ErrorKind::NotFound) when the
+/// generation directory or one of its files is missing, which is how a pruned
+/// generation reads — and otherwise exactly the refusals [`active_trust_set`]
+/// documents for a malformed record or document and for an epoch
+/// disagreement.
+pub fn generation_trust_set(root: &Path, generation: u64) -> Result<TrustSet, ReleaseTrustError> {
+    let dir = generation_dir(root, generation);
+    let path = dir.join(EPOCH_RECORD_FILE);
+    let record = std::fs::read(&path).map_err(|e| ReleaseTrustError::io(&path, e))?;
+    let epoch = parse_epoch_record(&record)?;
+    Ok(read_generation_material(&dir, epoch)?.trust)
+}
+
+/// Returns the generation index a release-trust tree entry's name spells, or
+/// `None` when it is not a generation directory's name.
+///
+/// This is the generation engine's own canonical-spelling rule: `gen-1` is
+/// `Some(1)`, while `gen-01`, `gen-+1`, `gen-1.tmp`, `gen-` and `active` are
+/// `None`, since the engine never writes them. `name` is one entry name, such
+/// as the target the engine writes into `active`; anything with more than one
+/// path component is `None`.
+#[must_use]
+pub fn parse_generation_name(name: &OsStr) -> Option<u64> {
+    let path = Path::new(name);
+    if path.file_name() != Some(name) {
+        return None;
+    }
+    parse_generation(path)
+}
+
+/// Everything one generation's two material reads yield, held together so
+/// nothing re-reads them.
 ///
 /// [`active_trust_set`] wants the [`TrustSet`] alone; the runtime accept path
 /// wants the document and the epoch as well, to answer a byte-identical
@@ -816,8 +864,26 @@ struct ActiveGenerationMaterial {
 /// [`ReleaseTrustError::Input`] and [`ReleaseTrustError::Io`].
 fn read_active_generation(root: &Path) -> Result<ActiveGenerationMaterial, ReleaseTrustError> {
     let epoch = read_active_epoch(root)?.ok_or(ReleaseTrustError::NoActiveGeneration)?;
+    read_generation_material(&active_link(root), epoch)
+}
 
-    let path = active_document(root);
+/// Reads the `trust-set.json` in `dir`, one generation's directory, through the
+/// refusing reader, holds it to `epoch` — the record already read from the same
+/// directory — and assembles the [`TrustSet`].
+///
+/// The one body behind [`read_active_generation`], which reaches `dir` through
+/// `active`, and [`generation_trust_set`], which names `gen-<n>` directly.
+///
+/// # Errors
+///
+/// Returns [`ReleaseTrustError::Io`] when the document cannot be read,
+/// [`ReleaseTrustError::Document`], [`ReleaseTrustError::EpochDisagreement`],
+/// [`ReleaseTrustError::MalformedAnchorKey`] and [`ReleaseTrustError::Input`].
+fn read_generation_material(
+    dir: &Path,
+    epoch: u64,
+) -> Result<ActiveGenerationMaterial, ReleaseTrustError> {
+    let path = dir.join(TRUST_SET_MEMBER);
     let member = std::fs::read(&path).map_err(|e| ReleaseTrustError::io(&path, e))?;
     let document = read_trust_set_document(&member)?;
     check_epoch_agreement(epoch, &document)?;
@@ -2081,9 +2147,10 @@ mod tests {
         ActiveGeneration, EPOCH_RECORD_FILE, GENERATION_PACKAGE_FILE, MATERIAL_SET_TARGET,
         REPLACE_GENERATION_CALLS, RebootstrapAuthorization, ReleaseTrustError, accept_generation,
         accept_generation_chain, active_package, active_trust_set, admit, admit_seed_generation,
-        bootstrap_from_join_material, classify_pin_marker, install_generation,
-        join_generation_file, material, read_active_epoch, read_generation_state,
-        rebootstrap_generation, replace_generation, require_pin_marker, verify_self_admitted,
+        bootstrap_from_join_material, classify_pin_marker, generation_trust_set,
+        install_generation, join_generation_file, material, parse_generation_name,
+        read_active_epoch, read_generation_state, rebootstrap_generation, replace_generation,
+        require_pin_marker, verify_self_admitted,
     };
     use crate::generation::{GenerationError, SYSTEMCTL_CALLS, active_link, generation_dir};
     use crate::layout::{ACTIVE_LINK, JOIN_GENERATION_FILE, Layout, REQUIRE_TRUST_PIN_MARKER};
@@ -2096,7 +2163,9 @@ mod tests {
     use crate::trust_set::{
         TRUST_SET_MEMBER, TrustSetDocumentError, member_digest, read_trust_set_document,
     };
-    use crate::verify::{TRUST_TARGET, VerifyError, VerifyRequest, key_id, verify_package};
+    use crate::verify::{
+        TRUST_TARGET, TrustSet, VerifyError, VerifyRequest, key_id, verify_package,
+    };
 
     /// A release epoch far from any generation index, so a test asserting
     /// `gen-1` cannot pass by conflating the two.
@@ -5324,5 +5393,226 @@ mod tests {
         let admitted = bootstrap_from_join_material(&t.root, None).expect("the first generation");
         assert_eq!(admitted.epoch, 1);
         assert_eq!(read_active_epoch(&t.root).expect("read"), Some(1));
+    }
+
+    // Reading one generation by number.
+
+    /// Copies every file of `gen-<generation>` into a fresh directory outside the
+    /// tree, so a test can put it back after a prune.
+    fn save_generation(root: &Path, generation: u64) -> TempDir {
+        let saved = TempDir::new().expect("tempdir");
+        for name in entries(&generation_dir(root, generation)) {
+            std::fs::copy(
+                generation_dir(root, generation).join(&name),
+                saved.path().join(&name),
+            )
+            .expect("copy a material file");
+        }
+        saved
+    }
+
+    /// Puts a saved generation back at `gen-<generation>`.
+    fn restore_generation(root: &Path, generation: u64, saved: &Path) {
+        let dir = generation_dir(root, generation);
+        std::fs::create_dir(&dir).expect("generation dir");
+        for name in entries(saved) {
+            std::fs::copy(saved.join(&name), dir.join(&name)).expect("restore a material file");
+        }
+    }
+
+    /// Repoints `active` at `gen-<generation>` by hand.
+    fn point_active_at(root: &Path, generation: u64) {
+        std::fs::remove_file(active_link(root)).expect("remove active");
+        std::os::unix::fs::symlink(generation_name(root, generation), active_link(root))
+            .expect("active symlink");
+    }
+
+    #[track_caller]
+    fn assert_not_found(error: &ReleaseTrustError) {
+        assert!(
+            matches!(
+                error,
+                ReleaseTrustError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+            ),
+            "expected a NotFound I/O refusal, got {error:?}"
+        );
+    }
+
+    /// A two-generation tree: `gen-1` seeded at [`SEED_EPOCH`] with nothing
+    /// withdrawn, `gen-2` replacing it at [`NEXT_EPOCH`] under another key and
+    /// withdrawing one build, and `gen-1` put back after the replace pruned it —
+    /// the state a reader sees between an activation and its prune.
+    struct TwoGenerations {
+        tree: Tree,
+        first: Ed25519KeyPair,
+        second: Ed25519KeyPair,
+    }
+
+    const WITHDRAWN: (&str, &str) = ("example", "1.0.0");
+
+    fn two_generations() -> TwoGenerations {
+        let t = tree();
+        let first = keypair();
+        let second = keypair();
+        admit_seed_generation(&t.root, &Generation::new(&first, SEED_EPOCH).package).expect("seed");
+        let saved = save_generation(&t.root, 1);
+        let next = Generation::from_fields(
+            &second,
+            &Fields {
+                epoch: Some(NEXT_EPOCH.to_string()),
+                withdrawn_builds: Some(array(&[withdrawn_json(
+                    WITHDRAWN.0,
+                    WITHDRAWN.1,
+                    STRANGER_COMMIT,
+                )])),
+                ..Fields::new(&second)
+            },
+            NEXT_EPOCH,
+        );
+        replace_generation(&t.root, &next.package).expect("replace");
+        assert_active_is(&t.root, 2);
+        assert_not_found(
+            &generation_trust_set(&t.root, 1).expect_err("the replace pruned the seed"),
+        );
+        restore_generation(&t.root, 1, saved.path());
+        TwoGenerations {
+            tree: t,
+            first,
+            second,
+        }
+    }
+
+    #[track_caller]
+    fn assert_generation(trust: &TrustSet, epoch: u64, signer: &Ed25519KeyPair, withdrawn: bool) {
+        assert_eq!(trust.epoch(), epoch);
+        let ids: Vec<&str> = trust
+            .anchors()
+            .iter()
+            .map(crate::verify::TrustAnchor::key_id)
+            .collect();
+        assert_eq!(ids, [key_id(&public_key_of(signer)).as_str()]);
+        assert_eq!(
+            trust.is_withdrawn(WITHDRAWN.0, WITHDRAWN.1, STRANGER_COMMIT),
+            withdrawn
+        );
+    }
+
+    #[test]
+    fn each_generation_reads_by_number_whichever_one_active_names() {
+        let g = two_generations();
+        let root = &g.tree.root;
+        for active in [2, 1] {
+            point_active_at(root, active);
+            let one = generation_trust_set(root, 1).expect("gen-1 reads");
+            assert_generation(&one, SEED_EPOCH, &g.first, false);
+            let two = generation_trust_set(root, 2).expect("gen-2 reads");
+            assert_generation(&two, NEXT_EPOCH, &g.second, true);
+
+            let by_active = active_trust_set(root).expect("the active generation");
+            let by_number = if active == 1 { &one } else { &two };
+            assert_eq!(format!("{by_number:?}"), format!("{by_active:?}"));
+        }
+    }
+
+    #[test]
+    fn a_generation_is_read_without_ever_touching_active() {
+        let g = two_generations();
+        let root = &g.tree.root;
+        // `active` gone altogether, then dangling: the numbered read does not
+        // notice either.
+        std::fs::remove_file(active_link(root)).expect("remove active");
+        assert_generation(
+            &generation_trust_set(root, 2).expect("gen-2 reads"),
+            NEXT_EPOCH,
+            &g.second,
+            true,
+        );
+        std::os::unix::fs::symlink("gen-nowhere", active_link(root)).expect("a dangling active");
+        assert_generation(
+            &generation_trust_set(root, 1).expect("gen-1 reads"),
+            SEED_EPOCH,
+            &g.first,
+            false,
+        );
+    }
+
+    #[test]
+    fn a_missing_generation_or_material_file_is_not_found() {
+        let g = two_generations();
+        let root = &g.tree.root;
+        assert_not_found(&generation_trust_set(root, 3).expect_err("never written"));
+
+        std::fs::remove_file(generation_dir(root, 1).join(TRUST_SET_MEMBER)).expect("remove");
+        assert_not_found(&generation_trust_set(root, 1).expect_err("the document is gone"));
+
+        std::fs::remove_file(generation_dir(root, 2).join(EPOCH_RECORD_FILE)).expect("remove");
+        assert_not_found(&generation_trust_set(root, 2).expect_err("the record is gone"));
+
+        std::fs::remove_dir_all(generation_dir(root, 1)).expect("prune by hand");
+        assert_not_found(&generation_trust_set(root, 1).expect_err("the generation is gone"));
+    }
+
+    /// Every corruption `active_trust_set` refuses in its active generation, the
+    /// numbered read refuses identically in any generation.
+    #[test]
+    fn a_corrupt_generation_is_refused_as_the_active_reader_refuses_it() {
+        let corruptions: [(&str, &[u8]); 5] = [
+            (EPOCH_RECORD_FILE, b"4712\n"),
+            (EPOCH_RECORD_FILE, b"04711\n"),
+            (EPOCH_RECORD_FILE, b"4711"),
+            (TRUST_SET_MEMBER, br#"{"trust_set_version":"1"}"#),
+            (TRUST_SET_MEMBER, b"not json"),
+        ];
+        for (file, bytes) in corruptions {
+            let t = tree();
+            let pair = keypair();
+            admit_seed_generation(&t.root, &Generation::new(&pair, SEED_EPOCH).package)
+                .expect("seed");
+            std::fs::write(generation_dir(&t.root, 1).join(file), bytes).expect("corrupt");
+
+            let by_number = generation_trust_set(&t.root, 1).expect_err("refused by number");
+            let by_active = active_trust_set(&t.root).expect_err("refused through active");
+            assert_eq!(
+                format!("{by_number:?}"),
+                format!("{by_active:?}"),
+                "{file} holding {bytes:?}"
+            );
+            assert!(!matches!(by_number, ReleaseTrustError::Io { .. }));
+        }
+    }
+
+    #[test]
+    fn a_generation_name_parses_exactly_as_the_engine_spells_it() {
+        for (name, expected) in [
+            ("gen-1", Some(1)),
+            ("gen-42", Some(42)),
+            ("gen-0", Some(0)),
+            ("gen-18446744073709551615", Some(u64::MAX)),
+            ("gen-01", None),
+            ("gen-+1", None),
+            ("gen-1.tmp", None),
+            ("gen-", None),
+            ("active", None),
+            ("gen-retention.tmp", None),
+            ("gen-18446744073709551616", None),
+            ("gen--1", None),
+            ("gen-1 ", None),
+            ("x/gen-1", None),
+            ("gen-1/", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                parse_generation_name(std::ffi::OsStr::new(name)),
+                expected,
+                "{name:?}"
+            );
+        }
+        // Every name the engine writes round-trips.
+        for generation in [1, 2, 9, 10, 4711] {
+            assert_eq!(
+                parse_generation_name(&generation_name(Path::new("/"), generation)),
+                Some(generation)
+            );
+        }
     }
 }

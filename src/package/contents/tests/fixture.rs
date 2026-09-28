@@ -72,9 +72,44 @@ impl Signer {
         container(manifest, archive, &signature, &self.hint())
     }
 
+    /// Assembles a signed `.pkg` whose `key_id` block holds `hint` verbatim.
+    pub(crate) fn container_hinted(&self, manifest: &[u8], archive: &[u8], hint: &str) -> Vec<u8> {
+        let signature = self.pair.sign(manifest);
+        container(manifest, archive, signature.as_ref(), hint)
+    }
+
+    /// This signer's anchor, revoked or not.
+    pub(crate) fn anchor(&self, revoked: bool) -> TrustAnchor {
+        TrustAnchor::new(public_key_of(&self.pair), revoked)
+    }
+
+    /// The `key_id` of this signer's anchor.
+    pub(crate) fn key_id(&self) -> String {
+        self.hint()
+    }
+
     fn hint(&self) -> String {
         key_id(&public_key_of(&self.pair))
     }
+}
+
+/// Assembles a `.pkg` carrying no signature block and no `key_id` block: the
+/// footer records the absent pair for both.
+pub(crate) fn unsigned(manifest: &[u8], archive: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(manifest);
+    out.extend_from_slice(archive);
+    out.extend_from_slice(&footer([
+        0,
+        len_u64(manifest),
+        len_u64(manifest),
+        len_u64(archive),
+        0,
+        0,
+        0,
+        0,
+    ]));
+    out
 }
 
 fn len_u64(bytes: &[u8]) -> u64 {
