@@ -63,7 +63,13 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   `verify_contents` pipeline over it under the caller's own trust, returning
   the `FinalizedPackage` that direct installation and store publication both
   consume. `prepare_sign_finalize` composes the three steps with one signing
-  callback, validating identically.
+  callback, validating identically. An upload hop, which knows only its
+  deployment namespace in advance, uses `verify_upload`: the same pipeline
+  with the build and architecture taken from the manifest's first artifact
+  entry once its signature has verified, returning metadata only — the
+  authenticated manifest, the derived build, the verifying anchor's `key_id`
+  and the manifest and package digests — under a disk budget,
+  `upload_staging_bound`, a caller can compute and reserve before the call.
 - **trust_set** — the generation document that verifier's injected material is
   delivered as, and the reader that refuses a malformed one rather than
   repairing it: a version gate, a structural decode that admits no unknown
@@ -74,7 +80,10 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   generation is the delivered container, the verified member and a one-integer
   `epoch` record finalised together. It exports the epoch reader, the one
   constructor that turns the active generation back into **verify**'s injected
-  trust set, and the two install-time admission doors — a seed that refuses a
+  trust set, its counterpart that reads one generation by number without
+  touching `active` — for a caller that resolves `active` once itself and
+  decodes the target with `parse_generation_name` — and the two install-time
+  admission doors — a seed that refuses a
   tree already carrying a generation and an operator-mediated replace that does
   not — which verify a delivered container against the trust set it carries
   before the tree's one crate-internal installer stages it. Separately it
