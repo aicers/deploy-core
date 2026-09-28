@@ -117,6 +117,11 @@
 //! The two disagree on exactly the trees whose `active` is not a canonical
 //! symlink, and neither is wrong. They are separate functions so they cannot
 //! drift back together.
+//!
+//! [`generation_trust_set`] asks neither question: it never looks at `active`,
+//! and reads the one `gen-<n>` its caller names. A caller that resolves `active`
+//! once itself, decoding the target with [`parse_generation_name`], reads through
+//! it exactly the generation it resolved, however `active` moves in between.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;

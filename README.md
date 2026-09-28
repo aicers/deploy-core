@@ -83,10 +83,10 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   trust set, its counterpart that reads one generation by number without
   touching `active` — for a caller that resolves `active` once itself and
   decodes the target with `parse_generation_name` — and the two install-time
-  admission doors — a seed that refuses a
-  tree already carrying a generation and an operator-mediated replace that does
-  not — which verify a delivered container against the trust set it carries
-  before the tree's one crate-internal installer stages it. Separately it
+  admission doors — a seed that refuses a tree already carrying a generation
+  and an operator-mediated replace that does not — which verify a delivered
+  container against the trust set it carries before the tree's one
+  crate-internal installer stages it. Separately it
   exports the runtime accept path the control plane pushes over, which judges a
   delivered generation against the **active** one's trust set and applies the
   `epoch` floor: the state query a caller asks before it pushes, the accept for
