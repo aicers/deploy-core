@@ -9734,8 +9734,12 @@ done
             /// directory and the process group the command gets.
             ///
             /// Needs root, `sudo`, and a `nobody` account that root may run
-            /// as, with its group; CI runs none of that. Run it as
-            /// `cargo test -- --ignored descent_through_the_real_sudo`.
+            /// as, with its group; CI runs none of that. It also needs no
+            /// controlling terminal, as in the systemd service the caller
+            /// runs in: under one, `sudo` with `use_pty` — Debian's and
+            /// Ubuntu's default — moves the command into a session of its
+            /// own. From a terminal, run it as
+            /// `setsid -w cargo test -- --ignored descent_through_the_real_sudo`.
             #[cfg(target_os = "linux")]
             #[test]
             #[ignore = "runs the real sudo as root to a real account"]
@@ -9746,6 +9750,10 @@ done
                 assert!(
                     rustix::process::geteuid().is_root(),
                     "this test runs `sudo` as root"
+                );
+                assert!(
+                    std::fs::File::open("/dev/tty").is_err(),
+                    "this test runs without a controlling terminal; start it under `setsid -w`"
                 );
                 let id = |flag: &str| {
                     let out = Command::new("/usr/bin/id")
