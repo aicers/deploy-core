@@ -2305,12 +2305,30 @@ fn sudo_sentinel_script() -> String {
 /// `cd`'s own diagnostic is discarded: it would echo `<cwd>`, and a path that
 /// contains the sentinel would then announce a start that never happened.
 /// Nothing the script writes before its fixed words derives from the caller.
+///
+/// Nor does the script's text contain either word it prints, since `sudo`
+/// repeats the command line — this script among it — when sudoers denies it,
+/// and a denial must not read as a start or a missing directory. Each word is
+/// printed from two halves; [`check_descent`] keeps the caller's words from
+/// holding one.
 fn descent_script() -> String {
     format!(
-        "cd -- \"$1\" 2>/dev/null || {{ printf '%s' '{NO_WORKING_DIRECTORY_MARKER}' >&2; exit 1; }}; \
-         shift; printf '%s' '{SUDO_OK_SENTINEL}' >&2; exec {env} -i \"$@\"",
+        "cd -- \"$1\" 2>/dev/null || {{ {no_directory}; exit 1; }}; \
+         shift; {started}; exec {env} -i \"$@\"",
+        no_directory = print_split(NO_WORKING_DIRECTORY_MARKER),
+        started = print_split(SUDO_OK_SENTINEL),
         env = bounded::ENV,
     )
+}
+
+/// A shell command printing `word` on standard error from two halves, so the
+/// command's own text never contains `word`.
+///
+/// Only called with this module's ASCII markers, so the midpoint is a
+/// character boundary.
+fn print_split(word: &str) -> String {
+    let (head, tail) = word.split_at(word.len() / 2);
+    format!("printf '%s%s' '{head}' '{tail}' >&2")
 }
 
 /// Removes the first [`SUDO_OK_SENTINEL`] from `stderr`, reporting whether it was
@@ -3350,19 +3368,33 @@ pub struct DescentProfile<'a> {
 /// this error.
 #[derive(Debug, thiserror::Error)]
 pub enum DescentError {
-    /// `command` is not an absolute path, or contains `=`.
+    /// `command` is not an absolute path, contains `=`, or holds a word the
+    /// descent reports its outcome with.
     ///
     /// The command runs with only the profile's environment, and is started
     /// through `env -i`, which reads an operand containing `=` as an
-    /// assignment rather than the utility.
-    #[error("command `{command}` is not an absolute path free of `=`")]
+    /// assignment rather than the utility. The outcome words are reserved
+    /// because `sudo` repeats the command line when sudoers denies it, and a
+    /// denial repeating one would read as a start or a missing directory.
+    #[error(
+        "command `{command}` is not an absolute path free of `=` and of the descent's outcome words"
+    )]
     InvalidCommand {
         /// The command as the caller named it.
         command: String,
     },
+    /// An argument of the command holds a word the descent reports its
+    /// outcome with, which `sudo` would repeat were sudoers to deny the
+    /// descent, making the denial read as a start or a missing directory.
+    #[error("argument {index} holds a word the descent reports its outcome with")]
+    InvalidArgument {
+        /// The argument's position in `args`, from `0`.
+        index: usize,
+    },
     /// An entry of [`DescentProfile::env`] was refused: its name is not
-    /// `[A-Za-z_][A-Za-z0-9_]*`, it is given twice, or its value contains a
-    /// NUL byte. The value is never carried.
+    /// `[A-Za-z_][A-Za-z0-9_]*`, it is given twice, its value contains a
+    /// NUL byte, or its name or value holds a word the descent reports its
+    /// outcome with. The value is never carried.
     #[error("environment variable `{name}` {reason}")]
     InvalidEnvironment {
         /// The variable's name.
@@ -3370,8 +3402,9 @@ pub enum DescentError {
         /// Why it was refused.
         reason: &'static str,
     },
-    /// [`DescentProfile::cwd`] is not absolute, or contains a NUL byte.
-    #[error("working directory `{}` is not an absolute path free of NUL", cwd.display())]
+    /// [`DescentProfile::cwd`] is not absolute, contains a NUL byte, or holds
+    /// a word the descent reports its outcome with.
+    #[error("working directory `{}` is not an absolute path free of NUL and of the descent's outcome words", cwd.display())]
     InvalidWorkingDirectory {
         /// The directory as the caller named it.
         cwd: PathBuf,
@@ -3418,11 +3451,25 @@ pub enum DescentSettle {
 
 /// Refuses a descent [`InDaemonExecutor::descent_command`] cannot build as
 /// asked.
-fn check_descent(command: &str, profile: &DescentProfile<'_>) -> Result<(), DescentError> {
-    if !is_absolute_and_plain(command) {
+///
+/// Every word the caller supplies reaches `sudo`'s command line, which `sudo`
+/// repeats on standard error when sudoers denies it; none may therefore hold
+/// a word [`InDaemonExecutor::settle_descent`] reads as an outcome.
+fn check_descent(
+    command: &str,
+    args: &[&str],
+    profile: &DescentProfile<'_>,
+) -> Result<(), DescentError> {
+    if !is_absolute_and_plain(command) || holds_outcome_word(command.as_bytes()) {
         return Err(DescentError::InvalidCommand {
             command: command.to_string(),
         });
+    }
+    if let Some(index) = args
+        .iter()
+        .position(|arg| holds_outcome_word(arg.as_bytes()))
+    {
+        return Err(DescentError::InvalidArgument { index });
     }
     let mut seen = std::collections::HashSet::new();
     for &(name, value) in profile.env {
@@ -3439,14 +3486,26 @@ fn check_descent(command: &str, profile: &DescentProfile<'_>) -> Result<(), Desc
         if value.contains('\0') {
             return Err(refuse("has a value containing a NUL byte"));
         }
+        if holds_outcome_word(name.as_bytes()) || holds_outcome_word(value.as_bytes()) {
+            return Err(refuse("holds a word the descent reports its outcome with"));
+        }
     }
     let cwd = profile.cwd;
-    if !cwd.is_absolute() || cwd.as_os_str().as_encoded_bytes().contains(&0) {
+    let cwd_bytes = cwd.as_os_str().as_encoded_bytes();
+    if !cwd.is_absolute() || cwd_bytes.contains(&0) || holds_outcome_word(cwd_bytes) {
         return Err(DescentError::InvalidWorkingDirectory {
             cwd: cwd.to_path_buf(),
         });
     }
     Ok(())
+}
+
+/// Reports whether `word` holds [`SUDO_OK_SENTINEL`] or
+/// [`NO_WORKING_DIRECTORY_MARKER`].
+fn holds_outcome_word(word: &[u8]) -> bool {
+    [SUDO_OK_SENTINEL, NO_WORKING_DIRECTORY_MARKER]
+        .iter()
+        .any(|outcome| bounded::find(word, outcome.as_bytes()).is_some())
 }
 
 /// Reports whether `name` matches `[A-Za-z_][A-Za-z0-9_]*`, the portable form
@@ -3509,6 +3568,11 @@ impl InDaemonExecutor {
     /// whose name is malformed or repeated or whose value holds a NUL byte, and
     /// [`DescentError::InvalidWorkingDirectory`] when `profile.cwd` is relative
     /// or holds a NUL byte.
+    ///
+    /// `sudo` repeats its command line when sudoers denies it, so no word the
+    /// caller supplies may hold one of the two words the descent reports its
+    /// outcome with: a `command`, an argument ([`DescentError::InvalidArgument`]),
+    /// a profile entry or a `profile.cwd` holding one is refused as above.
     pub fn descent_command(
         &self,
         who: Descent,
@@ -3516,7 +3580,7 @@ impl InDaemonExecutor {
         args: &[&str],
         profile: &DescentProfile<'_>,
     ) -> Result<Command, DescentError> {
-        check_descent(command, profile)?;
+        check_descent(command, args, profile)?;
         let mut cmd = self.sudo_descent(who);
         cmd.arg(bounded::SUPERVISOR_SHELL)
             .arg("-c")
@@ -9081,7 +9145,7 @@ exec "$@"
             use super::super::super::{
                 CommandOutput, Descent, DescentError, DescentProfile, DescentSettle, Executor,
                 ExecutorError, Identity, InDaemonExecutor, NO_WORKING_DIRECTORY_MARKER,
-                OperatorIds, SUDO_OK_SENTINEL, ServiceAccount, classify_elevation,
+                OperatorIds, SUDO_OK_SENTINEL, ServiceAccount, classify_elevation, descent_script,
                 spawn_retrying_text_busy,
             };
             use super::write_script;
@@ -9159,6 +9223,20 @@ done
                     dir,
                     "refusing-sudo",
                     "#!/bin/sh\necho 'sudo: unknown user clumit-insight' >&2\nexit 1\n",
+                )
+            }
+
+            /// A `sudo` stub that denies the command as sudoers does, repeating
+            /// the command line it was asked to run.
+            fn denying_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "denying-sudo",
+                    &format!(
+                        "#!/bin/sh\n{SKIP_SUDO_FLAGS}\
+                         echo \"Sorry, user root is not allowed to execute '$*' as insight on mgmt.\" >&2\n\
+                         exit 1\n"
+                    ),
                 )
             }
 
@@ -9417,19 +9495,11 @@ done
                 let dir = tempfile::tempdir().expect("tempdir");
                 let exec = daemon(descending_sudo(dir.path()));
                 let marker = real(&dir).join("ran");
-                // The second names the start announcement, which a shell
-                // diagnostic echoing the path would forge.
-                let missing = [
-                    real(&dir).join("missing"),
-                    real(&dir).join(format!("missing-{SUDO_OK_SENTINEL}")),
-                ];
-                for (who, missing) in both_descents()
-                    .into_iter()
-                    .flat_map(|who| missing.iter().map(move |missing| (who, missing)))
-                {
+                let missing = real(&dir).join("missing");
+                for who in both_descents() {
                     let profile = DescentProfile {
                         env: PROFILE_ENV,
-                        cwd: missing,
+                        cwd: &missing,
                     };
                     let cmd = exec
                         .descent_command(
@@ -9582,6 +9652,38 @@ done
                 }
             }
 
+            #[test]
+            fn a_denial_repeating_the_command_line_settles_as_refused() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(denying_sudo(dir.path()));
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: Path::new("/"),
+                };
+                let script = descent_script();
+                for word in [SUDO_OK_SENTINEL, NO_WORKING_DIRECTORY_MARKER] {
+                    assert!(!script.contains(word), "the script names {word}");
+                }
+                for who in both_descents() {
+                    let cmd = exec
+                        .descent_command(who, "/bin/cat", &["-u"], &profile)
+                        .expect("a valid descent");
+                    let out = output(cmd);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    assert!(
+                        stderr.contains(&script) && stderr.contains("/bin/cat -u"),
+                        "{who:?}: the denial repeats the command line: {stderr}"
+                    );
+                    match exec.settle_descent(&out.stderr, true) {
+                        DescentSettle::Refused(ExecutorError::SudoRefused { host, reason }) => {
+                            assert_eq!(host, "mgmt");
+                            assert_eq!(reason, stderr.trim(), "{who:?}");
+                        }
+                        other => panic!("{who:?}: expected a refusal, got {other:?}"),
+                    }
+                }
+            }
+
             /// Asserts a refusal whose reason is the first
             /// [`TRANSPORT_STDERR_LIMIT`] bytes of a run of `x`.
             fn assert_refused_with_the_limit(settled: DescentSettle) {
@@ -9671,6 +9773,75 @@ done
                 }
                 let ids = OperatorIds::new(1000, 1001).expect("valid ids");
                 assert_eq!((ids.uid(), ids.gid()), (1000, 1001));
+            }
+
+            /// `sudo` repeats its command line when sudoers denies it, so a
+            /// caller's word holding an outcome word would make the denial
+            /// read as that outcome.
+            #[test]
+            fn a_word_holding_an_outcome_word_is_refused_before_building() {
+                const SECRET: &str = "s3cret-value";
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(descending_sudo(dir.path()));
+                let valid = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: Path::new("/"),
+                };
+                let who = Descent::Operator(operator());
+
+                for word in [SUDO_OK_SENTINEL, NO_WORKING_DIRECTORY_MARKER] {
+                    let command = format!("/opt/{word}/bin/cat");
+                    let error = exec
+                        .descent_command(who, &command, &[], &valid)
+                        .expect_err("a command holding an outcome word is refused");
+                    assert!(
+                        matches!(&error, DescentError::InvalidCommand { command: named } if *named == command),
+                        "{word}: got {error:?}"
+                    );
+
+                    let arg = format!("x{word}x");
+                    let error = exec
+                        .descent_command(who, "/bin/cat", &["-u", &arg], &valid)
+                        .expect_err("an argument holding an outcome word is refused");
+                    assert!(
+                        matches!(error, DescentError::InvalidArgument { index: 1 }),
+                        "{word}: got {error:?}"
+                    );
+
+                    let value = format!("{SECRET}{word}");
+                    for (env, name) in [
+                        ([(word, "x")], word),
+                        ([("VALUE", value.as_str())], "VALUE"),
+                    ] {
+                        let profile = DescentProfile {
+                            env: &env,
+                            cwd: Path::new("/"),
+                        };
+                        let error = exec
+                            .descent_command(who, "/bin/cat", &[], &profile)
+                            .expect_err("an entry holding an outcome word is refused");
+                        assert!(
+                            matches!(&error, DescentError::InvalidEnvironment { name: named, .. } if named == name),
+                            "{word}: got {error:?}"
+                        );
+                        for text in [error.to_string(), format!("{error:?}")] {
+                            assert!(!text.contains(SECRET), "{word}: a value leaked: {text}");
+                        }
+                    }
+
+                    let cwd = PathBuf::from(format!("/tmp/{word}"));
+                    let profile = DescentProfile {
+                        env: PROFILE_ENV,
+                        cwd: &cwd,
+                    };
+                    let error = exec
+                        .descent_command(who, "/bin/cat", &[], &profile)
+                        .expect_err("a directory holding an outcome word is refused");
+                    assert!(
+                        matches!(&error, DescentError::InvalidWorkingDirectory { cwd: named } if *named == cwd),
+                        "{word}: got {error:?}"
+                    );
+                }
             }
 
             /// `/proc/<pid>/stat`'s command name, parent pid and process group.
