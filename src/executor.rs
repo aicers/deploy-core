@@ -516,6 +516,13 @@ const RC_MARKER: &str = "__BOOTLER_RC__:";
 /// command that merely exited non-zero — even one whose own stderr mentions a
 /// password — rather than classifying by scanning combined stderr afterwards.
 const SUDO_OK_SENTINEL: &str = "__BOOTLER_SUDO_OK__";
+/// Marker the descent script prints on stderr, in place of
+/// [`SUDO_OK_SENTINEL`], when the target identity cannot enter the profile's
+/// working directory: `sudo` descended, but the command was never started.
+const NO_WORKING_DIRECTORY_MARKER: &str = "__BOOTLER_NO_WORKING_DIRECTORY__";
+/// The `$0` the descent script runs under, so a shell diagnostic — `cd`'s,
+/// above all — names what printed it.
+const DESCENT_ARG0: &str = "bootler-descent";
 
 /// Errors raised by an executor primitive.
 #[derive(Debug, thiserror::Error)]
@@ -2285,6 +2292,23 @@ fn sudo_sentinel_script() -> String {
     format!("printf '%s' '{SUDO_OK_SENTINEL}' >&2; exec \"$0\" \"$@\"")
 }
 
+/// The `sh -c` script [`InDaemonExecutor::descent_command`] descends through,
+/// run as the target identity.
+///
+/// Invoked as `sh -c SCRIPT <arg0> <cwd> <K=V>… <command> <args…>`: it enters
+/// `<cwd>` or prints [`NO_WORKING_DIRECTORY_MARKER`] and exits `1`, then
+/// announces the start with [`SUDO_OK_SENTINEL`] and replaces itself with
+/// `env -i`, which takes the `K=V` words as the whole environment and the first
+/// word without `=` as the utility. Every value is a positional word, never
+/// spliced into the script text.
+fn descent_script() -> String {
+    format!(
+        "cd -- \"$1\" || {{ printf '%s' '{NO_WORKING_DIRECTORY_MARKER}' >&2; exit 1; }}; \
+         shift; printf '%s' '{SUDO_OK_SENTINEL}' >&2; exec {env} -i \"$@\"",
+        env = bounded::ENV,
+    )
+}
+
 /// Removes the first [`SUDO_OK_SENTINEL`] from `stderr`, reporting whether it was
 /// present (i.e. whether `sudo` elevated and started the wrapped command).
 fn take_sudo_sentinel(stderr: &mut Vec<u8>) -> bool {
@@ -3077,6 +3101,12 @@ impl Executor for SshExecutor {
 ///
 /// It does not implement [`Executor::open_channel`]: that call returns the
 /// trait default's [`ChannelError::Unsupported`] here.
+///
+/// A root caller that spawns, bounds and kills its own children — and knows
+/// an operator's ids from a session it authenticated itself — builds its
+/// descents with [`InDaemonExecutor::descent_command`] instead, which applies
+/// an execution profile after `sudo` has selected the identity. That is not an
+/// [`Identity`], and does not change what [`Identity::Operator`] does here.
 #[derive(Debug, Clone)]
 pub struct InDaemonExecutor {
     host: String,
@@ -3138,17 +3168,35 @@ impl InDaemonExecutor {
                 Ok((cmd, false))
             }
             Identity::Service(account) => {
-                let mut cmd = Command::new(&self.sudo_bin);
-                cmd.arg("-u")
-                    .arg(account.as_str())
-                    .arg(shell)
-                    .arg("-c")
-                    .arg(script)
-                    .arg(command)
-                    .args(args);
+                let mut cmd = self.sudo_descent(Descent::Service(account));
+                cmd.arg(shell).arg("-c").arg(script).arg(command).args(args);
                 Ok((cmd, true))
             }
         }
+    }
+
+    /// Returns `sudo` with the words that select `who` and nothing after them:
+    /// the one site building a descent from root, for [`Executor::run`] and its
+    /// siblings on [`Identity::Service`] and for
+    /// [`InDaemonExecutor::descent_command`] alike.
+    ///
+    /// A service account is `-u <account>`, one word whatever it contains. An
+    /// operator is `-u #<uid> -g #<gid>`, the numeric forms `sudo` reads as ids
+    /// rather than names.
+    fn sudo_descent(&self, who: Descent) -> Command {
+        let mut cmd = Command::new(&self.sudo_bin);
+        match who {
+            Descent::Service(account) => {
+                cmd.arg("-u").arg(account.as_str());
+            }
+            Descent::Operator(ids) => {
+                cmd.arg("-u")
+                    .arg(format!("#{}", ids.uid))
+                    .arg("-g")
+                    .arg(format!("#{}", ids.gid));
+            }
+        }
+        cmd
     }
 
     /// Spawns a resolved invocation, feeding `payload` verbatim — there is no
@@ -3210,6 +3258,321 @@ impl InDaemonExecutor {
                 Ok(output)
             }
         })
+    }
+}
+
+/// Who a root process descends to through
+/// [`InDaemonExecutor::descent_command`].
+///
+/// Not an [`Identity`]: [`Identity::Root`] has no place here, because a root
+/// caller spawns its own root children, and [`Descent::Operator`] names an
+/// operator by the ids a session already authenticated, where
+/// [`Identity::Operator`] inside the daemon has none to name and refuses.
+///
+/// Like [`Identity`], it has no `FromStr`, `Deserialize` or `From` impl:
+/// a service account is still one of the closed [`ServiceAccount`] set, so a
+/// configured account name cannot become a descent (RFC 0003 §9.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Descent {
+    /// A bootler-managed service account, reached by `sudo -u <account>`
+    /// exactly as [`Identity::Service`] is inside the daemon.
+    Service(ServiceAccount),
+    /// An already-authenticated operator, reached by
+    /// `sudo -u #<uid> -g #<gid>` — never root.
+    Operator(OperatorIds),
+}
+
+/// An already-authenticated operator's numeric user and group ids.
+///
+/// Built only by [`OperatorIds::new`], which refuses the ids that would not
+/// descend: `0`, root's, and `u32::MAX`, `(uid_t)-1`, which the kernel reads
+/// as "leave unchanged". There is no `From<(u32, u32)>`, so every pair goes
+/// through that check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorIds {
+    uid: u32,
+    gid: u32,
+}
+
+impl OperatorIds {
+    /// Creates the ids of an operator whose session authenticated `uid` and
+    /// `gid`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescentError::InvalidOperator`] when either id is `0` or
+    /// `u32::MAX`.
+    pub fn new(uid: u32, gid: u32) -> Result<Self, DescentError> {
+        let descendable = |id: u32| id != 0 && id != u32::MAX;
+        if descendable(uid) && descendable(gid) {
+            Ok(Self { uid, gid })
+        } else {
+            Err(DescentError::InvalidOperator { uid, gid })
+        }
+    }
+
+    /// Returns the operator's user id.
+    #[must_use]
+    pub fn uid(self) -> u32 {
+        self.uid
+    }
+
+    /// Returns the operator's primary group id.
+    #[must_use]
+    pub fn gid(self) -> u32 {
+        self.gid
+    }
+}
+
+/// The execution profile [`InDaemonExecutor::descent_command`] applies to the
+/// command after `sudo` has selected the identity.
+///
+/// **No secret belongs in `env`.** Each pair travels as a `K=V` argument word
+/// of `sudo` and of the shell it starts, so it is readable in the process
+/// table by any local user until the command replaces them.
+#[derive(Clone, Copy)]
+pub struct DescentProfile<'a> {
+    /// The command's whole environment, as `(name, value)` pairs. Each name
+    /// matches `[A-Za-z_][A-Za-z0-9_]*` and appears once; no value contains
+    /// a NUL byte.
+    pub env: &'a [(&'a str, &'a str)],
+    /// The command's working directory: absolute, with no NUL byte.
+    pub cwd: &'a Path,
+}
+
+/// Errors raised building a descent, before anything is built.
+///
+/// No variant carries an environment value, so none can reach a log through
+/// this error.
+#[derive(Debug, thiserror::Error)]
+pub enum DescentError {
+    /// `command` is not an absolute path, or contains `=`.
+    ///
+    /// The command runs with only the profile's environment, and is started
+    /// through `env -i`, which reads an operand containing `=` as an
+    /// assignment rather than the utility.
+    #[error("command `{command}` is not an absolute path free of `=`")]
+    InvalidCommand {
+        /// The command as the caller named it.
+        command: String,
+    },
+    /// An entry of [`DescentProfile::env`] was refused: its name is not
+    /// `[A-Za-z_][A-Za-z0-9_]*`, it is given twice, or its value contains a
+    /// NUL byte. The value is never carried.
+    #[error("environment variable `{name}` {reason}")]
+    InvalidEnvironment {
+        /// The variable's name.
+        name: String,
+        /// Why it was refused.
+        reason: &'static str,
+    },
+    /// [`DescentProfile::cwd`] is not absolute, or contains a NUL byte.
+    #[error("working directory `{}` is not an absolute path free of NUL", cwd.display())]
+    InvalidWorkingDirectory {
+        /// The directory as the caller named it.
+        cwd: PathBuf,
+    },
+    /// An operator's uid or gid is `0` or `u32::MAX`.
+    #[error("operator uid {uid} and gid {gid} cannot be descended to: neither may be 0 or {max}", max = u32::MAX)]
+    InvalidOperator {
+        /// The uid given.
+        uid: u32,
+        /// The gid given.
+        gid: u32,
+    },
+}
+
+/// What [`InDaemonExecutor::settle_descent`] reads in the standard error a
+/// descent has written so far.
+#[derive(Debug)]
+pub enum DescentSettle {
+    /// Undecided: read more, and ask again.
+    Pending,
+    /// `sudo` descended and the command has been started in the profile's
+    /// directory. Standard error from `command_stderr_from` on is the
+    /// command's; everything before it is not.
+    Started {
+        /// The offset just past the start announcement.
+        command_stderr_from: usize,
+    },
+    /// `sudo` descended, but the target identity could not enter the
+    /// profile's working directory, so the command was never started.
+    NoWorkingDirectory {
+        /// What the shell wrote on failing to enter it, trimmed.
+        reason: String,
+    },
+    /// `sudo` refused before the command could start — or wrote more than
+    /// 64 KiB before announcing a start, which is treated the same way — with
+    /// the error [`Executor::run`] reports for that refusal. The caller kills
+    /// the child.
+    Refused(ExecutorError),
+}
+
+/// Refuses a descent [`InDaemonExecutor::descent_command`] cannot build as
+/// asked.
+fn check_descent(command: &str, profile: &DescentProfile<'_>) -> Result<(), DescentError> {
+    if !is_absolute_and_plain(command) {
+        return Err(DescentError::InvalidCommand {
+            command: command.to_string(),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for &(name, value) in profile.env {
+        let refuse = |reason| DescentError::InvalidEnvironment {
+            name: name.to_string(),
+            reason,
+        };
+        if !is_env_name(name) {
+            return Err(refuse("is not a name of the form [A-Za-z_][A-Za-z0-9_]*"));
+        }
+        if !seen.insert(name) {
+            return Err(refuse("is given more than once"));
+        }
+        if value.contains('\0') {
+            return Err(refuse("has a value containing a NUL byte"));
+        }
+    }
+    let cwd = profile.cwd;
+    if !cwd.is_absolute() || cwd.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(DescentError::InvalidWorkingDirectory {
+            cwd: cwd.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Reports whether `name` matches `[A-Za-z_][A-Za-z0-9_]*`, the portable form
+/// of an environment variable name.
+fn is_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+impl InDaemonExecutor {
+    /// Builds, without spawning, the command that descends from this root
+    /// process to `who` and runs `command` with `args` under `profile`.
+    ///
+    /// The command is
+    /// `sudo <selection> /bin/sh -c <script> <arg0> <cwd> <K=V>… <command> <args…>`,
+    /// where `<selection>` is `-u <account>` for [`Descent::Service`] — the
+    /// same words [`Executor::run`] descends with for that account — and
+    /// `-u #<uid> -g #<gid>` for [`Descent::Operator`]. There is no `-n`, no
+    /// `-S` and no password line: descent from root never prompts. `sudo`
+    /// sets the target's uid, primary gid and group-database groups, as a
+    /// login would. The fixed script, run as the target identity, enters
+    /// `profile.cwd`, announces the start on standard error, and `exec`s
+    /// `env -i` with the `K=V` words and the command. So the command sees
+    /// exactly `profile.env`, runs in `profile.cwd`, and receives every
+    /// argument as one word; no value is ever spliced into the script.
+    ///
+    /// The returned [`Command`] has its program, its arguments and the working
+    /// directory `/` set — so `sudo` never depends on the caller's — and
+    /// nothing else: no stdio, process group, session, uid, gid, `pre_exec`
+    /// or environment change. The caller sets stdio and its process group,
+    /// spawns it, and reads its standard error through
+    /// [`InDaemonExecutor::settle_descent`] until that settles.
+    ///
+    /// **What the command gets besides the profile.** Umask and resource
+    /// limits are not set here: they are what the caller passes on and what
+    /// `sudo` and its PAM session leave (a sudoers `umask` is unioned with the
+    /// caller's). `sudo` closes descriptors above 2, so only stdio reaches the
+    /// command. With no controlling terminal, as in a systemd service, `sudo`
+    /// allocates no pty and runs the command without a new session; that is
+    /// the condition under which `sudo` and the command stay in the process
+    /// group the caller spawned it into. Under a terminal, `sudo` may move the
+    /// command into a session of its own.
+    ///
+    /// **No secret belongs in `profile.env`.** The `K=V` words are visible in
+    /// the process table, as arguments of `sudo` and of the shell, until the
+    /// script `exec`s the command.
+    ///
+    /// A host whose sudoers does not let root run as the account, or as the
+    /// operator's uid and gid, refuses; that settles as
+    /// [`DescentSettle::Refused`], and nothing falls back.
+    ///
+    /// # Errors
+    ///
+    /// Refuses before anything is built with
+    /// [`DescentError::InvalidCommand`] when `command` is not an absolute path
+    /// free of `=`, [`DescentError::InvalidEnvironment`] for a profile entry
+    /// whose name is malformed or repeated or whose value holds a NUL byte, and
+    /// [`DescentError::InvalidWorkingDirectory`] when `profile.cwd` is relative
+    /// or holds a NUL byte.
+    pub fn descent_command(
+        &self,
+        who: Descent,
+        command: &str,
+        args: &[&str],
+        profile: &DescentProfile<'_>,
+    ) -> Result<Command, DescentError> {
+        check_descent(command, profile)?;
+        let mut cmd = self.sudo_descent(who);
+        cmd.arg(bounded::SUPERVISOR_SHELL)
+            .arg("-c")
+            .arg(descent_script())
+            .arg(DESCENT_ARG0)
+            .arg(profile.cwd)
+            .args(
+                profile
+                    .env
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}")),
+            )
+            .arg(command)
+            .args(args)
+            .current_dir("/");
+        Ok(cmd)
+    }
+
+    /// Classifies what a child spawned from
+    /// [`InDaemonExecutor::descent_command`] has written on standard error so
+    /// far. `ended` is whether that stream reached end of file, or the child
+    /// exited.
+    ///
+    /// - The start announced within the first 64 KiB is
+    ///   [`DescentSettle::Started`]; the bytes after it are the command's.
+    /// - The working directory the target could not enter is
+    ///   [`DescentSettle::NoWorkingDirectory`].
+    /// - A stream that ended with neither is [`DescentSettle::Refused`],
+    ///   carrying the [`ExecutorError::SudoRefused`] that [`Executor::run`]
+    ///   reports for the same standard error.
+    /// - More than 64 KiB ahead of any announcement — not counting a trailing
+    ///   fragment that may still grow into one — is
+    ///   [`DescentSettle::Refused`] too, ended or not, with the first 64 KiB
+    ///   as its reason; the caller then kills the child. An announcement that
+    ///   arrives only past the limit does not excuse what precedes it.
+    /// - Anything else is [`DescentSettle::Pending`]. A fragment of the
+    ///   announcement is never taken for it.
+    ///
+    /// The announcement and the limit are judged exactly as
+    /// [`Executor::open_channel`] judges a channel's start.
+    #[must_use]
+    pub fn settle_descent(&self, stderr: &[u8], ended: bool) -> DescentSettle {
+        let limit = bounded::TRANSPORT_STDERR_LIMIT;
+        let capped = |end: usize| stderr.get(..end.min(limit)).unwrap_or_default();
+        match channel::announcement(stderr) {
+            channel::Announcement::Started(from) => DescentSettle::Started {
+                command_stderr_from: from,
+            },
+            channel::Announcement::Overran(transport) => {
+                DescentSettle::Refused(elevation_refusal(capped(transport), None, &self.host))
+            }
+            channel::Announcement::Undecided => {
+                let marker = NO_WORKING_DIRECTORY_MARKER.as_bytes();
+                if let Some(at) = bounded::find(stderr, marker) {
+                    DescentSettle::NoWorkingDirectory {
+                        reason: String::from_utf8_lossy(capped(at)).trim().to_string(),
+                    }
+                } else if ended {
+                    DescentSettle::Refused(elevation_refusal(stderr, None, &self.host))
+                } else {
+                    DescentSettle::Pending
+                }
+            }
+        }
     }
 }
 
@@ -7661,7 +8024,7 @@ exec "$@"
                 // and which must still end the command.
                 let dir = tempfile::tempdir().expect("tempdir");
                 let pids = dir.path().join("pids");
-                let supervisor = Supervisor::new(Duration::from_secs(300)).expect("a supervisor");
+                let supervisor = Supervisor::new(Duration::from_mins(5)).expect("a supervisor");
                 let mut child = spawn_supervised(&supervisor, &pids);
                 let deadline = Instant::now() + REAP_WAIT;
                 while !pids.exists() {
@@ -8688,6 +9051,764 @@ exec "$@"
                             "{label}: got {error:?}"
                         );
                     }
+                }
+            }
+        }
+
+        /// [`InDaemonExecutor::descent_command`] and
+        /// [`InDaemonExecutor::settle_descent`], against stub `sudo` programs:
+        /// the returned `Command` is spawned exactly as a root caller spawns
+        /// it, and the stub stands in for `sudo` alone, so the descent script,
+        /// `env -i` and the command all really run.
+        mod descents {
+            use std::path::{Path, PathBuf};
+            use std::process::{Command, Output, Stdio};
+
+            use tempfile::TempDir;
+
+            use super::super::super::bounded::TRANSPORT_STDERR_LIMIT;
+            use super::super::super::{
+                CommandOutput, Descent, DescentError, DescentProfile, DescentSettle, Executor,
+                ExecutorError, Identity, InDaemonExecutor, NO_WORKING_DIRECTORY_MARKER,
+                OperatorIds, SUDO_OK_SENTINEL, ServiceAccount, classify_elevation,
+                spawn_retrying_text_busy,
+            };
+            use super::write_script;
+
+            /// The pinned execution profile's variables.
+            const PROFILE_ENV: &[(&str, &str)] = &[
+                ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                ("HOME", "/home/operator"),
+                ("USER", "operator"),
+                ("LOGNAME", "operator"),
+                ("LANG", "C.UTF-8"),
+                ("LC_ALL", "C.UTF-8"),
+            ];
+            /// Arguments a shell would split, expand or read as options.
+            const AWKWARD_ARGS: &[&str] = &[
+                "two words",
+                "\"double\" and 'single' quotes",
+                "$(echo expanded)",
+                "`echo expanded`",
+                "line\nbreak",
+                "-n",
+                "-leading-dash",
+                "K=V",
+                "",
+                "*",
+            ];
+            /// Parses the flags a `sudo` stub drops — `-u` and `-g` with their
+            /// values, any other flag alone — leaving the wrapped command in
+            /// `$@`.
+            const SKIP_SUDO_FLAGS: &str = r#"while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -u|-g) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+"#;
+
+            /// A `sudo` stub that prints its arguments, each ended by a NUL.
+            fn recording_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "recording-sudo",
+                    &format!(
+                        "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\0' \"$arg\"; done\n\
+                         printf '%s' '{SUDO_OK_SENTINEL}' >&2\n"
+                    ),
+                )
+            }
+
+            /// A `sudo` stub that drops its flags and replaces itself with the
+            /// wrapped command.
+            fn descending_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "descending-sudo",
+                    &format!("#!/bin/sh\n{SKIP_SUDO_FLAGS}exec \"$@\"\n"),
+                )
+            }
+
+            /// A `sudo` stub that drops its flags and runs the wrapped command
+            /// as its child, staying alive beside it as `sudo` does.
+            #[cfg(target_os = "linux")]
+            fn staying_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "staying-sudo",
+                    &format!("#!/bin/sh\n{SKIP_SUDO_FLAGS}\"$@\"\nexit \"$?\"\n"),
+                )
+            }
+
+            /// A `sudo` stub that refuses an unknown account.
+            fn refusing_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "refusing-sudo",
+                    "#!/bin/sh\necho 'sudo: unknown user clumit-insight' >&2\nexit 1\n",
+                )
+            }
+
+            fn daemon(sudo: PathBuf) -> InDaemonExecutor {
+                InDaemonExecutor::new("mgmt").with_sudo_bin(sudo)
+            }
+
+            /// Returns `dir` with every symlink resolved, as `/bin/pwd` prints
+            /// it.
+            fn real(dir: &TempDir) -> PathBuf {
+                std::fs::canonicalize(dir.path()).expect("canonicalize the tempdir")
+            }
+
+            /// Spawns `cmd` with standard input closed and both output streams
+            /// captured, and waits for it.
+            fn output(mut cmd: Command) -> Output {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                spawn_retrying_text_busy(&mut cmd)
+                    .expect("spawn the descent")
+                    .wait_with_output()
+                    .expect("wait for the descent")
+            }
+
+            /// Runs `command` through a descent to `who` and returns its
+            /// standard output, once standard error has settled as started.
+            fn descended_stdout(
+                exec: &InDaemonExecutor,
+                who: Descent,
+                command: &str,
+                args: &[&str],
+                profile: &DescentProfile<'_>,
+            ) -> Vec<u8> {
+                let cmd = exec
+                    .descent_command(who, command, args, profile)
+                    .expect("a valid descent");
+                let out = output(cmd);
+                match exec.settle_descent(&out.stderr, true) {
+                    DescentSettle::Started {
+                        command_stderr_from,
+                    } => assert_eq!(
+                        out.stderr.get(command_stderr_from..),
+                        Some(&b""[..]),
+                        "the command wrote nothing on stderr"
+                    ),
+                    other => panic!("{who:?}: expected a start, got {other:?}"),
+                }
+                assert!(out.status.success(), "{who:?}: {out:?}");
+                out.stdout
+            }
+
+            fn operator() -> OperatorIds {
+                OperatorIds::new(1000, 1000).expect("1000 is an operator id")
+            }
+
+            fn both_descents() -> [Descent; 2] {
+                [
+                    Descent::Service(ServiceAccount::Insight),
+                    Descent::Operator(operator()),
+                ]
+            }
+
+            /// Splits NUL-ended words.
+            fn words(bytes: &[u8]) -> Vec<String> {
+                bytes
+                    .split(|&byte| byte == 0)
+                    .map(|word| String::from_utf8_lossy(word).into_owned())
+                    .collect::<Vec<_>>()
+                    .split_last()
+                    .map(|(_, words)| words.to_vec())
+                    .unwrap_or_default()
+            }
+
+            /// Returns the words before `shell`.
+            fn prefix<'w>(words: &'w [String], shell: &str) -> &'w [String] {
+                let at = words
+                    .iter()
+                    .position(|word| word == shell)
+                    .unwrap_or_else(|| panic!("`{shell}` should be present: {words:?}"));
+                words.get(..at).expect("the position is within the words")
+            }
+
+            #[test]
+            fn a_service_descends_as_run_does_and_an_operator_by_id() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(recording_sudo(dir.path()));
+                let cwd = real(&dir);
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: &cwd,
+                };
+
+                let run = exec
+                    .run(Identity::Service(ServiceAccount::Insight), "printf", &[])
+                    .expect("the recording stub runs");
+                let run_words = words(&run.stdout);
+                let run_prefix = prefix(&run_words, super::super::super::SH);
+                assert_eq!(run_prefix, ["-u", "clumit-insight"]);
+
+                for (who, expected) in [
+                    (
+                        Descent::Service(ServiceAccount::Insight),
+                        run_prefix.to_vec(),
+                    ),
+                    (
+                        Descent::Operator(operator()),
+                        ["-u", "#1000", "-g", "#1000"].map(String::from).to_vec(),
+                    ),
+                ] {
+                    let cmd = exec
+                        .descent_command(who, "/usr/bin/printf", &["%s", "a b"], &profile)
+                        .expect("a valid descent");
+                    let out = output(cmd);
+                    let argv = words(&out.stdout);
+                    assert_eq!(prefix(&argv, "/bin/sh"), expected, "{who:?}");
+                    for flag in ["-n", "-S", "-p"] {
+                        assert!(
+                            !argv.iter().any(|word| word == flag),
+                            "{who:?}: descent from root must not carry `{flag}`: {argv:?}"
+                        );
+                    }
+                    let mut tail = vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        super::super::super::descent_script(),
+                        "bootler-descent".to_string(),
+                        cwd.to_string_lossy().into_owned(),
+                    ];
+                    tail.extend(
+                        PROFILE_ENV
+                            .iter()
+                            .map(|(name, value)| format!("{name}={value}")),
+                    );
+                    tail.extend(["/usr/bin/printf", "%s", "a b"].map(String::from));
+                    assert_eq!(
+                        argv.get(expected.len()..),
+                        Some(tail.as_slice()),
+                        "{who:?}: every value is a word of its own"
+                    );
+                }
+            }
+
+            #[test]
+            fn the_command_is_built_and_not_spawned() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let marker = dir.path().join("spawned");
+                let sudo = write_script(
+                    dir.path(),
+                    "touching-sudo",
+                    &format!("#!/bin/sh\n: > '{}'\n", marker.display()),
+                );
+                let exec = daemon(sudo.clone());
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: Path::new("/"),
+                };
+                for who in both_descents() {
+                    let cmd = exec
+                        .descent_command(who, "/bin/cat", &[], &profile)
+                        .expect("a valid descent");
+                    assert_eq!(cmd.get_program(), sudo.as_os_str(), "{who:?}");
+                    assert_eq!(cmd.get_current_dir(), Some(Path::new("/")), "{who:?}");
+                    assert_eq!(cmd.get_envs().count(), 0, "{who:?}: no environment change");
+                }
+                assert!(!marker.exists(), "building a descent must spawn nothing");
+            }
+
+            #[test]
+            fn the_command_sees_exactly_the_profile_in_its_directory() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(descending_sudo(dir.path()));
+                let cwd = real(&dir);
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: &cwd,
+                };
+                let mut expected: Vec<String> = PROFILE_ENV
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect();
+                expected.sort_unstable();
+
+                for who in both_descents() {
+                    let mut cmd = exec
+                        .descent_command(who, "/usr/bin/env", &[], &profile)
+                        .expect("a valid descent");
+                    // Reaches the stub standing in for `sudo`, and must stop
+                    // there.
+                    cmd.env("BOOTLER_OUTER_ONLY", "leaked");
+                    let out = output(cmd);
+                    assert!(
+                        matches!(
+                            exec.settle_descent(&out.stderr, true),
+                            DescentSettle::Started { .. }
+                        ),
+                        "{who:?}: {out:?}"
+                    );
+                    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+                    let mut seen: Vec<String> = stdout.lines().map(String::from).collect();
+                    seen.sort_unstable();
+                    assert_eq!(seen, expected, "{who:?}: exactly the profile");
+
+                    let pwd = descended_stdout(&exec, who, "/bin/pwd", &[], &profile);
+                    assert_eq!(
+                        pwd,
+                        format!("{}\n", cwd.display()).into_bytes(),
+                        "{who:?}: the profile's directory"
+                    );
+                }
+            }
+
+            #[test]
+            fn every_argument_and_value_arrives_intact() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(descending_sudo(dir.path()));
+                let cwd = real(&dir);
+                let mut args = vec!["%s\n"];
+                args.extend_from_slice(AWKWARD_ARGS);
+                let expected: String = AWKWARD_ARGS.iter().flat_map(|arg| [*arg, "\n"]).collect();
+                let awkward_value = "a value with \"double\", 'single', $(x) and\nnewline";
+                let env = [("PATH", "/usr/bin:/bin"), ("AWKWARD", awkward_value)];
+                let profile = DescentProfile {
+                    env: &env,
+                    cwd: &cwd,
+                };
+
+                for who in both_descents() {
+                    let printed = descended_stdout(&exec, who, "/usr/bin/printf", &args, &profile);
+                    assert_eq!(
+                        String::from_utf8_lossy(&printed),
+                        expected,
+                        "{who:?}: every argument is one word, unchanged"
+                    );
+
+                    let printed = descended_stdout(
+                        &exec,
+                        who,
+                        "/usr/bin/printf",
+                        &["%s", "$AWKWARD"],
+                        &profile,
+                    );
+                    assert_eq!(printed, b"$AWKWARD", "{who:?}: no argument is expanded");
+
+                    let printed = descended_stdout(&exec, who, "/usr/bin/env", &[], &profile);
+                    assert!(
+                        String::from_utf8_lossy(&printed)
+                            .contains(&format!("AWKWARD={awkward_value}\n")),
+                        "{who:?}: the value arrives unchanged: {printed:?}"
+                    );
+                }
+            }
+
+            #[test]
+            fn a_missing_directory_starts_nothing_and_settles_as_such() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(descending_sudo(dir.path()));
+                let missing = real(&dir).join("missing");
+                let marker = real(&dir).join("ran");
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: &missing,
+                };
+                for who in both_descents() {
+                    let cmd = exec
+                        .descent_command(
+                            who,
+                            "/usr/bin/touch",
+                            &[&marker.to_string_lossy()],
+                            &profile,
+                        )
+                        .expect("a valid descent");
+                    let out = output(cmd);
+                    assert!(!out.status.success(), "{who:?}");
+                    assert!(!marker.exists(), "{who:?}: the command must not run");
+                    match exec.settle_descent(&out.stderr, true) {
+                        DescentSettle::NoWorkingDirectory { reason } => {
+                            assert!(reason.contains("missing"), "{who:?}: reason: {reason}");
+                            assert!(!reason.contains(NO_WORKING_DIRECTORY_MARKER));
+                        }
+                        other => panic!("{who:?}: expected no directory, got {other:?}"),
+                    }
+                }
+            }
+
+            #[test]
+            fn a_refusal_settles_as_run_classifies_it() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(refusing_sudo(dir.path()));
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: Path::new("/"),
+                };
+                for who in both_descents() {
+                    let cmd = exec
+                        .descent_command(who, "/bin/cat", &[], &profile)
+                        .expect("a valid descent");
+                    let out = output(cmd);
+                    let run = classify_elevation(
+                        CommandOutput {
+                            code: out.status.code(),
+                            stdout: Vec::new(),
+                            stderr: out.stderr.clone(),
+                        },
+                        None,
+                        "mgmt",
+                    )
+                    .expect_err("run refuses too");
+                    let ExecutorError::SudoRefused {
+                        host: run_host,
+                        reason: run_reason,
+                    } = run
+                    else {
+                        panic!("run classifies a refusal as SudoRefused, got {run:?}");
+                    };
+                    assert!(
+                        matches!(
+                            exec.settle_descent(&out.stderr, false),
+                            DescentSettle::Pending
+                        ),
+                        "{who:?}: a stream still open may yet announce a start"
+                    );
+                    match exec.settle_descent(&out.stderr, true) {
+                        DescentSettle::Refused(ExecutorError::SudoRefused { host, reason }) => {
+                            assert_eq!(host, run_host);
+                            assert_eq!(reason, run_reason);
+                            assert_eq!(reason, "sudo: unknown user clumit-insight");
+                        }
+                        other => panic!("{who:?}: expected a refusal, got {other:?}"),
+                    }
+                }
+            }
+
+            #[test]
+            fn settling_follows_the_sentinel_and_the_transport_limit() {
+                let exec = InDaemonExecutor::new("mgmt");
+                let sentinel = SUDO_OK_SENTINEL.as_bytes();
+                let (head, rest) = sentinel.split_at(sentinel.len() / 2);
+
+                // A sentinel split across two reads.
+                let mut read = b"sudo: note\n".to_vec();
+                read.extend_from_slice(head);
+                assert!(matches!(
+                    exec.settle_descent(&read, false),
+                    DescentSettle::Pending
+                ));
+                read.extend_from_slice(rest);
+                read.extend_from_slice(b"own");
+                assert!(matches!(
+                    exec.settle_descent(&read, false),
+                    DescentSettle::Started { command_stderr_from } if command_stderr_from == 11 + sentinel.len()
+                ));
+
+                // Once started, a marker in the command's own stderr is its own.
+                let mut read = sentinel.to_vec();
+                read.extend_from_slice(NO_WORKING_DIRECTORY_MARKER.as_bytes());
+                assert!(matches!(
+                    exec.settle_descent(&read, true),
+                    DescentSettle::Started { command_stderr_from } if command_stderr_from == sentinel.len()
+                ));
+
+                // The limit itself is not passed.
+                let mut read = vec![b'x'; TRANSPORT_STDERR_LIMIT];
+                read.extend_from_slice(sentinel);
+                assert!(matches!(
+                    exec.settle_descent(&read, false),
+                    DescentSettle::Started { command_stderr_from }
+                        if command_stderr_from == TRANSPORT_STDERR_LIMIT + sentinel.len()
+                ));
+
+                // Past the limit with no sentinel, while the stream is open.
+                let read = vec![b'x'; TRANSPORT_STDERR_LIMIT + 1];
+                assert_refused_with_the_limit(exec.settle_descent(&read, false));
+
+                // A fragment that may still become the sentinel is not counted,
+                // and is not the sentinel.
+                let mut read = vec![b'x'; TRANSPORT_STDERR_LIMIT];
+                read.extend_from_slice(
+                    sentinel
+                        .get(..sentinel.len() - 1)
+                        .expect("the sentinel is longer than one byte"),
+                );
+                assert!(matches!(
+                    exec.settle_descent(&read, false),
+                    DescentSettle::Pending
+                ));
+
+                // A sentinel arriving past the limit does not excuse what
+                // precedes it.
+                let mut read = vec![b'x'; TRANSPORT_STDERR_LIMIT + 1];
+                read.extend_from_slice(sentinel);
+                assert_refused_with_the_limit(exec.settle_descent(&read, false));
+            }
+
+            /// Asserts a refusal whose reason is the first
+            /// [`TRANSPORT_STDERR_LIMIT`] bytes of a run of `x`.
+            fn assert_refused_with_the_limit(settled: DescentSettle) {
+                match settled {
+                    DescentSettle::Refused(ExecutorError::SudoRefused { host, reason }) => {
+                        assert_eq!(host, "mgmt");
+                        assert_eq!(reason, "x".repeat(TRANSPORT_STDERR_LIMIT));
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+
+            #[test]
+            fn an_invalid_descent_is_refused_before_building() {
+                const SECRET: &str = "s3cret-value";
+                let dir = tempfile::tempdir().expect("tempdir");
+                let exec = daemon(descending_sudo(dir.path()));
+                let valid = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: Path::new("/"),
+                };
+                let who = Descent::Operator(operator());
+
+                for command in ["cat", "bin/cat", "/usr/bin/env=x", ""] {
+                    let error = exec
+                        .descent_command(who, command, &[], &valid)
+                        .expect_err("the command is refused");
+                    assert!(
+                        matches!(&error, DescentError::InvalidCommand { command: named } if named == command),
+                        "{command:?}: got {error:?}"
+                    );
+                }
+
+                let nul_value = format!("{SECRET}\0{SECRET}");
+                let cases: [(&[(&str, &str)], &str); 7] = [
+                    (&[("1PATH", SECRET)], "1PATH"),
+                    (&[("A-B", SECRET)], "A-B"),
+                    (&[("", SECRET)], ""),
+                    (&[("A=B", SECRET)], "A=B"),
+                    (&[("PÄTH", SECRET)], "PÄTH"),
+                    (&[("DUP", SECRET), ("OTHER", "x"), ("DUP", SECRET)], "DUP"),
+                    (&[("NUL", nul_value.as_str())], "NUL"),
+                ];
+                for (env, name) in cases {
+                    let profile = DescentProfile {
+                        env,
+                        cwd: Path::new("/"),
+                    };
+                    let error = exec
+                        .descent_command(who, "/bin/cat", &[], &profile)
+                        .expect_err("the environment is refused");
+                    assert!(
+                        matches!(&error, DescentError::InvalidEnvironment { name: named, .. } if named == name),
+                        "{name:?}: got {error:?}"
+                    );
+                    for text in [error.to_string(), format!("{error:?}")] {
+                        assert!(!text.contains(SECRET), "{name:?}: a value leaked: {text}");
+                    }
+                }
+
+                for cwd in [Path::new("tmp"), Path::new(""), Path::new("/tmp/a\0b")] {
+                    let profile = DescentProfile {
+                        env: PROFILE_ENV,
+                        cwd,
+                    };
+                    let error = exec
+                        .descent_command(who, "/bin/cat", &[], &profile)
+                        .expect_err("the directory is refused");
+                    assert!(
+                        matches!(&error, DescentError::InvalidWorkingDirectory { cwd: named } if named == cwd),
+                        "{cwd:?}: got {error:?}"
+                    );
+                }
+
+                for (uid, gid) in [
+                    (0, 1000),
+                    (1000, 0),
+                    (u32::MAX, 1000),
+                    (1000, u32::MAX),
+                    (0, 0),
+                ] {
+                    let error = OperatorIds::new(uid, gid).expect_err("the ids are refused");
+                    assert!(
+                        matches!(error, DescentError::InvalidOperator { uid: u, gid: g } if u == uid && g == gid),
+                        "{uid}:{gid}: got {error:?}"
+                    );
+                }
+                let ids = OperatorIds::new(1000, 1001).expect("valid ids");
+                assert_eq!((ids.uid(), ids.gid()), (1000, 1001));
+            }
+
+            /// `/proc/<pid>/stat`'s command name, parent pid and process group.
+            #[cfg(target_os = "linux")]
+            fn stat(pid: u32) -> Option<(String, u32, u32)> {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let open = stat.find('(')?;
+                let close = stat.rfind(')')?;
+                let comm = stat.get(open + 1..close)?.to_string();
+                let mut fields = stat.get(close + 1..)?.split_whitespace().skip(1);
+                let parent = fields.next()?.parse().ok()?;
+                let group = fields.next()?.parse().ok()?;
+                Some((comm, parent, group))
+            }
+
+            /// Waits for a process named `name` to be `root` or one of its
+            /// descendants, and returns its pid.
+            ///
+            /// Only called while that process blocks reading standard input
+            /// the test still holds open, so the state waited for is reached
+            /// and then stays.
+            #[cfg(target_os = "linux")]
+            fn await_descendant(root: u32, name: &str) -> u32 {
+                const POLLS: u32 = 1000;
+                const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+                let descends = |mut pid: u32| {
+                    while pid > 1 {
+                        if pid == root {
+                            return true;
+                        }
+                        match stat(pid) {
+                            Some((_, ppid, _)) => pid = ppid,
+                            None => return false,
+                        }
+                    }
+                    false
+                };
+                for _ in 0..POLLS {
+                    let found = std::fs::read_dir("/proc")
+                        .expect("read /proc")
+                        .flatten()
+                        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                        .find(|&pid| {
+                            stat(pid).is_some_and(|(comm, _, _)| comm == name) && descends(pid)
+                        });
+                    if let Some(pid) = found {
+                        return pid;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                panic!("no `{name}` appeared under pid {root}");
+            }
+
+            /// Spawns `cmd` in a new process group of its own, as the root
+            /// caller spawns it into its anchored group, and asserts that the
+            /// spawned process — `sudo`, here its stub — and `/bin/cat` beneath
+            /// it both report that group, then ends `cat` by closing its
+            /// standard input.
+            #[cfg(target_os = "linux")]
+            fn assert_one_process_group(mut cmd: Command) {
+                use std::os::unix::process::CommandExt;
+
+                cmd.process_group(0)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let mut child = spawn_retrying_text_busy(&mut cmd).expect("spawn the descent");
+                let group = child.id();
+                let cat = await_descendant(group, "cat");
+                for pid in [group, cat] {
+                    let (comm, _, pgrp) = stat(pid).expect("the process is alive");
+                    assert_eq!(pgrp, group, "`{comm}` ({pid}) is in the caller's group");
+                }
+                drop(child.stdin.take());
+                let status = child.wait().expect("wait for the descent");
+                assert!(status.success(), "{status:?}");
+            }
+
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn the_descent_stays_in_the_group_it_is_spawned_into() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: Path::new("/"),
+                };
+                for sudo in [staying_sudo(dir.path()), descending_sudo(dir.path())] {
+                    let exec = daemon(sudo);
+                    for who in both_descents() {
+                        assert_one_process_group(
+                            exec.descent_command(who, "/bin/cat", &[], &profile)
+                                .expect("a valid descent"),
+                        );
+                    }
+                }
+            }
+
+            /// Runs the real `sudo`, as root, down to the `nobody` account —
+            /// once named as a service account, once by its ids as an
+            /// operator — and checks the identity, the environment, the
+            /// directory and the process group the command gets.
+            ///
+            /// Needs root, `sudo`, and a `nobody` account that root may run
+            /// as, with its group; CI runs none of that. Run it as
+            /// `cargo test -- --ignored descent_through_the_real_sudo`.
+            #[cfg(target_os = "linux")]
+            #[test]
+            #[ignore = "runs the real sudo as root to a real account"]
+            fn descent_through_the_real_sudo() {
+                use std::os::unix::fs::PermissionsExt;
+
+                const ACCOUNT: &str = "nobody";
+                assert!(
+                    rustix::process::geteuid().is_root(),
+                    "this test runs `sudo` as root"
+                );
+                let id = |flag: &str| {
+                    let out = Command::new("/usr/bin/id")
+                        .args([flag, ACCOUNT])
+                        .output()
+                        .expect("run id");
+                    assert!(out.status.success(), "{out:?}");
+                    String::from_utf8(out.stdout).expect("utf-8")
+                };
+                let uid: u32 = id("-u").trim().parse().expect("a uid");
+                let gid: u32 = id("-g").trim().parse().expect("a gid");
+                let groups = id("-G");
+                let dir = tempfile::tempdir().expect("tempdir");
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                    .expect("let the account enter the directory");
+                let cwd = real(&dir);
+                let profile = DescentProfile {
+                    env: PROFILE_ENV,
+                    cwd: &cwd,
+                };
+                let mut expected_env: Vec<String> = PROFILE_ENV
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect();
+                expected_env.sort_unstable();
+                let exec = InDaemonExecutor::new("real");
+
+                for who in [
+                    Descent::Service(ServiceAccount::Fixture(ACCOUNT)),
+                    Descent::Operator(OperatorIds::new(uid, gid).expect("nobody is not root")),
+                ] {
+                    let text = |args: &[&str]| {
+                        let (command, args) = args.split_first().expect("a command");
+                        String::from_utf8(descended_stdout(&exec, who, command, args, &profile))
+                            .expect("utf-8")
+                    };
+                    assert_eq!(
+                        text(&["/usr/bin/id", "-u"]).trim(),
+                        uid.to_string(),
+                        "{who:?}"
+                    );
+                    assert_eq!(
+                        text(&["/usr/bin/id", "-g"]).trim(),
+                        gid.to_string(),
+                        "{who:?}"
+                    );
+                    assert_eq!(text(&["/usr/bin/id", "-G"]), groups, "{who:?}");
+                    let mut env: Vec<String> =
+                        text(&["/usr/bin/env"]).lines().map(String::from).collect();
+                    env.sort_unstable();
+                    assert_eq!(env, expected_env, "{who:?}");
+                    assert_eq!(
+                        text(&["/bin/pwd"]),
+                        format!("{}\n", cwd.display()),
+                        "{who:?}"
+                    );
+                    let printed = text(&["/usr/bin/printf", "%s\n", "a b", "$(x)", "-n"]);
+                    assert_eq!(printed, "a b\n$(x)\n-n\n", "{who:?}");
+                    assert_one_process_group(
+                        exec.descent_command(who, "/bin/cat", &[], &profile)
+                            .expect("a valid descent"),
+                    );
+                    eprintln!("{who:?}: uid {uid}, gid {gid}, groups {}", groups.trim());
                 }
             }
         }

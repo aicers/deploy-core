@@ -486,19 +486,50 @@ fn feed_and_settle(
 /// that passes the limit included. Before the sentinel has arrived, only a
 /// trailing fragment that may still grow into it is not yet counted.
 fn judge(read: &mut Vec<u8>, fed: bool) -> Option<Settled> {
-    let sentinel = SUDO_OK_SENTINEL.as_bytes();
-    match find(read, sentinel) {
-        Some(at) if at > TRANSPORT_STDERR_LIMIT => {
-            read.truncate(at);
+    match announcement(read) {
+        Announcement::Overran(transport) => {
+            read.truncate(transport);
             Some(Settled::Ended(std::mem::take(read)))
         }
         // A password `sudo` did not read is still written in full first, so
         // that the start script can discard it as one whole line.
-        Some(at) if fed => Some(Settled::Started(read.split_off(at + sentinel.len()))),
+        Announcement::Started(from) if fed => Some(Settled::Started(read.split_off(from))),
+        Announcement::Started(_) | Announcement::Undecided => None,
+    }
+}
+
+/// Where standard error read so far places a start's [`SUDO_OK_SENTINEL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Announcement {
+    /// The sentinel arrived within [`TRANSPORT_STDERR_LIMIT`]; the command's
+    /// own bytes begin at this offset, just past it.
+    Started(usize),
+    /// The transport wrote more than [`TRANSPORT_STDERR_LIMIT`] ahead of the
+    /// sentinel, whether or not the sentinel has arrived since. The
+    /// transport's bytes are the first this many.
+    Overran(usize),
+    /// Neither yet.
+    Undecided,
+}
+
+/// Returns what the standard error `read` so far says of a start announced
+/// with [`SUDO_OK_SENTINEL`]: the one rule every start through `sudo` or SSH
+/// is settled by, whoever reads the stream.
+///
+/// What precedes the sentinel is the transport's, and is held to
+/// [`TRANSPORT_STDERR_LIMIT`] wherever the sentinel lands — in the same read
+/// that passes the limit included. Before the sentinel has arrived, only a
+/// trailing fragment that may still grow into it is not yet counted, and such
+/// a fragment is never taken for the sentinel itself.
+pub(super) fn announcement(read: &[u8]) -> Announcement {
+    let sentinel = SUDO_OK_SENTINEL.as_bytes();
+    match find(read, sentinel) {
+        Some(at) if at > TRANSPORT_STDERR_LIMIT => Announcement::Overran(at),
+        Some(at) => Announcement::Started(at + sentinel.len()),
         None if read.len() - partial_suffix(read, sentinel) > TRANSPORT_STDERR_LIMIT => {
-            Some(Settled::Ended(std::mem::take(read)))
+            Announcement::Overran(read.len())
         }
-        Some(_) | None => None,
+        None => Announcement::Undecided,
     }
 }
 
