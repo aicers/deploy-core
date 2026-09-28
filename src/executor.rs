@@ -520,8 +520,8 @@ const SUDO_OK_SENTINEL: &str = "__BOOTLER_SUDO_OK__";
 /// [`SUDO_OK_SENTINEL`], when the target identity cannot enter the profile's
 /// working directory: `sudo` descended, but the command was never started.
 const NO_WORKING_DIRECTORY_MARKER: &str = "__BOOTLER_NO_WORKING_DIRECTORY__";
-/// The `$0` the descent script runs under, so a shell diagnostic — `cd`'s,
-/// above all — names what printed it.
+/// The `$0` the descent script runs under, so a shell diagnostic — one for an
+/// `exec` that fails, say — names what printed it.
 const DESCENT_ARG0: &str = "bootler-descent";
 
 /// Errors raised by an executor primitive.
@@ -2301,9 +2301,13 @@ fn sudo_sentinel_script() -> String {
 /// `env -i`, which takes the `K=V` words as the whole environment and the first
 /// word without `=` as the utility. Every value is a positional word, never
 /// spliced into the script text.
+///
+/// `cd`'s own diagnostic is discarded: it would echo `<cwd>`, and a path that
+/// contains the sentinel would then announce a start that never happened.
+/// Nothing the script writes before its fixed words derives from the caller.
 fn descent_script() -> String {
     format!(
-        "cd -- \"$1\" || {{ printf '%s' '{NO_WORKING_DIRECTORY_MARKER}' >&2; exit 1; }}; \
+        "cd -- \"$1\" 2>/dev/null || {{ printf '%s' '{NO_WORKING_DIRECTORY_MARKER}' >&2; exit 1; }}; \
          shift; printf '%s' '{SUDO_OK_SENTINEL}' >&2; exec {env} -i \"$@\"",
         env = bounded::ENV,
     )
@@ -3398,11 +3402,15 @@ pub enum DescentSettle {
     /// `sudo` descended, but the target identity could not enter the
     /// profile's working directory, so the command was never started.
     NoWorkingDirectory {
-        /// What the shell wrote on failing to enter it, trimmed.
+        /// What preceded the failure on standard error — `sudo`'s and its
+        /// PAM session's, if anything — capped at 64 KiB and trimmed. The
+        /// shell's own `cd` diagnostic is not among it, since it would echo
+        /// the directory; the caller already knows which one it asked for.
         reason: String,
     },
     /// `sudo` refused before the command could start — or wrote more than
-    /// 64 KiB before announcing a start, which is treated the same way — with
+    /// 64 KiB before announcing a start or a missing directory, which is
+    /// treated the same way — with
     /// the error [`Executor::run`] reports for that refusal. The caller kills
     /// the child.
     Refused(ExecutorError),
@@ -3535,15 +3543,17 @@ impl InDaemonExecutor {
     /// - The start announced within the first 64 KiB is
     ///   [`DescentSettle::Started`]; the bytes after it are the command's.
     /// - The working directory the target could not enter is
-    ///   [`DescentSettle::NoWorkingDirectory`].
+    ///   [`DescentSettle::NoWorkingDirectory`], however much standard error
+    ///   preceded it.
     /// - A stream that ended with neither is [`DescentSettle::Refused`],
     ///   carrying the [`ExecutorError::SudoRefused`] that [`Executor::run`]
     ///   reports for the same standard error.
-    /// - More than 64 KiB ahead of any announcement — not counting a trailing
-    ///   fragment that may still grow into one — is
-    ///   [`DescentSettle::Refused`] too, ended or not, with the first 64 KiB
-    ///   as its reason; the caller then kills the child. An announcement that
-    ///   arrives only past the limit does not excuse what precedes it.
+    /// - More than 64 KiB ahead of any announcement, with no missing
+    ///   directory reported before it — not counting a trailing fragment that
+    ///   may still grow into the announcement — is [`DescentSettle::Refused`]
+    ///   too, ended or not, with the first 64 KiB as its reason; the caller
+    ///   then kills the child. An announcement that arrives only past the
+    ///   limit does not excuse what precedes it.
     /// - Anything else is [`DescentSettle::Pending`]. A fragment of the
     ///   announcement is never taken for it.
     ///
@@ -3553,25 +3563,26 @@ impl InDaemonExecutor {
     pub fn settle_descent(&self, stderr: &[u8], ended: bool) -> DescentSettle {
         let limit = bounded::TRANSPORT_STDERR_LIMIT;
         let capped = |end: usize| stderr.get(..end.min(limit)).unwrap_or_default();
-        match channel::announcement(stderr) {
-            channel::Announcement::Started(from) => DescentSettle::Started {
-                command_stderr_from: from,
-            },
-            channel::Announcement::Overran(transport) => {
-                DescentSettle::Refused(elevation_refusal(capped(transport), None, &self.host))
+        let (transport, overran) = match channel::announcement(stderr) {
+            channel::Announcement::Started(from) => {
+                return DescentSettle::Started {
+                    command_stderr_from: from,
+                };
             }
-            channel::Announcement::Undecided => {
-                let marker = NO_WORKING_DIRECTORY_MARKER.as_bytes();
-                if let Some(at) = bounded::find(stderr, marker) {
-                    DescentSettle::NoWorkingDirectory {
-                        reason: String::from_utf8_lossy(capped(at)).trim().to_string(),
-                    }
-                } else if ended {
-                    DescentSettle::Refused(elevation_refusal(stderr, None, &self.host))
-                } else {
-                    DescentSettle::Pending
-                }
+            channel::Announcement::Overran(transport) => (transport, true),
+            channel::Announcement::Undecided => (stderr.len(), false),
+        };
+        let before_any_start = stderr.get(..transport).unwrap_or_default();
+        if let Some(at) = bounded::find(before_any_start, NO_WORKING_DIRECTORY_MARKER.as_bytes()) {
+            DescentSettle::NoWorkingDirectory {
+                reason: String::from_utf8_lossy(capped(at)).trim().to_string(),
             }
+        } else if overran {
+            DescentSettle::Refused(elevation_refusal(capped(transport), None, &self.host))
+        } else if ended {
+            DescentSettle::Refused(elevation_refusal(stderr, None, &self.host))
+        } else {
+            DescentSettle::Pending
         }
     }
 }
@@ -9405,13 +9416,21 @@ done
             fn a_missing_directory_starts_nothing_and_settles_as_such() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let exec = daemon(descending_sudo(dir.path()));
-                let missing = real(&dir).join("missing");
                 let marker = real(&dir).join("ran");
-                let profile = DescentProfile {
-                    env: PROFILE_ENV,
-                    cwd: &missing,
-                };
-                for who in both_descents() {
+                // The second names the start announcement, which a shell
+                // diagnostic echoing the path would forge.
+                let missing = [
+                    real(&dir).join("missing"),
+                    real(&dir).join(format!("missing-{SUDO_OK_SENTINEL}")),
+                ];
+                for (who, missing) in both_descents()
+                    .into_iter()
+                    .flat_map(|who| missing.iter().map(move |missing| (who, missing)))
+                {
+                    let profile = DescentProfile {
+                        env: PROFILE_ENV,
+                        cwd: missing,
+                    };
                     let cmd = exec
                         .descent_command(
                             who,
@@ -9421,14 +9440,20 @@ done
                         )
                         .expect("a valid descent");
                     let out = output(cmd);
-                    assert!(!out.status.success(), "{who:?}");
+                    assert!(!out.status.success(), "{who:?} {missing:?}");
                     assert!(!marker.exists(), "{who:?}: the command must not run");
+                    assert_eq!(
+                        out.stderr,
+                        NO_WORKING_DIRECTORY_MARKER.as_bytes(),
+                        "{who:?}: nothing but the marker, and nothing echoing the path"
+                    );
                     match exec.settle_descent(&out.stderr, true) {
                         DescentSettle::NoWorkingDirectory { reason } => {
-                            assert!(reason.contains("missing"), "{who:?}: reason: {reason}");
-                            assert!(!reason.contains(NO_WORKING_DIRECTORY_MARKER));
+                            assert_eq!(reason, "", "{who:?} {missing:?}");
                         }
-                        other => panic!("{who:?}: expected no directory, got {other:?}"),
+                        other => {
+                            panic!("{who:?} {missing:?}: expected no directory, got {other:?}")
+                        }
                     }
                 }
             }
@@ -9536,10 +9561,25 @@ done
                 ));
 
                 // A sentinel arriving past the limit does not excuse what
-                // precedes it.
+                // precedes it, and a marker after it is the command's.
                 let mut read = vec![b'x'; TRANSPORT_STDERR_LIMIT + 1];
                 read.extend_from_slice(sentinel);
                 assert_refused_with_the_limit(exec.settle_descent(&read, false));
+                read.extend_from_slice(NO_WORKING_DIRECTORY_MARKER.as_bytes());
+                assert_refused_with_the_limit(exec.settle_descent(&read, true));
+
+                // A missing directory past the limit is still one, and its
+                // reason is capped.
+                let mut read = vec![b'x'; TRANSPORT_STDERR_LIMIT + 1];
+                read.extend_from_slice(NO_WORKING_DIRECTORY_MARKER.as_bytes());
+                for ended in [false, true] {
+                    match exec.settle_descent(&read, ended) {
+                        DescentSettle::NoWorkingDirectory { reason } => {
+                            assert_eq!(reason, "x".repeat(TRANSPORT_STDERR_LIMIT));
+                        }
+                        other => panic!("expected no directory, got {other:?}"),
+                    }
+                }
             }
 
             /// Asserts a refusal whose reason is the first
