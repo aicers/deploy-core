@@ -202,7 +202,13 @@ Releases use bare version tags such as `0.1.0`, following review-web's
 convention. The tag and `Cargo.toml` package version must match. GitHub Actions
 creates a GitHub Release from the matching dated section of `CHANGELOG.md`;
 this library has no binary release assets and is not published to crates.io by
-this workflow.
+this workflow. After release creation succeeds, a separate job sends the
+repository name, version and release link to Slack.
+
+Before publishing a tag, configure the `SLACK_WEBHOOK_URL` GitHub Actions secret
+for this repository (or an organization secret accessible to it). Use a
+[Slack incoming webhook](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
+configured for the channel that should receive release announcements.
 
 1. Open a release issue and a preparation PR. Set the package version, promote
    `[Unreleased]` to the version with its release date, and replace its link
@@ -218,9 +224,13 @@ this workflow.
    git push origin refs/tags/0.1.0
    ```
 
-4. Confirm the Release workflow succeeds and inspect the GitHub Release notes.
+4. Confirm the Release workflow succeeds, inspect the GitHub Release notes,
+   and confirm the Slack announcement arrived.
    The workflow fails before creating a release if the tag, package version,
-   or changelog section disagree, or if the notes are empty.
+   or changelog section disagree, or if the notes are empty. If Slack delivery
+   fails or its secret is missing, the notification job fails and the published
+   release remains available. Fix the configuration and rerun only the failed
+   job to retry notification without recreating the release.
 
 The next user-visible change opens a new `[Unreleased]` section and its compare
 link. Consumers may pin the release with `tag = "0.1.0"` in their Git dependency.
