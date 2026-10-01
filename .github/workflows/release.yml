@@ -13,8 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      release_url: ${{ steps.create_release.outputs.release_url }}
     steps:
       - uses: actions/checkout@v5
       - name: Validate version and extract release notes
@@ -50,37 +48,10 @@ jobs:
           Path("release-notes.md").write_text(body + "\n")
           PY
       - name: Create GitHub Release
-        id: create_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          release_url=$(gh release create "$RELEASE_VERSION" --verify-tag \
-            --title "$RELEASE_VERSION" --notes-file release-notes.md)
-          printf 'release_url=%s\n' "$release_url" >> "$GITHUB_OUTPUT"
-
-  notify-slack:
-    needs: release
-    runs-on: ubuntu-latest
-    permissions: {}
-    steps:
-      - name: Notify Slack of the published release
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          RELEASE_URL: ${{ needs.release.outputs.release_url }}
-          RELEASE_VERSION: ${{ github.ref_name }}
-          RELEASE_REPOSITORY: ${{ github.repository }}
-        run: |
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "::error::Configure the SLACK_WEBHOOK_URL Actions secret for release notifications."
-            exit 1
-          fi
-          jq -n --arg repository "$RELEASE_REPOSITORY" \
-            --arg version "$RELEASE_VERSION" --arg url "$RELEASE_URL" \
-            '{text: ($repository + " " + $version + " released: <" + $url + "|View release>"), unfurl_links: false, unfurl_media: false}' \
-            > slack-payload.json
-          curl --silent --show-error --fail --connect-timeout 10 --max-time 30 \
-            --header 'Content-Type: application/json' \
-            --data-binary @slack-payload.json --output slack-response.txt \
-            "$SLACK_WEBHOOK_URL"
+          gh release create "$RELEASE_VERSION" --verify-tag \
+            --title "$RELEASE_VERSION" --notes-file release-notes.md
