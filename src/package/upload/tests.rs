@@ -676,7 +676,7 @@ fn an_untrusted_staging_parent_is_refused_before_anything_is_read() {
     };
     assert_eq!(*operation, IoOperation::InspectStagingParent);
     assert_eq!(path.as_deref(), Some(group_writable.as_path()));
-    assert!(entries(&group_writable).is_empty());
+    assert_eq!(entries(&group_writable), [] as [std::ffi::OsString; 0]);
 }
 
 // ---------------------------------------------------------------------------

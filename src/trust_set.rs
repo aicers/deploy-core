@@ -848,7 +848,7 @@ mod tests {
             document.min_manifest_format_version,
             MIN_MANIFEST_FORMAT_VERSION
         );
-        assert!(document.withdrawn_builds.is_empty());
+        assert_eq!(document.withdrawn_builds, [] as [WithdrawnBuild; 0]);
         let anchor = document.anchors.first().expect("one anchor");
         assert_eq!(document.anchors.len(), 1);
         assert_eq!(anchor.key_id, key_id(&public_key_of(&pair)));

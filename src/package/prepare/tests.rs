@@ -461,7 +461,7 @@ fn the_checked_in_placeholder_images_are_the_verifiers_verdict() {
     )
     .expect_err("preparation refuses");
     same_content_verdict(&error, &expected);
-    assert!(staging.entries().is_empty());
+    assert_eq!(staging.entries(), [] as [String; 0]);
 }
 
 #[test]
@@ -569,7 +569,7 @@ fn a_missing_first_source_is_named_before_an_oversize_second() {
         io_of(&error),
         (IoOperation::SourceRead, Some(missing), ErrorKind::NotFound)
     );
-    assert!(staging.entries().is_empty());
+    assert_eq!(staging.entries(), [] as [String; 0]);
 }
 
 #[test]
@@ -628,7 +628,7 @@ fn package_below_the_envelope_allocates_no_manifest() {
     let _seam = bounded_seam::install(None);
     let error = prepare(&natives(), &limits(LimitResource::Package, OVERHEAD - 1)).err();
     assert_eq!(limit_of(&error), (LimitResource::Package, OVERHEAD - 1));
-    assert!(bounded_seam::reservations().is_empty());
+    assert_eq!(bounded_seam::reservations(), [] as [(usize, usize); 0]);
     assert_eq!(bounded_seam::stored(), None);
 }
 
@@ -809,7 +809,7 @@ fn a_source_rewritten_mid_copy_is_declared_as_copied() {
         staging.path(),
     );
     let Ok(prepared) = result else {
-        assert!(staging.entries().is_empty());
+        assert_eq!(staging.entries(), [] as [String; 0]);
         return;
     };
     let bytes = container(&signer, &prepared);
@@ -1052,7 +1052,7 @@ fn persist_never_clobbers_an_existing_destination() {
         );
     }
     assert_eq!(std::fs::read(&file).expect("read"), b"keep");
-    assert!(entries(&dir).is_empty());
+    assert_eq!(entries(&dir), [] as [String; 0]);
     assert_eq!(entries(out.path()), ["dir", "file"]);
     assert_eq!(ready.package.scope_for_test().live_snapshots(), 1);
 }
@@ -1145,7 +1145,7 @@ fn a_publication_temporary_over_budget_is_disk_budget_exceeded() {
         ),
         "{error:?}"
     );
-    assert!(out.entries().is_empty());
+    assert_eq!(out.entries(), [] as [String; 0]);
 }
 
 #[test]
@@ -1164,7 +1164,7 @@ fn a_record_that_cannot_be_snapshotted_is_a_content_error() {
         path.as_deref(),
         Some(ready.package.scope_for_test().private_path())
     );
-    assert!(out.entries().is_empty());
+    assert_eq!(out.entries(), [] as [String; 0]);
 }
 
 #[test]
@@ -1195,7 +1195,7 @@ fn errors_display_in_lowercase_without_echoing_content() {
         let text = fault.to_string();
         assert_eq!(text, text.to_lowercase(), "{text}");
         let error = PackageWriteError::InvalidPreparation { reason: fault };
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
     }
     for reason in [
         DirectoryFault::NotAbsolute,

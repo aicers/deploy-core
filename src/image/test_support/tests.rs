@@ -1011,7 +1011,7 @@ fn a_scratch_image_has_empty_diff_ids_and_history_and_no_null_variant() {
     );
     let public_refs = refs(&["scratch:1"]);
     let archive = builder.finish(&public_refs).unwrap();
-    assert!(archive.diff_ids().is_empty());
+    assert_eq!(archive.diff_ids(), [] as [String; 0]);
     assert_eq!(image_entries(archive.bytes()).len(), 5);
     classify(&archive, &public_refs).unwrap();
 }

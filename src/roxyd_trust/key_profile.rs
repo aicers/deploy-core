@@ -297,7 +297,7 @@ fn bit_len(value: &[u8]) -> Option<usize> {
     if first == 0 {
         return None;
     }
-    let top_bits = usize::try_from(u8::BITS - first.leading_zeros()).ok()?;
+    let top_bits = usize::try_from(first.bit_width()).ok()?;
     rest.len().checked_mul(8)?.checked_add(top_bits)
 }
 

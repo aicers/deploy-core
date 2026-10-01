@@ -285,7 +285,7 @@ impl Charge {
         let updated = self
             .state
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 granted = want.min(limit.saturating_sub(used));
                 (granted > 0).then(|| used + granted)
             });

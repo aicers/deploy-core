@@ -1577,7 +1577,7 @@ fn a_failed_source_seek_is_source_seek_and_nothing_is_read() {
         io_of(&error),
         (IoOperation::SourceSeek, None, ErrorKind::PermissionDenied)
     );
-    assert!(log.borrow().reads.is_empty());
+    assert_eq!(log.borrow().reads, [] as [(u64, usize); 0]);
     assert_empty(dir.path());
 }
 

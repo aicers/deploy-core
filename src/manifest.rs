@@ -1611,7 +1611,7 @@ mod tests {
     #[test]
     fn empty_manifest_is_valid() {
         let manifest = manifest_of(None, Vec::new()).expect("empty manifest is valid");
-        assert!(manifest.artifacts().is_empty());
+        assert_eq!(manifest.artifacts(), []);
     }
 
     #[test]

@@ -75,7 +75,7 @@ fn reported_path(result: &Result<(), ArchiveCheckError>) -> Option<&str> {
 #[test]
 fn every_fixture_has_its_recorded_hash_and_verdict() {
     let fixtures = fixtures();
-    assert!(!fixtures.is_empty());
+    assert_ne!(fixtures, [] as [serde_json::Value; 0]);
     for fixture in &fixtures {
         let name = text(&fixture["name"]);
         let archive_name = text(&fixture["archive"]);

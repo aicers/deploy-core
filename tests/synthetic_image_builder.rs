@@ -207,7 +207,7 @@ fn every_supported_shape_is_accepted() {
         &tagged,
     );
     let scratch = accept(builder(amd64()), &tagged);
-    assert!(scratch.diff_ids().is_empty());
+    assert_eq!(scratch.diff_ids(), [] as [String; 0]);
     let repeated = accept(
         builder(amd64())
             .layer(hello(), LayerCompression::Uncompressed)
@@ -596,14 +596,14 @@ fn every_error_variant_is_nameable_with_its_fields() {
     ];
     for error in &errors {
         let message = error.to_string();
-        assert!(!message.is_empty());
+        assert_ne!(message, "");
         assert!(!message.ends_with('.'), "{message}");
         assert_eq!(
             message.chars().next().map(char::is_lowercase),
             Some(true),
             "{message}"
         );
-        assert!(!describe_builder_error(error).is_empty());
+        assert_ne!(describe_builder_error(error), "");
     }
     let checks = [
         ArchiveCheckError::Image(ImageVerifyError::LegacyImageEvidence {
@@ -616,7 +616,7 @@ fn every_error_variant_is_nameable_with_its_fields() {
         ArchiveCheckError::Io(io::Error::from(ErrorKind::PermissionDenied)),
     ];
     for error in &checks {
-        assert!(!describe_check_error(error).is_empty());
+        assert_ne!(describe_check_error(error), "");
         assert!(!error.to_string().ends_with('.'));
     }
 }

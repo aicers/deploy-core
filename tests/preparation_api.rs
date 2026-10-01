@@ -287,8 +287,8 @@ fn every_error_variant_is_nameable() {
         },
     ];
     for error in &errors {
-        assert!(!describe_error(error).is_empty());
-        assert!(!error.to_string().is_empty());
+        assert_ne!(describe_error(error), "");
+        assert_ne!(error.to_string(), "");
     }
     assert!(describe_error(&errors[0]).starts_with("OpenPreparation"));
 }

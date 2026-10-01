@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(echoed, b"frame");
         let exit = channel.wait().expect("wait");
         assert_eq!(exit.code, Some(0));
-        assert!(exit.stderr.is_empty());
+        assert_eq!(exit.stderr, [] as [u8; 0]);
         assert_eq!(
             exec.calls(),
             vec![RecordedCall::OpenChannel {

@@ -227,7 +227,7 @@ impl Case {
             .finalize()
             .expect("the prepared package still finalizes");
         drop(retried);
-        assert!(self.staging.entries().is_empty());
+        assert_eq!(self.staging.entries(), [] as [String; 0]);
         assert_unchanged(self.package(), &self.before);
         error
     }
@@ -400,7 +400,7 @@ fn finalization_reads_no_source_and_neither_serializes_nor_compresses() {
     for input in &case.ready.inputs {
         std::fs::remove_file(&input.source).expect("the source is deleted");
     }
-    assert!(entries(case.ready.sources.path()).is_empty());
+    assert_eq!(entries(case.ready.sources.path()), [] as [String; 0]);
 
     counters::reset();
     let finalized = case.finalize().expect("finalizes without any source");
@@ -1086,7 +1086,7 @@ fn a_trust_package_finalizes_only_past_the_active_epoch() {
         ),
         "{error:?}"
     );
-    assert!(staging.entries().is_empty());
+    assert_eq!(staging.entries(), [] as [String; 0]);
     let finalized = at(4).expect("an advancing epoch finalizes");
     assert_eq!(finalized.binding().trust_epoch(), Some(5));
 }
@@ -1248,7 +1248,7 @@ fn the_composition_is_byte_identical_to_its_three_steps() {
     // Only the finalization's own scope is left; the preparation's is gone.
     assert_eq!(staging.entries().len(), 1, "{:?}", staging.entries());
     drop(one);
-    assert!(staging.entries().is_empty());
+    assert_eq!(staging.entries(), [] as [String; 0]);
 }
 
 #[test]
@@ -1277,7 +1277,7 @@ fn a_signer_error_is_reported_as_the_signer() {
         }
         other => panic!("expected the signer, got {other:?}"),
     }
-    assert!(staging.entries().is_empty());
+    assert_eq!(staging.entries(), [] as [String; 0]);
 }
 
 #[test]
@@ -1314,7 +1314,7 @@ fn a_preparation_refusal_surfaces_unchanged_and_never_signs() {
     .expect_err("the composition refuses too");
     assert!(!invoked.get(), "the callback never ran");
     assert_eq!(format!("{error:?}"), format!("{expected:?}"));
-    assert!(staging.entries().is_empty());
+    assert_eq!(staging.entries(), [] as [String; 0]);
 }
 
 #[test]
@@ -1338,7 +1338,7 @@ fn a_finalization_refusal_surfaces_unchanged() {
         matches!(verdict_of(&error), VerifyError::UnknownKeyId { .. }),
         "{error:?}"
     );
-    assert!(staging.entries().is_empty());
+    assert_eq!(staging.entries(), [] as [String; 0]);
 }
 
 // ---------------------------------------------------------------------------

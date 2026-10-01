@@ -532,7 +532,10 @@ mod tests {
             !previous_of(&path).exists(),
             "a refused backup writes no `.previous`, whether of the link or of its target"
         );
-        assert!(strays(elsewhere.parent().expect("directory")).is_empty());
+        assert_eq!(
+            strays(elsewhere.parent().expect("directory")),
+            [] as [std::path::PathBuf; 0]
+        );
     }
 
     #[test]
@@ -563,7 +566,10 @@ mod tests {
             path.symlink_metadata().is_ok(),
             "and leaves the operator's link where it stands"
         );
-        assert!(strays(seeded.parent().expect("directory")).is_empty());
+        assert_eq!(
+            strays(seeded.parent().expect("directory")),
+            [] as [std::path::PathBuf; 0]
+        );
     }
 
     #[test]
@@ -635,7 +641,10 @@ mod tests {
             std::fs::read(&previous).expect("read the backup"),
             b"second-generation"
         );
-        assert!(strays(path.parent().expect("directory")).is_empty());
+        assert_eq!(
+            strays(path.parent().expect("directory")),
+            [] as [std::path::PathBuf; 0]
+        );
     }
 
     #[test]
@@ -691,6 +700,9 @@ mod tests {
             2,
             "two names for the artifact's inode, not three"
         );
-        assert!(strays(path.parent().expect("directory")).is_empty());
+        assert_eq!(
+            strays(path.parent().expect("directory")),
+            [] as [std::path::PathBuf; 0]
+        );
     }
 }

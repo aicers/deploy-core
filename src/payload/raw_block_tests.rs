@@ -279,7 +279,7 @@ fn the_raw_manifest_block_is_the_one_the_unsigned_writer_emitted() {
 fn the_raw_manifest_block_is_the_one_the_signer_was_handed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (bytes, handed) = signed(dir.path());
-    assert!(!handed.is_empty());
+    assert_ne!(handed, [] as [u8; 0]);
     assert_eq!(container(&bytes).raw_manifest_block(), handed.as_slice());
     assert_eq!(
         bytes.get(BASE.len()..BASE.len() + handed.len()),

@@ -408,7 +408,7 @@ mod tests {
         }
         assert_eq!(stored, cap);
         let reservations = seam::reservations();
-        assert!(!reservations.is_empty());
+        assert_ne!(reservations, [] as [(usize, usize); 0]);
         for &(len, additional) in &reservations {
             let (len, additional) = (as_u64(len), as_u64(additional));
             assert!(additional <= cap - len, "a request past the allowance");
@@ -451,7 +451,7 @@ mod tests {
                 .get_ref()
                 .is_some_and(<dyn std::error::Error + Send + Sync>::is::<AllocFault>)
         );
-        assert!(buf.into_inner().is_empty());
+        assert_eq!(buf.into_inner(), [] as [u8; 0]);
     }
 
     #[test]
@@ -460,7 +460,7 @@ mod tests {
         let mut buf = BoundedVec::new(ceilings(&[(LimitResource::Package, 0)]));
         let error = buf.write(b"x").expect_err("refused");
         assert_eq!(limit_fault(&error).resource, LimitResource::Package);
-        assert!(seam::reservations().is_empty());
+        assert_eq!(seam::reservations(), [] as [(usize, usize); 0]);
     }
 
     #[test]
