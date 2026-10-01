@@ -196,6 +196,35 @@ regenerated, is described in
 `assets/test-fixtures/signed-v6-images/README.md`. The manual Docker
 interoperability procedure is `docs/image-archive-interoperability.md`.
 
+## Releasing
+
+Releases use bare version tags such as `0.1.0`, following review-web's
+convention. The tag and `Cargo.toml` package version must match. GitHub Actions
+creates a GitHub Release from the matching dated section of `CHANGELOG.md`;
+this library has no binary release assets and is not published to crates.io by
+this workflow.
+
+1. Open a release issue and a preparation PR. Set the package version, promote
+   `[Unreleased]` to the version with its release date, and replace its link
+   with a compare link from the previous tag (a release-tag link for the first
+   release). Leave no empty `[Unreleased]` section.
+2. Run the CI checks and merge the preparation PR after its CI passes.
+3. On the merged main commit, after main CI passes, create and push only the
+   annotated version tag. For the first release:
+
+   ```sh
+   git fetch origin main
+   git tag -a 0.1.0 origin/main -m 'Release 0.1.0'
+   git push origin refs/tags/0.1.0
+   ```
+
+4. Confirm the Release workflow succeeds and inspect the GitHub Release notes.
+   The workflow fails before creating a release if the tag, package version,
+   or changelog section disagree, or if the notes are empty.
+
+The next user-visible change opens a new `[Unreleased]` section and its compare
+link. Consumers may pin the release with `tag = "0.1.0"` in their Git dependency.
+
 ## License
 
 See the repository for license information.
