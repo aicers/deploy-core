@@ -5208,7 +5208,7 @@ find "$1" -maxdepth 0 {predicate}"#
                 daemon()
                     .put_file(&dest, b"x", current_meta(0o644))
                     .expect("the write still lands");
-                assert!(strays(root.path()).is_empty());
+                assert_eq!(strays(root.path()), [] as [std::path::PathBuf; 0]);
             }
 
             /// Facts for a directory the synthetic staging walk should accept:
@@ -6236,7 +6236,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                         & 0o777,
                     BINARY_MODE
                 );
-                assert!(strays(artifact.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(artifact.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -6271,7 +6274,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     INCOMING,
                     "and what the symlink pointed at is untouched"
                 );
-                assert!(strays(artifact.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(artifact.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -7000,7 +7006,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     1,
                     "and must not have linked the artifact at all"
                 );
-                assert!(strays(artifact.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(artifact.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -7027,7 +7036,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 assert_eq!(inode(&previous), inode(&artifact));
                 assert_eq!(inode(&elsewhere), pointed_at);
                 assert_eq!(std::fs::read(&elsewhere).expect("read"), INCOMING);
-                assert!(strays(artifact.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(artifact.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -7065,7 +7077,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     2,
                     "two names for one inode, not three"
                 );
-                assert!(strays(previous.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(previous.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -7109,7 +7124,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     2,
                     "two names for one inode, not three"
                 );
-                assert!(strays(previous.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(previous.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -7152,7 +7170,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     1,
                     "the symlink's target was never linked either"
                 );
-                assert!(strays(target.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(target.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -7275,7 +7296,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     ),
                     other => panic!("expected Transfer, got {other:?}"),
                 }
-                assert!(strays(artifact.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(artifact.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
 
             #[test]
@@ -7311,7 +7335,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                     1,
                     "and the temporary link must be cleaned up again"
                 );
-                assert!(strays(artifact.parent().expect("dir")).is_empty());
+                assert_eq!(
+                    strays(artifact.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
             }
         }
 

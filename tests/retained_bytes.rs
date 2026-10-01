@@ -145,7 +145,7 @@ fn every_publication_error_variant_matches() {
     );
     for error in &errors {
         let message = error.to_string();
-        assert!(!message.is_empty());
+        assert_ne!(message, "");
         assert!(!message.ends_with('.'), "{message}");
         assert!(
             message.chars().next().is_some_and(|c| !c.is_uppercase()),
@@ -173,7 +173,7 @@ fn every_directory_trust_reason_matches() {
     unique.dedup();
     assert_eq!(unique.len(), reasons.len());
     for reason in reasons {
-        assert!(!reason.to_string().is_empty());
+        assert_ne!(reason.to_string(), "");
     }
 }
 

@@ -420,7 +420,7 @@ mod tests {
         let mut reader =
             CountingReader::new(source, limit(LimitResource::ConfigJson, 0), vec![], 7);
         assert_eq!(reader.read(&mut []).unwrap(), 0);
-        assert!(log.borrow().requests.is_empty());
+        assert_eq!(log.borrow().requests, [] as [usize; 0]);
     }
 
     #[test]

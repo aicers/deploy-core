@@ -248,7 +248,7 @@ fn syntax_refusal_makes_no_system_call() {
     let (path, reason) = unsafe_reason(open_trusted_dir(Path::new("/a/../b")).unwrap_err());
     assert_eq!(reason, DirectoryTrustReason::NotCanonical);
     assert_eq!(path, Path::new("/a/../b"));
-    assert!(fault::record().is_empty());
+    assert_eq!(fault::record(), [] as [fault::Step; 0]);
     drop(guard);
 }
 
@@ -408,7 +408,7 @@ fn scope_creates_private_directory_and_snapshot_modes() {
     assert_eq!(names_in(&private), vec!["snap-0".to_owned()]);
     writer.write_all(b"hello").unwrap();
     let bytes = writer.finish().unwrap();
-    assert!(names_in(&private).is_empty());
+    assert_eq!(names_in(&private), [] as [String; 0]);
     assert_eq!(bytes.len(), 5);
     assert_eq!(bytes.sha256(), &sha(b"hello"));
     assert_eq!(read_all(&bytes), b"hello");
@@ -491,7 +491,7 @@ fn random_source_failure_is_not_retried() {
     let record = fault::record();
     assert_eq!(record.iter().filter(|s| **s == Step::DrawName).count(), 1);
     assert!(!record.contains(&Step::MakeDirectory));
-    assert!(names_in(&root).is_empty());
+    assert_eq!(names_in(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -738,7 +738,7 @@ fn source_errors() {
     assert_eq!(op, RetentionOperation::ReadSource);
     assert_eq!(path, None);
     assert_eq!(kind, io::ErrorKind::ConnectionReset);
-    assert!(names_in(scope.private_path()).is_empty());
+    assert_eq!(names_in(scope.private_path()), [] as [String; 0]);
 }
 
 #[test]
@@ -962,7 +962,7 @@ fn dropping_an_unfinished_writer_releases_everything() {
     writer.write_all(b"partial").unwrap();
     assert_eq!(scope.budget_used(), before + 7);
     drop(writer);
-    assert!(names_in(scope.private_path()).is_empty());
+    assert_eq!(names_in(scope.private_path()), [] as [String; 0]);
     assert_eq!(scope.budget_used(), before);
 }
 
@@ -1103,7 +1103,7 @@ fn zero_budget_allows_only_empty_snapshots() {
     ));
     let empty = snap(&scope, b"");
     assert!(empty.is_empty());
-    assert!(names_in(scope.private_path()).is_empty());
+    assert_eq!(names_in(scope.private_path()), [] as [String; 0]);
 }
 
 #[test]
@@ -1142,7 +1142,7 @@ fn storage_full_is_io_not_budget() {
     assert_eq!(path, Some(scope.private_path().join("snap-0")));
     assert_eq!(kind, io::ErrorKind::StorageFull);
     assert_eq!(scope.budget_used(), 0);
-    assert!(names_in(scope.private_path()).is_empty());
+    assert_eq!(names_in(scope.private_path()), [] as [String; 0]);
 }
 
 #[test]
@@ -1188,7 +1188,7 @@ fn publish_file_success() {
     assert_eq!(receipt.len(), 150);
     assert_eq!(receipt.sha256(), &sha(&data));
     assert_eq!(mode_of(&destination), 0o600);
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
     assert_eq!(
         sequence(&record, FILE_STEPS),
         vec![
@@ -1225,7 +1225,7 @@ fn publish_file_refuses_existing_destinations() {
         fs::read_link(root.join("dangling")).unwrap(),
         root.join("nowhere")
     );
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 fn make_entry(kind: &str, path: &Path) {
@@ -1305,7 +1305,7 @@ fn link_failure_is_classified_by_inspection() {
         assert_eq!(got, kind);
         assert!(!destination.exists());
         assert!(!record.contains(&Step::Rename));
-        assert!(publish_siblings(&root).is_empty());
+        assert_eq!(publish_siblings(&root), [] as [String; 0]);
     }
 }
 
@@ -1321,7 +1321,7 @@ fn publish_file_refuses_unsafe_destinations() {
 
     let guard = fault::install(Seam::new());
     let err = publish_file(&bytes, Path::new("/"), &scope).unwrap_err();
-    assert!(fault::record().is_empty());
+    assert_eq!(fault::record(), [] as [fault::Step; 0]);
     drop(guard);
     match err {
         PublicationError::UnsafeDestinationParent { path, reason } => {
@@ -1354,9 +1354,9 @@ fn publish_file_refuses_unsafe_destinations() {
             other => panic!("{}: {other:?}", destination.display()),
         }
     }
-    assert!(names_in(&root.join("real")).is_empty());
-    assert!(names_in(&root.join("open")).is_empty());
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(names_in(&root.join("real")), [] as [String; 0]);
+    assert_eq!(names_in(&root.join("open")), [] as [String; 0]);
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1371,7 +1371,7 @@ fn publish_file_random_source_failure() {
     assert_eq!(path, Some(root.clone()));
     assert_eq!(kind, io::ErrorKind::Other);
     assert!(!fault::record().contains(&Step::CreateTemporary));
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1431,7 +1431,7 @@ fn publish_file_verification_catches_corruption() {
             other => panic!("{other:?}"),
         }
         assert!(!destination.exists());
-        assert!(publish_siblings(&root).is_empty());
+        assert_eq!(publish_siblings(&root), [] as [String; 0]);
     }
 }
 
@@ -1516,7 +1516,7 @@ fn publish_file_retained_read_failure() {
         publication_io(publish_file(&bytes, &root.join("out"), &scope).unwrap_err());
     assert_eq!(op, PublicationOperation::ReadRetained);
     assert_eq!(path, None);
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1532,7 +1532,7 @@ fn publish_file_shares_the_budget() {
     assert_eq!(scope.budget_high_water(), 10);
     assert_eq!(scope.budget_used(), 6);
     assert!(!destination.exists());
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1585,7 +1585,7 @@ fn publish_directory_success() {
         assert_eq!(fs::read(&path).unwrap(), read_all(bytes));
         assert_eq!(mode_of(&path), 0o600);
     }
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
     assert_eq!(
         sequence(
             &record,
@@ -1622,7 +1622,7 @@ fn publish_directory_refuses_existing_destinations() {
         }
         other => panic!("{other:?}"),
     }
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1659,7 +1659,7 @@ fn publish_directory_other_rename_failure() {
     assert_eq!(path, Some(destination.clone()));
     assert_eq!(kind, io::ErrorKind::PermissionDenied);
     assert!(!destination.exists());
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1674,7 +1674,7 @@ fn publish_directory_random_source_failure() {
     assert_eq!(op, PublicationOperation::CreateStagingDirectory);
     assert_eq!(path, Some(root.clone()));
     assert_eq!(kind, io::ErrorKind::Other);
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1693,7 +1693,7 @@ fn publish_directory_duplicate_name() {
     assert!(path.unwrap().ends_with("manifest.json"));
     assert_eq!(kind, io::ErrorKind::AlreadyExists);
     assert!(!destination.exists());
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }
 
 #[test]
@@ -1779,5 +1779,5 @@ fn publish_directory_shares_the_budget() {
     assert_eq!(scope.budget_high_water(), 20);
     assert_eq!(scope.budget_used(), 10);
     assert!(!destination.exists());
-    assert!(publish_siblings(&root).is_empty());
+    assert_eq!(publish_siblings(&root), [] as [String; 0]);
 }

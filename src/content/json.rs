@@ -730,7 +730,7 @@ mod tests {
         let (result, _, _) = read(data, document, &mut total, 8);
         let steps = seam::take();
         assert_eq!(result.unwrap_err(), exceeded(LimitResource::ConfigJson, 30));
-        assert!(!steps.is_empty());
+        assert_ne!(steps, [] as [seam::Step; 0]);
         for step in &steps {
             let remaining = 30 - step.accepted;
             let k = if remaining == 0 { 1 } else { remaining.min(8) };

@@ -1037,7 +1037,7 @@ fn every_error_variant_and_operation_is_nameable() {
     ];
     for operation in operations {
         let display = operation.to_string();
-        assert!(!display.is_empty());
+        assert_ne!(display, "");
         assert_eq!(display, display.to_lowercase());
         let error = ContentError::Io {
             operation,
@@ -1061,8 +1061,8 @@ fn every_error_variant_and_operation_is_nameable() {
         ContentError::Upload(UploadRefusal::ReservedTarget),
     ];
     for error in &errors {
-        assert!(!describe(error).is_empty());
-        assert!(!error.to_string().is_empty());
+        assert_ne!(describe(error), "");
+        assert_ne!(error.to_string(), "");
     }
     assert_eq!(
         errors[1].to_string(),
