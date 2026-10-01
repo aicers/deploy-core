@@ -196,6 +196,6 @@ regenerated, is described in
 `assets/test-fixtures/signed-v6-images/README.md`. The manual Docker
 interoperability procedure is `docs/image-archive-interoperability.md`.
 
-## License
+## Copyright
 
-See the repository for license information.
+Copyright 2026 ClumL Inc.
