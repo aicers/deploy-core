@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate version and extract release notes
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          version = os.environ["RELEASE_VERSION"]
+          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
+              raise SystemExit(f"invalid release tag: {version}")
+          package = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+          if package["version"] != version:
+              raise SystemExit(f"tag {version} differs from Cargo.toml version {package['version']}")
+
+          lines = Path("CHANGELOG.md").read_text().splitlines()
+          heading = re.compile(rf"## (?:\[{re.escape(version)}\]|{re.escape(version)})(?: - \d{{4}}-\d{{2}}-\d{{2}})?")
+          starts = [i for i, line in enumerate(lines) if heading.fullmatch(line)]
+          if len(starts) != 1:
+              raise SystemExit(f"expected one changelog section for {version}, found {len(starts)}")
+          notes = []
+          for line in lines[starts[0] + 1:]:
+              if line.startswith("## ") or re.match(r"^\[[^\]]+\]:", line):
+                  break
+              notes.append(line)
+          body = "\n".join(notes).strip()
+          if not any(line.strip() and not line.startswith("#") for line in notes):
+              raise SystemExit(f"empty changelog section for {version}")
+          Path("release-notes.md").write_text(body + "\n")
+          PY
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_VERSION" --verify-tag \
+            --title "$RELEASE_VERSION" --notes-file release-notes.md
