@@ -83,10 +83,53 @@ impl<'a> BootrootRunner<'a> {
 
 /// One `AppRole` captured from the `init` summary — the service-registration
 /// credential and the two rotation credentials (RFC 0001 §6 Phase 2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRole {
     /// The `AppRole` role id.
     pub role_id: String,
     /// The `AppRole` secret id.
     pub secret_id: String,
+}
+
+/// Hand-written so neither id leaks through a `Debug` on this or on anything holding it.
+impl std::fmt::Debug for AppRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppRole")
+            .field("role_id", &"<redacted>")
+            .field("secret_id", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_role_debug_redacts_both_ids() {
+        const ROLE_SENTINEL: &str = "role-id-sentinel-7f3a";
+        const SECRET_SENTINEL: &str = "secret-id-sentinel-c91e";
+        let approle = AppRole {
+            role_id: ROLE_SENTINEL.to_owned(),
+            secret_id: SECRET_SENTINEL.to_owned(),
+        };
+
+        for rendered in [format!("{approle:?}"), format!("{approle:#?}")] {
+            assert!(
+                !rendered.contains(ROLE_SENTINEL),
+                "role id leaked: {rendered}"
+            );
+            assert!(
+                !rendered.contains(SECRET_SENTINEL),
+                "secret id leaked: {rendered}"
+            );
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("role_id"), "{rendered}");
+            assert!(rendered.contains("secret_id"), "{rendered}");
+        }
+        assert_eq!(
+            format!("{approle:?}"),
+            r#"AppRole { role_id: "<redacted>", secret_id: "<redacted>" }"#
+        );
+    }
 }
