@@ -1,0 +1,34 @@
+cpus = 1
+
+[auth]
+ca_certs = ["${ca_bundle_path}"]
+cert = "${cert_path}"
+key = "${key_path}"
+
+[review]
+review_rpc_srv_addr = "${manager_address}"
+review_name = "${manager_server_name}"
+
+[[detectors]]
+detector_id = 10
+timeseries = false
+stats = false
+review_model = "unsupervised-default"
+period = "5m"
+
+[detectors.data_source]
+type = "giganto"
+batch_size = 500_000
+start = "1970-01-01T00:00:00Z"
+
+[detectors.labeldb]
+event_range = 30
+protocol = "http"
+min_events_ratio = 10
+generate_unlabeled_from_outliers = true
+limit_unlabeled_from_outliers = 5
+
+[[detectors.labeldb.columns]]
+column_ids = [15]
+db = "HttpUriThreat"
+min_score = 0.7

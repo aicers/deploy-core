@@ -44,7 +44,19 @@
 
 use std::fmt;
 
-const CATALOG: &[ConfigTemplate] = &[];
+const CATALOG: &[ConfigTemplate] = &[ConfigTemplate {
+    component: "reconverge",
+    id: "default",
+    name: LocalizedText {
+        en: "Default",
+        ko: "기본",
+    },
+    description: LocalizedText {
+        en: "Runs one detector every 5 minutes on the Data Store's HTTP events, using the HttpUriThreat label database. It needs a model named unsupervised-default, built on HTTP events, in the Central Manager. Until that model exists, the engine runs but detects nothing; once it is created, detection starts at the next 5-minute run.",
+        ko: "탐지기 하나가 5분마다 데이터 저장소의 HTTP 이벤트를 HttpUriThreat 레이블 데이터베이스를 사용해 분석합니다. 중앙 관리자에 HTTP 이벤트로 만든 unsupervised-default라는 이름의 모델이 있어야 합니다. 이 모델이 없는 동안에도 엔진은 실행되지만 탐지는 하지 않으며, 모델을 만들면 다음 5분 주기부터 탐지를 시작합니다.",
+    },
+    body: include_str!("../templates/reconverge/default.toml"),
+}];
 const REQUIRES_TEMPLATE: &[&str] = &["reconverge"];
 
 /// An operator-facing text in English and Korean.
@@ -699,6 +711,86 @@ server = "${manager_server_name}"
                 "{}",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn reconverge_default_is_the_only_template() {
+        let entry = find("reconverge", "default").unwrap();
+        assert_eq!(entry.component, "reconverge");
+        assert_eq!(entry.id, "default");
+        assert_eq!(entry.name.en, "Default");
+        assert_eq!(entry.name.ko, "기본");
+        assert_eq!(templates_for("reconverge").collect::<Vec<_>>(), [entry]);
+        assert_eq!(CATALOG, [*entry]);
+    }
+
+    #[test]
+    fn reconverge_default_renders_to_reconverge_config() {
+        const EXPECTED: &str = r#"
+cpus = 1
+
+[auth]
+ca_certs = ["/enrollment/ca.pem"]
+cert = "/enrollment/cert.pem"
+key = "/enrollment/key.pem"
+
+[review]
+review_rpc_srv_addr = "[::1]:8443"
+review_name = "manager.example"
+
+[[detectors]]
+detector_id = 10
+timeseries = false
+stats = false
+review_model = "unsupervised-default"
+period = "5m"
+
+[detectors.data_source]
+type = "giganto"
+batch_size = 500000
+start = "1970-01-01T00:00:00Z"
+
+[detectors.labeldb]
+event_range = 30
+protocol = "http"
+min_events_ratio = 10
+generate_unlabeled_from_outliers = true
+limit_unlabeled_from_outliers = 5
+
+[[detectors.labeldb.columns]]
+column_ids = [15]
+db = "HttpUriThreat"
+min_score = 0.7
+"#;
+        let entry = find("reconverge", "default").unwrap();
+        let output = render(entry.body, &VALUES)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        let expected = EXPECTED.parse::<toml::Table>().unwrap();
+
+        // Recursive table equality checks every exact key set, TOML type and
+        // value, including array lengths and the string (not datetime) start.
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn reconverge_default_requires_every_host_value() {
+        let entry = find("reconverge", "default").unwrap();
+        for token in TemplateToken::ALL {
+            let mut values = VALUES;
+            match token {
+                TemplateToken::CertPath => values.cert_path = None,
+                TemplateToken::KeyPath => values.key_path = None,
+                TemplateToken::CaBundlePath => values.ca_bundle_path = None,
+                TemplateToken::ManagerAddress => values.manager_address = None,
+                TemplateToken::ManagerServerName => values.manager_server_name = None,
+            }
+            assert!(matches!(
+                render(entry.body, &values),
+                Err(ConfigTemplateError::UnresolvedToken { token: found }) if found == token
+            ));
         }
     }
 
