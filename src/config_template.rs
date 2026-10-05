@@ -537,6 +537,45 @@ server = "${manager_server_name}"
     }
 
     #[test]
+    fn supplied_empty_values_are_not_treated_as_absent() {
+        const BODY: &str = "values = ['${cert_path}', '${key_path}', '${ca_bundle_path}', '${manager_address}', '${manager_server_name}']";
+        const EXPECTED: &str = "values = ['', '', '', '', '']";
+        let values = HostValues {
+            cert_path: Some(""),
+            key_path: Some(""),
+            ca_bundle_path: Some(""),
+            manager_address: Some(""),
+            manager_server_name: Some(""),
+        };
+        assert_eq!(
+            render(BODY, &values)
+                .unwrap()
+                .parse::<toml::Table>()
+                .unwrap(),
+            EXPECTED.parse::<toml::Table>().unwrap()
+        );
+    }
+
+    #[test]
+    fn errors_do_not_expose_previously_substituted_host_values() {
+        const BODIES: &[&str] = &[
+            "a = '${cert_path}'\nz = '${key_path}'",
+            "a = '${cert_path}'\nz = '${unknown}'",
+            "a = '${cert_path}'\n'z${key}' = 1",
+        ];
+        const HOST_VALUE: &str = "host-value-that-must-not-appear-in-an-error";
+        let values = HostValues {
+            cert_path: Some(HOST_VALUE),
+            ..HostValues::default()
+        };
+        for body in BODIES {
+            let error = render(body, &values).unwrap_err();
+            assert!(!error.to_string().contains(HOST_VALUE));
+            assert!(!format!("{error:?}").contains(HOST_VALUE));
+        }
+    }
+
+    #[test]
     fn substitutes_in_a_single_pass() {
         const BODY: &str = "cert = '${cert_path}'";
         let values = HostValues {
