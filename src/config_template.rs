@@ -721,6 +721,14 @@ server = "${manager_server_name}"
         assert_eq!(entry.id, "default");
         assert_eq!(entry.name.en, "Default");
         assert_eq!(entry.name.ko, "기본");
+        assert_eq!(
+            entry.description.en,
+            "Runs one detector every 5 minutes on the Data Store's HTTP events, using the HttpUriThreat label database. It needs a model named unsupervised-default, built on HTTP events, in the Central Manager. Until that model exists, the engine runs but detects nothing; once it is created, detection starts at the next 5-minute run."
+        );
+        assert_eq!(
+            entry.description.ko,
+            "탐지기 하나가 5분마다 데이터 저장소의 HTTP 이벤트를 HttpUriThreat 레이블 데이터베이스를 사용해 분석합니다. 중앙 관리자에 HTTP 이벤트로 만든 unsupervised-default라는 이름의 모델이 있어야 합니다. 이 모델이 없는 동안에도 엔진은 실행되지만 탐지는 하지 않으며, 모델을 만들면 다음 5분 주기부터 탐지를 시작합니다."
+        );
         assert_eq!(templates_for("reconverge").collect::<Vec<_>>(), [entry]);
         assert_eq!(CATALOG, [*entry]);
     }
