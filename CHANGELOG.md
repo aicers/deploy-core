@@ -8,6 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- A `default` configuration template for `reconverge`: one detector every 5 minutes
+  on the Data Store's HTTP events with the HttpUriThreat label database, using
+  the Central Manager model named `unsupervised-default`.
 - A catalog of named configuration templates for components whose first-install
   configuration file comes from a template, with English and Korean names and
   descriptions, the set of components that require one, lookups by component and
