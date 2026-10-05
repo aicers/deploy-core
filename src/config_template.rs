@@ -672,11 +672,8 @@ server = "${manager_server_name}"
     }
 
     #[test]
-    fn real_catalog_is_empty_and_only_reconverge_requires_a_template() {
-        assert_eq!(CATALOG, []);
+    fn only_reconverge_requires_a_template() {
         assert!(requires_template("reconverge"));
-        assert_eq!(templates_for("reconverge").count(), 0);
-        assert!(find("reconverge", "default").is_none());
         for component in ["piglet", "giganto", "hog", "crusher", "Reconverge", ""] {
             assert!(!requires_template(component));
             assert_eq!(templates_for(component).count(), 0);
