@@ -10,8 +10,8 @@
 //! To add an entry, add one TOML file at `templates/<component>/<id>.toml` and one
 //! element of `CATALOG`, with its body compiled in using
 //! `include_str!("../templates/<component>/<id>.toml")`; nothing else is needed.
-//! Catalog order is presentation order. The catalog includes the `default`
-//! template for reconverge, which requires a template for its first installs.
+//! Catalog order is presentation order. The catalog is initially empty, while
+//! reconverge requires a template, so the manager refuses its first installs.
 //!
 //! Templates can name `${cert_path}`, `${key_path}`, `${ca_bundle_path}`,
 //! `${manager_address}` and `${manager_server_name}`. Rendering parses a TOML
