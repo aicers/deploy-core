@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- A catalog of named configuration templates for components whose first-install
+  configuration file comes from a template, with English and Korean names and
+  descriptions, the set of components that require one, lookups by component and
+  by template id, and a renderer that substitutes the host's values — the
+  enrollment certificate, key and CA bundle paths and the manager's address and
+  server name — into a template and returns the configuration file's TOML text.
+
 ### Changed
 
 - An `AppRole`'s `Debug` output no longer shows its role id or secret id; both
