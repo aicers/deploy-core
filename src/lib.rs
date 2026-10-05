@@ -26,8 +26,10 @@
 //! across a job boundary, and the read-only retained bytes and no-clobber
 //! publication receipts that package content is read and published through. It
 //! carries **no** product concept — no component catalog, no per-component
-//! renderers — so both the installer and the per-machine root daemon depend on
-//! it and share a single implementation rather than shelling out to a CLI.
+//! renderers — except for [`config_template`], the deliberate configuration
+//! template catalog exception decided in bootler RFC 0004 §4. Everything else
+//! remains product-neutral, so both the installer and the per-machine root daemon
+//! depend on it and share a single implementation rather than shelling out to a CLI.
 //!
 //! The product-specific install/update orchestration, the component catalog, and
 //! the per-component rendering stay in the installer crate, which depends on this
@@ -35,6 +37,7 @@
 
 pub mod apply;
 pub mod bootroot_cmd;
+pub mod config_template;
 // Bounded tar, gzip and JSON primitives and their shared fault vocabulary.
 // Crate-private: the image-archive validator and the package verification and
 // writer pipeline are built on them and map their faults onto public errors of

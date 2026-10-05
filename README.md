@@ -96,6 +96,8 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **apply** — the apply primitives that actuate a diff on a host (place files,
   create directories, run root commands, load images, extract bundles).
 - **bootroot_cmd** — the wrapper around the on-host PKI command.
+- **config_template** — named first-install configuration templates and the
+  components that require one, with a renderer that substitutes host values.
 - **registration** — service registration against the on-host PKI.
 - **roxyd_selfupdate** — the roxyd self-update rollback supervisor units as
   data: the three activation services and the deadline timer, with no renderer
@@ -119,8 +121,10 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   prune) that every root-owned trust tree under **layout** shares.
 
 It carries no product concept — no component catalog, no per-component
-renderers — so both the installer and the per-machine root daemon depend
-on it and share one implementation.
+renderers — except for **config_template**, the deliberate configuration
+template catalog exception decided in bootler RFC 0004 §4. Everything else
+remains product-neutral, so both the installer and the per-machine root daemon
+depend on it and share one implementation.
 
 ## Build requirements
 

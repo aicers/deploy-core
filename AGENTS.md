@@ -478,8 +478,10 @@ Where the crate handles key material or secrets:
   catch it.
 - Errors are `thiserror`, and callers match on the variants.
 - It carries no product concept — no component catalog, no
-  per-component renderers. Keep it that way: anything that names a
-  product belongs in the caller.
+  per-component renderers — except for `config_template`, the deliberate
+  configuration template catalog exception decided in bootler RFC 0004 §4.
+  Keep everything else product-neutral: anything else that names a product
+  belongs in the caller.
 - Certificate verification lives in `src/roxyd_trust.rs`, which drives
   `webpki`'s `EndEntityCert` directly rather than going through
   `rustls`. That is the one module the shared rule refers to.
