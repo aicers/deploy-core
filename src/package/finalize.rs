@@ -194,7 +194,7 @@ pub fn finalize_package(
 ///
 /// # Signed fixtures
 ///
-/// This is the complete API for constructing genuinely signed format-6
+/// This is the complete API for constructing genuinely signed image-declaring
 /// packages in a consumer's tests: with a test key minted per test and a
 /// `TrustSet` anchoring only it, and — under the `test-support` feature, in
 /// `[dev-dependencies]` only — real image archives from

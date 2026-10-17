@@ -97,13 +97,15 @@ pub struct RenderContext<'a> {
     /// [`RenderVar::ManagerEndpoint`] states. The renderer substitutes it and
     /// parses nothing.
     pub manager_endpoint: Option<&'a str>,
-    /// The account the service runs as, or `None` for a root-run unit.
+    /// The account a unit that does not declare [`UnitTemplate::run_as`] runs
+    /// as, or `None` for a root-run unit.
     ///
-    /// `Some` emits `User=<account>`; `None` emits no `User=` line at all,
-    /// which is how a root-run unit is expressed. This is a
-    /// [`ServiceAccount`] rather than a string precisely so an account name
-    /// read from operator input or off the host cannot become the identity a
-    /// service runs as.
+    /// For such a unit, `Some` emits `User=<account>`; `None` emits no `User=`
+    /// line at all, which is how a root-run unit is expressed. A unit that
+    /// declares `run_as` renders no `User=` line whatever is supplied here.
+    /// This is a [`ServiceAccount`] rather than a string precisely so an
+    /// account name read from operator input or off the host cannot become the
+    /// identity a service runs as.
     pub service_account: Option<ServiceAccount>,
     /// Unit-file-name prefix. A DNS label.
     pub namespace: &'a str,
@@ -367,7 +369,11 @@ fn render_text(unit: &UnitTemplate, context: &RenderContext<'_>) -> Result<Strin
     // The account is a closed compile-time constant, exactly like a
     // `SystemdTarget`'s unit-file spelling, so it is emitted as it stands
     // rather than through the escaping rule that package-declared values need.
-    if let Some(account) = context.service_account {
+    // A unit declaring `run_as` takes the line away whatever account is
+    // supplied.
+    if unit.run_as.is_none()
+        && let Some(account) = context.service_account
+    {
         lines.push(format!("User={}", account.as_str()));
     }
     lines.push(format!(
@@ -509,7 +515,7 @@ mod tests {
     use crate::manifest::ArtifactKind;
     use crate::module_spec::{
         Arg, ModuleSpec, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec,
-        RenderVar, RestartPolicy, SystemdTarget, UnitTemplate,
+        RenderVar, RestartPolicy, RunAs, SystemdTarget, UnitTemplate,
     };
 
     /// `RestartSec=` value both shipped anchors carry.
@@ -556,6 +562,7 @@ mod tests {
             restart: RestartPolicy::Always,
             restart_sec: RESTART_SEC,
             limit_nofile: None,
+            run_as: None,
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
@@ -590,6 +597,7 @@ mod tests {
             restart: RestartPolicy::Always,
             restart_sec: RESTART_SEC,
             limit_nofile: None,
+            run_as: None,
             protect_home: true,
             private_tmp: true,
             no_new_privileges: true,
@@ -733,6 +741,78 @@ WantedBy=multi-user.target
         assert!(!unit.text.contains("User="), "got: {}", unit.text);
         assert_eq!(unit.file_name, "clumit-security-roxyd.service");
         assert!(!unit.text.contains(UNUSED), "got: {}", unit.text);
+    }
+
+    #[test]
+    fn the_production_renderer_reproduces_a_root_declaring_anchor_byte_for_byte() {
+        // The review anchor's golden minus its `User=` line, and nothing else:
+        // the context still supplies the account the review anchor runs as.
+        let expected = "\
+[Unit]
+Description=Clumit Security review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/clumit-security/bin/review /etc/clumit-security/review.toml
+WorkingDirectory=/var/lib/clumit-security/review/data
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+";
+        let mut declared = review_unit();
+        declared.run_as = Some(RunAs::Root);
+        let context = review_context();
+        assert!(context.service_account.is_some());
+        let unit = rendered(&spec(Some(declared)), &context);
+        assert_eq!(unit.text, expected);
+        assert_eq!(unit.file_name, "clumit-security-review.service");
+        assert!(!unit.text.contains(UNUSED), "got: {}", unit.text);
+    }
+
+    #[test]
+    fn run_as_root_renders_no_user_whatever_account_is_supplied() {
+        let expected = rendered(&spec(Some(roxyd_unit())), &roxyd_context()).text;
+        let mut declared = roxyd_unit();
+        declared.run_as = Some(RunAs::Root);
+        let declared = spec(Some(declared));
+
+        for account in [
+            None,
+            Some(ServiceAccount::Security),
+            Some(ServiceAccount::Fixture("nobody")),
+        ] {
+            let context = RenderContext {
+                service_account: account,
+                ..roxyd_context()
+            };
+            let unit = rendered(&declared, &context);
+            assert_eq!(unit.text, expected, "account {account:?}");
+            assert!(
+                !unit.text.lines().any(|line| line.starts_with("User=")),
+                "account {account:?} got: {}",
+                unit.text
+            );
+            for sandbox in ["ProtectHome=yes", "PrivateTmp=yes", "NoNewPrivileges=yes"] {
+                assert!(
+                    unit.text.lines().any(|line| line == sandbox),
+                    "account {account:?} lost {sandbox}: {}",
+                    unit.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_unit_not_declaring_run_as_still_runs_as_the_supplied_account() {
+        let unit = rendered(&spec(Some(review_unit())), &review_context());
+        assert!(
+            unit.text.contains("[Service]\nUser=clumit-security\n"),
+            "got: {}",
+            unit.text
+        );
     }
 
     /// The roxyd anchor with the one argument that varies per deployment named

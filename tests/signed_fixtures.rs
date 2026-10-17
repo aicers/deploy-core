@@ -1,4 +1,4 @@
-//! Genuinely signed format-6 fixtures built entirely through the public API,
+//! Genuinely signed image-declaring fixtures built entirely through the public API,
 //! the way an image consumer builds them in its own tests: real image
 //! archives from the synthetic builder, a test key minted per test, and
 //! `package::prepare_sign_finalize` — or the detached preparation, reopen and
@@ -19,7 +19,7 @@ use deploy_core::image::{
     ImagePlatform, ImageProvenance, ProductBuildProvenance, ReferenceLifecycle, RegistryProvenance,
     canonical_runtime_alias,
 };
-use deploy_core::manifest::{ArtifactKind, Disposition, TargetArch};
+use deploy_core::manifest::{ArtifactKind, Disposition, MANIFEST_FORMAT_VERSION, TargetArch};
 use deploy_core::package::{
     ContentError, ContentLimits, FinalizedPackage, PreparationBinding, VerifiedContents,
     VerifiedImages, finalize_package, prepare_package, prepare_sign_finalize, reopen_prepared,
@@ -624,7 +624,9 @@ fn checked_in(name: &str) -> (Vec<u8>, TrustSet) {
 
 /// The checked-in signed format-6 package the `write_signed_v6_fixture`
 /// example wrote verifies in full under its own key: its signed manifest is
-/// exactly what preparing the example's members gives, every member is the
+/// what preparing the example's members gives apart from its leading
+/// `format_version`, which is the version the package was written at, every
+/// member is the
 /// example's bytes, and each image's evidence names the canonical manifest
 /// the builder wrote.
 #[test]
@@ -647,7 +649,27 @@ fn the_checked_in_signed_v6_package_verifies_in_full() {
         staging.path(),
     )
     .expect("the example's members prepare");
-    let manifest = prepared.manifest_bytes();
+    // The producer has moved on since the package was written, and the
+    // floor's promise is that the package still verifies at the version it
+    // was written at, so only the leading stamp is taken from the package.
+    let written_at = deploy_core::payload::open_package(Cursor::new(&package))
+        .expect("the fixture opens")
+        .manifest()
+        .format_version()
+        .expect("the fixture is versioned");
+    let prepared_manifest =
+        std::str::from_utf8(prepared.manifest_bytes()).expect("a manifest is UTF-8 JSON");
+    let current_stamp = format!(r#"{{"format_version":{MANIFEST_FORMAT_VERSION},"#);
+    assert!(
+        prepared_manifest.starts_with(&current_stamp),
+        "the prepared manifest leads with the producer's stamp"
+    );
+    let manifest = prepared_manifest.replacen(
+        &current_stamp,
+        &format!(r#"{{"format_version":{written_at},"#),
+        1,
+    );
+    let manifest = manifest.as_bytes();
     assert!(
         package
             .windows(manifest.len())

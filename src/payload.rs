@@ -3783,6 +3783,7 @@ mod tests {
                 restart: RestartPolicy::Always,
                 restart_sec: 5,
                 limit_nofile: None,
+                run_as: None,
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,

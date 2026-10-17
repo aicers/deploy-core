@@ -4,6 +4,17 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `module_spec::UnitTemplate::run_as` lets a package declare that its service
+  runs as root (`module_spec::RunAs::Root`, manifest spelling `"root"`); such a
+  unit renders no `User=` line whatever account the caller supplies. A package
+  still cannot name an account.
+- A producer now stamps manifest format version 7, and this build reads 3
+  through 7. A build that reads only up to 6 refuses a format-7 manifest.
+
 ## [0.1.1] - 2026-10-05
 
 ### Added
@@ -64,5 +75,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.1.1...main
 [0.1.1]: https://github.com/aicers/deploy-core/compare/0.1.0...0.1.1
 [0.1.0]: https://github.com/aicers/deploy-core/releases/tag/0.1.0

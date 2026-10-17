@@ -1,4 +1,5 @@
-//! Writes the signed format-6 package fixture whose images verify in full.
+//! Writes the signed image-declaring package fixture whose images verify in
+//! full.
 //!
 //! ```text
 //! write_signed_v6_fixture <dir>
