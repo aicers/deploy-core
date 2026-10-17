@@ -843,9 +843,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Attributed, CommandOutput, Ended, FRAMING_GRACE, Framing, Kill, MAX_SLEEP_SECS, SLEEP,
-        Supervisor, TIMEOUT_MARKER_PREFIX, TIMEOUT_MARKER_SUFFIX, finish, partial_suffix,
-        remote_code_suffix, run,
+        Attributed, CommandOutput, Ended, FRAMING_GRACE, Framing, Handoff, Kill, MAX_SLEEP_SECS,
+        SLEEP, SUPERVISOR_SHELL, Supervisor, TIMEOUT_MARKER_PREFIX, TIMEOUT_MARKER_SUFFIX, finish,
+        partial_suffix, remote_code_suffix, run,
     };
     use crate::executor::{
         OutputStream, RC_MARKER, RunLimits, RunWithInputError, SUDO_OK_SENTINEL,
@@ -1120,6 +1120,45 @@ mod tests {
             MAX_SLEEP_SECS
         );
         assert_eq!(sleeps(Duration::MAX), MAX_SLEEP_SECS);
+    }
+
+    #[test]
+    fn a_supervisor_with_a_handoff_starts_the_command_only_past_its_line() {
+        let handoff = Handoff::new(SUPERVISOR_SHELL).expect("a handoff");
+        let supervisor = Supervisor::new(LIMITS.timeout, Some(&handoff)).expect("a supervisor");
+        let supervise = |feed: &[u8]| {
+            let mut command = Command::new(SUPERVISOR_SHELL);
+            command.args(["-c", supervisor.script(), "/bin/cat"]);
+            match run(
+                command,
+                SUPERVISOR_SHELL,
+                feed,
+                LIMITS,
+                supervisor.framing(false),
+                Kill::Group,
+            )
+            .expect("the run completes")
+            {
+                Ended::Exited(output) => output,
+                other => panic!("{feed:?}: {other:?}"),
+            }
+        };
+
+        // An unread password line is discarded with the handoff line, and the
+        // command reads exactly what follows.
+        let mut feed = b"s3cret\n".to_vec();
+        feed.extend_from_slice(&handoff.line());
+        feed.extend_from_slice(b"request");
+        let output = supervise(&feed);
+        assert_eq!(output.code, Some(0));
+        assert_eq!(output.stdout, b"request");
+
+        // Standard input that ends before the handoff line starts nothing.
+        for feed in [&b""[..], b"s3cret\n", b"s3cret\nrequest"] {
+            let output = supervise(feed);
+            assert_eq!(output.code, Some(1), "{feed:?}");
+            assert!(output.stdout.is_empty(), "{feed:?}");
+        }
     }
 
     /// Runs `script` under `sh`, directly and in its own group, framed as a
