@@ -51,7 +51,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_NAME: ${{ github.event.repository.name }}
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
           gh release create "$RELEASE_VERSION" --verify-tag \
-            --title "$RELEASE_VERSION" --notes-file release-notes.md
+            --title "$RELEASE_NAME $RELEASE_VERSION" --notes-file release-notes.md
