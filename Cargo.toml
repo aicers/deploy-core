@@ -65,7 +65,7 @@ name = "measure_verify_contents"
 path = "examples/measure_verify_contents/main.rs"
 required-features = ["test-support"]
 
-# Writes the signed format-6 package fixture in
+# Writes the signed image-declaring package fixture in
 # `assets/test-fixtures/signed-v6-images`; built on `image::test_support`, so
 # it exists only under `test-support`.
 [[example]]
@@ -89,8 +89,9 @@ required-features = ["test-support"]
 name = "verify_contents"
 required-features = ["test-support"]
 
-# Builds genuinely signed format-6 fixtures from synthetic images through
-# `package::prepare_sign_finalize`, so it exists only under `test-support`.
+# Builds genuinely signed image-declaring fixtures from synthetic images
+# through `package::prepare_sign_finalize`, so it exists only under
+# `test-support`.
 [[test]]
 name = "signed_fixtures"
 required-features = ["test-support"]

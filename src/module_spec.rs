@@ -13,7 +13,8 @@
 //! fails to deserialize rather than rendering an empty string or a literal
 //! `{{config}}` into a root-executed `ExecStart=`. There is deliberately no
 //! free-form directive field, no raw unit-text field, and no way for package
-//! data to name a service account.
+//! data to name a service account: a unit may only declare, through the closed
+//! [`RunAs`], that it runs as root.
 //!
 //! [`validate`] enforces every rule in this module and is invoked from this
 //! crate's manifest read path, so a consumer that never links an installer
@@ -37,7 +38,8 @@ const MAX_CONTAINER_NAME_LEN: usize = 255;
 /// [`ArtifactKind`] — the kind is already on the enclosing artifact and a
 /// second copy could disagree with it — and carries neither a service account
 /// (a closed compile-time enum that can never come from package data) nor a
-/// unit file name (derived host-side by the renderer).
+/// unit file name (derived host-side by the renderer). A unit may only declare,
+/// through [`UnitTemplate::run_as`], that it runs as root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleSpec {
@@ -70,17 +72,19 @@ pub struct ModuleSpec {
 /// 1. `[Unit]` — `Description=`, then one `After=` line per [`Self::after`]
 ///    element in declared order, then one `Wants=` line per [`Self::wants`]
 ///    element in declared order.
-/// 2. `[Service]` — `User=`, `ExecStart=`, `ExecReload=`, `WorkingDirectory=`,
-///    one `Environment=` line per [`Self::environment`] entry in declared
-///    order, `Restart=`, `RestartSec=`, `LimitNOFILE=`, then `ProtectHome=yes`,
-///    `PrivateTmp=yes` and `NoNewPrivileges=yes`, each emitted only when its
-///    flag is `true`.
+/// 2. `[Service]` — `User=` (only when [`Self::run_as`] is absent and the
+///    consumer supplies an account), `ExecStart=`, `ExecReload=`,
+///    `WorkingDirectory=`, one `Environment=` line per [`Self::environment`]
+///    entry in declared order, `Restart=`, `RestartSec=`, `LimitNOFILE=`, then
+///    `ProtectHome=yes`, `PrivateTmp=yes` and `NoNewPrivileges=yes`, each
+///    emitted only when its flag is `true`.
 /// 3. `[Install]` — one `WantedBy=` line per [`Self::wanted_by`] element in
 ///    declared order.
 ///
 /// `User=` is deliberately **not** a field here — the account is a closed
-/// compile-time enum that package data can never name — but its position
-/// belongs to this layout, so it is fixed here rather than twice.
+/// compile-time enum that package data can never name, and [`Self::run_as`]
+/// can only take the line away — but its position belongs to this layout, so
+/// it is fixed here rather than twice.
 /// [`Self::description`], [`Self::exec_start`], [`Self::restart`] and
 /// [`Self::restart_sec`] have no absent state, so their directives always
 /// render; that is why an empty `description` is rejected rather than left to
@@ -125,6 +129,19 @@ pub struct UnitTemplate {
     /// sentinel written out rather than a limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_nofile: Option<u64>,
+    /// The account the unit runs as, when the unit itself decides it.
+    ///
+    /// Absent means the unit runs as whatever account the consumer supplies,
+    /// which is what every unit rendered before this field existed does.
+    /// [`RunAs::Root`] renders no `User=` line whatever account the consumer
+    /// supplies, the shape a root-run unit already has. It adds and changes no
+    /// other directive.
+    ///
+    /// A consumer that creates a directory such a unit works in must create it
+    /// root-owned and closed to other accounts, because a root service follows
+    /// a link another account plants there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<RunAs>,
     /// Emits `ProtectHome=yes` when set.
     pub protect_home: bool,
     /// Emits `PrivateTmp=yes` when set.
@@ -178,6 +195,19 @@ impl RestartPolicy {
             Self::Always => "always",
         }
     }
+}
+
+/// The account a unit declares it runs as.
+///
+/// Closed on purpose, with one variant: package data can declare that its unit
+/// runs as root and can never name an account. There is no unit-file spelling,
+/// because the variant renders as the absence of a `User=` line rather than as
+/// a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunAs {
+    /// The unit runs as root.
+    Root,
 }
 
 /// One element of a unit-file argument list.
@@ -591,7 +621,7 @@ fn is_container_name(value: &str) -> bool {
 mod tests {
     use super::{
         Arg, ModuleSpec, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec,
-        RenderVar, RestartPolicy, SystemdTarget, UnitTemplate, validate,
+        RenderVar, RestartPolicy, RunAs, SystemdTarget, UnitTemplate, validate,
     };
     use crate::manifest::ArtifactKind;
 
@@ -614,6 +644,7 @@ mod tests {
             restart: RestartPolicy::Always,
             restart_sec: RESTART_SEC,
             limit_nofile: None,
+            run_as: None,
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
@@ -992,6 +1023,7 @@ mod tests {
         // The anchor sets no limit, so this is also the assertion that an
         // unchanged package's bytes did not move when the field was added.
         assert_eq!(unit.limit_nofile, None);
+        assert_eq!(unit.run_as, None);
         assert!(unit.protect_home);
         assert!(!unit.private_tmp);
         assert!(unit.no_new_privileges);
@@ -1071,6 +1103,90 @@ mod tests {
             ))
             .is_err(),
             "a negative sentinel must not be expressible"
+        );
+    }
+
+    #[test]
+    fn run_as_round_trips_only_when_it_is_present() {
+        // As for `limit_nofile`, the absent case is the wire-form test's whole
+        // bytes, so each case below differs from it by the key under test.
+        let with_root =
+            WIRE_SPEC.replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":"root","#);
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_root).expect("a declared root must decode");
+        let unit = decoded.unit.as_ref().expect("a unit is declared");
+        assert_eq!(unit.run_as, Some(RunAs::Root));
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, with_root);
+
+        let with_both = WIRE_SPEC.replace(
+            r#""restart_sec":5,"#,
+            r#""restart_sec":5,"limit_nofile":8000,"run_as":"root","#,
+        );
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_both).expect("both optional fields must decode");
+        let unit = decoded.unit.as_ref().expect("a unit is declared");
+        assert_eq!(unit.limit_nofile, Some(8000));
+        assert_eq!(unit.run_as, Some(RunAs::Root));
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, with_both);
+
+        let with_null =
+            WIRE_SPEC.replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":null,"#);
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_null).expect("an explicit null must decode");
+        assert_eq!(
+            decoded.unit.as_ref().expect("a unit is declared").run_as,
+            None
+        );
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, WIRE_SPEC);
+
+        // The vocabulary is exactly `"root"`: no other spelling of it, no
+        // account name, and no other shape decodes.
+        for refused in [
+            r#""Root""#,
+            r#""ROOT""#,
+            r#""clumit-security""#,
+            r#""user""#,
+            r#""nobody""#,
+            "0",
+            "true",
+            r#"{"user":"clumit-security"}"#,
+            r#"["root"]"#,
+        ] {
+            let wire = WIRE_SPEC.replace(
+                r#""restart_sec":5,"#,
+                &format!(r#""restart_sec":5,"run_as":{refused},"#),
+            );
+            assert!(
+                serde_json::from_str::<ModuleSpec>(&wire).is_err(),
+                "`run_as` {refused} must not decode"
+            );
+        }
+
+        // Nor does the field open the record to a sibling naming an account.
+        for sibling in ["user", "run_as_user"] {
+            let wire = with_root.replace(
+                r#""run_as""#,
+                &format!(r#""{sibling}":"clumit-security","run_as""#),
+            );
+            assert!(
+                serde_json::from_str::<ModuleSpec>(&wire).is_err(),
+                "a sibling `{sibling}` key must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn run_as_root_spells_root_in_the_manifest() {
+        assert_eq!(
+            serde_json::to_string(&RunAs::Root).expect("serialization must succeed"),
+            r#""root""#
+        );
+        assert_eq!(
+            serde_json::from_str::<RunAs>(r#""root""#).expect("`root` must decode"),
+            RunAs::Root
         );
     }
 

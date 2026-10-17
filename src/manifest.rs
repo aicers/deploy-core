@@ -23,7 +23,7 @@ use crate::module_spec::{ModuleSpec, ModuleSpecError};
 /// Stamped unconditionally, never derived from a manifest's contents: a
 /// manifest's version is the producer's, not a function of which optional
 /// variables its templates happen to name.
-pub const MANIFEST_FORMAT_VERSION: u32 = 6;
+pub const MANIFEST_FORMAT_VERSION: u32 = 7;
 
 /// Inclusive floor of the `format_version` range this build accepts.
 ///
@@ -41,7 +41,7 @@ pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 3;
 /// Tracks [`MANIFEST_FORMAT_VERSION`]: this build reads what it writes, and a
 /// manifest naming anything newer is refused for its version alone rather than
 /// failing as an opaque decode error somewhere inside it.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 6;
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 7;
 
 /// First `format_version` at which a container image artifact carries an
 /// [`ImageDeclaration`].
@@ -1175,13 +1175,14 @@ mod tests {
         ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest, TargetArch,
         is_pre_versioned_baseline, is_valid_commit,
     };
+    use crate::executor::ServiceAccount;
     use crate::image::{
         ImageArchitecture, ImageDeclaration, ImageDeclarationError, ImageOs, ImageOwner,
         ImagePlatform, ImageProvenance, ProductBuildProvenance, ReferenceLifecycle, SegmentField,
     };
     use crate::module_spec::{
         Arg, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
-        RestartPolicy, SystemdTarget, UnitTemplate,
+        RestartPolicy, RunAs, SystemdTarget, UnitTemplate,
     };
     use crate::render::{RenderContext, RenderError, render_unit};
 
@@ -1403,6 +1404,7 @@ mod tests {
                 restart: RestartPolicy::Always,
                 restart_sec: 5,
                 limit_nofile: Some(8000),
+                run_as: Some(RunAs::Root),
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,
@@ -2194,6 +2196,7 @@ mod tests {
         assert_eq!(unit.restart, expected.restart);
         assert_eq!(unit.restart_sec, expected.restart_sec);
         assert_eq!(unit.limit_nofile, expected.limit_nofile);
+        assert_eq!(unit.run_as, expected.run_as);
         assert_eq!(unit.protect_home, expected.protect_home);
         assert_eq!(unit.private_tmp, expected.private_tmp);
         assert_eq!(unit.no_new_privileges, expected.no_new_privileges);
@@ -2579,6 +2582,97 @@ mod tests {
         );
     }
 
+    /// Parses a current-version manifest whose one `c` unit is `unit`, and
+    /// renders it with the product account supplied.
+    fn render_current_version_unit(unit: &str) -> String {
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(unit));
+        let json = format!(
+            r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+        );
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a current-version manifest must parse");
+        let spec = manifest
+            .artifacts()
+            .first()
+            .expect("one artifact")
+            .spec
+            .as_ref()
+            .expect("the spec is carried");
+        let context = RenderContext {
+            service_account: Some(ServiceAccount::Security),
+            ..read_path_context(None)
+        };
+        render_unit(spec, &context)
+            .expect("the spec must render")
+            .expect("the spec declares a unit")
+            .text
+    }
+
+    #[test]
+    fn a_manifest_at_the_current_version_renders_a_unit_declaring_run_as_root() {
+        // The wire-driven mirror of the descriptor-limit test above: the key
+        // crosses the manifest, the read path accepts it, and the renderer
+        // drops the `User=` line the caller's account would otherwise produce.
+        let declared = unit_json(VALID_EXEC_START)
+            .replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":"root","#);
+        assert_eq!(
+            render_current_version_unit(&declared),
+            "[Unit]\nDescription=C\n\n[Service]\nExecStart=/opt/c/bin/c\nRestart=always\n\
+             RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+        );
+
+        // The same unit without the key runs as the supplied account.
+        assert_eq!(
+            render_current_version_unit(&unit_json(VALID_EXEC_START)),
+            "[Unit]\nDescription=C\n\n[Service]\nUser=clumit-security\nExecStart=/opt/c/bin/c\n\
+             Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+        );
+    }
+
+    #[test]
+    fn a_manifest_refuses_a_run_as_outside_its_vocabulary() {
+        for refused in [r#""Root""#, r#""clumit-security""#, "0"] {
+            let unit = unit_json(VALID_EXEC_START).replace(
+                r#""restart_sec":5,"#,
+                &format!(r#""restart_sec":5,"run_as":{refused},"#),
+            );
+            let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
+            let json = format!(
+                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+            );
+            assert!(
+                PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION).is_err(),
+                "`run_as` {refused} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn run_as_is_not_gated_by_format_version() {
+        // As with `limit_nofile`, the key is optional and its absence is the
+        // older behaviour, so every version in the window decodes it.
+        let unit = unit_json(VALID_EXEC_START)
+            .replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":"root","#);
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
+        for version in MIN_MANIFEST_FORMAT_VERSION..=MAX_MANIFEST_FORMAT_VERSION {
+            let json =
+                format!(r#"{{"format_version":{version},{MEMBERS_JSON}"artifacts":[{entry}]}}"#);
+            let manifest =
+                PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                    .unwrap_or_else(|error| panic!("version {version} must parse: {error}"));
+            let run_as = manifest
+                .artifacts()
+                .first()
+                .expect("one artifact")
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.unit.as_ref())
+                .expect("the spec declares a unit")
+                .run_as;
+            assert_eq!(run_as, Some(RunAs::Root), "version {version}");
+        }
+    }
+
     #[test]
     fn a_manifest_at_the_current_version_renders_a_spec_naming_the_manager_endpoint() {
         // The mirror of the test above, and the read path the bump was cut
@@ -2751,10 +2845,7 @@ mod tests {
             ],
         )
         .expect("a declared image is valid");
-        assert_eq!(
-            manifest.format_version(),
-            Some(IMAGE_DECLARATION_FORMAT_VERSION)
-        );
+        assert_eq!(manifest.format_version(), Some(MANIFEST_FORMAT_VERSION));
         let document: serde_json::Value =
             serde_json::to_value(&manifest).expect("serialization should succeed");
         let artifacts = document["artifacts"].as_array().expect("an array");

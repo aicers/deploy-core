@@ -188,7 +188,7 @@ declaration — and
 receives and answers each from a script, so a **dependent** crate's tests can
 construct them across the crate boundary. With
 `package::prepare_sign_finalize` and a test key minted per test, those
-archives become genuinely signed format-6 packages that pass every final
+archives become genuinely signed image-declaring packages that pass every final
 check; `tests/signed_fixtures.rs` builds one through the public API alone.
 Enable it only as a `[dev-dependencies]` feature — never under normal
 `[dependencies]` — so the fixtures stay absent from every release build.

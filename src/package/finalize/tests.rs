@@ -15,7 +15,7 @@ use super::super::prepare_fixture::{
 };
 use super::super::{PublicationOperation, VerifiedImages, reopen_prepared};
 use super::*;
-use crate::manifest::{ArtifactKind, PayloadManifest};
+use crate::manifest::{ArtifactKind, MANIFEST_FORMAT_VERSION, PayloadManifest};
 use crate::payload::{FOOTER_SIZE, FORMAT_VERSION, MAGIC, append_trailer_signed, counters};
 use crate::retain::fault::{self, Seam, Step};
 use crate::trust_fixture::{keypair, public_key_of};
@@ -1026,16 +1026,14 @@ fn a_withdrawn_build_is_refused() {
 #[test]
 fn a_trust_floor_above_the_format_is_refused() {
     let case = Case::new();
-    let trust = TrustSet::new(vec![case.key.anchor(false)], Vec::new(), 7, 0).expect("trust");
+    let floor = MANIFEST_FORMAT_VERSION + 1;
+    let trust = TrustSet::new(vec![case.key.anchor(false)], Vec::new(), floor, 0).expect("trust");
     let verdict = same_verdict_as_verify_package(&case, &case.signed(), &trust);
     assert!(
         matches!(
             verdict,
-            VerifyError::UnsupportedManifestFormat {
-                found: 6,
-                min: 7,
-                ..
-            }
+            VerifyError::UnsupportedManifestFormat { found, min, .. }
+                if found == MANIFEST_FORMAT_VERSION && min == floor
         ),
         "{verdict:?}"
     );

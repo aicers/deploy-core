@@ -33,7 +33,8 @@ The example mints a fresh key on every run, so `package.pkg` and
 `public-key.hex` both change each time, and neither is reproducible byte for
 byte. Everything the key does not touch is: `tests/signed_fixtures.rs`
 prepares the same members through the example's own `fixture` module and
-requires the checked-in package to carry exactly that signed manifest, to
+requires the checked-in package to carry that signed manifest, apart from its
+leading `format_version`, which is the version the package was written at, to
 verify in full, and to report the manifest digest the builder wrote for each
 image. The example prints those digests as it writes the package.
 
