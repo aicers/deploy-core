@@ -39,6 +39,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub use self::channel::{Channel, ChannelError, ChannelExit, ChannelLimits};
+use self::handoff::Handoff;
 use crate::durability::sync_dir;
 use crate::transport::{HostKeyPolicy, Ssh};
 
@@ -47,6 +48,8 @@ use crate::transport::{HostKeyPolicy, Ssh};
 mod bounded;
 // The long-lived channel behind `Executor::open_channel`.
 mod channel;
+// The handoff line a script run under `sudo -S` discards standard input up to.
+mod handoff;
 // A scriptable, recording executor, for this crate's tests and for dependents
 // that enable `test-support` under `[dev-dependencies]`.
 #[cfg(any(test, feature = "test-support"))]
@@ -1007,6 +1010,13 @@ pub enum Identity {
 pub enum SudoAuth {
     /// Interactive: feed this cached password to `sudo -S` (the password is
     /// obtained once, then reused).
+    ///
+    /// The password line never reaches the elevated command's standard input
+    /// or a file [`Executor::put_file`] lands, whether or not `sudo` reads it.
+    /// A `sudo` that does not ask for it — a `NOPASSWD` rule, or credentials
+    /// it still has cached — leaves the line unread, and the script it runs
+    /// discards standard input up to a line drawn for that invocation alone
+    /// before it starts the command.
     Password(String),
     /// Non-interactive: use `sudo -n`; an elevated command that would prompt
     /// is a host-named [`ExecutorError::Elevation`] error.
@@ -1042,6 +1052,13 @@ pub trait Executor {
     /// concrete invocation — `sudo`, `sudo -u`, or no prefix — is this
     /// implementation's business alone; the caller only names who it needs to be.
     ///
+    /// The command is given no standard input. Under [`SudoAuth::Password`] the
+    /// password line never reaches it, whether or not `sudo` reads it: a
+    /// command that reads standard input finds it ended at once. A `sudo` that
+    /// rejects the password is not left waiting for another: it fails on the
+    /// lines fed after the password and is reported as
+    /// [`ExecutorError::SudoRefused`].
+    ///
     /// # Errors
     ///
     /// Returns [`ExecutorError`] when the command cannot be spawned or the
@@ -1071,7 +1088,9 @@ pub trait Executor {
     ///   spawned.
     /// - **`input` is written to the command's standard input**, which is then
     ///   closed; an empty `input` closes it at once. The bytes pass through
-    ///   every transport verbatim.
+    ///   every transport verbatim, and are all the command reads: under
+    ///   [`SudoAuth::Password`] the password line never reaches it, whether or
+    ///   not `sudo` reads it.
     /// - **The command runs with an empty environment** — no inherited
     ///   variable, and so no `PATH` lookup. Where `sudo` or an SSH session
     ///   stands between this process and the command, the environment either
@@ -1282,6 +1301,10 @@ pub trait Executor {
     /// too: a `put_file` that returned `Ok` on such a host reports nothing about
     /// the flush it could not perform, and this crate has no logging facade to
     /// raise it through.
+    ///
+    /// The landed file holds exactly `contents`. Under [`SudoAuth::Password`]
+    /// the password line never reaches it, whether or not `sudo` reads it, and
+    /// a `sudo` that rejects the password lands nothing.
     ///
     /// # Errors
     ///
@@ -2288,8 +2311,54 @@ fn extract_remote_code(stderr: &[u8]) -> Option<(usize, i32)> {
 /// command passed as `$0`/`$@`, preserving each argument as a discrete word. The
 /// sentinel proves elevation began, so a later non-zero exit is attributed to
 /// the command, never mistaken for a sudo refusal.
-fn sudo_sentinel_script() -> String {
-    format!("printf '%s' '{SUDO_OK_SENTINEL}' >&2; exec \"$0\" \"$@\"")
+///
+/// Where `handoff` is given — under [`SudoAuth::Password`], see
+/// [`password_handoff`] — the script discards standard input up to its line
+/// between the two, so a password line `sudo` left unread never reaches the
+/// command, and exits `1` without starting it if standard input ends first.
+/// The command is still found through `PATH` and keeps the environment `sudo`
+/// set up.
+fn sudo_sentinel_script(handoff: Option<&Handoff>) -> String {
+    let discard = handoff.map_or_else(String::new, |handoff| format!("{}; ", handoff.discard()));
+    format!("printf '%s' '{SUDO_OK_SENTINEL}' >&2; {discard}exec \"$0\" \"$@\"")
+}
+
+/// Draws the [`Handoff`] an invocation by `identity` discards standard input up
+/// to, under the script `sudo` runs as `shell`.
+///
+/// One is drawn exactly where `sudo -S` is fed a password line it may leave
+/// unread — a `NOPASSWD` rule, or credentials it still has cached: an identity
+/// that elevates, under [`SudoAuth::Password`]. Anywhere else this is `None`,
+/// and the script and standard input are what they would be without it.
+///
+/// # Errors
+///
+/// Returns [`ExecutorError::Spawn`] when the system's random source fails.
+fn password_handoff(
+    auth: &SudoAuth,
+    identity: Identity,
+    shell: &str,
+) -> Result<Option<Handoff>, ExecutorError> {
+    match (auth, Elevation::of(identity)) {
+        (SudoAuth::Password(_), Some(_)) => Handoff::new(shell).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Returns what an elevating transport writes on `sudo -S`'s standard input
+/// ahead of the caller's bytes: the password line, then `handoff`'s line where
+/// the script `sudo` runs discards up to one.
+///
+/// The two are written in one go, without waiting for `sudo` to grant
+/// anything. A `sudo` that rejects the password reads the handoff line as
+/// another attempt and fails on it, rather than waiting on a silent standard
+/// input for one that never comes.
+fn password_preamble(password: &str, handoff: Option<&Handoff>) -> Vec<u8> {
+    let mut preamble = format!("{password}\n").into_bytes();
+    if let Some(handoff) = handoff {
+        preamble.extend_from_slice(&handoff.line());
+    }
+    preamble
 }
 
 /// The `sh -c` script [`InDaemonExecutor::descent_command`] descends through,
@@ -2433,8 +2502,23 @@ impl LocalExecutor {
     /// - [`Identity::Service`] prefixes `sudo -u <account>`, descending rather
     ///   than elevating. The account name is passed as a discrete `Command`
     ///   argument, so it reaches `sudo` as exactly one word whatever it contains.
-    fn resolve(&self, identity: Identity, command: &str, args: &[&str]) -> Resolved {
-        self.resolve_through(identity, SH, &sudo_sentinel_script(), command, args)
+    ///
+    /// Under [`SudoAuth::Password`] the elevated script discards standard input
+    /// up to a handoff line of this invocation's own, which the preamble
+    /// carries after the password line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Spawn`] when the handoff line cannot be drawn.
+    fn resolve(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+    ) -> Result<Resolved, ExecutorError> {
+        let handoff = password_handoff(&self.auth, identity, SH)?;
+        let script = sudo_sentinel_script(handoff.as_ref());
+        Ok(self.resolve_through(identity, SH, &script, handoff.as_ref(), command, args))
     }
 
     /// Resolves an `(identity, Local)` pair as [`LocalExecutor::resolve`]
@@ -2442,11 +2526,16 @@ impl LocalExecutor {
     /// the sentinel script — the one knob [`Executor::run_with_input`] turns.
     /// Whether `sudo` is involved, and with which flags and descent, is decided
     /// here for both methods.
+    ///
+    /// `handoff` is the line `script` discards standard input up to, which the
+    /// preamble then carries after the password line; `None` where the script
+    /// discards nothing, or takes its handoff line later, as a channel's does.
     fn resolve_through(
         &self,
         identity: Identity,
         shell: &str,
         script: &str,
+        handoff: Option<&Handoff>,
         command: &str,
         args: &[&str],
     ) -> Resolved {
@@ -2455,19 +2544,19 @@ impl LocalExecutor {
             cmd.args(args);
             return Resolved {
                 command: cmd,
-                password_line: None,
+                preamble: None,
                 elevated: false,
             };
         };
         let mut cmd = Command::new(&self.sudo_bin);
-        let password_line = match &self.auth {
+        let preamble = match &self.auth {
             SudoAuth::NonInteractive => {
                 cmd.arg("-n");
                 None
             }
             SudoAuth::Password(password) => {
                 cmd.args(["-S", "-p", ""]);
-                Some(format!("{password}\n").into_bytes())
+                Some(password_preamble(password, handoff))
             }
         };
         if let Elevation::Descend(account) = elevation {
@@ -2476,13 +2565,13 @@ impl LocalExecutor {
         cmd.arg(shell).arg("-c").arg(script).arg(command).args(args);
         Resolved {
             command: cmd,
-            password_line,
+            preamble,
             elevated: true,
         }
     }
 
-    /// Spawns a [`Resolved`] invocation, feeding `payload` after any password
-    /// line and settling the sudo sentinel when the invocation elevated.
+    /// Spawns a [`Resolved`] invocation, feeding `payload` after any preamble
+    /// and settling the sudo sentinel when the invocation elevated.
     fn spawn_resolved(
         &self,
         resolved: Resolved,
@@ -2490,11 +2579,11 @@ impl LocalExecutor {
     ) -> Result<CommandOutput, ExecutorError> {
         let Resolved {
             command,
-            password_line,
+            preamble,
             elevated,
         } = resolved;
         let program = command.get_program().to_string_lossy().into_owned();
-        let feed = match (password_line, payload) {
+        let feed = match (preamble, payload) {
             (Some(mut line), Some(bytes)) => {
                 line.extend_from_slice(bytes);
                 Some(line)
@@ -2523,15 +2612,17 @@ impl LocalExecutor {
         input: &[u8],
         limits: RunLimits,
     ) -> Result<CommandOutput, RunWithInputError> {
-        let supervisor = bounded::Supervisor::new(limits.timeout)?;
+        let handoff = password_handoff(&self.auth, identity, bounded::SUPERVISOR_SHELL)?;
+        let supervisor = bounded::Supervisor::new(limits.timeout, handoff.as_ref())?;
         let Resolved {
             command: mut cmd,
-            password_line,
+            preamble,
             elevated,
         } = self.resolve_through(
             identity,
             bounded::SUPERVISOR_SHELL,
             supervisor.script(),
+            handoff.as_ref(),
             command,
             args,
         );
@@ -2547,10 +2638,10 @@ impl LocalExecutor {
         } else {
             (bounded::Framing::DIRECT, bounded::Kill::Group)
         };
-        let feed = match password_line {
-            Some(mut line) => {
-                line.extend_from_slice(input);
-                line
+        let feed = match preamble {
+            Some(mut feed) => {
+                feed.extend_from_slice(input);
+                feed
             }
             None => input.to_vec(),
         };
@@ -2566,11 +2657,12 @@ impl LocalExecutor {
 }
 
 /// A local invocation resolved from an identity: the command to spawn, the
-/// password line to feed ahead of any payload, and whether the sudo sentinel
+/// preamble to feed ahead of any payload — the password line, and the handoff
+/// line where the script discards up to one — and whether the sudo sentinel
 /// must be settled afterwards.
 struct Resolved {
     command: Command,
-    password_line: Option<Vec<u8>>,
+    preamble: Option<Vec<u8>>,
     elevated: bool,
 }
 
@@ -2612,7 +2704,7 @@ impl Executor for LocalExecutor {
         command: &str,
         args: &[&str],
     ) -> Result<CommandOutput, ExecutorError> {
-        self.spawn_resolved(self.resolve(identity, command, args), None)
+        self.spawn_resolved(self.resolve(identity, command, args)?, None)
     }
 
     fn run_with_input(
@@ -2638,12 +2730,13 @@ impl Executor for LocalExecutor {
         let script = channel::StartScript::new()?;
         let Resolved {
             command: mut cmd,
-            password_line,
+            preamble: password_line,
             elevated,
         } = self.resolve_through(
             identity,
             channel::START_SHELL,
             script.script(),
+            None,
             command,
             args,
         );
@@ -2671,7 +2764,7 @@ impl Executor for LocalExecutor {
         // another elevation; the payload is fed on the script's stdin.
         let argv = landing_argv(dest, meta);
         let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let resolved = self.resolve(Identity::Root, SH, &borrowed);
+        let resolved = self.resolve(Identity::Root, SH, &borrowed)?;
         let output = self.spawn_resolved(resolved, Some(contents))?;
         if !output.success() {
             return Err(ExecutorError::Transfer {
@@ -2841,8 +2934,23 @@ impl SshExecutor {
     /// Every word — the account name included — goes through [`shell_join`], so
     /// the target's login shell re-parses each as exactly one word without
     /// re-splitting argument boundaries.
-    fn resolve(&self, identity: Identity, command: &str, args: &[&str]) -> ResolvedRemote {
-        self.resolve_through(identity, SH, &sudo_sentinel_script(), None, command, args)
+    ///
+    /// Under [`SudoAuth::Password`] the elevated script discards standard input
+    /// up to a handoff line of this invocation's own, which the preamble
+    /// carries after the password line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Spawn`] when the handoff line cannot be drawn.
+    fn resolve(
+        &self,
+        identity: Identity,
+        command: &str,
+        args: &[&str],
+    ) -> Result<ResolvedRemote, ExecutorError> {
+        let handoff = password_handoff(&self.auth, identity, SH)?;
+        let script = sudo_sentinel_script(handoff.as_ref());
+        Ok(self.resolve_through(identity, SH, &script, handoff.as_ref(), None, command, args))
     }
 
     /// Resolves an `(identity, Ssh)` pair as [`SshExecutor::resolve`] does,
@@ -2852,11 +2960,19 @@ impl SshExecutor {
     /// bare. Those are the knobs [`Executor::run_with_input`] turns; whether
     /// `sudo` is involved, and with which flags and descent, is decided here
     /// for both methods.
+    ///
+    /// `handoff` is the line `script` discards standard input up to, which the
+    /// preamble then carries after the password line; `None` where the script
+    /// discards nothing, or takes its handoff line later, as a channel's does.
+    // Each knob is one its callers turn independently: the elevated script,
+    // the handoff it discards up to, and the operator's script.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_through(
         &self,
         identity: Identity,
         shell: &str,
         script: &str,
+        handoff: Option<&Handoff>,
         operator_script: Option<&str>,
         command: &str,
         args: &[&str],
@@ -2872,7 +2988,7 @@ impl SshExecutor {
             };
             return ResolvedRemote {
                 remote,
-                password_line: None,
+                preamble: None,
                 elevated: false,
             };
         };
@@ -2884,10 +3000,10 @@ impl SshExecutor {
             Elevation::Elevate => String::new(),
             Elevation::Descend(account) => format!(" -u {}", shell_quote(account.as_str())),
         };
-        let (flags, password_line) = match &self.auth {
+        let (flags, preamble) = match &self.auth {
             SudoAuth::NonInteractive => ("-n", None),
             SudoAuth::Password(password) => {
-                ("-S -p ''", Some(format!("{password}\n").into_bytes()))
+                ("-S -p ''", Some(password_preamble(password, handoff)))
             }
         };
         ResolvedRemote {
@@ -2896,13 +3012,13 @@ impl SshExecutor {
                 self.remote_sudo,
                 shell_join(wrapped)
             ),
-            password_line,
+            preamble,
             elevated: true,
         }
     }
 
     /// Runs a [`ResolvedRemote`] invocation, feeding `payload` after any
-    /// password line and settling the sudo sentinel when it elevated.
+    /// preamble and settling the sudo sentinel when it elevated.
     fn run_resolved(
         &self,
         resolved: ResolvedRemote,
@@ -2910,10 +3026,10 @@ impl SshExecutor {
     ) -> Result<CommandOutput, ExecutorError> {
         let ResolvedRemote {
             remote,
-            password_line,
+            preamble,
             elevated,
         } = resolved;
-        let feed = match (password_line, payload) {
+        let feed = match (preamble, payload) {
             (Some(mut line), Some(bytes)) => {
                 line.extend_from_slice(bytes);
                 Some(line)
@@ -2943,23 +3059,27 @@ impl SshExecutor {
         input: &[u8],
         limits: RunLimits,
     ) -> Result<CommandOutput, RunWithInputError> {
-        let supervisor = bounded::Supervisor::new(limits.timeout)?;
+        // A handoff is drawn only for an identity that elevates, so the
+        // supervisor's discard never reaches the operator's script.
+        let handoff = password_handoff(&self.auth, identity, bounded::SUPERVISOR_SHELL)?;
+        let supervisor = bounded::Supervisor::new(limits.timeout, handoff.as_ref())?;
         let ResolvedRemote {
             remote,
-            password_line,
+            preamble,
             elevated,
         } = self.resolve_through(
             identity,
             bounded::SUPERVISOR_SHELL,
             supervisor.script(),
+            handoff.as_ref(),
             Some(supervisor.script()),
             command,
             args,
         );
-        let feed = match password_line {
-            Some(mut line) => {
-                line.extend_from_slice(input);
-                line
+        let feed = match preamble {
+            Some(mut feed) => {
+                feed.extend_from_slice(input);
+                feed
             }
             None => input.to_vec(),
         };
@@ -2987,11 +3107,12 @@ impl SshExecutor {
 }
 
 /// A remote invocation resolved from an identity: the complete remote command
-/// line, the password line to feed ahead of any payload, and whether the sudo
+/// line, the preamble to feed ahead of any payload — the password line, and the
+/// handoff line where the script discards up to one — and whether the sudo
 /// sentinel must be settled afterwards.
 struct ResolvedRemote {
     remote: String,
-    password_line: Option<Vec<u8>>,
+    preamble: Option<Vec<u8>>,
     elevated: bool,
 }
 
@@ -3002,7 +3123,7 @@ impl Executor for SshExecutor {
         command: &str,
         args: &[&str],
     ) -> Result<CommandOutput, ExecutorError> {
-        self.run_resolved(self.resolve(identity, command, args), None)
+        self.run_resolved(self.resolve(identity, command, args)?, None)
     }
 
     fn run_with_input(
@@ -3028,12 +3149,13 @@ impl Executor for SshExecutor {
         let script = channel::StartScript::new()?;
         let ResolvedRemote {
             remote,
-            password_line,
+            preamble: password_line,
             elevated,
         } = self.resolve_through(
             identity,
             channel::START_SHELL,
             script.script(),
+            None,
             Some(script.script()),
             command,
             args,
@@ -3066,7 +3188,7 @@ impl Executor for SshExecutor {
         // word so the remote login shell re-parses each as exactly one word.
         let argv = landing_argv(dest, meta);
         let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let resolved = self.resolve(Identity::Root, SH, &borrowed);
+        let resolved = self.resolve(Identity::Root, SH, &borrowed)?;
         let output = self.run_resolved(resolved, Some(contents))?;
         if output.success() {
             Ok(())
@@ -3164,7 +3286,7 @@ impl InDaemonExecutor {
         command: &str,
         args: &[&str],
     ) -> Result<(Command, bool), ExecutorError> {
-        self.resolve_through(identity, SH, &sudo_sentinel_script(), command, args)
+        self.resolve_through(identity, SH, &sudo_sentinel_script(None), command, args)
     }
 
     /// Resolves an `(identity, InDaemon)` pair as [`InDaemonExecutor::resolve`]
@@ -3251,7 +3373,7 @@ impl InDaemonExecutor {
         input: &[u8],
         limits: RunLimits,
     ) -> Result<CommandOutput, RunWithInputError> {
-        let supervisor = bounded::Supervisor::new(limits.timeout)?;
+        let supervisor = bounded::Supervisor::new(limits.timeout, None)?;
         let (mut cmd, elevated) = self.resolve_through(
             identity,
             bounded::SUPERVISOR_SHELL,
@@ -7526,16 +7648,23 @@ exec "$@"
             #[test]
             fn a_password_line_is_consumed_before_the_input_on_the_elevating_transports() {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let sudo = password_sudo(dir.path());
+                let asking = password_sudo(dir.path());
+                // A `NOPASSWD` rule, or cached credentials: `sudo` leaves the
+                // password line unread.
+                let not_asking = descending_sudo(dir.path());
                 let auth = || SudoAuth::Password("s3cret".to_string());
                 let input = pattern(REQUEST_MAX);
-                let pairs: Vec<(&str, Box<dyn Executor>)> = vec![
-                    (
-                        "local",
+                let mut pairs: Vec<(String, Box<dyn Executor>)> = Vec::new();
+                for (how, sudo) in [("asking", &asking), ("not asking", &not_asking)] {
+                    pairs.push((
+                        format!("local, {how}"),
                         Box::new(LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone())),
-                    ),
-                    ("ssh", Box::new(ssh_with(dir.path(), &sudo, auth()))),
-                ];
+                    ));
+                    pairs.push((
+                        format!("ssh, {how}"),
+                        Box::new(ssh_with(dir.path(), sudo, auth())),
+                    ));
+                }
                 for (label, exec) in pairs {
                     for identity in [Identity::Root, Identity::Service(ServiceAccount::Roxyd)] {
                         let output = exec
@@ -8107,7 +8236,8 @@ exec "$@"
                 // supervisor, and its own deadline still kills everything.
                 let dir = tempfile::tempdir().expect("tempdir");
                 let pids = dir.path().join("pids");
-                let supervisor = Supervisor::new(Duration::from_millis(200)).expect("a supervisor");
+                let supervisor =
+                    Supervisor::new(Duration::from_millis(200), None).expect("a supervisor");
                 let child = spawn_supervised(&supervisor, &pids);
                 let output = child.wait_with_output().expect("the supervisor ends");
                 assert!(!output.status.success());
@@ -8126,7 +8256,8 @@ exec "$@"
                 // and which must still end the command.
                 let dir = tempfile::tempdir().expect("tempdir");
                 let pids = dir.path().join("pids");
-                let supervisor = Supervisor::new(Duration::from_mins(5)).expect("a supervisor");
+                let supervisor =
+                    Supervisor::new(Duration::from_mins(5), None).expect("a supervisor");
                 let mut child = spawn_supervised(&supervisor, &pids);
                 let deadline = Instant::now() + REAP_WAIT;
                 while !pids.exists() {
@@ -9152,6 +9283,276 @@ exec "$@"
                             matches!(error, ChannelError::Unsupported),
                             "{label}: got {error:?}"
                         );
+                    }
+                }
+            }
+        }
+        /// [`SudoAuth::Password`] on the elevating transports, against a
+        /// `sudo` that asks for the password and one that does not — a
+        /// `NOPASSWD` rule, or credentials it still has cached — which leaves
+        /// the password line unread: the line reaches neither a command nor a
+        /// landed file.
+        mod password_handoffs {
+            use std::path::{Path, PathBuf};
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            use super::super::super::{
+                Executor, ExecutorError, Identity, LocalExecutor, RunLimits, RunWithInputError,
+                SUDO_OK_SENTINEL, ServiceAccount, SshExecutor, SudoAuth, sudo_sentinel_script,
+            };
+            use super::bounded_runs::{descending_sudo, password_sudo, ssh_with};
+            use super::{current_meta, dest_under, write_script};
+
+            /// Limits roomy enough never to be what ends a run here.
+            const ROOMY: RunLimits = RunLimits {
+                max_stdout: 1 << 20,
+                max_stderr: 1 << 20,
+                timeout: Duration::from_secs(30),
+            };
+            /// More than any pipe buffer holds.
+            const LARGE: usize = 512 * 1024;
+            /// How long a call against a `sudo` that rejects the password may
+            /// take before it is taken to be blocked.
+            const REFUSAL_WAIT: Duration = Duration::from_secs(10);
+            /// What opens every handoff line.
+            const HANDOFF_PREFIX: &str = "__BOOTLER_STDIN_";
+
+            /// Every byte value, repeated out to `len` bytes.
+            fn pattern(len: usize) -> Vec<u8> {
+                (0..=u8::MAX).cycle().take(len).collect()
+            }
+
+            /// The local and SSH transports under `SudoAuth::Password(password)`
+            /// against each of `sudos`, labelled for failure messages.
+            fn pairs(
+                dir: &Path,
+                password: &str,
+                sudos: &[(&str, &PathBuf)],
+            ) -> Vec<(String, Box<dyn Executor>)> {
+                let auth = || SudoAuth::Password(password.to_string());
+                let mut pairs: Vec<(String, Box<dyn Executor>)> = Vec::new();
+                for &(how, sudo) in sudos {
+                    pairs.push((
+                        format!("local, {how}"),
+                        Box::new(LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone())),
+                    ));
+                    pairs.push((format!("ssh, {how}"), Box::new(ssh_with(dir, sudo, auth()))));
+                }
+                pairs
+            }
+
+            /// A `sudo` stub that reads lines until one is `s3cret` or its
+            /// input ends, complaining after each as `sudo -S` does on a
+            /// wrong password — it never grants anything to anyone else.
+            fn insisting_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "insisting-sudo",
+                    "#!/bin/sh\nwhile IFS= read -r line; do\n  \
+                     [ \"$line\" = s3cret ] && exit 0\n  \
+                     echo 'Sorry, try again.' >&2\ndone\n\
+                     echo 'sudo: 3 incorrect password attempts' >&2\nexit 1\n",
+                )
+            }
+
+            /// A `sudo` stub that prints its arguments, each ended by a NUL,
+            /// and then the elevation sentinel.
+            fn recording_sudo(dir: &Path) -> PathBuf {
+                write_script(
+                    dir,
+                    "recording-sudo",
+                    &format!(
+                        "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\0' \"$arg\"; done\n\
+                         printf '%s' '{SUDO_OK_SENTINEL}' >&2\n"
+                    ),
+                )
+            }
+
+            /// Runs `call` on a thread of its own and returns what it
+            /// returned, failing the test if it has not within
+            /// [`REFUSAL_WAIT`].
+            fn promptly<T: Send + 'static>(
+                label: &str,
+                call: impl FnOnce() -> T + Send + 'static,
+            ) -> T {
+                let (sender, receiver) = mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let _ = sender.send(call());
+                });
+                let returned = receiver
+                    .recv_timeout(REFUSAL_WAIT)
+                    .unwrap_or_else(|_| panic!("{label}: the call blocked"));
+                handle.join().expect("the call's thread");
+                returned
+            }
+
+            /// Asserts that `run`, `put_file` and `run_with_input` on `exec`
+            /// each return [`ExecutorError::SudoRefused`] with `sudo`'s
+            /// complaint, promptly, and that `put_file` landed nothing.
+            fn assert_refused_promptly<E>(label: &str, exec: &E, root: &Path)
+            where
+                E: Executor + Clone + Send + 'static,
+            {
+                let refused = |error: &ExecutorError| {
+                    matches!(error, ExecutorError::SudoRefused { reason, .. }
+                        if reason.contains("Sorry, try again"))
+                };
+
+                let run = exec.clone();
+                let error = promptly(label, move || {
+                    run.run(Identity::Root, "/bin/cat", &[])
+                        .expect_err("the password was rejected")
+                });
+                assert!(refused(&error), "{label}: run: {error:?}");
+
+                let put = exec.clone();
+                let dest = dest_under(root, &format!("{}.conf", label.replace(' ', "-")));
+                let target = dest.clone();
+                let error = promptly(label, move || {
+                    put.put_file(&target, b"line one\nline two\n", current_meta(0o644))
+                        .expect_err("the password was rejected")
+                });
+                assert!(refused(&error), "{label}: put_file: {error:?}");
+                assert!(!dest.exists(), "{label}: put_file landed {dest:?}");
+
+                let bounded = exec.clone();
+                let error = promptly(label, move || {
+                    bounded
+                        .run_with_input(Identity::Root, "/bin/cat", &[], b"request\n", ROOMY)
+                        .expect_err("the password was rejected")
+                });
+                assert!(
+                    matches!(&error, RunWithInputError::Executor(inner) if refused(inner)),
+                    "{label}: run_with_input: {error:?}"
+                );
+            }
+
+            /// Returns the script `sudo` was handed after `-c`, from what
+            /// [`recording_sudo`] printed.
+            fn script_handed_to_sudo(stdout: &[u8]) -> String {
+                let args: Vec<&[u8]> = stdout.split(|&byte| byte == 0).collect();
+                let at = args
+                    .iter()
+                    .position(|arg| *arg == b"-c")
+                    .expect("sudo was handed `sh -c`");
+                let script = args.get(at + 1).expect("a script after `-c`");
+                String::from_utf8(script.to_vec()).expect("the script is UTF-8")
+            }
+
+            #[test]
+            fn put_file_lands_exactly_the_payload_whether_or_not_sudo_reads_the_password() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let asking = password_sudo(dir.path());
+                let not_asking = descending_sudo(dir.path());
+                let look_alike = format!("{HANDOFF_PREFIX}{}__\nthe rest\n", "0".repeat(32));
+                let payloads = [
+                    ("large", pattern(LARGE)),
+                    ("look-alike", look_alike.into_bytes()),
+                    ("empty", Vec::new()),
+                ];
+                let sudos = [("asking", &asking), ("not asking", &not_asking)];
+                for (index, (label, exec)) in
+                    pairs(dir.path(), "s3cret", &sudos).into_iter().enumerate()
+                {
+                    for (name, payload) in &payloads {
+                        let dest = dest_under(dir.path(), &format!("{index}-{name}.bin"));
+                        exec.put_file(&dest, payload, current_meta(0o644))
+                            .unwrap_or_else(|error| panic!("{label}, {name}: {error:?}"));
+                        let landed = std::fs::read(&dest).expect("read back");
+                        assert!(
+                            landed == *payload,
+                            "{label}, {name}: {} bytes given, {} landed, starting {:?}",
+                            payload.len(),
+                            landed.len(),
+                            String::from_utf8_lossy(landed.get(..16).unwrap_or(&landed))
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn an_empty_password_lands_no_leading_newline() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let not_asking = descending_sudo(dir.path());
+                let helper = pattern(LARGE);
+                for (index, (label, exec)) in pairs(dir.path(), "", &[("not asking", &not_asking)])
+                    .into_iter()
+                    .enumerate()
+                {
+                    let dest = dest_under(dir.path(), &format!("{index}-helper"));
+                    exec.put_file(&dest, &helper, current_meta(0o755))
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    let landed = std::fs::read(&dest).expect("read back");
+                    assert_eq!(landed.len(), helper.len(), "{label}");
+                    assert!(landed == helper, "{label}: the bytes differ");
+                }
+            }
+
+            #[test]
+            fn run_gives_the_command_no_stray_input() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let asking = password_sudo(dir.path());
+                let not_asking = descending_sudo(dir.path());
+                let sudos = [("asking", &asking), ("not asking", &not_asking)];
+                for (label, exec) in pairs(dir.path(), "s3cret", &sudos) {
+                    for identity in [Identity::Root, Identity::Service(ServiceAccount::Roxyd)] {
+                        let output = exec
+                            .run(identity, "/bin/cat", &[])
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        assert_eq!(output.code, Some(0), "{label}, {identity:?}");
+                        assert_eq!(
+                            String::from_utf8_lossy(&output.stdout),
+                            "",
+                            "{label}, {identity:?}: the command read input"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn a_wrong_password_is_refused_promptly_and_lands_nothing() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = insisting_sudo(dir.path());
+                let auth = || SudoAuth::Password("wrong".to_string());
+                let local = LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone());
+                assert_refused_promptly("local", &local, dir.path());
+                let ssh: SshExecutor = ssh_with(dir.path(), &sudo, auth());
+                assert_refused_promptly("ssh", &ssh, dir.path());
+            }
+
+            #[test]
+            fn only_a_password_brings_a_handoff_into_the_script() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = recording_sudo(dir.path());
+                let unchanged = sudo_sentinel_script(None);
+                for (auth, handed_off) in [
+                    (SudoAuth::NonInteractive, false),
+                    (SudoAuth::Password("s3cret".to_string()), true),
+                ] {
+                    let pairs: Vec<(&str, Box<dyn Executor>)> = vec![
+                        (
+                            "local",
+                            Box::new(
+                                LocalExecutor::new("seat", auth.clone())
+                                    .with_sudo_bin(sudo.clone()),
+                            ),
+                        ),
+                        ("ssh", Box::new(ssh_with(dir.path(), &sudo, auth.clone()))),
+                    ];
+                    for (label, exec) in pairs {
+                        let output = exec
+                            .run(Identity::Root, "true", &[])
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        let script = script_handed_to_sudo(&output.stdout);
+                        assert_eq!(
+                            script.contains(HANDOFF_PREFIX),
+                            handed_off,
+                            "{label}, {auth:?}: {script}"
+                        );
+                        if !handed_off {
+                            assert_eq!(script, unchanged, "{label}");
+                        }
                     }
                 }
             }

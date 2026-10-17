@@ -24,7 +24,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use aws_lc_rs::rand::SecureRandom;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 
@@ -32,6 +31,7 @@ use super::bounded::{
     Deadline, ENV, KILL_GRACE, SUPERVISOR_SHELL, TRANSPORT_STDERR_LIMIT, find, partial_suffix,
     reap_within,
 };
+use super::handoff::Handoff;
 use super::{CommandOutput, ExecutorError, RC_MARKER, SUDO_OK_SENTINEL, spawn_retrying_text_busy};
 
 /// How long [`Channel::wait`] waits for standard error to end once the local
@@ -42,13 +42,6 @@ const STDERR_GRACE: Duration = Duration::from_secs(5);
 /// The shell a [`StartScript`] runs under, named absolutely so the start
 /// depends on no `PATH`.
 pub(super) const START_SHELL: &str = SUPERVISOR_SHELL;
-/// What opens every [`StartScript`]'s handoff line; the start's own random
-/// nonce follows it.
-const HANDOFF_PREFIX: &str = "__BOOTLER_STDIN_";
-/// What closes every [`StartScript`]'s handoff line.
-const HANDOFF_SUFFIX: &str = "__";
-/// Random bytes in a handoff line's nonce.
-const HANDOFF_NONCE_LEN: usize = 16;
 /// Bytes read from standard error per readiness.
 const READ_CHUNK: usize = 8192;
 /// Bytes at the end of an SSH channel's standard error held back from the
@@ -190,15 +183,13 @@ pub(super) fn check_command(command: &str) -> Result<(), ChannelError> {
 ///   empty environment. Standard input that ends before the handoff line
 ///   means the transport broke, and the script exits `1` without starting it.
 ///
-/// The handoff line shares standard input with what precedes it, so it is not
-/// a fixed string a password could happen to equal: it carries a nonce of
-/// [`HANDOFF_NONCE_LEN`] bytes drawn from the system's secure random source
-/// for this start alone.
+/// The handoff line is a [`Handoff`], the same one every script run under
+/// `sudo -S` discards up to, and carries a nonce drawn for this start alone.
 ///
 /// [`SudoAuth::Password`]: super::SudoAuth::Password
 pub(super) struct StartScript {
     script: String,
-    handoff: String,
+    handoff: Handoff,
 }
 
 impl StartScript {
@@ -210,20 +201,10 @@ impl StartScript {
     /// to draw the handoff line's nonce: without it, nothing can be started
     /// under this script.
     pub(super) fn new() -> Result<Self, ExecutorError> {
-        let mut nonce = [0u8; HANDOFF_NONCE_LEN];
-        aws_lc_rs::rand::SystemRandom::new()
-            .fill(&mut nonce)
-            .map_err(|_| ExecutorError::Spawn {
-                command: START_SHELL.to_string(),
-                source: std::io::Error::other("system random source failed"),
-            })?;
-        let hex = crate::payload::to_hex(&nonce);
-        let handoff = format!("{HANDOFF_PREFIX}{hex}{HANDOFF_SUFFIX}");
+        let handoff = Handoff::new(START_SHELL)?;
         let script = format!(
-            "printf '%s' '{SUDO_OK_SENTINEL}' >&2; \
-             while IFS= read -r line; do \
-             [ \"$line\" = '{handoff}' ] && exec {ENV} -i \"$0\" \"$@\"; \
-             done; exit 1"
+            "printf '%s' '{SUDO_OK_SENTINEL}' >&2; {}; exec {ENV} -i \"$0\" \"$@\"",
+            handoff.discard()
         );
         Ok(Self { script, handoff })
     }
@@ -236,7 +217,7 @@ impl StartScript {
     /// Returns the line [`open_started`] writes once the start is announced,
     /// newline included.
     fn handoff_line(&self) -> Vec<u8> {
-        format!("{}\n", self.handoff).into_bytes()
+        self.handoff.line()
     }
 }
 
