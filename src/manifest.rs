@@ -2648,6 +2648,32 @@ mod tests {
     }
 
     #[test]
+    fn run_as_is_not_gated_by_format_version() {
+        // As with `limit_nofile`, the key is optional and its absence is the
+        // older behaviour, so every version in the window decodes it.
+        let unit = unit_json(VALID_EXEC_START)
+            .replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":"root","#);
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(&unit));
+        for version in MIN_MANIFEST_FORMAT_VERSION..=MAX_MANIFEST_FORMAT_VERSION {
+            let json =
+                format!(r#"{{"format_version":{version},{MEMBERS_JSON}"artifacts":[{entry}]}}"#);
+            let manifest =
+                PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                    .unwrap_or_else(|error| panic!("version {version} must parse: {error}"));
+            let run_as = manifest
+                .artifacts()
+                .first()
+                .expect("one artifact")
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.unit.as_ref())
+                .expect("the spec declares a unit")
+                .run_as;
+            assert_eq!(run_as, Some(RunAs::Root), "version {version}");
+        }
+    }
+
+    #[test]
     fn a_manifest_at_the_current_version_renders_a_spec_naming_the_manager_endpoint() {
         // The mirror of the test above, and the read path the bump was cut
         // for: a producer's manifest declares the variable, the validator on

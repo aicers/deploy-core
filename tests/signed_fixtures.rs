@@ -1,6 +1,6 @@
-//! Genuinely signed image-declaring fixtures built entirely through the public API,
-//! the way an image consumer builds them in its own tests: real image
-//! archives from the synthetic builder, a test key minted per test, and
+//! Genuinely signed image-declaring fixtures built entirely through the
+//! public API, the way an image consumer builds them in its own tests: real
+//! image archives from the synthetic builder, a test key minted per test, and
 //! `package::prepare_sign_finalize` — or the detached preparation, reopen and
 //! finalization it composes — followed by a full re-verification of the
 //! published file.
@@ -626,9 +626,8 @@ fn checked_in(name: &str) -> (Vec<u8>, TrustSet) {
 /// example wrote verifies in full under its own key: its signed manifest is
 /// what preparing the example's members gives apart from its leading
 /// `format_version`, which is the version the package was written at, every
-/// member is the
-/// example's bytes, and each image's evidence names the canonical manifest
-/// the builder wrote.
+/// member is the example's bytes, and each image's evidence names the
+/// canonical manifest the builder wrote.
 #[test]
 fn the_checked_in_signed_v6_package_verifies_in_full() {
     let (package, trust) = checked_in("signed-v6-images");
