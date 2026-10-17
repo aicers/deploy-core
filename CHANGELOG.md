@@ -4,6 +4,17 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Under `SudoAuth::Password`, `Executor::run`, `Executor::run_with_input` and
+  `Executor::put_file` on `LocalExecutor` and `SshExecutor` no longer pass the
+  password line on to the command when `sudo` does not read it (a `NOPASSWD`
+  rule, or credentials `sudo` still has cached). Before, the command read the
+  password as its first line of input, and `put_file` wrote it in plain text at
+  the start of the file it landed, with that file's owner and mode.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added
@@ -75,6 +86,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.2.0...main
 [0.2.0]: https://github.com/aicers/deploy-core/compare/0.1.1...0.2.0
 [0.1.1]: https://github.com/aicers/deploy-core/compare/0.1.0...0.1.1
 [0.1.0]: https://github.com/aicers/deploy-core/releases/tag/0.1.0

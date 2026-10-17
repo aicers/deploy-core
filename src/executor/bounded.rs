@@ -26,6 +26,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
+use super::handoff::Handoff;
 use super::{
     CommandOutput, ExecutorError, OutputStream, RC_MARKER, RunLimits, RunWithInputError,
     SUDO_OK_SENTINEL, spawn_retrying_text_busy,
@@ -210,6 +211,11 @@ pub(super) enum Ended {
 ///   and points its own at `/dev/null`: a shell reports a job a signal killed
 ///   — bash prints `Killed: 9` for the cancelled `sleep` below — and that
 ///   report is not the command's output.
+/// - **Under [`SudoAuth::Password`] it then discards standard input up to a
+///   [`Handoff`] line**, where the caller gives one: the password line a
+///   `sudo` that did not ask for it left unread, then the handoff line itself.
+///   Standard input that ends first exits `1` without starting the command.
+///   Without a handoff, standard input is left as it arrived.
 /// - **Standard input is handed to the command.** A shell gives a command it
 ///   runs in the background `/dev/null` unless told otherwise, so the script
 ///   moves its standard input aside and redirects it back onto the command
@@ -251,20 +257,24 @@ pub(super) enum Ended {
 /// with the status its subshell returned; and a command started in the
 /// background of a shell without job control starts with `SIGINT` and
 /// `SIGQUIT` ignored.
+///
+/// [`SudoAuth::Password`]: super::SudoAuth::Password
 pub(super) struct Supervisor {
     script: String,
     timeout_marker: String,
 }
 
 impl Supervisor {
-    /// Creates the supervisor of one run held to `timeout`.
+    /// Creates the supervisor of one run held to `timeout`, discarding
+    /// standard input up to `handoff`'s line before anything else where one
+    /// is given.
     ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::Spawn`] when the system's random source fails
     /// to draw the timeout marker's nonce: without it, nothing can be spawned
     /// under this supervisor.
-    pub(super) fn new(timeout: Duration) -> Result<Self, ExecutorError> {
+    pub(super) fn new(timeout: Duration, handoff: Option<&Handoff>) -> Result<Self, ExecutorError> {
         let mut nonce = [0u8; TIMEOUT_NONCE_LEN];
         aws_lc_rs::rand::SystemRandom::new()
             .fill(&mut nonce)
@@ -275,7 +285,7 @@ impl Supervisor {
         let hex = crate::payload::to_hex(&nonce);
         let timeout_marker = format!("{TIMEOUT_MARKER_PREFIX}{hex}{TIMEOUT_MARKER_SUFFIX}");
         Ok(Self {
-            script: script(&timeout_marker, timeout),
+            script: script(&timeout_marker, timeout, handoff),
             timeout_marker,
         })
     }
@@ -302,16 +312,18 @@ impl Supervisor {
 }
 
 /// Returns a [`Supervisor`]'s script, printing `timeout_marker` at a deadline
-/// of `timeout` rounded up to a whole second.
-fn script(timeout_marker: &str, timeout: Duration) -> String {
+/// of `timeout` rounded up to a whole second, and discarding standard input up
+/// to `handoff`'s line once it has announced itself.
+fn script(timeout_marker: &str, timeout: Duration, handoff: Option<&Handoff>) -> String {
     let seconds = timeout
         .as_secs()
         .saturating_add(u64::from(timeout.subsec_nanos() > 0))
         .min(MAX_SLEEP_SECS);
+    let discard = handoff.map_or_else(String::new, |handoff| format!("{}\n", handoff.discard()));
     format!(
         r#"trap 'kill -KILL 0' TERM HUP INT
 printf '%s' '{SUDO_OK_SENTINEL}' >&2
-exec 3<&0 0</dev/null 4>&2 2>/dev/null
+{discard}exec 3<&0 0</dev/null 4>&2 2>/dev/null
 {SLEEP} {seconds} </dev/null >/dev/null 3<&- 4>&- &
 nap=$!
 {{
@@ -831,9 +843,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Attributed, CommandOutput, Ended, FRAMING_GRACE, Framing, Kill, MAX_SLEEP_SECS, SLEEP,
-        Supervisor, TIMEOUT_MARKER_PREFIX, TIMEOUT_MARKER_SUFFIX, finish, partial_suffix,
-        remote_code_suffix, run,
+        Attributed, CommandOutput, Ended, FRAMING_GRACE, Framing, Handoff, Kill, MAX_SLEEP_SECS,
+        SLEEP, SUPERVISOR_SHELL, Supervisor, TIMEOUT_MARKER_PREFIX, TIMEOUT_MARKER_SUFFIX, finish,
+        partial_suffix, remote_code_suffix, run,
     };
     use crate::executor::{
         OutputStream, RC_MARKER, RunLimits, RunWithInputError, SUDO_OK_SENTINEL,
@@ -1067,8 +1079,8 @@ mod tests {
 
     #[test]
     fn each_supervisor_draws_its_own_marker() {
-        let first = Supervisor::new(Duration::from_secs(1)).expect("a supervisor");
-        let second = Supervisor::new(Duration::from_secs(1)).expect("a supervisor");
+        let first = Supervisor::new(Duration::from_secs(1), None).expect("a supervisor");
+        let second = Supervisor::new(Duration::from_secs(1), None).expect("a supervisor");
         assert_ne!(first.timeout_marker(), second.timeout_marker());
         for supervisor in [&first, &second] {
             let marker = supervisor.timeout_marker();
@@ -1085,7 +1097,7 @@ mod tests {
     #[test]
     fn the_supervisor_deadline_is_whole_seconds_rounded_up_and_capped() {
         let sleeps = |timeout| {
-            let supervisor = Supervisor::new(timeout).expect("a supervisor");
+            let supervisor = Supervisor::new(timeout, None).expect("a supervisor");
             let line = supervisor
                 .script()
                 .lines()
@@ -1108,6 +1120,45 @@ mod tests {
             MAX_SLEEP_SECS
         );
         assert_eq!(sleeps(Duration::MAX), MAX_SLEEP_SECS);
+    }
+
+    #[test]
+    fn a_supervisor_with_a_handoff_starts_the_command_only_past_its_line() {
+        let handoff = Handoff::new(SUPERVISOR_SHELL).expect("a handoff");
+        let supervisor = Supervisor::new(LIMITS.timeout, Some(&handoff)).expect("a supervisor");
+        let supervise = |feed: &[u8]| {
+            let mut command = Command::new(SUPERVISOR_SHELL);
+            command.args(["-c", supervisor.script(), "/bin/cat"]);
+            match run(
+                command,
+                SUPERVISOR_SHELL,
+                feed,
+                LIMITS,
+                supervisor.framing(false),
+                Kill::Group,
+            )
+            .expect("the run completes")
+            {
+                Ended::Exited(output) => output,
+                other => panic!("{feed:?}: {other:?}"),
+            }
+        };
+
+        // An unread password line is discarded with the handoff line, and the
+        // command reads exactly what follows.
+        let mut feed = b"s3cret\n".to_vec();
+        feed.extend_from_slice(&handoff.line());
+        feed.extend_from_slice(b"request");
+        let output = supervise(&feed);
+        assert_eq!(output.code, Some(0));
+        assert_eq!(output.stdout, b"request");
+
+        // Standard input that ends before the handoff line starts nothing.
+        for feed in [&b""[..], b"s3cret\n", b"s3cret\nrequest"] {
+            let output = supervise(feed);
+            assert_eq!(output.code, Some(1), "{feed:?}");
+            assert!(output.stdout.is_empty(), "{feed:?}");
+        }
     }
 
     /// Runs `script` under `sh`, directly and in its own group, framed as a
