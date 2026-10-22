@@ -3784,6 +3784,7 @@ mod tests {
                 restart_sec: 5,
                 limit_nofile: None,
                 run_as: None,
+                supplementary_groups: Vec::new(),
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,

@@ -103,6 +103,8 @@ pub struct RenderContext<'a> {
     /// For such a unit, `Some` emits `User=<account>`; `None` emits no `User=`
     /// line at all, which is how a root-run unit is expressed. A unit that
     /// declares `run_as` renders no `User=` line whatever is supplied here.
+    /// A unit that declares [`UnitTemplate::supplementary_groups`] needs
+    /// `Some`, and refuses to render without one.
     /// This is a [`ServiceAccount`] rather than a string precisely so an
     /// account name read from operator input or off the host cannot become the
     /// identity a service runs as.
@@ -227,6 +229,11 @@ pub enum RenderError {
         /// The rejected value.
         value: String,
     },
+    /// The unit declares [`UnitTemplate::supplementary_groups`] and renders no
+    /// `User=` line for them to qualify, because the context supplies no
+    /// [`RenderContext::service_account`].
+    #[error("the unit declares supplementary groups yet renders no `User=` line")]
+    SupplementaryGroupsWithoutUser,
     /// The declared placement class does not hold on this host.
     #[error("a `{class:?}` artifact does not belong on this host: {reason}")]
     PlacementRefused {
@@ -264,7 +271,10 @@ pub enum RenderError {
 /// covers the empty string as well as every control character. A template
 /// naming a variable whose optional context field is `None` returns
 /// [`RenderError::UnresolvedVariable`] rather than rendering anything in its
-/// place.
+/// place, and a unit declaring [`UnitTemplate::supplementary_groups`] in a
+/// context whose [`RenderContext::service_account`] is `None` returns
+/// [`RenderError::SupplementaryGroupsWithoutUser`] rather than dropping the
+/// line.
 pub fn render_unit(
     spec: &ModuleSpec,
     context: &RenderContext<'_>,
@@ -371,10 +381,23 @@ fn render_text(unit: &UnitTemplate, context: &RenderContext<'_>) -> Result<Strin
     // rather than through the escaping rule that package-declared values need.
     // A unit declaring `run_as` takes the line away whatever account is
     // supplied.
-    if unit.run_as.is_none()
-        && let Some(account) = context.service_account
-    {
+    let account = context.service_account.filter(|_| unit.run_as.is_none());
+    if let Some(account) = account {
         lines.push(format!("User={}", account.as_str()));
+    }
+    // The groups are closed compile-time constants too. They qualify the
+    // account on the `User=` line, so a unit that renders none is refused
+    // rather than left to run as root with the line silently dropped.
+    if !unit.supplementary_groups.is_empty() {
+        if account.is_none() {
+            return Err(RenderError::SupplementaryGroupsWithoutUser);
+        }
+        let groups: Vec<&str> = unit
+            .supplementary_groups
+            .iter()
+            .map(|group| group.as_unit_str())
+            .collect();
+        lines.push(format!("SupplementaryGroups={}", groups.join(" ")));
     }
     lines.push(format!(
         "ExecStart={}",
@@ -515,7 +538,7 @@ mod tests {
     use crate::manifest::ArtifactKind;
     use crate::module_spec::{
         Arg, ModuleSpec, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec,
-        RenderVar, RestartPolicy, RunAs, SystemdTarget, UnitTemplate,
+        RenderVar, RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate,
     };
 
     /// `RestartSec=` value both shipped anchors carry.
@@ -563,6 +586,7 @@ mod tests {
             restart_sec: RESTART_SEC,
             limit_nofile: None,
             run_as: None,
+            supplementary_groups: Vec::new(),
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
@@ -598,6 +622,7 @@ mod tests {
             restart_sec: RESTART_SEC,
             limit_nofile: None,
             run_as: None,
+            supplementary_groups: Vec::new(),
             protect_home: true,
             private_tmp: true,
             no_new_privileges: true,
@@ -813,6 +838,72 @@ WantedBy=multi-user.target
             "got: {}",
             unit.text
         );
+    }
+
+    #[test]
+    fn supplementary_groups_render_one_line_right_after_user() {
+        // The review anchor's golden plus one line, and nothing else.
+        let expected = "\
+[Unit]
+Description=Clumit Security review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=clumit-security
+SupplementaryGroups=adm
+ExecStart=/opt/clumit-security/bin/review /etc/clumit-security/review.toml
+WorkingDirectory=/var/lib/clumit-security/review/data
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+";
+        let mut declared = review_unit();
+        declared.supplementary_groups = vec![SupplementaryGroup::Adm];
+        let unit = rendered(&spec(Some(declared)), &review_context());
+        assert_eq!(unit.text, expected);
+        assert_eq!(unit.file_name, "clumit-security-review.service");
+        assert!(!unit.text.contains(UNUSED), "got: {}", unit.text);
+    }
+
+    #[test]
+    fn supplementary_groups_without_a_user_line_are_refused() {
+        let mut declared = review_unit();
+        declared.supplementary_groups = vec![SupplementaryGroup::Adm];
+        let context = RenderContext {
+            service_account: None,
+            ..review_context()
+        };
+        let error = render_unit(&spec(Some(declared)), &context)
+            .expect_err("groups with no account must not render");
+        assert!(
+            matches!(error, RenderError::SupplementaryGroupsWithoutUser),
+            "got: {error:?}"
+        );
+
+        // The other way to render no `User=` line, declaring `run_as`, is a
+        // spec the validator refuses before anything renders, whatever account
+        // is supplied.
+        let mut beside_root = review_unit();
+        beside_root.run_as = Some(RunAs::Root);
+        beside_root.supplementary_groups = vec![SupplementaryGroup::Adm];
+        for account in [None, Some(ServiceAccount::Security)] {
+            let context = RenderContext {
+                service_account: account,
+                ..review_context()
+            };
+            let error = render_unit(&spec(Some(beside_root.clone())), &context)
+                .expect_err("groups beside run_as must not render");
+            assert!(
+                matches!(
+                    error,
+                    RenderError::InvalidSpec(ModuleSpecError::SupplementaryGroupsWithRunAs)
+                ),
+                "account {account:?} got: {error:?}"
+            );
+        }
     }
 
     /// The roxyd anchor with the one argument that varies per deployment named
