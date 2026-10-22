@@ -1,17 +1,21 @@
 //! Named first-install configuration templates shared by the manager and host agent.
 //!
-//! This compile-time catalog is interim, until a UI policy for reconverge's
-//! `[[detectors]]` settings is decided. The manager reads ids, names, descriptions
-//! and the set of components that require a template; it never renders, sends,
-//! logs or exposes a template body. The host agent looks up a template by the
-//! install target and id, renders it with its host values, and writes the returned
-//! TOML verbatim as the instance's configuration file.
+//! No component requires a template, and the catalog is empty. The manager reads
+//! ids, names, descriptions and the set of components that require a template;
+//! it never renders, sends, logs or exposes a template body. The host agent looks
+//! up a template by the install target and id, renders it with its host values,
+//! and writes the returned TOML verbatim as the instance's configuration file.
+//! With the catalog empty, every lookup finds nothing.
 //!
 //! To add an entry, add one TOML file at `templates/<component>/<id>.toml` and one
 //! element of `CATALOG`, with its body compiled in using
 //! `include_str!("../templates/<component>/<id>.toml")`; nothing else is needed.
-//! Catalog order is presentation order. The catalog is initially empty, while
-//! reconverge requires a template, so the manager refuses its first installs.
+//! Catalog order is presentation order.
+//!
+//! `reconverge/default` is retired: reconverge takes its configuration from the
+//! manager rather than from a file rendered on its host, and that template
+//! targeted a reconverge release whose configuration later grew mandatory
+//! fields. Its id is never to be reused.
 //!
 //! Templates can name `${cert_path}`, `${key_path}`, `${ca_bundle_path}`,
 //! `${manager_address}` and `${manager_server_name}`. Rendering parses a TOML
@@ -40,24 +44,19 @@
 //! - A template's content **never changes under an existing id**. Changed
 //!   content gets a new id, and a retired id is never reused for other content.
 //!   Managers and hosts linking different deploy-core versions must never
-//!   render different files for one id.
+//!   render different files for one id. A retired identity is recorded in
+//!   `RETIRED`, and the catalog test refuses an entry carrying one.
 
 use std::fmt;
 
-const CATALOG: &[ConfigTemplate] = &[ConfigTemplate {
-    component: "reconverge",
-    id: "default",
-    name: LocalizedText {
-        en: "Default",
-        ko: "기본",
-    },
-    description: LocalizedText {
-        en: "Runs one detector every 5 minutes on the Data Store's HTTP events, using the HttpUriThreat label database. It needs a model named unsupervised-default, built on HTTP events, in the Central Manager. Until that model exists, the engine runs but detects nothing; once it is created, detection starts at the next 5-minute run.",
-        ko: "탐지기 하나가 5분마다 데이터 저장소의 HTTP 이벤트를 HttpUriThreat 레이블 데이터베이스를 사용해 분석합니다. 중앙 관리자에 HTTP 이벤트로 만든 unsupervised-default라는 이름의 모델이 있어야 합니다. 이 모델이 없는 동안에도 엔진은 실행되지만 탐지는 하지 않으며, 모델을 만들면 다음 5분 주기부터 탐지를 시작합니다.",
-    },
-    body: include_str!("../templates/reconverge/default.toml"),
-}];
-const REQUIRES_TEMPLATE: &[&str] = &["reconverge"];
+const CATALOG: &[ConfigTemplate] = &[];
+/// Template identities, as `(component, id)`, that have left the catalog.
+///
+/// A retired identity is never reused for other content, so a manager and a host
+/// linking different deploy-core versions cannot render different files for it.
+#[cfg(test)]
+const RETIRED: &[(&str, &str)] = &[("reconverge", "default")];
+const REQUIRES_TEMPLATE: &[&str] = &[];
 
 /// An operator-facing text in English and Korean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,9 +295,11 @@ mod tests {
         manager_server_name: Some("manager.example"),
     };
     const PLAIN_BODY: &str = "value = 'unchanged'";
+    const FIXTURE_COMPONENT: &str = "fixture";
+    const FIXTURE_REQUIRES_TEMPLATE: &[&str] = &[FIXTURE_COMPONENT];
     const ENTRY: ConfigTemplate = ConfigTemplate {
-        component: "reconverge",
-        id: "default",
+        component: FIXTURE_COMPONENT,
+        id: "base",
         name: LocalizedText {
             en: "Default",
             ko: "기본",
@@ -319,7 +320,7 @@ mod tests {
         ConfigTemplate { id: "a", ..ENTRY },
     ];
 
-    fn check_catalog(catalog: &[ConfigTemplate]) -> Result<(), String> {
+    fn check_catalog(catalog: &[ConfigTemplate], required: &[&str]) -> Result<(), String> {
         let mut identities = HashSet::new();
         for entry in catalog {
             let id = entry.id.as_bytes();
@@ -339,7 +340,13 @@ mod tests {
                     entry.component, entry.id
                 ));
             }
-            if !requires_template(entry.component) {
+            if RETIRED.contains(&(entry.component, entry.id)) {
+                return Err(format!(
+                    "retired template: {}/{}",
+                    entry.component, entry.id
+                ));
+            }
+            if !requires_template_in(required, entry.component) {
                 return Err(format!(
                     "component does not require a template: {}",
                     entry.component
@@ -656,37 +663,48 @@ server = "${manager_server_name}"
     #[test]
     fn fixture_lookups_are_exact_and_preserve_declared_order() {
         assert_eq!(
-            templates_in(FIXTURE_CATALOG, "reconverge")
+            templates_in(FIXTURE_CATALOG, FIXTURE_COMPONENT)
                 .map(|entry| entry.id)
                 .collect::<Vec<_>>(),
             ["z", "a"]
         );
-        let entry = find_in(FIXTURE_CATALOG, "reconverge", "z").unwrap();
-        assert_eq!(entry.component, "reconverge");
+        let entry = find_in(FIXTURE_CATALOG, FIXTURE_COMPONENT, "z").unwrap();
+        assert_eq!(entry.component, FIXTURE_COMPONENT);
         assert_eq!(entry.id, "z");
         assert_eq!(
             find_in(FIXTURE_CATALOG, "hog", "z").unwrap().component,
             "hog"
         );
         for (component, id) in [
-            ("reconverge", "unknown"),
+            (FIXTURE_COMPONENT, "unknown"),
             ("piglet", "z"),
-            ("reconverge", ""),
-            ("reconverge", "Z"),
-            ("Reconverge", "z"),
+            (FIXTURE_COMPONENT, ""),
+            (FIXTURE_COMPONENT, "Z"),
+            ("Fixture", "z"),
         ] {
             assert!(find_in(FIXTURE_CATALOG, component, id).is_none());
         }
-        assert_eq!(templates_in(FIXTURE_CATALOG, "Reconverge").count(), 0);
+        assert_eq!(templates_in(FIXTURE_CATALOG, "Fixture").count(), 0);
         assert_eq!(templates_in(FIXTURE_CATALOG, "piglet").count(), 0);
-        assert!(requires_template_in(&["fixture"], "fixture"));
-        assert!(!requires_template_in(&["fixture"], "Fixture"));
+        assert!(requires_template_in(
+            FIXTURE_REQUIRES_TEMPLATE,
+            FIXTURE_COMPONENT
+        ));
+        assert!(!requires_template_in(FIXTURE_REQUIRES_TEMPLATE, "Fixture"));
     }
 
     #[test]
-    fn only_reconverge_requires_a_template() {
-        assert!(requires_template("reconverge"));
-        for component in ["piglet", "giganto", "hog", "crusher", "Reconverge", ""] {
+    fn no_component_requires_a_template() {
+        assert_eq!(REQUIRES_TEMPLATE, [""; 0]);
+        for component in [
+            "reconverge",
+            "piglet",
+            "giganto",
+            "hog",
+            "crusher",
+            "Reconverge",
+            "",
+        ] {
             assert!(!requires_template(component));
             assert_eq!(templates_for(component).count(), 0);
             assert!(find(component, "default").is_none());
@@ -695,7 +713,7 @@ server = "${manager_server_name}"
 
     #[test]
     fn real_catalog_satisfies_invariants() {
-        check_catalog(CATALOG).unwrap();
+        check_catalog(CATALOG, REQUIRES_TEMPLATE).unwrap();
     }
 
     #[test]
@@ -715,91 +733,11 @@ server = "${manager_server_name}"
     }
 
     #[test]
-    fn reconverge_default_is_the_only_template() {
-        let entry = find("reconverge", "default").unwrap();
-        assert_eq!(entry.component, "reconverge");
-        assert_eq!(entry.id, "default");
-        assert_eq!(entry.name.en, "Default");
-        assert_eq!(entry.name.ko, "기본");
-        assert_eq!(
-            entry.description.en,
-            "Runs one detector every 5 minutes on the Data Store's HTTP events, using the HttpUriThreat label database. It needs a model named unsupervised-default, built on HTTP events, in the Central Manager. Until that model exists, the engine runs but detects nothing; once it is created, detection starts at the next 5-minute run."
-        );
-        assert_eq!(
-            entry.description.ko,
-            "탐지기 하나가 5분마다 데이터 저장소의 HTTP 이벤트를 HttpUriThreat 레이블 데이터베이스를 사용해 분석합니다. 중앙 관리자에 HTTP 이벤트로 만든 unsupervised-default라는 이름의 모델이 있어야 합니다. 이 모델이 없는 동안에도 엔진은 실행되지만 탐지는 하지 않으며, 모델을 만들면 다음 5분 주기부터 탐지를 시작합니다."
-        );
-        assert_eq!(templates_for("reconverge").collect::<Vec<_>>(), [entry]);
-        assert_eq!(CATALOG, [*entry]);
-    }
-
-    #[test]
-    fn reconverge_default_renders_to_reconverge_config() {
-        const EXPECTED: &str = r#"
-cpus = 1
-
-[auth]
-ca_certs = ["/enrollment/ca.pem"]
-cert = "/enrollment/cert.pem"
-key = "/enrollment/key.pem"
-
-[review]
-review_rpc_srv_addr = "[::1]:8443"
-review_name = "manager.example"
-
-[[detectors]]
-detector_id = 10
-timeseries = false
-stats = false
-review_model = "unsupervised-default"
-period = "5m"
-
-[detectors.data_source]
-type = "giganto"
-batch_size = 500000
-start = "1970-01-01T00:00:00Z"
-
-[detectors.labeldb]
-event_range = 30
-protocol = "http"
-min_events_ratio = 10
-generate_unlabeled_from_outliers = true
-limit_unlabeled_from_outliers = 5
-
-[[detectors.labeldb.columns]]
-column_ids = [15]
-db = "HttpUriThreat"
-min_score = 0.7
-"#;
-        let entry = find("reconverge", "default").unwrap();
-        let output = render(entry.body, &VALUES)
-            .unwrap()
-            .parse::<toml::Table>()
-            .unwrap();
-        let expected = EXPECTED.parse::<toml::Table>().unwrap();
-
-        // Recursive table equality checks every exact key set, TOML type and
-        // value, including array lengths and the string (not datetime) start.
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn reconverge_default_requires_every_host_value() {
-        let entry = find("reconverge", "default").unwrap();
-        for token in TemplateToken::ALL {
-            let mut values = VALUES;
-            match token {
-                TemplateToken::CertPath => values.cert_path = None,
-                TemplateToken::KeyPath => values.key_path = None,
-                TemplateToken::CaBundlePath => values.ca_bundle_path = None,
-                TemplateToken::ManagerAddress => values.manager_address = None,
-                TemplateToken::ManagerServerName => values.manager_server_name = None,
-            }
-            assert!(matches!(
-                render(entry.body, &values),
-                Err(ConfigTemplateError::UnresolvedToken { token: found }) if found == token
-            ));
-        }
+    fn reconverge_default_is_retired() {
+        assert!(find("reconverge", "default").is_none());
+        assert_eq!(templates_for("reconverge").count(), 0);
+        assert_eq!(CATALOG, []);
+        assert!(RETIRED.contains(&("reconverge", "default")));
     }
 
     #[test]
@@ -810,33 +748,76 @@ min_score = 0.7
         assert_eq!(LONGEST.len(), 63);
         for id in ["", "Default", "-a", "a_b", TOO_LONG, "한글", "a\n"] {
             assert!(
-                check_catalog(&[ConfigTemplate { id, ..ENTRY }]).is_err(),
+                check_catalog(&[ConfigTemplate { id, ..ENTRY }], FIXTURE_REQUIRES_TEMPLATE)
+                    .is_err(),
                 "id: {id:?}"
             );
         }
         for id in [LONGEST, "a-", "0", "a"] {
-            check_catalog(&[ConfigTemplate { id, ..ENTRY }]).unwrap();
+            check_catalog(&[ConfigTemplate { id, ..ENTRY }], FIXTURE_REQUIRES_TEMPLATE).unwrap();
         }
     }
 
     #[test]
     fn invariants_reject_duplicates_and_components_that_do_not_require_templates() {
-        assert!(check_catalog(&[ENTRY, ENTRY]).is_err());
+        assert!(check_catalog(&[ENTRY, ENTRY], FIXTURE_REQUIRES_TEMPLATE).is_err());
         assert!(
-            check_catalog(&[ConfigTemplate {
-                component: "hog",
-                ..ENTRY
-            }])
+            check_catalog(
+                &[ConfigTemplate {
+                    component: "hog",
+                    ..ENTRY
+                }],
+                FIXTURE_REQUIRES_TEMPLATE
+            )
             .is_err()
         );
-        check_catalog(&[
-            ENTRY,
-            ConfigTemplate {
-                id: "other",
-                ..ENTRY
-            },
-        ])
+        check_catalog(
+            &[
+                ENTRY,
+                ConfigTemplate {
+                    id: "other",
+                    ..ENTRY
+                },
+            ],
+            FIXTURE_REQUIRES_TEMPLATE,
+        )
         .unwrap();
+    }
+
+    #[test]
+    fn invariants_reject_retired_identities() {
+        const REQUIRED: &[&str] = &["reconverge"];
+        let retired = ConfigTemplate {
+            component: "reconverge",
+            id: "default",
+            ..ENTRY
+        };
+        assert_eq!(
+            check_catalog(&[retired], REQUIRED),
+            Err("retired template: reconverge/default".to_owned())
+        );
+        check_catalog(
+            &[ConfigTemplate {
+                id: "other",
+                ..retired
+            }],
+            REQUIRED,
+        )
+        .unwrap();
+        for &(component, id) in RETIRED {
+            assert!(
+                check_catalog(
+                    &[ConfigTemplate {
+                        component,
+                        id,
+                        ..ENTRY
+                    }],
+                    &[component]
+                )
+                .is_err(),
+                "{component}/{id}"
+            );
+        }
     }
 
     #[test]
@@ -844,12 +825,21 @@ min_score = 0.7
         const BODIES: &[&str] = &["value = '${unknown}'", "'${key}' = 1", "not TOML"];
         const BODY: &str = "values = ['${cert_path}', '${key_path}', '${ca_bundle_path}', '${manager_address}', '${manager_server_name}']";
         for body in BODIES {
-            assert!(check_catalog(&[ConfigTemplate { body, ..ENTRY }]).is_err());
+            assert!(
+                check_catalog(
+                    &[ConfigTemplate { body, ..ENTRY }],
+                    FIXTURE_REQUIRES_TEMPLATE
+                )
+                .is_err()
+            );
         }
-        check_catalog(&[ConfigTemplate {
-            body: BODY,
-            ..ENTRY
-        }])
+        check_catalog(
+            &[ConfigTemplate {
+                body: BODY,
+                ..ENTRY
+            }],
+            FIXTURE_REQUIRES_TEMPLATE,
+        )
         .unwrap();
     }
 
@@ -886,7 +876,7 @@ min_score = 0.7
                     ..ENTRY
                 },
             ] {
-                assert!(check_catalog(&[entry]).is_err());
+                assert!(check_catalog(&[entry], FIXTURE_REQUIRES_TEMPLATE).is_err());
             }
         }
     }
