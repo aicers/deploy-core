@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `module_spec::UnitTemplate::supplementary_groups` lets a package's unit
+  declare supplementary groups from the closed `module_spec::SupplementaryGroup`
+  (one variant, `Adm`, manifest spelling `"adm"`), rendered as
+  `SupplementaryGroups=adm` right after `User=`. A duplicated group, groups
+  together with `run_as`, groups in a manifest stamped below format version 8,
+  and rendering groups with no service account are refused.
+- A producer now stamps manifest format version 8, and this build reads 3
+  through 8. A build that reads only up to 7 refuses a format-8 manifest.
+
 ### Changed
 
 - `config_template::requires_template` no longer returns `true` for

@@ -13,12 +13,16 @@
 //! fails to deserialize rather than rendering an empty string or a literal
 //! `{{config}}` into a root-executed `ExecStart=`. There is deliberately no
 //! free-form directive field, no raw unit-text field, and no way for package
-//! data to name a service account: a unit may only declare, through the closed
-//! [`RunAs`], that it runs as root.
+//! data to name a service account or an arbitrary group: a unit may only
+//! declare, through the closed [`RunAs`], that it runs as root, and, through
+//! the closed [`SupplementaryGroup`] list, which of a fixed set of groups its
+//! account additionally joins.
 //!
 //! [`validate`] enforces every rule in this module and is invoked from this
 //! crate's manifest read path, so a consumer that never links an installer
 //! still refuses a malformed spec before acting on it.
+
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,7 +43,9 @@ const MAX_CONTAINER_NAME_LEN: usize = 255;
 /// second copy could disagree with it — and carries neither a service account
 /// (a closed compile-time enum that can never come from package data) nor a
 /// unit file name (derived host-side by the renderer). A unit may only declare,
-/// through [`UnitTemplate::run_as`], that it runs as root.
+/// through [`UnitTemplate::run_as`], that it runs as root, and, through
+/// [`UnitTemplate::supplementary_groups`], which groups from the closed
+/// [`SupplementaryGroup`] list its account additionally joins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleSpec {
@@ -73,7 +79,9 @@ pub struct ModuleSpec {
 ///    element in declared order, then one `Wants=` line per [`Self::wants`]
 ///    element in declared order.
 /// 2. `[Service]` — `User=` (only when [`Self::run_as`] is absent and the
-///    consumer supplies an account), `ExecStart=`, `ExecReload=`,
+///    consumer supplies an account), then one `SupplementaryGroups=` line
+///    carrying every [`Self::supplementary_groups`] element's unit spelling in
+///    declared order, joined by one space, then `ExecStart=`, `ExecReload=`,
 ///    `WorkingDirectory=`, one `Environment=` line per [`Self::environment`]
 ///    entry in declared order, `Restart=`, `RestartSec=`, `LimitNOFILE=`, then
 ///    `ProtectHome=yes`, `PrivateTmp=yes` and `NoNewPrivileges=yes`, each
@@ -142,6 +150,23 @@ pub struct UnitTemplate {
     /// a link another account plants there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_as: Option<RunAs>,
+    /// Groups the unit's account additionally joins, in declared order.
+    ///
+    /// Empty means the unit joins no group beyond its account's own, which is
+    /// what every unit rendered before this field existed does. A non-empty
+    /// list renders one `SupplementaryGroups=` line right after `User=`, so it
+    /// widens what one service may read without giving the account itself a
+    /// supplementary group every other unit running as it would inherit.
+    ///
+    /// A group appears at most once, and the list is refused beside
+    /// [`Self::run_as`]: a root-run unit already reads everything a group
+    /// grants. A unit declaring groups must render a `User=` line, so a
+    /// consumer that supplies no account refuses to render it rather than
+    /// dropping the line. A manifest stamped below
+    /// [`crate::manifest::SUPPLEMENTARY_GROUPS_FORMAT_VERSION`] cannot carry
+    /// a non-empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_groups: Vec<SupplementaryGroup>,
     /// Emits `ProtectHome=yes` when set.
     pub protect_home: bool,
     /// Emits `PrivateTmp=yes` when set.
@@ -208,6 +233,29 @@ impl RestartPolicy {
 pub enum RunAs {
     /// The unit runs as root.
     Root,
+}
+
+/// A group a unit's account may additionally join.
+///
+/// Closed on purpose: package data can name only a group this enum offers,
+/// never an arbitrary one, so what a package may widen a service's access to
+/// is decided here rather than in the package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupplementaryGroup {
+    /// `adm`, the group that owns most of the system logs under `/var/log`.
+    Adm,
+}
+
+impl SupplementaryGroup {
+    /// Returns the unit-file string this group renders as, which is separate
+    /// from its manifest spelling exactly as [`SystemdTarget::as_unit_str`] is.
+    #[must_use]
+    pub fn as_unit_str(self) -> &'static str {
+        match self {
+            Self::Adm => "adm",
+        }
+    }
 }
 
 /// One element of a unit-file argument list.
@@ -388,6 +436,12 @@ pub enum ModuleSpecError {
     /// `RLIM_INFINITY`.
     #[error("unit template `limit_nofile` is `u64::MAX`, which systemd reads as `infinity`")]
     InfiniteLimitNofile,
+    /// `supplementary_groups` named the same group more than once.
+    #[error("unit template `supplementary_groups` names `{0:?}` more than once")]
+    DuplicateSupplementaryGroup(SupplementaryGroup),
+    /// `supplementary_groups` was non-empty in a unit that declares `run_as`.
+    #[error("unit template declares `supplementary_groups` together with `run_as`")]
+    SupplementaryGroupsWithRunAs,
     /// `main-pid` appeared outside `exec_reload`.
     #[error("the `main-pid` variable is permitted only inside `exec_reload`")]
     MainPidOutsideExecReload,
@@ -511,6 +565,19 @@ fn validate_unit(unit: &UnitTemplate) -> Result<(), ModuleSpecError> {
         _ => {}
     }
 
+    // A root-run unit renders no `User=` line for the groups to follow, and
+    // root already reads whatever a group would grant, so the pair can only
+    // mean a package that misdescribes its own unit.
+    if unit.run_as.is_some() && !unit.supplementary_groups.is_empty() {
+        return Err(ModuleSpecError::SupplementaryGroupsWithRunAs);
+    }
+    let mut seen = BTreeSet::new();
+    for group in &unit.supplementary_groups {
+        if !seen.insert(*group) {
+            return Err(ModuleSpecError::DuplicateSupplementaryGroup(*group));
+        }
+    }
+
     Ok(())
 }
 
@@ -621,7 +688,7 @@ fn is_container_name(value: &str) -> bool {
 mod tests {
     use super::{
         Arg, ModuleSpec, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec,
-        RenderVar, RestartPolicy, RunAs, SystemdTarget, UnitTemplate, validate,
+        RenderVar, RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate, validate,
     };
     use crate::manifest::ArtifactKind;
 
@@ -645,6 +712,7 @@ mod tests {
             restart_sec: RESTART_SEC,
             limit_nofile: None,
             run_as: None,
+            supplementary_groups: Vec::new(),
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
@@ -768,6 +836,35 @@ mod tests {
                 "limit {limit}: got {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn supplementary_groups_are_distinct_and_never_beside_run_as() {
+        for groups in [Vec::new(), vec![SupplementaryGroup::Adm]] {
+            let mut unit = review_unit();
+            unit.supplementary_groups = groups;
+            validate_unit_template(unit).expect("no group or one distinct group is valid");
+        }
+
+        let mut duplicated = review_unit();
+        duplicated.supplementary_groups = vec![SupplementaryGroup::Adm, SupplementaryGroup::Adm];
+        assert!(matches!(
+            validate_unit_template(duplicated).expect_err("a duplicated group"),
+            ModuleSpecError::DuplicateSupplementaryGroup(SupplementaryGroup::Adm)
+        ));
+
+        let mut beside_root = review_unit();
+        beside_root.run_as = Some(RunAs::Root);
+        beside_root.supplementary_groups = vec![SupplementaryGroup::Adm];
+        assert!(matches!(
+            validate_unit_template(beside_root).expect_err("groups beside run_as"),
+            ModuleSpecError::SupplementaryGroupsWithRunAs
+        ));
+
+        // `run_as` alone is still valid: the refusal is of the pair.
+        let mut root_alone = review_unit();
+        root_alone.run_as = Some(RunAs::Root);
+        validate_unit_template(root_alone).expect("run_as without groups is valid");
     }
 
     #[test]
@@ -1176,6 +1273,77 @@ mod tests {
                 "a sibling `{sibling}` key must not decode"
             );
         }
+    }
+
+    #[test]
+    fn supplementary_groups_round_trip_only_when_present() {
+        // As for `limit_nofile` and `run_as`, the absent case is the wire-form
+        // test's whole bytes, so each case below differs from it by the key
+        // under test.
+        let with_adm = WIRE_SPEC.replace(
+            r#""restart_sec":5,"#,
+            r#""restart_sec":5,"supplementary_groups":["adm"],"#,
+        );
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_adm).expect("a declared group must decode");
+        let unit = decoded.unit.as_ref().expect("a unit is declared");
+        assert_eq!(unit.supplementary_groups, vec![SupplementaryGroup::Adm]);
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, with_adm);
+
+        // An empty list is a spelling of absence and does not round-trip back
+        // to a key, so a unit without groups keeps its old bytes.
+        let with_empty = WIRE_SPEC.replace(
+            r#""restart_sec":5,"#,
+            r#""restart_sec":5,"supplementary_groups":[],"#,
+        );
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_empty).expect("an empty list must decode");
+        assert_eq!(
+            decoded
+                .unit
+                .as_ref()
+                .expect("a unit is declared")
+                .supplementary_groups,
+            []
+        );
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, WIRE_SPEC);
+
+        // The vocabulary is exactly `"adm"`, carried in a list: no other
+        // spelling of it, no other group name, and no other shape decodes.
+        for refused in [
+            r#"["Adm"]"#,
+            r#"["ADM"]"#,
+            r#"["wheel"]"#,
+            r#"["root"]"#,
+            "[0]",
+            r#""adm""#,
+            "0",
+            r#"{"adm":true}"#,
+        ] {
+            let wire = WIRE_SPEC.replace(
+                r#""restart_sec":5,"#,
+                &format!(r#""restart_sec":5,"supplementary_groups":{refused},"#),
+            );
+            assert!(
+                serde_json::from_str::<ModuleSpec>(&wire).is_err(),
+                "`supplementary_groups` {refused} must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn supplementary_group_adm_spells_adm_in_the_manifest_and_the_unit() {
+        assert_eq!(
+            serde_json::to_string(&SupplementaryGroup::Adm).expect("serialization must succeed"),
+            r#""adm""#
+        );
+        assert_eq!(
+            serde_json::from_str::<SupplementaryGroup>(r#""adm""#).expect("`adm` must decode"),
+            SupplementaryGroup::Adm
+        );
+        assert_eq!(SupplementaryGroup::Adm.as_unit_str(), "adm");
     }
 
     #[test]

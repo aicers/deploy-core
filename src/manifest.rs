@@ -23,7 +23,22 @@ use crate::module_spec::{ModuleSpec, ModuleSpecError};
 /// Stamped unconditionally, never derived from a manifest's contents: a
 /// manifest's version is the producer's, not a function of which optional
 /// variables its templates happen to name.
-pub const MANIFEST_FORMAT_VERSION: u32 = 7;
+///
+/// # Readers first
+///
+/// A format change ships in two steps. First, a release whose readers (roxyd,
+/// `REview`) understand version *V* while every writer still stamps *V − 1*,
+/// so [`MAX_MANIFEST_FORMAT_VERSION`] leads this constant by one; then, in a
+/// later release, writers stamp *V* and the two meet again. A reader that is
+/// already deployed — the Host Agent applying its own update package among
+/// them — therefore never meets a manifest it cannot read. Content introduced
+/// at *V* is refused in a manifest stamped below *V*, so a writer that still
+/// stamps *V − 1* cannot emit it either. The first step may be skipped only
+/// when no versioned product (bootler) release has shipped a reader whose
+/// ceiling is below *V*. The ceiling therefore equals this constant or exceeds
+/// it by exactly one, and never falls below it, since a build never stamps a
+/// version it cannot read; a test holds the pair to that at compile time.
+pub const MANIFEST_FORMAT_VERSION: u32 = 8;
 
 /// Inclusive floor of the `format_version` range this build accepts.
 ///
@@ -38,10 +53,13 @@ pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Inclusive ceiling of the `format_version` range this build accepts.
 ///
-/// Tracks [`MANIFEST_FORMAT_VERSION`]: this build reads what it writes, and a
-/// manifest naming anything newer is refused for its version alone rather than
-/// failing as an opaque decode error somewhere inside it.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 7;
+/// Leads [`MANIFEST_FORMAT_VERSION`] by at most one, under the readers-first
+/// rule stated there: it equals the producer's stamp, or exceeds it by one in
+/// the release that teaches readers a version before any writer stamps it, and
+/// never falls below it. A manifest naming anything newer is refused for its
+/// version alone rather than failing as an opaque decode error somewhere
+/// inside it.
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 8;
 
 /// First `format_version` at which a container image artifact carries an
 /// [`ImageDeclaration`].
@@ -53,6 +71,28 @@ pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 7;
 /// carries no declaration, and an `image` key on any artifact is refused
 /// whatever its value, so no legacy manifest can be read as declaring one.
 pub const IMAGE_DECLARATION_FORMAT_VERSION: u32 = 6;
+
+/// First `format_version` at which a unit template may declare
+/// [`UnitTemplate::supplementary_groups`](crate::module_spec::UnitTemplate::supplementary_groups).
+///
+/// A manifest stamped below it that declares a non-empty list is refused,
+/// because a reader of that format would not know the field: content
+/// introduced at a version is never carried in a manifest stamped below it.
+pub const SUPPLEMENTARY_GROUPS_FORMAT_VERSION: u32 = 8;
+
+// A reader must understand every version whose content it gates, or the gate
+// would refuse content this build cannot read in the first place.
+const _: () = assert!(SUPPLEMENTARY_GROUPS_FORMAT_VERSION <= MAX_MANIFEST_FORMAT_VERSION);
+
+/// Reports whether a reader ceiling of `max` may ship beside a producer stamp
+/// of `current` under the readers-first rule stated on
+/// [`MANIFEST_FORMAT_VERSION`]: the two are equal, or the ceiling leads by
+/// exactly one. A ceiling below the stamp is refused, since a build never
+/// stamps a version it cannot read.
+#[cfg(test)]
+const fn is_readers_first_window(max: u32, current: u32) -> bool {
+    max == current || matches!(current.checked_add(1), Some(next) if next == max)
+}
 
 /// Container footer version the pre-versioned baseline payloads were written
 /// at.
@@ -298,6 +338,17 @@ pub enum ManifestError {
         "artifact `{archive_path}` carries an `image`, which manifest format version {format_version} cannot declare"
     )]
     ImageBeforeDeclarationFormat {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The manifest's `format_version`.
+        format_version: u32,
+    },
+    /// A manifest below [`SUPPLEMENTARY_GROUPS_FORMAT_VERSION`] had an
+    /// artifact whose unit declares supplementary groups.
+    #[error(
+        "artifact `{archive_path}` declares supplementary groups, which manifest format version {format_version} cannot carry"
+    )]
+    SupplementaryGroupsBeforeFormat {
         /// `archive_path` of the offending artifact.
         archive_path: String,
         /// The manifest's `format_version`.
@@ -870,7 +921,9 @@ impl PayloadManifest {
     /// Returns [`ManifestError`] when an artifact carries no dispositions, uses
     /// an unsafe `archive_path`, shares an `archive_path` with another artifact,
     /// carries no valid `commit`, declares a [`ModuleSpec`] that violates a
-    /// spec rule, is a container image without a valid [`ImageDeclaration`]
+    /// spec rule or declares supplementary groups the stamped format cannot
+    /// carry ([`ManifestError::SupplementaryGroupsBeforeFormat`]), is a
+    /// container image without a valid [`ImageDeclaration`]
     /// ([`ManifestError::MissingImageDeclaration`],
     /// [`ManifestError::InvalidImageDeclaration`]), or is any other kind and
     /// carries one ([`ManifestError::ImageOnNonImageArtifact`]). The checks run
@@ -960,7 +1013,10 @@ impl PayloadManifest {
     /// [`ManifestError::ImageBeforeDeclarationFormat`] when an artifact of a
     /// manifest below [`IMAGE_DECLARATION_FORMAT_VERSION`] carries an `image`
     /// key, [`ManifestError::ImageDecode`] when a declaration does not decode,
-    /// or any validation error [`PayloadManifest::new`] raises.
+    /// [`ManifestError::SupplementaryGroupsBeforeFormat`] when a unit of a
+    /// manifest below [`SUPPLEMENTARY_GROUPS_FORMAT_VERSION`] declares
+    /// supplementary groups, or any validation error [`PayloadManifest::new`]
+    /// raises.
     ///
     /// The `image` key is not a term of the baseline conjunction: stage 1 is
     /// unchanged by it, and an unversioned manifest carrying one is refused at
@@ -1089,6 +1145,19 @@ impl PayloadManifest {
                         source,
                     },
                 )?;
+                let declares_groups = spec
+                    .unit
+                    .as_ref()
+                    .is_some_and(|unit| !unit.supplementary_groups.is_empty());
+                if let Some(format_version) = format_version
+                    && format_version < SUPPLEMENTARY_GROUPS_FORMAT_VERSION
+                    && declares_groups
+                {
+                    return Err(ManifestError::SupplementaryGroupsBeforeFormat {
+                        archive_path: artifact.archive_path.clone(),
+                        format_version,
+                    });
+                }
             }
             // Last of this artifact's checks, and before the next artifact's
             // first: an earlier artifact's fault or an earlier check on this
@@ -1172,8 +1241,9 @@ mod tests {
         ArchiveMember, ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN,
         IMAGE_DECLARATION_FORMAT_VERSION, IMAGE_DIGEST_HEX_LEN, LEGACY_UNVERSIONED_FOOTER_VERSION,
         MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION,
-        ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest, TargetArch,
-        is_pre_versioned_baseline, is_valid_commit,
+        ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest,
+        SUPPLEMENTARY_GROUPS_FORMAT_VERSION, TargetArch, is_pre_versioned_baseline,
+        is_readers_first_window, is_valid_commit,
     };
     use crate::executor::ServiceAccount;
     use crate::image::{
@@ -1182,7 +1252,7 @@ mod tests {
     };
     use crate::module_spec::{
         Arg, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
-        RestartPolicy, RunAs, SystemdTarget, UnitTemplate,
+        RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate,
     };
     use crate::render::{RenderContext, RenderError, render_unit};
 
@@ -1405,6 +1475,7 @@ mod tests {
                 restart_sec: 5,
                 limit_nofile: Some(8000),
                 run_as: Some(RunAs::Root),
+                supplementary_groups: Vec::new(),
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,
@@ -1617,22 +1688,48 @@ mod tests {
     }
 
     #[test]
-    fn the_accepted_range_is_open_below_the_producer_and_closed_at_it() {
-        // The producer writes at the ceiling — a build never stamps a version
-        // it would then refuse to read — and the floor sits strictly below it,
-        // so the window admits more than one version. Pinned rather than left
-        // implicit because a later bump that moved all three together would
-        // close the window again and silently strand every payload published
-        // at the older version.
+    fn readers_first_the_ceiling_meets_the_producer_or_leads_it_by_one() {
+        // Readers learn a version one release before any writer stamps it, so
+        // the ceiling may lead the producer by one; it may never trail it — a
+        // build never stamps a version it would then refuse to read — and the
+        // floor sits strictly below the producer, so the window admits more
+        // than one version. Pinned rather than left implicit because a later
+        // bump that moved all three together would close the window again and
+        // silently strand every payload published at the older version.
         //
-        // Both hold at compile time, so both are stated that way: a bump that
-        // closed the window fails the build rather than one test run.
-        const _: () = assert!(MAX_MANIFEST_FORMAT_VERSION == MANIFEST_FORMAT_VERSION);
+        // All of this holds at compile time, so it is stated that way: a bump
+        // that broke the rule fails the build rather than one test run.
+        const _: () = assert!(is_readers_first_window(
+            MAX_MANIFEST_FORMAT_VERSION,
+            MANIFEST_FORMAT_VERSION
+        ));
         const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < MANIFEST_FORMAT_VERSION);
         // Image declarations begin inside the window and above its floor, so
         // the window holds both legacy image formats and the declaring one.
         const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < IMAGE_DECLARATION_FORMAT_VERSION);
         const _: () = assert!(IMAGE_DECLARATION_FORMAT_VERSION <= MANIFEST_FORMAT_VERSION);
+        // Supplementary groups begin above the floor too, so the window holds
+        // formats that cannot carry them as well as the ones that can.
+        const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < SUPPLEMENTARY_GROUPS_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn the_readers_first_window_admits_an_equal_or_one_ahead_ceiling_only() {
+        const CURRENT: u32 = 8;
+        assert!(is_readers_first_window(CURRENT, CURRENT));
+        assert!(is_readers_first_window(CURRENT + 1, CURRENT));
+        assert!(!is_readers_first_window(CURRENT + 2, CURRENT));
+        assert!(!is_readers_first_window(CURRENT - 1, CURRENT));
+        // The stamp at the top of the range has no successor to lead it, and
+        // asking must not overflow.
+        assert!(is_readers_first_window(u32::MAX, u32::MAX));
+        assert!(!is_readers_first_window(0, u32::MAX));
+        assert!(is_readers_first_window(1, 0));
+        // The shipped pair is one the rule admits.
+        assert!(is_readers_first_window(
+            MAX_MANIFEST_FORMAT_VERSION,
+            MANIFEST_FORMAT_VERSION
+        ));
     }
 
     #[test]
@@ -2671,6 +2768,176 @@ mod tests {
                 .run_as;
             assert_eq!(run_as, Some(RunAs::Root), "version {version}");
         }
+    }
+
+    /// The `c` fixture's unit declaring `groups` as its
+    /// `supplementary_groups` value, verbatim.
+    fn unit_json_with_groups(groups: &str) -> String {
+        unit_json(VALID_EXEC_START).replace(
+            r#""restart_sec":5,"#,
+            &format!(r#""restart_sec":5,"supplementary_groups":{groups},"#),
+        )
+    }
+
+    /// A manifest stamped `version` whose one `c` artifact declares `unit`.
+    fn manifest_json_with_unit(version: u32, unit: &str) -> String {
+        let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(unit));
+        format!(r#"{{"format_version":{version},{MEMBERS_JSON}"artifacts":[{entry}]}}"#)
+    }
+
+    #[test]
+    fn a_manifest_at_the_current_version_renders_a_unit_declaring_supplementary_groups() {
+        // The wire-driven mirror of the `run_as` test above: the key crosses
+        // the manifest, the read path accepts it, and the renderer puts the
+        // line right after the caller's `User=`.
+        assert_eq!(
+            render_current_version_unit(&unit_json_with_groups(r#"["adm"]"#)),
+            "[Unit]\nDescription=C\n\n[Service]\nUser=clumit-security\n\
+             SupplementaryGroups=adm\nExecStart=/opt/c/bin/c\nRestart=always\n\
+             RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+        );
+    }
+
+    #[test]
+    fn a_manifest_at_the_supplementary_groups_version_parses_a_declared_group() {
+        let json = manifest_json_with_unit(
+            SUPPLEMENTARY_GROUPS_FORMAT_VERSION,
+            &unit_json_with_groups(r#"["adm"]"#),
+        );
+        let manifest = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("a manifest at the groups version must parse");
+        let groups = &manifest
+            .artifacts()
+            .first()
+            .expect("one artifact")
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.unit.as_ref())
+            .expect("the spec declares a unit")
+            .supplementary_groups;
+        assert_eq!(groups, &[SupplementaryGroup::Adm]);
+    }
+
+    #[test]
+    fn supplementary_groups_are_refused_in_a_manifest_stamped_below_their_version() {
+        let declaring = unit_json_with_groups(r#"["adm"]"#);
+        for version in MIN_MANIFEST_FORMAT_VERSION..SUPPLEMENTARY_GROUPS_FORMAT_VERSION {
+            let json = manifest_json_with_unit(version, &declaring);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("groups below their version must be refused");
+            assert!(
+                matches!(
+                    error,
+                    ManifestError::SupplementaryGroupsBeforeFormat {
+                        ref archive_path,
+                        format_version,
+                    } if archive_path == "bin/c" && format_version == version
+                ),
+                "version {version}: got {error:?}"
+            );
+
+            // The typed door refuses it identically: the gate lives in the one
+            // validation point every constructor routes through.
+            let error = serde_json::from_str::<PayloadManifest>(&json)
+                .expect_err("the derived decode must refuse it too");
+            assert!(
+                error.to_string().contains("supplementary groups"),
+                "version {version}: got {error}"
+            );
+
+            // An empty list is absence, which every version can express.
+            let json = manifest_json_with_unit(version, &unit_json_with_groups("[]"));
+            PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .unwrap_or_else(|error| panic!("version {version} must parse: {error}"));
+
+            // The gate runs after the spec validator, so a spec that is
+            // invalid on its own terms reports that rule rather than its
+            // version.
+            let beside_root =
+                declaring.replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":"root","#);
+            let json = manifest_json_with_unit(version, &beside_root);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("groups beside run_as must be refused");
+            assert!(
+                matches!(
+                    error,
+                    ManifestError::InvalidSpec {
+                        source: ModuleSpecError::SupplementaryGroupsWithRunAs,
+                        ..
+                    }
+                ),
+                "version {version}: got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_path_refuses_a_duplicated_group_and_groups_beside_run_as() {
+        let cases: [(String, RuleCheck); 2] = [
+            (unit_json_with_groups(r#"["adm","adm"]"#), |error| {
+                matches!(
+                    error,
+                    ModuleSpecError::DuplicateSupplementaryGroup(SupplementaryGroup::Adm)
+                )
+            }),
+            (
+                unit_json_with_groups(r#"["adm"]"#)
+                    .replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":"root","#),
+                |error| matches!(error, ModuleSpecError::SupplementaryGroupsWithRunAs),
+            ),
+        ];
+        for (unit, is_expected) in cases {
+            let json = manifest_json_with_unit(MANIFEST_FORMAT_VERSION, &unit);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("a malformed group list must be refused on read");
+            let ManifestError::InvalidSpec {
+                ref archive_path,
+                ref source,
+            } = error
+            else {
+                panic!("unit {unit}: expected a spec rejection, got {error:?}");
+            };
+            assert_eq!(archive_path, "bin/c");
+            assert!(is_expected(source), "unit {unit}: got {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_refuses_a_supplementary_group_outside_its_vocabulary() {
+        for refused in [r#""Adm""#, r#""wheel""#, "0"] {
+            let json = manifest_json_with_unit(
+                MANIFEST_FORMAT_VERSION,
+                &unit_json_with_groups(&format!("[{refused}]")),
+            );
+            assert!(
+                PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION).is_err(),
+                "supplementary group {refused} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn the_producer_writes_a_declared_group_and_reads_it_back() {
+        let mut spec = module_spec();
+        let unit = spec.unit.as_mut().expect("fixture carries a unit");
+        unit.run_as = None;
+        unit.supplementary_groups = vec![SupplementaryGroup::Adm];
+        let mut declaring = artifact(
+            "bin/native",
+            ArtifactKind::NativeBinary,
+            &[Disposition::Install],
+        );
+        declaring.spec = Some(spec);
+        let manifest =
+            manifest_of(None, vec![declaring]).expect("the producer accepts a declared group");
+        let json = serde_json::to_string(&manifest).expect("serialization should succeed");
+        assert!(
+            json.contains(r#""supplementary_groups":["adm"]"#),
+            "got: {json}"
+        );
+        let restored = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("the producer's manifest must parse");
+        assert_eq!(restored, manifest);
     }
 
     #[test]
