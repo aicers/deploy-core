@@ -2277,11 +2277,17 @@ fn shell_join<'a>(words: impl IntoIterator<Item = &'a str>) -> String {
 }
 
 /// Reports whether `sudo` refused because it needs a password or a terminal.
+///
+/// It recognises the wording of both classic sudo and sudo-rs, the `sudo` of
+/// Ubuntu 26.04: classic's `a password is required` and `a terminal is
+/// required …`, and sudo-rs's `interactive authentication is required` and
+/// `A terminal is required to authenticate`.
 #[must_use]
 pub fn sudo_needs_password(stderr: &[u8]) -> bool {
     let text = String::from_utf8_lossy(stderr);
     text.contains("a password is required")
-        || text.contains("a terminal is required")
+        || text.contains("interactive authentication is required")
+        || text.contains("terminal is required")
         || text.contains("no askpass")
         || text.contains("no tty present")
 }
@@ -2400,13 +2406,21 @@ fn print_split(word: &str) -> String {
     format!("printf '%s%s' '{head}' '{tail}' >&2")
 }
 
-/// Removes the first [`SUDO_OK_SENTINEL`] from `stderr`, reporting whether it was
-/// present (i.e. whether `sudo` elevated and started the wrapped command).
+/// Removes every byte of `stderr` up to and including the first
+/// [`SUDO_OK_SENTINEL`], reporting whether it was present (i.e. whether `sudo`
+/// elevated and started the wrapped command).
+///
+/// What precedes the sentinel is the transport's, never the command's: the
+/// script `sudo` runs prints it before it `exec`s the command, so anything
+/// before it is `sudo`'s or `ssh`'s — a warning, a lecture, or the empty line
+/// sudo-rs writes after it reads a password. A later copy of the sentinel is
+/// the command's own, and stays. Where the sentinel is absent, `stderr` is left
+/// untouched.
 fn take_sudo_sentinel(stderr: &mut Vec<u8>) -> bool {
     let token = SUDO_OK_SENTINEL.as_bytes();
     match stderr.windows(token.len()).position(|w| w == token) {
         Some(pos) => {
-            stderr.drain(pos..pos + token.len());
+            stderr.drain(..pos + token.len());
             true
         }
         None => false,
@@ -2414,8 +2428,9 @@ fn take_sudo_sentinel(stderr: &mut Vec<u8>) -> bool {
 }
 
 /// Finalises an invocation that went through `sudo`: strips the sudo sentinel
-/// and, when it is absent, raises a host-named elevation error rather than
-/// passing `sudo`'s own exit off as the wrapped command's result.
+/// and what the transport wrote before it and, when it is absent, raises a
+/// host-named elevation error rather than passing `sudo`'s own exit off as the
+/// wrapped command's result.
 ///
 /// This follows `sudo`, not the transport: every arm that invokes `sudo` or
 /// `sudo -u` settles here, including [`Identity::Service`] on
@@ -3848,7 +3863,15 @@ impl Executor for InDaemonExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{Executor, ExecutorError, Identity, LocalExecutor, shell_quote};
+    use super::{
+        Executor, ExecutorError, Identity, LocalExecutor, SUDO_OK_SENTINEL, shell_quote,
+        sudo_needs_password, take_sudo_sentinel,
+    };
+
+    /// The line OpenSSH writes on stderr when it records a new host key,
+    /// before anything the remote side prints.
+    const SSH_HOST_KEY_WARNING: &str =
+        "Warning: Permanently added 'localhost' (ED25519) to the list of known hosts.\r\n";
 
     #[test]
     fn shell_quote_wraps_and_escapes() {
@@ -3856,6 +3879,161 @@ mod tests {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// What each `sudo` writes on stderr, byte for byte, as captured over
+    /// `ssh -T` with `LC_ALL=C`, beside the older classic `no askpass` and
+    /// `no tty present` texts: the case, the text, and whether it means a
+    /// password is wanted.
+    const SUDO_TEXTS: &[(&str, &str, bool)] = &[
+        (
+            "classic, -n, password needed",
+            "sudo: a password is required\n",
+            true,
+        ),
+        (
+            "sudo-rs, -n, password needed",
+            "sudo: interactive authentication is required\n",
+            true,
+        ),
+        (
+            "classic 1.9.15p5, no tty",
+            "sudo: a terminal is required to read the password; either use the -S \
+             option to read from standard input or configure an askpass helper\n\
+             sudo: a password is required\n",
+            true,
+        ),
+        (
+            "classic 1.9.17p2 (sudo.ws), no tty",
+            "sudo: a terminal is required to read the password; either use ssh's -t \
+             option or configure an askpass helper\n\
+             sudo: a password is required\n",
+            true,
+        ),
+        (
+            "sudo-rs, no tty",
+            "sudo: A terminal is required to authenticate\n",
+            true,
+        ),
+        (
+            "classic, no askpass",
+            "sudo: no askpass program specified\n",
+            true,
+        ),
+        (
+            "classic, no tty present",
+            "sudo: no tty present and no askpass program specified\n",
+            true,
+        ),
+        (
+            "classic, -S, one wrong line then end of input",
+            "Sorry, try again.\n\nsudo: no password was provided\n\
+             sudo: 1 incorrect password attempt\n",
+            false,
+        ),
+        (
+            "sudo-rs, -S, one wrong line then end of input",
+            "\nsudo: Authentication failed, try again.\n\n\
+             sudo: Authentication required but not attempted\n",
+            false,
+        ),
+        (
+            "classic, -S, three wrong lines",
+            "Sorry, try again.\nSorry, try again.\nsudo: 3 incorrect password attempts\n",
+            false,
+        ),
+        (
+            "sudo-rs, -S, three wrong lines",
+            "\nsudo: Authentication failed, try again.\n\n\
+             sudo: Authentication failed, try again.\n\n\
+             sudo: maximum 3 incorrect authentication attempts\n",
+            false,
+        ),
+        ("classic, -S, right password", "", false),
+        ("sudo-rs, -S, right password", "\n", false),
+        (
+            // Only consulted under `NonInteractive`, which never uses `-S`.
+            "classic, -S, empty stdin",
+            "\nsudo: no password was provided\nsudo: a password is required\n",
+            true,
+        ),
+        (
+            "sudo-rs, -S, empty stdin",
+            "\nsudo: Authentication required but not attempted\n",
+            false,
+        ),
+        (
+            "classic, not in sudoers, -n",
+            "sudo: a password is required\n",
+            true,
+        ),
+        (
+            "sudo-rs, not in sudoers, -n",
+            "sudo: I'm sorry probenone. I'm afraid I can't do that\n",
+            false,
+        ),
+        (
+            "classic, not in sudoers, -S with the right password",
+            "probenone is not in the sudoers file.\n",
+            false,
+        ),
+        (
+            "sudo-rs, not in sudoers, -S with the right password",
+            "sudo: I'm sorry probenone. I'm afraid I can't do that\n",
+            false,
+        ),
+    ];
+
+    #[test]
+    fn sudo_needs_password_recognises_both_classic_sudo_and_sudo_rs() {
+        for &(case, text, needs) in SUDO_TEXTS {
+            assert_eq!(
+                sudo_needs_password(text.as_bytes()),
+                needs,
+                "{case}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn take_sudo_sentinel_drops_everything_up_to_the_first_sentinel() {
+        let sentinel = SUDO_OK_SENTINEL;
+        let cases = [
+            (
+                "sudo-rs's empty line",
+                format!("\n{sentinel}err\n"),
+                "err\n".to_string(),
+            ),
+            (
+                "ssh's host key warning",
+                format!("{SSH_HOST_KEY_WARNING}{sentinel}err\n"),
+                "err\n".to_string(),
+            ),
+            (
+                "at offset 0",
+                format!("{sentinel}err\n"),
+                "err\n".to_string(),
+            ),
+            (
+                "twice",
+                format!("{sentinel}a{sentinel}b"),
+                format!("a{sentinel}b"),
+            ),
+        ];
+        for (case, input, expected) in cases {
+            let mut stderr = input.into_bytes();
+            assert!(take_sudo_sentinel(&mut stderr), "{case}");
+            assert_eq!(String::from_utf8_lossy(&stderr), expected, "{case}");
+        }
+
+        let refusal = b"\nsudo: Authentication failed, try again.\n".to_vec();
+        let mut stderr = refusal.clone();
+        assert!(!take_sudo_sentinel(&mut stderr));
+        assert_eq!(stderr, refusal, "no sentinel leaves the bytes unchanged");
+
+        let mut stderr = Vec::new();
+        assert!(!take_sudo_sentinel(&mut stderr));
+        assert_eq!(stderr, b"");
     }
 
     #[test]
@@ -3900,6 +4078,20 @@ mod tests {
         /// An argument carrying the metacharacters the SSH transport must not
         /// let a remote shell re-split.
         const TRICKY_ARG: &str = "a b\"c'd$e;f|g&h`i(j)";
+        /// What a `sudo -n` that wants a password writes before it exits `1`:
+        /// classic sudo's wording, then sudo-rs's with and without a terminal
+        /// to ask on.
+        const PASSWORD_WANTED: &[(&str, &str)] = &[
+            ("classic", "sudo: a password is required"),
+            ("sudo-rs", "sudo: interactive authentication is required"),
+            (
+                "sudo-rs, no tty",
+                "sudo: A terminal is required to authenticate",
+            ),
+        ];
+        /// What sudo-rs writes before it exits `1` for a user sudoers does not
+        /// name, password or not.
+        const SUDO_RS_NOT_IN_SUDOERS: &str = "sudo: I'm sorry ops. I'm afraid I can't do that";
 
         /// Writes `body` to an executable script and returns its path.
         fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -3930,6 +4122,53 @@ shift
 exec /bin/sh -c "$*"
 "#,
             )
+        }
+
+        /// A stub `ssh` that writes OpenSSH's own line on recording a new host
+        /// key on stderr, as OpenSSH does before anything the remote side
+        /// prints, and then behaves as [`fake_ssh`].
+        fn warning_ssh(dir: &Path) -> PathBuf {
+            let plain = fake_ssh(dir);
+            write_script(
+                dir,
+                "warning-ssh",
+                &format!(
+                    "#!/bin/sh\nprintf '%s' {} >&2\nexec {} \"$@\"\n",
+                    super::super::shell_quote(super::SSH_HOST_KEY_WARNING),
+                    super::super::shell_quote(&plain.to_string_lossy()),
+                ),
+            )
+        }
+
+        /// A `sudo` stub that writes `complaint` on stderr, as one line, and
+        /// exits `1` without running anything.
+        fn complaining_sudo(dir: &Path, name: &str, complaint: &str) -> PathBuf {
+            write_script(
+                dir,
+                name,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' {} >&2\nexit 1\n",
+                    super::super::shell_quote(complaint)
+                ),
+            )
+        }
+
+        /// A `sudo` stub per [`PASSWORD_WANTED`] entry, labelled by it.
+        fn password_wanting_sudos(dir: &Path) -> Vec<(&'static str, PathBuf)> {
+            PASSWORD_WANTED
+                .iter()
+                .enumerate()
+                .map(|(index, &(label, complaint))| {
+                    let name = format!("password-wanting-sudo-{index}");
+                    (label, complaining_sudo(dir, &name, complaint))
+                })
+                .collect()
+        }
+
+        /// A `sudo` stub that refuses as sudo-rs does a user sudoers does not
+        /// name.
+        fn sudo_rs_denying_sudo(dir: &Path) -> PathBuf {
+            complaining_sudo(dir, "sudo-rs-denying-sudo", SUDO_RS_NOT_IN_SUDOERS)
         }
 
         /// A stub `ssh` that prints each argument it received on its own line,
@@ -4489,19 +4728,25 @@ exec "$@"
         #[test]
         fn non_interactive_without_nopasswd_is_a_host_named_error() {
             let dir = tempfile::tempdir().expect("tempdir");
-            // A sudo stub that refuses like real `sudo -n` without NOPASSWD.
-            let sudo = write_script(
-                dir.path(),
-                "refusing-sudo",
-                "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
-            );
-            let exec = LocalExecutor::new("mgmt", SudoAuth::NonInteractive).with_sudo_bin(sudo);
-            let error = exec
-                .run(Identity::Root, "true", &[])
-                .expect_err("elevation without NOPASSWD should error");
-            match error {
-                ExecutorError::Elevation { host } => assert_eq!(host, "mgmt"),
-                other => panic!("expected Elevation naming the host, got: {other:?}"),
+            // Sudo stubs that refuse like real `sudo -n` without NOPASSWD, in
+            // classic sudo's wording and in sudo-rs's.
+            for (label, sudo) in password_wanting_sudos(dir.path()) {
+                let local = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(sudo.clone());
+                let ssh = ssh_executor(&dir, SudoAuth::NonInteractive)
+                    .with_remote_sudo(sudo.to_string_lossy().into_owned());
+                let pairs: [(&str, &dyn Executor); 2] = [("mgmt", &local), ("target", &ssh)];
+                for (expected, exec) in pairs {
+                    let error = exec
+                        .run(Identity::Root, "true", &[])
+                        .expect_err("elevation without NOPASSWD should error");
+                    match error {
+                        ExecutorError::Elevation { host } => assert_eq!(host, expected, "{label}"),
+                        other => {
+                            panic!("{label}: expected Elevation naming the host, got: {other:?}")
+                        }
+                    }
+                }
             }
         }
 
@@ -4542,6 +4787,29 @@ exec "$@"
                 matches!(error, ExecutorError::SudoRefused { .. }),
                 "got: {error:?}"
             );
+        }
+
+        #[test]
+        fn a_sudo_rs_refusal_before_the_command_runs_is_a_host_named_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sudo = sudo_rs_denying_sudo(dir.path());
+            let local =
+                LocalExecutor::new("mgmt", SudoAuth::NonInteractive).with_sudo_bin(sudo.clone());
+            let ssh = ssh_executor(&dir, SudoAuth::NonInteractive)
+                .with_remote_sudo(sudo.to_string_lossy().into_owned());
+            let pairs: [(&str, &dyn Executor); 2] = [("mgmt", &local), ("target", &ssh)];
+            for (expected, exec) in pairs {
+                let error = exec
+                    .run(Identity::Root, "true", &[])
+                    .expect_err("a sudo refusal before the command runs is an elevation error");
+                match error {
+                    ExecutorError::SudoRefused { host, reason } => {
+                        assert_eq!(host, expected);
+                        assert_eq!(reason, SUDO_RS_NOT_IN_SUDOERS, "{expected}");
+                    }
+                    other => panic!("{expected}: expected SudoRefused, got: {other:?}"),
+                }
+            }
         }
 
         #[test]
@@ -7487,7 +7755,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 LocalExecutor, OutputStream, RunLimits, RunWithInputError, ServiceAccount,
                 SshExecutor, SshPrompt, SudoAuth,
             };
-            use super::{failing_ssh, fake_ssh, write_script};
+            use super::{
+                SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, password_wanting_sudos,
+                sudo_rs_denying_sudo, warning_ssh, write_script,
+            };
 
             /// Limits roomy enough for every test that is not about them.
             const ROOMY: RunLimits = RunLimits {
@@ -8063,53 +8334,72 @@ exec "$@"
                     ..ROOMY
                 };
                 let dir = tempfile::tempdir().expect("tempdir");
-                let refusing = write_script(
-                    dir.path(),
-                    "refusing-sudo",
-                    "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
-                );
+                // Classic sudo's wording and sudo-rs's.
+                let refusing = password_wanting_sudos(dir.path());
                 let denying = write_script(
                     dir.path(),
                     "denying-sudo",
                     "#!/bin/sh\necho 'ops is not in the sudoers file.' >&2\nexit 1\n",
                 );
+                let sudo_rs_denying = sudo_rs_denying_sudo(dir.path());
                 let config = crate::transport::Ssh {
                     user: "ops".to_string(),
                     port: 22,
                     key: PathBuf::from("/dev/null"),
                     host_key: crate::transport::HostKeyPolicy::Strict,
                 };
-                let unreachable = SshExecutor::from_config(
-                    "mgmt",
-                    &config,
-                    "10.0.0.10",
-                    SudoAuth::NonInteractive,
-                    SshPrompt::Deny,
-                )
-                .with_ssh_bin(failing_ssh(dir.path()));
-                let remote_refusing = SshExecutor::from_config(
-                    "mgmt",
-                    &config,
-                    "10.0.0.10",
-                    SudoAuth::NonInteractive,
-                    SshPrompt::Deny,
-                )
-                .with_ssh_bin(fake_ssh(dir.path()))
-                .with_remote_sudo(refusing.to_string_lossy().into_owned());
+                let ssh = || {
+                    SshExecutor::from_config(
+                        "mgmt",
+                        &config,
+                        "10.0.0.10",
+                        SudoAuth::NonInteractive,
+                        SshPrompt::Deny,
+                    )
+                };
+                let unreachable = ssh().with_ssh_bin(failing_ssh(dir.path()));
+                let remote = |sudo: &Path| {
+                    ssh()
+                        .with_ssh_bin(fake_ssh(dir.path()))
+                        .with_remote_sudo(sudo.to_string_lossy().into_owned())
+                };
                 let password = password_sudo(dir.path());
                 let wrong_password =
                     LocalExecutor::new("mgmt", SudoAuth::Password("wrong".to_string()))
                         .with_sudo_bin(password);
                 for limits in [ROOMY, tight] {
-                    let error = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
-                        .with_sudo_bin(refusing.clone())
-                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
-                        .expect_err("sudo refused");
-                    assert!(
-                        matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
-                            if host == "mgmt"),
-                        "{limits:?}: got {error:?}"
-                    );
+                    for (label, sudo) in &refusing {
+                        let local = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                            .with_sudo_bin(sudo.clone());
+                        let remote = remote(sudo);
+                        let pairs: [(&str, &dyn Executor); 2] =
+                            [("local", &local), ("remote", &remote)];
+                        for (transport, exec) in pairs {
+                            let error = exec
+                                .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                                .expect_err("sudo refused");
+                            assert!(
+                                matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
+                                    if host == "mgmt"),
+                                "{transport}, {label}, {limits:?}: got {error:?}"
+                            );
+                        }
+                    }
+                    let local = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                        .with_sudo_bin(sudo_rs_denying.clone());
+                    let remote_denying = remote(&sudo_rs_denying);
+                    let pairs: [(&str, &dyn Executor); 2] =
+                        [("local", &local), ("remote", &remote_denying)];
+                    for (transport, exec) in pairs {
+                        let error = exec
+                            .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
+                            .expect_err("sudo-rs refused");
+                        assert!(
+                            matches!(&error, RunWithInputError::Executor(ExecutorError::SudoRefused { host, reason })
+                                if host == "mgmt" && reason == SUDO_RS_NOT_IN_SUDOERS),
+                            "{transport}, {limits:?}: got {error:?}"
+                        );
+                    }
                     let error = wrong_password
                         .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
                         .expect_err("sudo rejected the password");
@@ -8151,14 +8441,6 @@ exec "$@"
                         ),
                         "{limits:?}: got {error:?}"
                     );
-                    let error = remote_refusing
-                        .run_with_input(Identity::Root, "/bin/cat", &[], b"{}", limits)
-                        .expect_err("the remote sudo refused");
-                    assert!(
-                        matches!(&error, RunWithInputError::Executor(ExecutorError::Elevation { host })
-                            if host == "mgmt"),
-                        "{limits:?}: got {error:?}"
-                    );
                 }
 
                 let error = InDaemonExecutor::new("mgmt")
@@ -8171,6 +8453,19 @@ exec "$@"
                     ),
                     "got {error:?}"
                 );
+            }
+
+            #[test]
+            fn sshs_own_line_before_the_command_is_not_the_commands() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = descending_sudo(dir.path());
+                let exec = ssh_with(dir.path(), &sudo, SudoAuth::NonInteractive)
+                    .with_ssh_bin(warning_ssh(dir.path()));
+                let output = exec
+                    .run(Identity::Root, "sh", &["-c", "echo err >&2"])
+                    .expect("the command ran");
+                assert_eq!(output.code, Some(0));
+                assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
             }
 
             #[test]
@@ -8369,7 +8664,10 @@ exec "$@"
                 ServiceAccount, SshExecutor, SshPrompt, SudoAuth, spawn_retrying_text_busy,
             };
             use super::bounded_runs::{descending_sudo, password_sudo, ssh_with};
-            use super::{failing_ssh, fake_ssh, write_script};
+            use super::{
+                SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, password_wanting_sudos,
+                sudo_rs_denying_sudo, write_script,
+            };
 
             /// Limits roomy enough for every test that is not about them.
             const ROOMY: ChannelLimits = ChannelLimits {
@@ -8826,29 +9124,39 @@ exec "$@"
             #[test]
             fn failures_before_the_start_are_reported_as_run_reports_them() {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let refusing = write_script(
-                    dir.path(),
-                    "refusing-sudo",
-                    "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
-                );
+                // Classic sudo's wording and sudo-rs's.
+                let refusing = password_wanting_sudos(dir.path());
                 let denying = write_script(
                     dir.path(),
                     "denying-sudo",
                     "#!/bin/sh\necho 'ops is not in the sudoers file.' >&2\nexit 1\n",
                 );
+                let sudo_rs_denying = sudo_rs_denying_sudo(dir.path());
                 let open = |exec: &dyn Executor, identity| {
                     exec.open_channel(identity, "/bin/cat", &[], ROOMY)
                         .expect_err("the start fails")
                 };
 
+                for (label, sudo) in &refusing {
+                    let error = open(
+                        &LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                            .with_sudo_bin(sudo.clone()),
+                        Identity::Root,
+                    );
+                    assert!(
+                        matches!(&error, ChannelError::Executor(ExecutorError::Elevation { host })
+                            if host == "mgmt"),
+                        "{label}: got {error:?}"
+                    );
+                }
                 let error = open(
                     &LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
-                        .with_sudo_bin(refusing.clone()),
+                        .with_sudo_bin(sudo_rs_denying.clone()),
                     Identity::Root,
                 );
                 assert!(
-                    matches!(&error, ChannelError::Executor(ExecutorError::Elevation { host })
-                        if host == "mgmt"),
+                    matches!(&error, ChannelError::Executor(ExecutorError::SudoRefused { host, reason })
+                        if host == "mgmt" && reason == SUDO_RS_NOT_IN_SUDOERS),
                     "got {error:?}"
                 );
                 let error = open(
@@ -8886,13 +9194,23 @@ exec "$@"
                         "{identity:?}: got {error:?}"
                     );
                 }
-                let remote_refusing = ssh()
-                    .with_ssh_bin(fake_ssh(dir.path()))
-                    .with_remote_sudo(refusing.to_string_lossy().into_owned());
-                let error = open(&remote_refusing, Identity::Root);
+                let remote = |sudo: &Path| {
+                    ssh()
+                        .with_ssh_bin(fake_ssh(dir.path()))
+                        .with_remote_sudo(sudo.to_string_lossy().into_owned())
+                };
+                for (label, sudo) in &refusing {
+                    let error = open(&remote(sudo), Identity::Root);
+                    assert!(
+                        matches!(&error, ChannelError::Executor(ExecutorError::Elevation { host })
+                            if host == "mgmt"),
+                        "{label}: got {error:?}"
+                    );
+                }
+                let error = open(&remote(&sudo_rs_denying), Identity::Root);
                 assert!(
-                    matches!(&error, ChannelError::Executor(ExecutorError::Elevation { host })
-                        if host == "mgmt"),
+                    matches!(&error, ChannelError::Executor(ExecutorError::SudoRefused { host, reason })
+                        if host == "mgmt" && reason == SUDO_RS_NOT_IN_SUDOERS),
                     "got {error:?}"
                 );
                 let remote_denying = ssh()
@@ -8960,26 +9278,51 @@ exec "$@"
             fn a_rejected_password_times_out_with_sudos_complaint() {
                 // `sudo -S` asks again rather than exiting on a wrong password.
                 let dir = tempfile::tempdir().expect("tempdir");
-                let asking = write_script(
+                let classic = write_script(
                     dir.path(),
                     "asking-sudo",
                     "#!/bin/sh\nwhile IFS= read -r line; do\n  \
                      [ \"$line\" = s3cret ] && exit 0\n  \
                      echo 'Sorry, try again.' >&2\ndone\n",
                 );
+                // sudo-rs ends every line it reads with one of its own.
+                let sudo_rs = write_script(
+                    dir.path(),
+                    "sudo-rs-asking-sudo",
+                    "#!/bin/sh\nwhile IFS= read -r line; do\n  \
+                     printf '\\n' >&2\n  \
+                     [ \"$line\" = s3cret ] && exit 0\n  \
+                     echo 'sudo: Authentication failed, try again.' >&2\ndone\n",
+                );
                 let limits = ChannelLimits {
                     elevation_timeout: Duration::from_millis(500),
                     ..ROOMY
                 };
-                let error = LocalExecutor::new("mgmt", SudoAuth::Password("wrong".to_string()))
-                    .with_sudo_bin(asking)
-                    .open_channel(Identity::Root, "/bin/cat", &[], limits)
-                    .expect_err("the password was rejected");
-                assert!(
-                    matches!(&error, ChannelError::ElevationTimedOut { diagnostic, .. }
-                        if diagnostic.contains("Sorry, try again")),
-                    "got {error:?}"
-                );
+                for (asking, complaint) in [
+                    (classic, "Sorry, try again"),
+                    (sudo_rs, "Authentication failed, try again"),
+                ] {
+                    // Run once first, so the first run of a fresh executable —
+                    // which macOS scans — is not what the short timeout
+                    // measures.
+                    let warmed = spawn_retrying_text_busy(
+                        std::process::Command::new(&asking)
+                            .stdin(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null()),
+                    )
+                    .and_then(|mut child| child.wait())
+                    .expect("warm the stub");
+                    assert!(warmed.success());
+                    let error = LocalExecutor::new("mgmt", SudoAuth::Password("wrong".to_string()))
+                        .with_sudo_bin(asking)
+                        .open_channel(Identity::Root, "/bin/cat", &[], limits)
+                        .expect_err("the password was rejected");
+                    assert!(
+                        matches!(&error, ChannelError::ElevationTimedOut { diagnostic, .. }
+                            if diagnostic.contains(complaint)),
+                        "{complaint}: got {error:?}"
+                    );
+                }
             }
 
             #[test]
@@ -9298,8 +9641,9 @@ exec "$@"
             use std::time::Duration;
 
             use super::super::super::{
-                Executor, ExecutorError, Identity, LocalExecutor, RunLimits, RunWithInputError,
-                SUDO_OK_SENTINEL, ServiceAccount, SshExecutor, SudoAuth, sudo_sentinel_script,
+                ChannelLimits, Executor, ExecutorError, Identity, LocalExecutor, RunLimits,
+                RunWithInputError, SUDO_OK_SENTINEL, ServiceAccount, SshExecutor, SudoAuth,
+                sudo_sentinel_script,
             };
             use super::bounded_runs::{descending_sudo, password_sudo, ssh_with};
             use super::{current_meta, dest_under, write_script};
@@ -9342,17 +9686,80 @@ exec "$@"
                 pairs
             }
 
+            /// The `sudo` whose wording a stub complains in.
+            #[derive(Debug, Clone, Copy)]
+            enum Wording {
+                Classic,
+                SudoRs,
+            }
+
+            impl Wording {
+                /// What the complaint about a wrong password contains.
+                fn complaint(self) -> &'static str {
+                    match self {
+                        Self::Classic => "Sorry, try again",
+                        Self::SudoRs => "Authentication failed, try again",
+                    }
+                }
+            }
+
             /// A `sudo` stub that reads lines until one is `s3cret` or its
             /// input ends, complaining after each as `sudo -S` does on a
             /// wrong password — it never grants anything to anyone else.
-            fn insisting_sudo(dir: &Path) -> PathBuf {
+            ///
+            /// In sudo-rs's wording it also ends every line it reads, or its
+            /// input, with an empty line of its own, and gives up after three
+            /// wrong lines, as sudo-rs does.
+            fn insisting_sudo(dir: &Path, wording: Wording) -> PathBuf {
+                match wording {
+                    Wording::Classic => write_script(
+                        dir,
+                        "insisting-sudo",
+                        "#!/bin/sh\nwhile IFS= read -r line; do\n  \
+                         [ \"$line\" = s3cret ] && exit 0\n  \
+                         echo 'Sorry, try again.' >&2\ndone\n\
+                         echo 'sudo: 3 incorrect password attempts' >&2\nexit 1\n",
+                    ),
+                    Wording::SudoRs => write_script(
+                        dir,
+                        "sudo-rs-insisting-sudo",
+                        "#!/bin/sh\nwrong=0\nwhile :; do\n  \
+                         IFS= read -r line || {\n    \
+                         printf '\\nsudo: Authentication required but not attempted\\n' >&2\n    \
+                         exit 1\n  }\n  \
+                         printf '\\n' >&2\n  \
+                         [ \"$line\" = s3cret ] && exit 0\n  \
+                         wrong=$((wrong + 1))\n  \
+                         [ \"$wrong\" -ge 3 ] && {\n    \
+                         echo 'sudo: maximum 3 incorrect authentication attempts' >&2\n    \
+                         exit 1\n  }\n  \
+                         echo 'sudo: Authentication failed, try again.' >&2\ndone\n",
+                    ),
+                }
+            }
+
+            /// A `sudo` stub that insists on reading `s3cret` as its first
+            /// line of stdin, writes the empty line sudo-rs writes after it
+            /// reads a password, and then execs the wrapped command with the
+            /// rest of the stream.
+            fn sudo_rs_password_sudo(dir: &Path) -> PathBuf {
                 write_script(
                     dir,
-                    "insisting-sudo",
-                    "#!/bin/sh\nwhile IFS= read -r line; do\n  \
-                     [ \"$line\" = s3cret ] && exit 0\n  \
-                     echo 'Sorry, try again.' >&2\ndone\n\
-                     echo 'sudo: 3 incorrect password attempts' >&2\nexit 1\n",
+                    "sudo-rs-password-sudo",
+                    r#"#!/bin/sh
+IFS= read -r line
+printf '\n' >&2
+[ "$line" = s3cret ] || { echo 'sudo: Authentication failed, try again.' >&2; exit 1; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p|-u) shift 2 ;;
+    -n|-S) shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+"#,
                 )
             }
 
@@ -9389,14 +9796,14 @@ exec "$@"
 
             /// Asserts that `run`, `put_file` and `run_with_input` on `exec`
             /// each return [`ExecutorError::SudoRefused`] with `sudo`'s
-            /// complaint, promptly, and that `put_file` landed nothing.
-            fn assert_refused_promptly<E>(label: &str, exec: &E, root: &Path)
+            /// `complaint`, promptly, and that `put_file` landed nothing.
+            fn assert_refused_promptly<E>(label: &str, exec: &E, root: &Path, complaint: &str)
             where
                 E: Executor + Clone + Send + 'static,
             {
                 let refused = |error: &ExecutorError| {
                     matches!(error, ExecutorError::SudoRefused { reason, .. }
-                        if reason.contains("Sorry, try again"))
+                        if reason.contains(complaint))
                 };
 
                 let run = exec.clone();
@@ -9513,12 +9920,84 @@ exec "$@"
             #[test]
             fn a_wrong_password_is_refused_promptly_and_lands_nothing() {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let sudo = insisting_sudo(dir.path());
                 let auth = || SudoAuth::Password("wrong".to_string());
-                let local = LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone());
-                assert_refused_promptly("local", &local, dir.path());
-                let ssh: SshExecutor = ssh_with(dir.path(), &sudo, auth());
-                assert_refused_promptly("ssh", &ssh, dir.path());
+                for wording in [Wording::Classic, Wording::SudoRs] {
+                    let sudo = insisting_sudo(dir.path(), wording);
+                    let complaint = wording.complaint();
+                    let local = LocalExecutor::new("seat", auth()).with_sudo_bin(sudo.clone());
+                    assert_refused_promptly(
+                        &format!("local {wording:?}"),
+                        &local,
+                        dir.path(),
+                        complaint,
+                    );
+                    let ssh: SshExecutor = ssh_with(dir.path(), &sudo, auth());
+                    assert_refused_promptly(
+                        &format!("ssh {wording:?}"),
+                        &ssh,
+                        dir.path(),
+                        complaint,
+                    );
+                }
+            }
+
+            #[test]
+            fn sudo_rs_s_line_after_a_right_password_is_not_the_commands() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = sudo_rs_password_sudo(dir.path());
+                let script = ["-c", "echo err >&2"];
+                for (index, (label, exec)) in pairs(dir.path(), "s3cret", &[("sudo-rs", &sudo)])
+                    .into_iter()
+                    .enumerate()
+                {
+                    let output = exec
+                        .run(Identity::Root, "/bin/sh", &script)
+                        .unwrap_or_else(|error| panic!("{label}: run: {error:?}"));
+                    assert_eq!(output.code, Some(0), "{label}: run");
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stderr),
+                        "err\n",
+                        "{label}: run"
+                    );
+
+                    let output = exec
+                        .run_with_input(Identity::Root, "/bin/sh", &script, b"", ROOMY)
+                        .unwrap_or_else(|error| panic!("{label}: run_with_input: {error:?}"));
+                    assert_eq!(output.code, Some(0), "{label}: run_with_input");
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stderr),
+                        "err\n",
+                        "{label}: run_with_input"
+                    );
+
+                    let limits = ChannelLimits {
+                        elevation_timeout: ROOMY.timeout,
+                        max_stderr: ROOMY.max_stderr,
+                    };
+                    let mut channel = exec
+                        .open_channel(Identity::Root, "/bin/sh", &script, limits)
+                        .unwrap_or_else(|error| panic!("{label}: open_channel: {error:?}"));
+                    drop(channel.take_stdin());
+                    let exit = channel
+                        .wait()
+                        .unwrap_or_else(|error| panic!("{label}: wait: {error:?}"));
+                    assert_eq!(exit.code, Some(0), "{label}: open_channel");
+                    assert_eq!(
+                        String::from_utf8_lossy(&exit.stderr),
+                        "err\n",
+                        "{label}: open_channel"
+                    );
+
+                    let payload = b"line one\nline two\n";
+                    let dest = dest_under(dir.path(), &format!("{index}-sudo-rs.conf"));
+                    exec.put_file(&dest, payload, current_meta(0o644))
+                        .unwrap_or_else(|error| panic!("{label}: put_file: {error:?}"));
+                    assert_eq!(
+                        std::fs::read(&dest).expect("read back"),
+                        payload,
+                        "{label}: put_file"
+                    );
+                }
             }
 
             #[test]

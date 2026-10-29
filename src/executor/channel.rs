@@ -114,8 +114,9 @@ pub enum ChannelError {
     /// [`ChannelLimits::elevation_timeout`]. It was killed and reaped.
     ///
     /// A `sudo -S` that rejected the password waits for another line rather
-    /// than exiting, so a wrong password ends here, its `Sorry, try again.`
-    /// in `diagnostic`.
+    /// than exiting, so a wrong password ends here, its complaint in
+    /// `diagnostic`: classic sudo's `Sorry, try again.`, or sudo-rs's
+    /// `sudo: Authentication failed, try again.`.
     #[error("host `{host}`: the channel did not start within {timeout:?}: {diagnostic}")]
     ElevationTimedOut {
         /// The host whose transport did not start the command.
