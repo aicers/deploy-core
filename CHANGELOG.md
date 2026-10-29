@@ -4,6 +4,35 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `Executor::run`, `Executor::run_with_input`, `Executor::open_channel` and
+  everything built on them now refuse an invocation that goes through `sudo`
+  when its command or any argument contains `__BOOTLER_SUDO_OK__`, before
+  anything is spawned. This covers `Identity::Root` and `Identity::Service` on
+  `LocalExecutor` and `SshExecutor`, and `Identity::Service` on
+  `InDaemonExecutor`. The refusal is `ExecutorError::Spawn` with an
+  `InvalidInput` source naming the word's position; `run_with_input` and
+  `open_channel` wrap it in their `Executor` variant.
+- The command line an elevated run hands `sudo` no longer contains
+  `__BOOTLER_SUDO_OK__`: the scripts print it from two halves. A test double
+  that recognises an elevated run by finding that word in its command line no
+  longer finds it.
+
+### Fixed
+
+- A classic `sudo` that denies a command under sudoers and repeats the command
+  line in its denial is now reported as `ExecutorError::SudoRefused` by
+  `Executor::run`, `Executor::put_file` and the other elevated helpers, and by
+  `Executor::run_with_input` and `Executor::open_channel` inside their
+  `Executor` variant. Before, `run` returned the denial as the command's own
+  output with exit code `1`, `put_file` reported it as
+  `ExecutorError::Transfer`, `run_with_input` reported
+  `RunWithInputError::TimedOut`, and `open_channel` returned a channel to a
+  command that never started.
+
 ## [0.3.1] - 2026-10-29
 
 ### Fixed
@@ -126,6 +155,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.3.1...main
 [0.3.1]: https://github.com/aicers/deploy-core/compare/0.3.0...0.3.1
 [0.3.0]: https://github.com/aicers/deploy-core/compare/0.2.1...0.3.0
 [0.2.1]: https://github.com/aicers/deploy-core/compare/0.2.0...0.2.1
