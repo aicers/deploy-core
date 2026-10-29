@@ -5140,7 +5140,8 @@ exec "$@"
                     &format!("{label}, put_file"),
                     &error,
                     SH,
-                    "argument ",
+                    // `dest`'s place among the landing script's arguments.
+                    "argument 3",
                     &holding,
                 );
                 assert!(!dest.exists(), "{label}: nothing lands");
