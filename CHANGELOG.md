@@ -8,9 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-- `executor::sudo_needs_password` now recognises sudo-rs, the `sudo` of Ubuntu
-  26.04, as well as classic sudo: `sudo: interactive authentication is
-  required` and `sudo: A terminal is required to authenticate`. A
+- `executor::sudo_needs_password` now also recognises the wording of sudo-rs,
+  the `sudo` of Ubuntu 26.04: `sudo: interactive authentication is required`
+  and `sudo: A terminal is required to authenticate`. A
   `SudoAuth::NonInteractive` executor whose sudo-rs wants a password now fails
   with `ExecutorError::Elevation`, as it does with classic sudo, instead of
   `ExecutorError::SudoRefused`.
