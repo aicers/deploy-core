@@ -4,6 +4,22 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `executor::sudo_needs_password` now recognises sudo-rs, the `sudo` of Ubuntu
+  26.04, as well as classic sudo: `sudo: interactive authentication is
+  required` and `sudo: A terminal is required to authenticate`. A
+  `SudoAuth::NonInteractive` executor whose sudo-rs wants a password now fails
+  with `ExecutorError::Elevation`, as it does with classic sudo, instead of
+  `ExecutorError::SudoRefused`.
+- The standard error that `Executor::run` returns for a command run through
+  `sudo` now starts with the command's own first byte. What `sudo` or `ssh`
+  wrote before the command started is dropped, as `Executor::run_with_input`
+  and `Executor::open_channel` already did; that includes the empty line
+  sudo-rs writes after it reads a password.
+
 ## [0.3.0] - 2026-10-22
 
 ### Added
@@ -110,6 +126,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.3.0...main
 [0.3.0]: https://github.com/aicers/deploy-core/compare/0.2.1...0.3.0
 [0.2.1]: https://github.com/aicers/deploy-core/compare/0.2.0...0.2.1
 [0.2.0]: https://github.com/aicers/deploy-core/compare/0.1.1...0.2.0
