@@ -32,7 +32,10 @@ use super::bounded::{
     reap_within,
 };
 use super::handoff::Handoff;
-use super::{CommandOutput, ExecutorError, RC_MARKER, SUDO_OK_SENTINEL, spawn_retrying_text_busy};
+use super::{
+    CommandOutput, ExecutorError, RC_MARKER, SUDO_OK_SENTINEL, print_split,
+    spawn_retrying_text_busy,
+};
 
 /// How long [`Channel::wait`] waits for standard error to end once the local
 /// transport process has exited. A descendant of the command can hold the
@@ -187,6 +190,12 @@ pub(super) fn check_command(command: &str) -> Result<(), ChannelError> {
 /// The handoff line is a [`Handoff`], the same one every script run under
 /// `sudo -S` discards up to, and carries a nonce drawn for this start alone.
 ///
+/// The script's text does not contain the sentinel it prints, since `sudo`
+/// repeats the command line — this script among it — when sudoers denies it,
+/// and a denial must not read as a start. The sentinel is printed from two
+/// halves, and the caller's words are kept from holding it where they reach
+/// `sudo`.
+///
 /// [`SudoAuth::Password`]: super::SudoAuth::Password
 pub(super) struct StartScript {
     script: String,
@@ -204,7 +213,8 @@ impl StartScript {
     pub(super) fn new() -> Result<Self, ExecutorError> {
         let handoff = Handoff::new(START_SHELL)?;
         let script = format!(
-            "printf '%s' '{SUDO_OK_SENTINEL}' >&2; {}; exec {ENV} -i \"$0\" \"$@\"",
+            "{}; {}; exec {ENV} -i \"$0\" \"$@\"",
+            print_split(SUDO_OK_SENTINEL, 2),
             handoff.discard()
         );
         Ok(Self { script, handoff })
@@ -928,9 +938,19 @@ fn split_status_line(tail: &[u8]) -> Option<(usize, i32)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RC_MARKER, SUDO_OK_SENTINEL, Settled, Sink, TRANSPORT_STDERR_LIMIT, judge,
+        RC_MARKER, SUDO_OK_SENTINEL, Settled, Sink, StartScript, TRANSPORT_STDERR_LIMIT, judge,
         split_status_line,
     };
+
+    #[test]
+    fn the_start_script_does_not_contain_the_sentinel_it_prints() {
+        let script = StartScript::new().expect("a start script");
+        assert!(
+            !script.script().contains(SUDO_OK_SENTINEL),
+            "{}",
+            script.script()
+        );
+    }
 
     /// `before` bytes of the transport's, then `after`.
     fn preamble(before: usize, after: &str) -> Vec<u8> {

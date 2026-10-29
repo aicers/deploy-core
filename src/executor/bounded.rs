@@ -29,7 +29,7 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 use super::handoff::Handoff;
 use super::{
     CommandOutput, ExecutorError, OutputStream, RC_MARKER, RunLimits, RunWithInputError,
-    SUDO_OK_SENTINEL, spawn_retrying_text_busy,
+    SUDO_OK_SENTINEL, print_split, spawn_retrying_text_busy,
 };
 
 /// Bytes read from one output pipe per readiness.
@@ -252,6 +252,13 @@ pub(super) enum Ended {
 /// supervisor's arguments on purpose, and all that would win it is being
 /// reported as timed out — which it could as well have had by not exiting.
 ///
+/// Nor does the script's text contain either word it prints, since `sudo`
+/// repeats the command line — this script among it — when sudoers denies it,
+/// and a denial must not read as a start or as the deadline passing. Each
+/// word is printed from two halves; the caller's words are kept from holding
+/// the sentinel where they reach `sudo`, and none can hold the timeout marker,
+/// whose nonce is drawn for this run.
+///
 /// Two things differ from a command run directly. A command a signal killed
 /// reports `128 + signal` rather than no exit code, since the script exits
 /// with the status its subshell returned; and a command started in the
@@ -320,9 +327,11 @@ fn script(timeout_marker: &str, timeout: Duration, handoff: Option<&Handoff>) ->
         .saturating_add(u64::from(timeout.subsec_nanos() > 0))
         .min(MAX_SLEEP_SECS);
     let discard = handoff.map_or_else(String::new, |handoff| format!("{}\n", handoff.discard()));
+    let started = print_split(SUDO_OK_SENTINEL, 2);
+    let timed_out = print_split(timeout_marker, 4);
     format!(
         r#"trap 'kill -KILL 0' TERM HUP INT
-printf '%s' '{SUDO_OK_SENTINEL}' >&2
+{started}
 {discard}exec 3<&0 0</dev/null 4>&2 2>/dev/null
 {SLEEP} {seconds} </dev/null >/dev/null 3<&- 4>&- &
 nap=$!
@@ -335,7 +344,7 @@ nap=$!
 run=$!
 exec 3<&-
 if wait "$nap"; then
-  printf '%s' '{timeout_marker}' >&4
+  {timed_out}
   kill -KILL 0
 fi
 wait "$run""#
@@ -1090,7 +1099,8 @@ mod tests {
                 .expect("prefix, nonce, suffix");
             assert_eq!(nonce.len(), 32);
             assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            assert!(supervisor.script().contains(marker));
+            assert!(!supervisor.script().contains(marker));
+            assert!(!supervisor.script().contains(SUDO_OK_SENTINEL));
         }
     }
 

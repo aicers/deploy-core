@@ -530,7 +530,9 @@ const DESCENT_ARG0: &str = "bootler-descent";
 /// Errors raised by an executor primitive.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
-    /// A command could not be spawned (for example the binary was not found).
+    /// A command could not be spawned (for example the binary was not found),
+    /// or a `sudo` invocation whose command or argument holds the elevation
+    /// sentinel was refused before anything was spawned.
     #[error("failed to spawn `{command}`: {source}")]
     Spawn {
         /// The command that could not be spawned.
@@ -1068,6 +1070,10 @@ pub trait Executor {
     /// password the run cannot supply and [`ExecutorError::SudoRefused`] when
     /// `sudo` refuses for any other reason; a non-zero exit of the *elevated*
     /// command is still a [`CommandOutput`]. Returns
+    /// [`ExecutorError::Spawn`] with an [`std::io::ErrorKind::InvalidInput`]
+    /// source, before anything is spawned, when `identity` resolves through
+    /// `sudo` and `command` or an argument holds the elevation sentinel
+    /// `__BOOTLER_SUDO_OK__`. Returns
     /// [`ExecutorError::NoOperatorIdentity`] when `identity` is
     /// [`Identity::Operator`] on a transport that has none.
     fn run(
@@ -1160,7 +1166,11 @@ pub trait Executor {
     /// an absolute path free of `=`, [`RunWithInputError::OutputLimit`] or
     /// [`RunWithInputError::TimedOut`] for a command that was stopped, and
     /// [`RunWithInputError::Executor`] carrying whatever [`Executor::run`]
-    /// would report for a spawn, transport or elevation failure.
+    /// would report for a spawn, transport or elevation failure. That
+    /// includes [`ExecutorError::Spawn`] with an
+    /// [`std::io::ErrorKind::InvalidInput`] source, before anything is
+    /// spawned, when `identity` resolves through `sudo` and `command` or an
+    /// argument holds the elevation sentinel `__BOOTLER_SUDO_OK__`.
     fn run_with_input(
         &self,
         identity: Identity,
@@ -1242,7 +1252,11 @@ pub trait Executor {
     /// [`ExecutorError::SudoRefused`]. An SSH transport whose remote shell
     /// ran but did not start the command is reported as
     /// [`ExecutorError::SudoRefused`] carrying the remote diagnostic, for the
-    /// operator too.
+    /// operator too. [`ChannelError::Executor`] also carries
+    /// [`ExecutorError::Spawn`] with an [`std::io::ErrorKind::InvalidInput`]
+    /// source, before anything is spawned, when `identity` resolves through
+    /// `sudo` and `command` or an argument holds the elevation sentinel
+    /// `__BOOTLER_SUDO_OK__`.
     fn open_channel(
         &self,
         identity: Identity,
@@ -2324,9 +2338,17 @@ fn extract_remote_code(stderr: &[u8]) -> Option<(usize, i32)> {
 /// command, and exits `1` without starting it if standard input ends first.
 /// The command is still found through `PATH` and keeps the environment `sudo`
 /// set up.
+///
+/// The script's text does not contain the sentinel it prints, since `sudo`
+/// repeats the command line — this script among it — when sudoers denies it,
+/// and a denial must not read as a start. The sentinel is printed from two
+/// halves; [`check_sudo_words`] keeps the caller's words from holding it.
 fn sudo_sentinel_script(handoff: Option<&Handoff>) -> String {
     let discard = handoff.map_or_else(String::new, |handoff| format!("{}; ", handoff.discard()));
-    format!("printf '%s' '{SUDO_OK_SENTINEL}' >&2; {discard}exec \"$0\" \"$@\"")
+    format!(
+        "{started}; {discard}exec \"$0\" \"$@\"",
+        started = print_split(SUDO_OK_SENTINEL, 2),
+    )
 }
 
 /// Draws the [`Handoff`] an invocation by `identity` discards standard input up
@@ -2390,20 +2412,20 @@ fn descent_script() -> String {
     format!(
         "cd -- \"$1\" 2>/dev/null || {{ {no_directory}; exit 1; }}; \
          shift; {started}; exec {env} -i \"$@\"",
-        no_directory = print_split(NO_WORKING_DIRECTORY_MARKER),
-        started = print_split(SUDO_OK_SENTINEL),
+        no_directory = print_split(NO_WORKING_DIRECTORY_MARKER, 2),
+        started = print_split(SUDO_OK_SENTINEL, 2),
         env = bounded::ENV,
     )
 }
 
-/// A shell command printing `word` on standard error from two halves, so the
+/// A shell command printing `word` on descriptor `fd` from two halves, so the
 /// command's own text never contains `word`.
 ///
 /// Only called with this module's ASCII markers, so the midpoint is a
 /// character boundary.
-fn print_split(word: &str) -> String {
+fn print_split(word: &str, fd: u8) -> String {
     let (head, tail) = word.split_at(word.len() / 2);
-    format!("printf '%s%s' '{head}' '{tail}' >&2")
+    format!("printf '%s%s' '{head}' '{tail}' >&{fd}")
 }
 
 /// Removes every byte of `stderr` up to and including the first
@@ -2425,6 +2447,38 @@ fn take_sudo_sentinel(stderr: &mut Vec<u8>) -> bool {
         }
         None => false,
     }
+}
+
+/// Refuses a `sudo` invocation whose `command` or any of whose `args` holds
+/// [`SUDO_OK_SENTINEL`].
+///
+/// Every word the caller supplies reaches `sudo`'s command line, which classic
+/// `sudo` repeats on standard error when sudoers denies it, and a denial that
+/// carries the sentinel would read as a start. The scripts `sudo` runs print
+/// it from two halves; this keeps the caller's words from holding it. The
+/// refusal names the word by its position only: an argument may be anything
+/// the caller passes.
+///
+/// # Errors
+///
+/// Returns [`ExecutorError::Spawn`] with an [`std::io::ErrorKind::InvalidInput`]
+/// source when a word holds the sentinel.
+fn check_sudo_words(command: &str, args: &[&str]) -> Result<(), ExecutorError> {
+    let holds = |word: &str| bounded::find(word.as_bytes(), SUDO_OK_SENTINEL.as_bytes()).is_some();
+    let word = if holds(command) {
+        "the command".to_string()
+    } else if let Some(index) = args.iter().position(|arg| holds(arg)) {
+        format!("argument {index}")
+    } else {
+        return Ok(());
+    };
+    Err(ExecutorError::Spawn {
+        command: command.to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{word} holds `{SUDO_OK_SENTINEL}`, which an elevated run reserves"),
+        ),
+    })
 }
 
 /// Finalises an invocation that went through `sudo`: strips the sudo sentinel
@@ -2524,7 +2578,9 @@ impl LocalExecutor {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorError::Spawn`] when the handoff line cannot be drawn.
+    /// Returns [`ExecutorError::Spawn`] when the handoff line cannot be drawn,
+    /// or when the invocation goes through `sudo` and a word holds
+    /// [`SUDO_OK_SENTINEL`]; see [`check_sudo_words`].
     fn resolve(
         &self,
         identity: Identity,
@@ -2533,7 +2589,7 @@ impl LocalExecutor {
     ) -> Result<Resolved, ExecutorError> {
         let handoff = password_handoff(&self.auth, identity, SH)?;
         let script = sudo_sentinel_script(handoff.as_ref());
-        Ok(self.resolve_through(identity, SH, &script, handoff.as_ref(), command, args))
+        self.resolve_through(identity, SH, &script, handoff.as_ref(), command, args)
     }
 
     /// Resolves an `(identity, Local)` pair as [`LocalExecutor::resolve`]
@@ -2545,6 +2601,12 @@ impl LocalExecutor {
     /// `handoff` is the line `script` discards standard input up to, which the
     /// preamble then carries after the password line; `None` where the script
     /// discards nothing, or takes its handoff line later, as a channel's does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Spawn`] when the invocation goes through
+    /// `sudo` and `command` or an argument holds [`SUDO_OK_SENTINEL`]; see
+    /// [`check_sudo_words`].
     fn resolve_through(
         &self,
         identity: Identity,
@@ -2553,16 +2615,17 @@ impl LocalExecutor {
         handoff: Option<&Handoff>,
         command: &str,
         args: &[&str],
-    ) -> Resolved {
+    ) -> Result<Resolved, ExecutorError> {
         let Some(elevation) = Elevation::of(identity) else {
             let mut cmd = Command::new(command);
             cmd.args(args);
-            return Resolved {
+            return Ok(Resolved {
                 command: cmd,
                 preamble: None,
                 elevated: false,
-            };
+            });
         };
+        check_sudo_words(command, args)?;
         let mut cmd = Command::new(&self.sudo_bin);
         let preamble = match &self.auth {
             SudoAuth::NonInteractive => {
@@ -2578,11 +2641,11 @@ impl LocalExecutor {
             cmd.arg("-u").arg(account.as_str());
         }
         cmd.arg(shell).arg("-c").arg(script).arg(command).args(args);
-        Resolved {
+        Ok(Resolved {
             command: cmd,
             preamble,
             elevated: true,
-        }
+        })
     }
 
     /// Spawns a [`Resolved`] invocation, feeding `payload` after any preamble
@@ -2640,7 +2703,7 @@ impl LocalExecutor {
             handoff.as_ref(),
             command,
             args,
-        );
+        )?;
         // A command spawned directly has its environment cleared here. `sudo`
         // keeps the caller's, so it is found exactly as `run` finds it; the
         // supervisor clears the command's after `sudo` has set up its own.
@@ -2754,7 +2817,7 @@ impl Executor for LocalExecutor {
             None,
             command,
             args,
-        );
+        )?;
         // A command spawned directly has its environment cleared here. `sudo`
         // keeps the caller's, so it is found exactly as `run` finds it; the
         // start script clears the command's after `sudo` has set up its own.
@@ -2956,7 +3019,9 @@ impl SshExecutor {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorError::Spawn`] when the handoff line cannot be drawn.
+    /// Returns [`ExecutorError::Spawn`] when the handoff line cannot be drawn,
+    /// or when the invocation goes through `sudo` and a word holds
+    /// [`SUDO_OK_SENTINEL`]; see [`check_sudo_words`].
     fn resolve(
         &self,
         identity: Identity,
@@ -2965,7 +3030,7 @@ impl SshExecutor {
     ) -> Result<ResolvedRemote, ExecutorError> {
         let handoff = password_handoff(&self.auth, identity, SH)?;
         let script = sudo_sentinel_script(handoff.as_ref());
-        Ok(self.resolve_through(identity, SH, &script, handoff.as_ref(), None, command, args))
+        self.resolve_through(identity, SH, &script, handoff.as_ref(), None, command, args)
     }
 
     /// Resolves an `(identity, Ssh)` pair as [`SshExecutor::resolve`] does,
@@ -2979,6 +3044,12 @@ impl SshExecutor {
     /// `handoff` is the line `script` discards standard input up to, which the
     /// preamble then carries after the password line; `None` where the script
     /// discards nothing, or takes its handoff line later, as a channel's does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Spawn`] when the invocation goes through
+    /// `sudo` and `command` or an argument holds [`SUDO_OK_SENTINEL`]; see
+    /// [`check_sudo_words`].
     // Each knob is one its callers turn independently: the elevated script,
     // the handoff it discards up to, and the operator's script.
     #[allow(clippy::too_many_arguments)]
@@ -2991,7 +3062,7 @@ impl SshExecutor {
         operator_script: Option<&str>,
         command: &str,
         args: &[&str],
-    ) -> ResolvedRemote {
+    ) -> Result<ResolvedRemote, ExecutorError> {
         let Some(elevation) = Elevation::of(identity) else {
             let remote = match operator_script {
                 Some(wrapper) => shell_join(
@@ -3001,12 +3072,13 @@ impl SshExecutor {
                 ),
                 None => shell_join(std::iter::once(command).chain(args.iter().copied())),
             };
-            return ResolvedRemote {
+            return Ok(ResolvedRemote {
                 remote,
                 preamble: None,
                 elevated: false,
-            };
+            });
         };
+        check_sudo_words(command, args)?;
         let wrapped = [shell, "-c", script, command]
             .into_iter()
             .chain(args.iter().copied())
@@ -3021,7 +3093,7 @@ impl SshExecutor {
                 ("-S -p ''", Some(password_preamble(password, handoff)))
             }
         };
-        ResolvedRemote {
+        Ok(ResolvedRemote {
             remote: format!(
                 "{} {flags}{descent} {}",
                 self.remote_sudo,
@@ -3029,7 +3101,7 @@ impl SshExecutor {
             ),
             preamble,
             elevated: true,
-        }
+        })
     }
 
     /// Runs a [`ResolvedRemote`] invocation, feeding `payload` after any
@@ -3090,7 +3162,7 @@ impl SshExecutor {
             Some(supervisor.script()),
             command,
             args,
-        );
+        )?;
         let feed = match preamble {
             Some(mut feed) => {
                 feed.extend_from_slice(input);
@@ -3174,7 +3246,7 @@ impl Executor for SshExecutor {
             Some(script.script()),
             command,
             args,
-        );
+        )?;
         // `ssh` keeps the caller's environment, as it does for `run`; the
         // remote start script clears the command's.
         let mut cmd = self.ssh_command();
@@ -3294,7 +3366,9 @@ impl InDaemonExecutor {
     ///
     /// This is the one site where this transport decides whether `sudo` is
     /// involved. The account name is a discrete `Command` argument, so it
-    /// reaches `sudo -u` as exactly one word whatever it contains.
+    /// reaches `sudo -u` as exactly one word whatever it contains. A descent
+    /// whose `command` or argument holds [`SUDO_OK_SENTINEL`] is refused with
+    /// [`ExecutorError::Spawn`]; see [`check_sudo_words`].
     fn resolve(
         &self,
         identity: Identity,
@@ -3327,6 +3401,7 @@ impl InDaemonExecutor {
                 Ok((cmd, false))
             }
             Identity::Service(account) => {
+                check_sudo_words(command, args)?;
                 let mut cmd = self.sudo_descent(Descent::Service(account));
                 cmd.arg(shell).arg("-c").arg(script).arg(command).args(args);
                 Ok((cmd, true))
@@ -3863,9 +3938,10 @@ impl Executor for InDaemonExecutor {
 
 #[cfg(test)]
 mod tests {
+    use super::handoff::Handoff;
     use super::{
-        Executor, ExecutorError, Identity, LocalExecutor, SUDO_OK_SENTINEL, shell_quote,
-        sudo_needs_password, take_sudo_sentinel,
+        Executor, ExecutorError, Identity, LocalExecutor, SH, SUDO_OK_SENTINEL, check_sudo_words,
+        shell_quote, sudo_needs_password, sudo_sentinel_script, take_sudo_sentinel,
     };
 
     /// The line OpenSSH writes on stderr when it records a new host key,
@@ -3996,6 +4072,81 @@ mod tests {
     }
 
     #[test]
+    fn check_sudo_words_refuses_only_a_word_holding_the_whole_sentinel() {
+        let holding = format!("x{SUDO_OK_SENTINEL}y");
+        let partial = SUDO_OK_SENTINEL
+            .strip_suffix("__")
+            .expect("the sentinel ends in `__`");
+        let holding_command = format!("/usr/bin/{SUDO_OK_SENTINEL}");
+        let cases: [(&str, &str, Vec<&str>, Option<&str>); 6] = [
+            ("no word", "/bin/echo", vec!["a", "b"], None),
+            (
+                "the command",
+                &holding_command,
+                vec!["a"],
+                Some("the command"),
+            ),
+            (
+                "argument 0",
+                "/bin/echo",
+                vec![&holding, "b"],
+                Some("argument 0"),
+            ),
+            (
+                "argument 2",
+                "/bin/echo",
+                vec!["a", "b", &holding],
+                Some("argument 2"),
+            ),
+            ("a partial word", "/bin/echo", vec![partial], None),
+            ("no arguments", "/bin/echo", vec![], None),
+        ];
+        for (case, command, args, refused) in cases {
+            let result = check_sudo_words(command, &args);
+            match (result, refused) {
+                (Ok(()), None) => {}
+                (
+                    Err(ExecutorError::Spawn {
+                        command: named,
+                        source,
+                    }),
+                    Some(word),
+                ) => {
+                    assert_eq!(named, command, "{case}");
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput, "{case}");
+                    let message = source.to_string();
+                    assert!(message.starts_with(word), "{case}: {message}");
+                    assert!(message.contains(SUDO_OK_SENTINEL), "{case}: {message}");
+                    assert!(!message.contains(&holding), "{case}: {message}");
+                }
+                (other, _) => panic!("{case}: got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_sentinel_script_prints_the_sentinel_it_does_not_contain() {
+        let handoff = Handoff::new(SH).expect("a handoff");
+        let cases = [
+            ("no handoff", sudo_sentinel_script(None)),
+            ("a handoff", sudo_sentinel_script(Some(&handoff))),
+        ];
+        for (case, script) in cases {
+            assert!(!script.contains(SUDO_OK_SENTINEL), "{case}: {script}");
+        }
+        let output = std::process::Command::new(SH)
+            .arg("-c")
+            .arg(sudo_sentinel_script(None))
+            .arg("/bin/echo")
+            .arg("out")
+            .output()
+            .expect("run the script");
+        assert!(output.status.success());
+        assert_eq!(output.stderr, SUDO_OK_SENTINEL.as_bytes());
+        assert_eq!(output.stdout, b"out\n");
+    }
+
+    #[test]
     fn take_sudo_sentinel_drops_everything_up_to_the_first_sentinel() {
         let sentinel = SUDO_OK_SENTINEL;
         let cases = [
@@ -4071,8 +4222,9 @@ mod tests {
         use tempfile::TempDir;
 
         use super::super::{
-            Executor, ExecutorError, FileMeta, Identity, LocalExecutor, Principal, SshExecutor,
-            SshPrompt, SudoAuth,
+            ChannelError, ChannelLimits, Executor, ExecutorError, FileMeta, Identity,
+            InDaemonExecutor, LocalExecutor, Principal, RunLimits, RunWithInputError, SH,
+            SUDO_OK_SENTINEL, ServiceAccount, SshExecutor, SshPrompt, SudoAuth,
         };
 
         /// An argument carrying the metacharacters the SSH transport must not
@@ -4092,6 +4244,16 @@ mod tests {
         /// What sudo-rs writes before it exits `1` for a user sudoers does not
         /// name, password or not.
         const SUDO_RS_NOT_IN_SUDOERS: &str = "sudo: I'm sorry ops. I'm afraid I can't do that";
+        /// Parses the flags a `sudo` stub drops — `-u` and `-g` with their
+        /// values, any other flag alone — leaving the wrapped command in `$@`.
+        const SKIP_SUDO_FLAGS: &str = r#"while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -u|-g) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+"#;
 
         /// Writes `body` to an executable script and returns its path.
         fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -4101,6 +4263,21 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).expect("chmod");
             path
+        }
+
+        /// A `sudo` stub that denies the command as classic sudo does under
+        /// sudoers, repeating the command line it was asked to run after its
+        /// own flags, and exits `1` without running anything.
+        fn repeating_sudo(dir: &Path) -> PathBuf {
+            write_script(
+                dir,
+                "repeating-sudo",
+                &format!(
+                    "#!/bin/sh\n{SKIP_SUDO_FLAGS}\
+                     printf \"Sorry, user ops is not allowed to execute '%s' as root on seat.\\n\" \"$*\" >&2\n\
+                     exit 1\n"
+                ),
+            )
         }
 
         /// A stub `ssh` that strips the connection options and target, then runs
@@ -4787,6 +4964,231 @@ exec "$@"
                 matches!(error, ExecutorError::SudoRefused { .. }),
                 "got: {error:?}"
             );
+        }
+
+        #[test]
+        fn a_denial_repeating_the_command_line_is_a_sudo_refusal() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sudo = repeating_sudo(dir.path());
+            let local =
+                LocalExecutor::new("mgmt", SudoAuth::NonInteractive).with_sudo_bin(sudo.clone());
+            let ssh = ssh_executor(&dir, SudoAuth::NonInteractive)
+                .with_remote_sudo(sudo.to_string_lossy().into_owned());
+            let daemon = InDaemonExecutor::new("mgmt").with_sudo_bin(sudo);
+            let service = Identity::Service(ServiceAccount::Security);
+            let pairs: [(&str, &dyn Executor, Identity); 4] = [
+                ("local root", &local, Identity::Root),
+                ("local service", &local, service),
+                ("ssh root", &ssh, Identity::Root),
+                ("daemon service", &daemon, service),
+            ];
+            for (label, exec, identity) in pairs {
+                let error = exec
+                    .run(identity, "/bin/echo", &["hello"])
+                    .expect_err("sudo denied the command");
+                match error {
+                    ExecutorError::SudoRefused { reason, .. } => {
+                        assert!(
+                            reason.contains("is not allowed to execute"),
+                            "{label}: {reason}"
+                        );
+                    }
+                    other => panic!("{label}: expected SudoRefused, got: {other:?}"),
+                }
+            }
+
+            let pairs: [(&str, &dyn Executor); 2] = [("local", &local), ("ssh", &ssh)];
+            for (label, exec) in pairs {
+                let path = dir.path().join(format!("{label}-landed.bin"));
+                let error = exec
+                    .put_file(&path, b"data", current_meta(0o644))
+                    .expect_err("sudo denied the landing");
+                assert!(
+                    matches!(&error, ExecutorError::SudoRefused { reason, .. }
+                        if reason.contains("is not allowed to execute")),
+                    "{label}: got: {error:?}"
+                );
+                assert!(!path.exists(), "{label}: nothing lands");
+            }
+        }
+
+        /// Asserts `error` is the refusal of a `sudo` word holding the
+        /// sentinel: a [`ExecutorError::Spawn`] naming `command`, whose
+        /// `InvalidInput` source names the word by `position` and never by
+        /// its `value`.
+        fn assert_sentinel_refused(
+            label: &str,
+            error: &ExecutorError,
+            command: &str,
+            position: &str,
+            value: &str,
+        ) {
+            match error {
+                ExecutorError::Spawn {
+                    command: named,
+                    source,
+                } => {
+                    assert_eq!(named, command, "{label}");
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput, "{label}");
+                    let message = source.to_string();
+                    assert!(message.starts_with(position), "{label}: {message}");
+                    assert!(message.contains(SUDO_OK_SENTINEL), "{label}: {message}");
+                    assert!(!message.contains(value), "{label}: {message}");
+                }
+                other => panic!("{label}: expected Spawn, got: {other:?}"),
+            }
+        }
+
+        // One table of entry points over every identity that reaches `sudo`,
+        // and the same words through every identity that does not.
+        #[allow(clippy::too_many_lines)]
+        #[test]
+        fn a_word_holding_the_sentinel_never_reaches_sudo() {
+            const RUN_LIMITS: RunLimits = RunLimits {
+                max_stdout: 1 << 20,
+                max_stderr: 1 << 20,
+                timeout: std::time::Duration::from_secs(30),
+            };
+            const CHANNEL_LIMITS: ChannelLimits = ChannelLimits {
+                elevation_timeout: std::time::Duration::from_secs(30),
+                max_stderr: 1 << 20,
+            };
+            let holding = format!("x{SUDO_OK_SENTINEL}y");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let ran = dir.path().join("sudo-ran");
+            let sudo = write_script(
+                dir.path(),
+                "granting-sudo",
+                &format!(
+                    "#!/bin/sh\n: > {}\n{SKIP_SUDO_FLAGS}exec \"$@\"\n",
+                    super::super::shell_quote(&ran.to_string_lossy())
+                ),
+            );
+            let local =
+                LocalExecutor::new("mgmt", SudoAuth::NonInteractive).with_sudo_bin(sudo.clone());
+            let ssh = ssh_executor(&dir, SudoAuth::NonInteractive)
+                .with_remote_sudo(sudo.to_string_lossy().into_owned());
+            let daemon = InDaemonExecutor::new("mgmt").with_sudo_bin(sudo);
+            let service = Identity::Service(ServiceAccount::Security);
+
+            let elevated: [(&str, &dyn Executor, Identity, bool); 5] = [
+                ("local root", &local, Identity::Root, true),
+                ("local service", &local, service, true),
+                ("ssh root", &ssh, Identity::Root, true),
+                ("ssh service", &ssh, service, true),
+                ("daemon service", &daemon, service, false),
+            ];
+            for (label, exec, identity, channels) in elevated {
+                let error = exec
+                    .run(identity, "/bin/echo", &["a", &holding])
+                    .expect_err("refused");
+                assert_sentinel_refused(
+                    &format!("{label}, run"),
+                    &error,
+                    "/bin/echo",
+                    "argument 1",
+                    &holding,
+                );
+                let command = format!("/opt/{holding}");
+                let error = exec.run(identity, &command, &[]).expect_err("refused");
+                assert_sentinel_refused(
+                    &format!("{label}, run, command"),
+                    &error,
+                    &command,
+                    "the command",
+                    "nothing else",
+                );
+
+                let error = exec
+                    .run_with_input(identity, "/bin/echo", &[&holding], b"", RUN_LIMITS)
+                    .expect_err("refused");
+                match &error {
+                    RunWithInputError::Executor(error) => assert_sentinel_refused(
+                        &format!("{label}, run_with_input"),
+                        error,
+                        "/bin/echo",
+                        "argument 0",
+                        &holding,
+                    ),
+                    other => panic!("{label}, run_with_input: got {other:?}"),
+                }
+
+                if channels {
+                    let error = exec
+                        .open_channel(identity, "/bin/echo", &[&holding], CHANNEL_LIMITS)
+                        .expect_err("refused");
+                    match &error {
+                        ChannelError::Executor(error) => assert_sentinel_refused(
+                            &format!("{label}, open_channel"),
+                            error,
+                            "/bin/echo",
+                            "argument 0",
+                            &holding,
+                        ),
+                        other => panic!("{label}, open_channel: got {other:?}"),
+                    }
+                }
+            }
+
+            let pairs: [(&str, &dyn Executor); 2] = [("local", &local), ("ssh", &ssh)];
+            for (label, exec) in pairs {
+                let dest = dir.path().join(&holding);
+                let error = exec
+                    .put_file(&dest, b"data", current_meta(0o644))
+                    .expect_err("refused");
+                assert_sentinel_refused(
+                    &format!("{label}, put_file"),
+                    &error,
+                    SH,
+                    // `dest`'s place among the landing script's arguments.
+                    "argument 3",
+                    &holding,
+                );
+                assert!(!dest.exists(), "{label}: nothing lands");
+            }
+            assert!(!ran.exists(), "sudo was never invoked");
+
+            let direct: [(&str, &dyn Executor, Identity, bool); 3] = [
+                ("local operator", &local, Identity::Operator, true),
+                ("ssh operator", &ssh, Identity::Operator, true),
+                ("daemon root", &daemon, Identity::Root, false),
+            ];
+            let expected = format!("{holding}\n");
+            for (label, exec, identity, channels) in direct {
+                let output = exec
+                    .run(identity, "/bin/echo", &[&holding])
+                    .unwrap_or_else(|error| panic!("{label}, run: {error:?}"));
+                assert_eq!(output.code, Some(0), "{label}, run");
+                assert_eq!(output.stdout, expected.as_bytes(), "{label}, run");
+
+                let output = exec
+                    .run_with_input(identity, "/bin/echo", &[&holding], b"", RUN_LIMITS)
+                    .unwrap_or_else(|error| panic!("{label}, run_with_input: {error:?}"));
+                assert_eq!(output.code, Some(0), "{label}, run_with_input");
+                assert_eq!(
+                    output.stdout,
+                    expected.as_bytes(),
+                    "{label}, run_with_input"
+                );
+
+                if channels {
+                    let mut channel = exec
+                        .open_channel(identity, "/bin/echo", &[&holding], CHANNEL_LIMITS)
+                        .unwrap_or_else(|error| panic!("{label}, open_channel: {error:?}"));
+                    drop(channel.take_stdin());
+                    let mut stdout = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut channel.take_stdout().expect("stdout is the caller's"),
+                        &mut stdout,
+                    )
+                    .expect("read stdout");
+                    channel
+                        .wait()
+                        .unwrap_or_else(|error| panic!("{label}, wait: {error:?}"));
+                    assert_eq!(stdout, expected.as_bytes(), "{label}, open_channel");
+                }
+            }
+            assert!(!ran.exists(), "sudo was never invoked");
         }
 
         #[test]
@@ -7757,7 +8159,7 @@ exec sh -c "$script" _ "$source" "$dest""#;
             };
             use super::{
                 SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, password_wanting_sudos,
-                sudo_rs_denying_sudo, warning_ssh, write_script,
+                repeating_sudo, sudo_rs_denying_sudo, warning_ssh, write_script,
             };
 
             /// Limits roomy enough for every test that is not about them.
@@ -8320,6 +8722,34 @@ exec "$@"
                 assert_gone("closed streams", &recorded_pids(&pids));
             }
 
+            #[test]
+            fn a_denial_repeating_the_command_line_is_a_sudo_refusal_not_a_timeout() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = repeating_sudo(dir.path());
+                let local = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(sudo.clone());
+                let ssh = ssh_with(dir.path(), &sudo, SudoAuth::NonInteractive);
+                let daemon = InDaemonExecutor::new("mgmt").with_sudo_bin(sudo);
+                let service = Identity::Service(ServiceAccount::Security);
+                let pairs: [(&str, &dyn Executor, Identity); 5] = [
+                    ("local root", &local, Identity::Root),
+                    ("local service", &local, service),
+                    ("ssh root", &ssh, Identity::Root),
+                    ("ssh service", &ssh, service),
+                    ("daemon service", &daemon, service),
+                ];
+                for (label, exec, identity) in pairs {
+                    let error = exec
+                        .run_with_input(identity, "/bin/cat", &[], b"{}", ROOMY)
+                        .expect_err("sudo denied the command");
+                    assert!(
+                        matches!(&error, RunWithInputError::Executor(ExecutorError::SudoRefused { reason, .. })
+                            if reason.contains("is not allowed to execute")),
+                        "{label}: got {error:?}"
+                    );
+                }
+            }
+
             // One table of failures across every transport, each checked under
             // both limits; split up, the shared stubs would be built per part.
             #[allow(clippy::too_many_lines)]
@@ -8666,7 +9096,7 @@ exec "$@"
             use super::bounded_runs::{descending_sudo, password_sudo, ssh_with};
             use super::{
                 SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, password_wanting_sudos,
-                sudo_rs_denying_sudo, write_script,
+                repeating_sudo, sudo_rs_denying_sudo, write_script,
             };
 
             /// Limits roomy enough for every test that is not about them.
@@ -9118,6 +9548,32 @@ exec "$@"
                         );
                         assert_eq!(channel.wait().expect("wait").code, Some(0), "{label}");
                     }
+                }
+            }
+
+            #[test]
+            fn a_denial_repeating_the_command_line_is_a_sudo_refusal() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let sudo = repeating_sudo(dir.path());
+                let local = LocalExecutor::new("mgmt", SudoAuth::NonInteractive)
+                    .with_sudo_bin(sudo.clone());
+                let ssh = ssh_with(dir.path(), &sudo, SudoAuth::NonInteractive);
+                let service = Identity::Service(ServiceAccount::Security);
+                let pairs: [(&str, &dyn Executor, Identity); 4] = [
+                    ("local root", &local, Identity::Root),
+                    ("local service", &local, service),
+                    ("ssh root", &ssh, Identity::Root),
+                    ("ssh service", &ssh, service),
+                ];
+                for (label, exec, identity) in pairs {
+                    let error = exec
+                        .open_channel(identity, "/bin/cat", &[], ROOMY)
+                        .expect_err("sudo denied the command");
+                    assert!(
+                        matches!(&error, ChannelError::Executor(ExecutorError::SudoRefused { reason, .. })
+                            if reason.contains("is not allowed to execute")),
+                        "{label}: got {error:?}"
+                    );
                 }
             }
 
@@ -10055,7 +10511,7 @@ exec "$@"
                 OperatorIds, SUDO_OK_SENTINEL, ServiceAccount, classify_elevation, descent_script,
                 spawn_retrying_text_busy,
             };
-            use super::write_script;
+            use super::{SKIP_SUDO_FLAGS, repeating_sudo, write_script};
 
             /// The pinned execution profile's variables.
             const PROFILE_ENV: &[(&str, &str)] = &[
@@ -10079,18 +10535,6 @@ exec "$@"
                 "",
                 "*",
             ];
-            /// Parses the flags a `sudo` stub drops — `-u` and `-g` with their
-            /// values, any other flag alone — leaving the wrapped command in
-            /// `$@`.
-            const SKIP_SUDO_FLAGS: &str = r#"while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -u|-g) shift 2 ;;
-    -*) shift ;;
-    *) break ;;
-  esac
-done
-"#;
-
             /// A `sudo` stub that prints its arguments, each ended by a NUL.
             fn recording_sudo(dir: &Path) -> PathBuf {
                 write_script(
@@ -10130,20 +10574,6 @@ done
                     dir,
                     "refusing-sudo",
                     "#!/bin/sh\necho 'sudo: unknown user clumit-insight' >&2\nexit 1\n",
-                )
-            }
-
-            /// A `sudo` stub that denies the command as sudoers does, repeating
-            /// the command line it was asked to run.
-            fn denying_sudo(dir: &Path) -> PathBuf {
-                write_script(
-                    dir,
-                    "denying-sudo",
-                    &format!(
-                        "#!/bin/sh\n{SKIP_SUDO_FLAGS}\
-                         echo \"Sorry, user root is not allowed to execute '$*' as insight on mgmt.\" >&2\n\
-                         exit 1\n"
-                    ),
                 )
             }
 
@@ -10562,7 +10992,7 @@ done
             #[test]
             fn a_denial_repeating_the_command_line_settles_as_refused() {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let exec = daemon(denying_sudo(dir.path()));
+                let exec = daemon(repeating_sudo(dir.path()));
                 let profile = DescentProfile {
                     env: PROFILE_ENV,
                     cwd: Path::new("/"),
