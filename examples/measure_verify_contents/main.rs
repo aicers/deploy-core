@@ -11,8 +11,9 @@
 //! is one image whose uncompressed layer holds 64 MiB of incompressible bytes,
 //! with the same two files. Every layer is uncompressed: a gzip layer's
 //! manifest is not canonical, and verification refuses it. `generate` writes
-//! `package.pkg` and `public-key.hex` into `<dir>` and discards the private
-//! key. `verify` prints the elapsed time and the retained-disk high-water
+//! `package.pkg`, `ed25519-public-key.hex` and `ml-dsa-87-public-key.hex` into
+//! `<dir>`, signing with a fresh key of each algorithm, and discards both
+//! private keys. `verify` prints the elapsed time and the retained-disk high-water
 //! mark, which is the package snapshot plus the archive-block copy plus every
 //! member snapshot.
 //! Run `verify` under `/usr/bin/time -l` (macOS) or `/usr/bin/time -v`
@@ -26,7 +27,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
 use deploy_core::image::test_support::{
     LayerCompression, SyntheticImageArchiveBuilder, SyntheticLayer,
 };
@@ -36,8 +37,12 @@ use deploy_core::image::{
 };
 use deploy_core::manifest::{ArtifactKind, Disposition, TargetArch};
 use deploy_core::package::{ContentLimits, VerifiedImages, verify_contents};
-use deploy_core::payload::{ArtifactInput, FOOTER_SIZE, Signed, append_trailer_signed};
-use deploy_core::verify::{TrustAnchor, TrustSet, VerifyRequest, key_id};
+use deploy_core::payload::{
+    ArtifactInput, DetachedSignature, FOOTER_SIZE, Signed, SignerError, append_trailer_signed,
+};
+use deploy_core::verify::{
+    ML_DSA_87_PUBLIC_KEY_LEN, ML_DSA_87_SIGNATURE_LEN, TrustAnchor, TrustSet, VerifyRequest, key_id,
+};
 
 const COMPONENT: &str = "example-app";
 const VERSION: &str = "1.0.0";
@@ -174,20 +179,49 @@ fn generate(kind: &str, dir: &Path) -> Result<(), Failure> {
         .map_err(|_| "key generation failed")?;
     let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| "the key does not parse")?;
     let public: [u8; 32] = pair.public_key().as_ref().try_into()?;
+    let ml_dsa = PqdsaKeyPair::generate(&ML_DSA_87_SIGNING)
+        .map_err(|_| "ML-DSA-87 key generation failed")?;
+    let ml_dsa_public = ml_dsa.public_key().as_ref().to_vec();
     let out = File::create(dir.join("package.pkg"))?;
     append_trailer_signed(std::io::empty(), out, None, None, &inputs, |manifest| {
+        let mut ml_dsa_signature =
+            vec![0; usize::try_from(ML_DSA_87_SIGNATURE_LEN).map_err(SignerError::new)?];
+        let written = ml_dsa
+            .sign(manifest, &mut ml_dsa_signature)
+            .map_err(|_| SignerError::new(std::io::Error::other("ML-DSA-87 signing failed")))?;
+        ml_dsa_signature.truncate(written);
         Ok(Signed {
-            signature: pair.sign(manifest).as_ref().to_vec(),
-            key_id: key_id(&public),
+            ed25519: DetachedSignature {
+                signature: pair.sign(manifest).as_ref().to_vec(),
+                key_id: key_id(&public),
+            },
+            ml_dsa_87: DetachedSignature {
+                signature: ml_dsa_signature,
+                key_id: key_id(&ml_dsa_public),
+            },
         })
     })?;
-    let hex = public.iter().fold(String::new(), |mut out, byte| {
+    std::fs::write(dir.join("ed25519-public-key.hex"), to_hex(&public))?;
+    std::fs::write(dir.join("ml-dsa-87-public-key.hex"), to_hex(&ml_dsa_public))?;
+    Ok(())
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
         out
-    });
-    std::fs::write(dir.join("public-key.hex"), hex)?;
-    Ok(())
+    })
+}
+
+/// Reads the raw key `file` in `dir` holds as lowercase hex.
+fn read_key(dir: &Path, file: &str) -> Result<Vec<u8>, Failure> {
+    let hex = std::fs::read_to_string(dir.join(file))?;
+    let hex = hex.trim();
+    Ok((0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(hex.get(at..at + 2).unwrap_or("zz"), 16))
+        .collect::<Result<_, _>>()?)
 }
 
 /// Reads the archive block's length off the footer alone.
@@ -203,13 +237,21 @@ fn archive_block_len(package: &Path) -> Result<u64, Failure> {
 }
 
 fn verify(dir: &Path, staging: &Path) -> Result<(), Failure> {
-    let hex = std::fs::read_to_string(dir.join("public-key.hex"))?;
-    let key: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(hex.get(at..at + 2).unwrap_or("zz"), 16))
-        .collect::<Result<_, _>>()?;
-    let key: [u8; 32] = key.try_into().map_err(|_| "a 32-byte key")?;
-    let trust = TrustSet::new(vec![TrustAnchor::new(key, false)], Vec::new(), 0, 0)?;
+    let key: [u8; 32] = read_key(dir, "ed25519-public-key.hex")?
+        .try_into()
+        .map_err(|_| "a 32-byte key")?;
+    let ml_dsa_key: [u8; ML_DSA_87_PUBLIC_KEY_LEN] = read_key(dir, "ml-dsa-87-public-key.hex")?
+        .try_into()
+        .map_err(|_| "a raw ML-DSA-87 key")?;
+    let trust = TrustSet::new(
+        vec![
+            TrustAnchor::new(key, false),
+            TrustAnchor::new_ml_dsa_87(&ml_dsa_key, false),
+        ],
+        Vec::new(),
+        0,
+        0,
+    )?;
     let request = VerifyRequest::for_namespaced_package(COMPONENT, VERSION, COMMIT, NAMESPACE)?;
     let package = dir.join("package.pkg");
 

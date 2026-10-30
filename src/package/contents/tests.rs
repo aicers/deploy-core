@@ -9,7 +9,7 @@ use super::*;
 use crate::manifest::TargetArch;
 use crate::package::source::seam::{self, Observed, Op, Seam};
 use crate::payload::PayloadError;
-use crate::verify::{VerifyError, verify_package};
+use crate::verify::{SignatureAlgorithm, VerifyError, verify_package};
 
 pub(crate) mod fixture;
 
@@ -308,7 +308,9 @@ fn a_bad_signature_outranks_an_image_archive_fault() {
     let bytes = signer.badly_signed(&manifest_bytes(&arts), &archive(&arts));
     assert!(matches!(
         same_verdict(&bytes, &signer.trust(), &request()),
-        VerifyError::BadSignature
+        VerifyError::BadSignature {
+            algorithm: SignatureAlgorithm::Ed25519
+        }
     ));
 }
 
@@ -659,7 +661,9 @@ fn raw_manifest_is_refused_before_allocation_and_before_the_signature() {
     let bytes = signer.badly_signed(&manifest, &archive(&arts));
     assert!(matches!(
         verify_package(Cursor::new(&bytes), &signer.trust(), &request()).map(|_| ()),
-        Err(VerifyError::BadSignature)
+        Err(VerifyError::BadSignature {
+            algorithm: SignatureAlgorithm::Ed25519
+        })
     ));
 
     let guard = seam::install(Seam::new());
@@ -680,7 +684,9 @@ fn raw_manifest_is_refused_before_allocation_and_before_the_signature() {
         .expect_err("refused");
     assert!(matches!(
         error,
-        ContentError::Verify(VerifyError::BadSignature)
+        ContentError::Verify(VerifyError::BadSignature {
+            algorithm: SignatureAlgorithm::Ed25519
+        })
     ));
     // Lowering the archive limit alone does not touch the manifest check.
     let (_, archive_len) = archive_block(&bytes);
@@ -692,7 +698,9 @@ fn raw_manifest_is_refused_before_allocation_and_before_the_signature() {
     .expect_err("refused");
     assert!(matches!(
         error,
-        ContentError::Verify(VerifyError::BadSignature)
+        ContentError::Verify(VerifyError::BadSignature {
+            algorithm: SignatureAlgorithm::Ed25519
+        })
     ));
 }
 
@@ -777,7 +785,9 @@ fn compressed_archive_is_refused_before_any_archive_byte_and_the_signature() {
     let (_, len) = archive_block(&bytes);
     assert!(matches!(
         verify_package(Cursor::new(&bytes), &signer.trust(), &request()).map(|_| ()),
-        Err(VerifyError::BadSignature)
+        Err(VerifyError::BadSignature {
+            algorithm: SignatureAlgorithm::Ed25519
+        })
     ));
 
     let guard = seam::install(Seam::new());
@@ -793,7 +803,7 @@ fn compressed_archive_is_refused_before_any_archive_byte_and_the_signature() {
     );
     // Only the footer candidates were read.
     let read = package_bytes_read(&seam::observed());
-    assert!(read <= 41 + 73, "read {read} bytes");
+    assert!(read <= 41 + 73 + 105, "read {read} bytes");
     assert!(!seam_saw(SourceRole::ArchiveCopy));
     drop(guard);
 
@@ -836,7 +846,9 @@ fn a_package_over_its_limit_is_refused_during_the_snapshot() {
         verify_limited(&bytes, &signer, &limits(LimitResource::Package, len)).expect_err("refused");
     assert!(matches!(
         error,
-        ContentError::Verify(VerifyError::BadSignature)
+        ContentError::Verify(VerifyError::BadSignature {
+            algorithm: SignatureAlgorithm::Ed25519
+        })
     ));
 }
 
@@ -1786,11 +1798,11 @@ fn retained_fault(role: SourceRole, op: Op, n: usize, kind: ErrorKind) -> Conten
 fn every_retained_read_and_seek_failure_is_read_snapshot() {
     let cases = [
         // Bounded authentication: the seek locating the footer, the seek to
-        // the manifest block after the two footer candidates, and the read
+        // the manifest block after the three footer candidates, and the read
         // of the manifest block after theirs.
         (SourceRole::Package, Op::Seek, 1),
-        (SourceRole::Package, Op::Seek, 4),
-        (SourceRole::Package, Op::Read, 3),
+        (SourceRole::Package, Op::Seek, 5),
+        (SourceRole::Package, Op::Read, 4),
         // The archive-block copy: its seek and its first read.
         (SourceRole::ArchiveCopy, Op::Seek, 1),
         (SourceRole::ArchiveCopy, Op::Read, 1),
@@ -1829,7 +1841,7 @@ fn a_retained_failure_in_bounded_authentication_is_its_io_case() {
     let retained = scope
         .snapshot_from(&mut bytes.as_slice(), u64::MAX)
         .expect("a snapshot");
-    for (op, n) in [(Op::Seek, 1), (Op::Seek, 4), (Op::Read, 3)] {
+    for (op, n) in [(Op::Seek, 1), (Op::Seek, 5), (Op::Read, 4)] {
         let _guard = seam::install(Seam::new().fail_nth(
             SourceRole::Package,
             op,
@@ -1917,7 +1929,7 @@ fn bounded_authentication_reads_the_footer_then_the_manifest_then_the_envelope()
     drop(guard);
     let len = bytes.len() as u64;
     assert_eq!(
-        package.get(..7),
+        package.get(..9),
         Some(
             &[
                 (Op::Seek, len),
@@ -1925,6 +1937,8 @@ fn bounded_authentication_reads_the_footer_then_the_manifest_then_the_envelope()
                 (Op::Read, 41),
                 (Op::Seek, len - 73),
                 (Op::Read, 73),
+                (Op::Seek, len - 105),
+                (Op::Read, 105),
                 (Op::Seek, 0),
                 (Op::Read, manifest_len),
             ][..]
@@ -2332,7 +2346,9 @@ fn a_source_changing_during_the_snapshot_yields_a_refusal_or_exactly_what_was_re
                 assert!(!accepted);
                 assert!(matches!(
                     error,
-                    ContentError::Verify(VerifyError::BadSignature)
+                    ContentError::Verify(VerifyError::BadSignature {
+                        algorithm: SignatureAlgorithm::Ed25519
+                    })
                 ));
                 assert_ne!(source.delivered, bytes);
                 assert_empty(parent.path());

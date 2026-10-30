@@ -79,7 +79,7 @@
 //! `archive_path` = `TRUST_SET_MEMBER`. Everything cryptographic comes from
 //! the verifier and is not restated here.
 //!
-//! The signature covers the raw manifest-block bytes and nothing else, so the
+//! The signatures cover the raw manifest-block bytes and nothing else, so the
 //! property this module keeps is not "verify the member, then parse the member",
 //! which the container format does not offer; it is that the refusing reader
 //! only ever runs over member bytes whose digest a verified manifest names.
@@ -920,9 +920,9 @@ mod tests {
     // than inside it: `crate::release_trust`'s tests mint exactly the same
     // container, and the install-time admission paths built on them will too.
     use crate::trust_fixture::{
-        EPOCH, Fields, anchor_json, anchor_of, array, default_document, generation_pkg, hex_of,
-        keypair, live_ml_dsa_anchor, ml_dsa_anchor_of, ml_dsa_keypair, ml_dsa_public_key_of,
-        pkg_naming, public_key_of, version_1_anchor_of, withdrawn_json,
+        EPOCH, Fields, anchor_json, anchor_of, array, companion_anchor_of, default_document,
+        generation_pkg, hex_of, keypair, live_ml_dsa_anchor, ml_dsa_anchor_of, ml_dsa_keypair,
+        ml_dsa_public_key_of, pkg_naming, public_key_of, version_1_anchor_of, withdrawn_json,
     };
     use crate::verify::SignatureAlgorithm::{Ed25519, MlDsa87};
     use crate::verify::{
@@ -1556,12 +1556,10 @@ mod tests {
         // which key it names, and the reader answers that on its own.
         let pair = keypair();
         let public_key = public_key_of(&pair);
-        let fields = Fields::with_ed25519_anchors(&[anchor_json(
-            Ed25519,
-            STRANGER_KEY_ID,
-            &hex_of(&public_key),
-            false,
-        )]);
+        let fields = Fields::anchored(&[
+            anchor_json(Ed25519, STRANGER_KEY_ID, &hex_of(&public_key), false),
+            companion_anchor_of(&pair, false),
+        ]);
         let member = fields.render();
         let package = generation_pkg(&pair, &member, EPOCH);
         self_admit(&package, &member).expect("the container itself verifies");
@@ -1806,7 +1804,7 @@ mod tests {
         let package = generation_pkg(&revoked, &member, EPOCH);
         assert!(matches!(
             self_admit(&package, &member).expect_err("the generation should be refused"),
-            VerifyError::RevokedKey { key_id: id } if id == key_id(&public_key_of(&revoked))
+            VerifyError::RevokedKey { algorithm: Ed25519, key_id: id } if id == key_id(&public_key_of(&revoked))
         ));
     }
 

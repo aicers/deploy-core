@@ -7,7 +7,7 @@ use std::io::{Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
 use deploy_core::image::test_support::{
     LayerCompression, SyntheticImageArchiveBuilder, SyntheticLayer,
 };
@@ -22,11 +22,13 @@ use deploy_core::package::{
     UploadRefusal, VerifiedContents, VerifiedImages, verify_contents,
 };
 use deploy_core::payload::{
-    ArtifactInput, FORMAT_VERSION, MAGIC, PayloadError, Signed, append_trailer_signed,
+    ArtifactInput, DetachedSignature, FOOTER_SIZE, FORMAT_VERSION, MAGIC, PayloadError, Signed,
+    append_trailer_signed,
 };
 use deploy_core::verify::{
-    ImageReferences, ImageVerifyError, InvalidArchiveReason, TRUST_TARGET, TarFault, TrustAnchor,
-    TrustSet, UnsupportedArchiveFeature, VerifyError, VerifyRequest, key_id, verify_package,
+    ImageReferences, ImageVerifyError, InvalidArchiveReason, ML_DSA_87_PUBLIC_KEY_LEN,
+    ML_DSA_87_SIGNATURE_LEN, SignatureAlgorithm, TRUST_TARGET, TarFault, TrustAnchor, TrustSet,
+    UnsupportedArchiveFeature, VerifyError, VerifyRequest, key_id, verify_package,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -44,8 +46,10 @@ const SELECTED: &str = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/// An Ed25519 and an ML-DSA-87 key pair, both minted for one test.
 struct Signer {
     pair: Ed25519KeyPair,
+    ml_dsa: PqdsaKeyPair,
 }
 
 impl Signer {
@@ -53,6 +57,7 @@ impl Signer {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("a fresh test key");
         Signer {
             pair: Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("the key parses"),
+            ml_dsa: PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).expect("a fresh test key"),
         }
     }
 
@@ -64,24 +69,47 @@ impl Signer {
             .expect("a 32-byte key")
     }
 
+    fn ml_dsa_public_key(&self) -> [u8; ML_DSA_87_PUBLIC_KEY_LEN] {
+        self.ml_dsa
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("a raw ML-DSA-87 key")
+    }
+
     fn trust(&self) -> TrustSet {
         self.trust_at(0)
     }
 
     fn trust_at(&self, epoch: u64) -> TrustSet {
         TrustSet::new(
-            vec![TrustAnchor::new(self.public_key(), false)],
+            vec![
+                TrustAnchor::new(self.public_key(), false),
+                TrustAnchor::new_ml_dsa_87(&self.ml_dsa_public_key(), false),
+            ],
             Vec::new(),
             0,
             epoch,
         )
-        .expect("a one-anchor trust set")
+        .expect("a two-anchor trust set")
     }
 
     fn sign(&self, manifest: &[u8]) -> Signed {
+        let mut ml_dsa = vec![0; usize::try_from(ML_DSA_87_SIGNATURE_LEN).expect("fits")];
+        let written = self
+            .ml_dsa
+            .sign(manifest, &mut ml_dsa)
+            .expect("signing succeeds");
+        ml_dsa.truncate(written);
         Signed {
-            signature: self.pair.sign(manifest).as_ref().to_vec(),
-            key_id: key_id(&self.public_key()),
+            ed25519: DetachedSignature {
+                signature: self.pair.sign(manifest).as_ref().to_vec(),
+                key_id: key_id(&self.public_key()),
+            },
+            ml_dsa_87: DetachedSignature {
+                signature: ml_dsa,
+                key_id: key_id(&self.ml_dsa_public_key()),
+            },
         }
     }
 }
@@ -404,7 +432,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Splits a current-version container into its manifest and archive blocks.
 fn blocks(package: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let footer = &package[package.len() - 73..];
+    let footer = &package[package.len() - FOOTER_SIZE..];
     assert_eq!(&footer[..8], &MAGIC);
     let field = |at: usize| {
         let start = 9 + at * 8;
@@ -428,22 +456,19 @@ fn assemble(signer: &Signer, manifest: &[u8], archive: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(manifest);
     out.extend_from_slice(archive);
-    let signature_offset = len(manifest) + len(archive);
-    out.extend_from_slice(&stamp.signature);
-    let key_offset = signature_offset + len(&stamp.signature);
-    out.extend_from_slice(stamp.key_id.as_bytes());
+    let mut fields = vec![0, len(manifest), len(manifest), len(archive)];
+    for block in [
+        stamp.ed25519.signature.as_slice(),
+        stamp.ed25519.key_id.as_bytes(),
+        stamp.ml_dsa_87.signature.as_slice(),
+        stamp.ml_dsa_87.key_id.as_bytes(),
+    ] {
+        fields.extend([len(&out), len(block)]);
+        out.extend_from_slice(block);
+    }
     out.extend_from_slice(&MAGIC);
     out.push(FORMAT_VERSION);
-    for field in [
-        0,
-        len(manifest),
-        len(manifest),
-        len(archive),
-        signature_offset,
-        len(&stamp.signature),
-        key_offset,
-        len(stamp.key_id.as_bytes()),
-    ] {
+    for field in fields {
         out.extend_from_slice(&u64::to_le_bytes(field));
     }
     out
@@ -799,14 +824,25 @@ fn the_checked_in_metadata_fixture_is_not_full_content_evidence() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets/test-fixtures/signed-v6-placeholder-images");
     let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
-    let key_hex = std::fs::read_to_string(dir.join("public-key.hex")).expect("its key");
-    let key_hex = key_hex.trim();
-    let key: Vec<u8> = (0..key_hex.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&key_hex[at..at + 2], 16).expect("hex"))
-        .collect();
+    let key = |file: &str| -> Vec<u8> {
+        let hex = std::fs::read_to_string(dir.join(file)).expect("its key");
+        let hex = hex.trim();
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+            .collect()
+    };
+    let ml_dsa: [u8; ML_DSA_87_PUBLIC_KEY_LEN] = key("ml-dsa-87-public-key.hex")
+        .try_into()
+        .expect("a raw ML-DSA-87 key");
     let trust = TrustSet::new(
-        vec![TrustAnchor::new(key.try_into().expect("32 bytes"), false)],
+        vec![
+            TrustAnchor::new(
+                key("ed25519-public-key.hex").try_into().expect("32 bytes"),
+                false,
+            ),
+            TrustAnchor::new_ml_dsa_87(&ml_dsa, false),
+        ],
         Vec::new(),
         0,
         0,
@@ -1047,7 +1083,9 @@ fn every_error_variant_and_operation_is_nameable() {
         assert!(describe(&error).contains(operation_name(operation)));
     }
     let errors = [
-        ContentError::from(VerifyError::BadSignature),
+        ContentError::from(VerifyError::BadSignature {
+            algorithm: SignatureAlgorithm::MlDsa87,
+        }),
         ContentError::ArchitectureMismatch {
             archive_path: "bin/agent".to_string(),
             expected: TargetArch::X86_64,

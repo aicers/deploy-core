@@ -10,8 +10,9 @@
 //! # What is verified, and in what order
 //!
 //! [`verify_package`] reads the container far enough to reach the raw manifest
-//! block and the two envelope blocks, checks the Ed25519 signature over those
-//! **raw bytes**, and only then parses them. Nothing on this path re-serializes
+//! block and the four envelope blocks, checks both signatures over those **raw
+//! bytes** — Ed25519, then pure ML-DSA-87 (FIPS 204, empty context) — and only
+//! then parses them. Nothing on this path re-serializes
 //! a parsed manifest: two serializers that disagreed about map ordering or
 //! whitespace would reject an authentic package, and there is no fallback for
 //! that. The bytes on disk are the canonical form, which is why no
@@ -21,7 +22,15 @@
 //! fail at once the earlier one is the verdict:
 //!
 //! 1. the raw blocks are read, without parsing the manifest;
-//! 2. the signature is verified, in [`TrustSet`] anchor order;
+//! 2. the two signatures are verified, each in [`TrustSet`] anchor order over
+//!    the anchors of its own algorithm alone, with its own `key_id` hint:
+//!    - **2a** the Ed25519 signature, under the Ed25519 anchors;
+//!    - **2b** the ML-DSA-87 signature, under the ML-DSA-87 anchors.
+//!
+//!    Both must verify, and the first that fails is the verdict, so a package
+//!    whose two signatures are both bad is reported for Ed25519. An absent
+//!    signature of either algorithm is that algorithm's
+//!    [`VerifyError::BadSignature`];
 //! 3. `format_version` is read through stage one of the parse and checked
 //!    against the trust set's injected floor, and — inside the parse's own
 //!    stage one, before its body decode — against this build's range;
@@ -46,6 +55,9 @@
 //! 15. **owner component** — each declaration's `owner.component` against the
 //!     requested target.
 //!
+//! A cryptanalytic break of one signature algorithm alone, a quantum break of
+//! Ed25519 included, therefore forges no package: step 2 asks both.
+//!
 //! Steps 5 through 9 decide about the package first and about the request last:
 //! a package that is malformed, withdrawn, or built from an unsafe identifier
 //! is reported as such whatever was asked for.
@@ -67,14 +79,15 @@
 //! bounded rather than described. A footer's block lengths are the attacker's
 //! to choose and the container layer confines them only to the input's own
 //! size, which a sparse file inflates for nothing; reading a block on that
-//! say-so would be a denial of service ahead of the check that rejects it. Both
-//! envelope blocks have exactly one useful length — an Ed25519 signature is 64
-//! bytes and a `key_id` is 64 hex characters — so a block at any other length
-//! is answered from its length and never allocated. That costs nothing: its
-//! contents would have produced the same verdict.
+//! say-so would be a denial of service ahead of the check that rejects it. Each
+//! of the four envelope blocks has exactly one useful length — an Ed25519
+//! signature is 64 bytes, an ML-DSA-87 signature 4,627 bytes, and each
+//! `key_id` 64 hex characters — so a block at any other length is answered
+//! from its length and never allocated. That costs nothing: its contents would
+//! have produced the same verdict.
 //!
-//! The manifest block is the one thing read in full, because the signature is
-//! over it and there is no answering for it otherwise.
+//! The manifest block is the one thing read in full, because both signatures
+//! are over it and there is no answering for it otherwise.
 //!
 //! # What it does not do
 //!
@@ -99,7 +112,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::path::Path;
 
-use aws_lc_rs::signature::{ED25519, ED25519_PUBLIC_KEY_LEN, UnparsedPublicKey};
+use aws_lc_rs::signature::{ED25519, ED25519_PUBLIC_KEY_LEN, ML_DSA_87, UnparsedPublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::image::{
@@ -148,15 +161,22 @@ pub const KEY_ID_HEX_LEN: u64 = 64;
 /// answers one from its length rather than reading it.
 pub const ED25519_SIGNATURE_LEN: u64 = 64;
 
+/// Number of bytes an ML-DSA-87 (FIPS 204) signature is.
+///
+/// A signature of any other length verifies under no key, so the container read
+/// answers one from its length rather than reading it.
+pub const ML_DSA_87_SIGNATURE_LEN: u64 = 4627;
+
 /// Number of bytes a raw ML-DSA-87 (FIPS 204) public key is.
 ///
 /// The raw encoding and nothing else: an SPKI or DER wrapper around the same
 /// key has another length, so a key of this length is never a wrapped one.
 pub const ML_DSA_87_PUBLIC_KEY_LEN: usize = 2592;
 
-/// The lengths at which this verifier reads the container's envelope blocks.
+/// The lengths at which this verifier reads the container's four envelope
+/// blocks.
 ///
-/// Both blocks are read before anything has been authenticated, from a footer
+/// Every block is read before anything has been authenticated, from a footer
 /// an attacker wrote, and each has exactly one length this verifier can do
 /// anything with. Stating them here keeps the container read from allocating a
 /// block advertised at gigabyte or terabyte scale — which a sparse file, or a
@@ -167,6 +187,8 @@ pub const ML_DSA_87_PUBLIC_KEY_LEN: usize = 2592;
 pub const ENVELOPE_BOUNDS: EnvelopeBounds = EnvelopeBounds {
     signature_len: ED25519_SIGNATURE_LEN,
     key_id_len: KEY_ID_HEX_LEN,
+    ml_dsa_87_signature_len: ML_DSA_87_SIGNATURE_LEN,
+    ml_dsa_87_key_id_len: KEY_ID_HEX_LEN,
 };
 
 /// Longest build identifier [`is_safe_build_identifier`] admits, in **bytes**
@@ -411,15 +433,27 @@ impl TrustAnchor {
         &self.key_id
     }
 
-    /// Reports whether the Ed25519 `signature` verifies over `message` under
-    /// this anchor's key.
+    /// Reports whether `signature`, of this anchor's algorithm, verifies over
+    /// `message` under this anchor's key.
     ///
-    /// Ed25519 only: [`verify_signature`] calls it on the set's Ed25519 anchors
-    /// and on no other, so an ML-DSA-87 key is never handed to it.
+    /// An Ed25519 anchor verifies Ed25519. An ML-DSA-87 anchor verifies pure
+    /// ML-DSA-87: FIPS 204 `ML-DSA.Verify` with an empty context over
+    /// `message` itself — not HashML-DSA, and not over a digest of it. The key
+    /// handed to aws-lc-rs is always the anchor's raw bytes; it would also
+    /// parse a DER-wrapped key, and no anchor holds one, since each
+    /// constructor takes a key of exactly its algorithm's raw length.
+    ///
+    /// [`verify_signature`] tries a signature only under anchors of its own
+    /// algorithm, so a signature is never handed to the other algorithm's key.
     fn verifies(&self, message: &[u8], signature: &[u8]) -> bool {
-        UnparsedPublicKey::new(&ED25519, &self.public_key)
-            .verify(message, signature)
-            .is_ok()
+        match self.algorithm {
+            SignatureAlgorithm::Ed25519 => UnparsedPublicKey::new(&ED25519, &self.public_key)
+                .verify(message, signature)
+                .is_ok(),
+            SignatureAlgorithm::MlDsa87 => UnparsedPublicKey::new(&ML_DSA_87, &self.public_key)
+                .verify(message, signature)
+                .is_ok(),
+        }
     }
 }
 
@@ -510,8 +544,8 @@ impl TrustSet {
 /// deployment namespace it is uploaded under, and nothing else.
 ///
 /// A hop that receives a package learns its component, version, commit and
-/// architecture only from the manifest, and only once the signature over that
-/// manifest has verified, so none of them can be asked for in advance.
+/// architecture only from the manifest, and only once both signatures over that
+/// manifest have verified, so none of them can be asked for in advance.
 /// [`package::verify_upload`](crate::package::verify_upload) takes this in
 /// place of a [`VerifyRequest`] and derives the request from the authenticated
 /// manifest.
@@ -835,41 +869,56 @@ impl VerifyRequest {
 /// and never also arrive nested.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
-    /// No anchor's key verifies the signature over the manifest block — or the
-    /// container carries no signature at all.
+    /// No anchor of `algorithm` verifies the package's signature of that
+    /// algorithm over the manifest block — or the container carries no
+    /// signature of it at all.
     ///
     /// An unsigned package is this and not a variant of its own: the unsigned
-    /// [`crate::payload::append_trailer`] entry point emits both envelope pairs
+    /// [`crate::payload::append_trailer`] entry point emits every envelope pair
     /// absent, so unsigned packages exist and must be answered, and one this
-    /// verifier cannot authenticate is not a new failure mode. It is also what
-    /// an unusable `key_id` hint falls back to, since a hint that is not a
-    /// `key_id` at all names nothing.
+    /// verifier cannot authenticate is not a new failure mode. Ed25519 is
+    /// verified first, so an unsigned package is this for Ed25519, and a
+    /// package carrying only its Ed25519 signature is this for ML-DSA-87. It
+    /// is also what an unusable `key_id` hint falls back to, since a hint that
+    /// is not a `key_id` at all names nothing.
     ///
-    /// A signature block present at any length other than the 64 bytes an
-    /// Ed25519 signature is reaches this the ordinary way rather than directly:
+    /// A signature block present at any length other than the one a signature
+    /// of its algorithm is reaches this the ordinary way rather than directly:
     /// it verifies under no anchor, so the same four-step order names the
     /// rejection, which for a usable hint naming no anchor is
     /// [`VerifyError::UnknownKeyId`].
-    #[error("no trust anchor verifies the package signature")]
-    BadSignature,
+    #[error("no trust anchor verifies the package's {algorithm} signature")]
+    BadSignature {
+        /// The algorithm of the signature that did not verify.
+        algorithm: SignatureAlgorithm,
+    },
 
-    /// The container's `key_id` hint was usable, named no anchor in the trust
-    /// set, and nothing else verified either.
+    /// The container's `key_id` hint for its `algorithm` signature was usable,
+    /// named no anchor of that algorithm in the trust set, and nothing else of
+    /// that algorithm verified either.
     ///
     /// "The package named a key we do not hold", which takes a well-formed
-    /// name: an unusable hint falls to [`VerifyError::BadSignature`].
-    #[error("the package names key id `{key_id}`, which is in no trust anchor")]
+    /// name: an unusable hint falls to [`VerifyError::BadSignature`]. A hint
+    /// naming an anchor of the other algorithm names no anchor of this one.
+    #[error(
+        "the package names {algorithm} key id `{key_id}`, which is in no {algorithm} trust anchor"
+    )]
     UnknownKeyId {
+        /// The algorithm of the signature the hint accompanied.
+        algorithm: SignatureAlgorithm,
         /// The hint the container carried.
         key_id: String,
     },
 
-    /// The package's actual signer is a revoked anchor.
+    /// The package's actual signer of its `algorithm` signature is a revoked
+    /// anchor.
     ///
     /// Judged from the anchor that verified, never from the footer hint, and
-    /// only once no non-revoked anchor verified.
-    #[error("the package is signed by revoked key `{key_id}`")]
+    /// only once no non-revoked anchor of that algorithm verified.
+    #[error("the package's {algorithm} signature is by revoked key `{key_id}`")]
     RevokedKey {
+        /// The algorithm of the signature the revoked anchor verified.
+        algorithm: SignatureAlgorithm,
         /// `key_id` of the anchor that verified the signature.
         key_id: String,
     },
@@ -1550,16 +1599,18 @@ impl<'a> DeclaredImageReferences<'a> {
 /// Verifies the package in `src` against `trust` and `request`, returning it as
 /// a [`VerifiedPackage`].
 ///
-/// The signature is checked over the raw manifest-block bytes read off the
-/// container, before those bytes are parsed, and the remaining checks run in
+/// Both signatures — Ed25519, then ML-DSA-87 — are checked over the raw
+/// manifest-block bytes read off the container, before those bytes are
+/// parsed, and the remaining checks run in
 /// the total order this module's documentation states. Neither the archive
 /// block nor any artifact's bytes are read here.
 ///
 /// # Errors
 ///
 /// Returns [`VerifyError`]: [`VerifyError::BadSignature`],
-/// [`VerifyError::UnknownKeyId`] or [`VerifyError::RevokedKey`] when the
-/// signature cannot be attributed to a usable anchor;
+/// [`VerifyError::UnknownKeyId`] or [`VerifyError::RevokedKey`], naming the
+/// algorithm, when either signature cannot be attributed to a usable anchor
+/// of its algorithm;
 /// [`VerifyError::UnsupportedManifestFormat`] for a manifest version outside
 /// the accepted range; [`VerifyError::UnlistedMember`],
 /// [`VerifyError::DuplicatePath`], [`VerifyError::UnsafePath`] or
@@ -1714,20 +1765,24 @@ fn authenticate<R: Read + Seek>(
     Ok(manifest)
 }
 
-/// A manifest past steps 2 to 4 of the order this module states — signature,
-/// format floor, typed parse — and before any statement check.
+/// A manifest past steps 2 to 4 of the order this module states — both
+/// signatures, format floor, typed parse — and before any statement check.
 #[derive(Debug)]
 pub(crate) struct Authenticated {
     /// The parsed manifest.
     pub(crate) manifest: PayloadManifest,
-    /// `key_id` of the anchor whose key verified the signature.
-    pub(crate) key_id: String,
+    /// `key_id` of the Ed25519 anchor whose key verified the Ed25519
+    /// signature.
+    pub(crate) ed25519_key_id: String,
+    /// `key_id` of the ML-DSA-87 anchor whose key verified the ML-DSA-87
+    /// signature.
+    pub(crate) ml_dsa_87_key_id: String,
     /// SHA-256 of the raw manifest block, exactly as it was read and verified.
     pub(crate) manifest_sha256: [u8; 32],
 }
 
 /// Steps 2 to 4 of the order this module states, over a container whose blocks
-/// have been read: the signature over the raw manifest bytes, the version
+/// have been read: both signatures over the raw manifest bytes, the version
 /// floor, the typed parse.
 ///
 /// **An `Ok` decides nothing about the statements the manifest makes**: a
@@ -1737,8 +1792,25 @@ pub(crate) fn authenticate_manifest<R: Read + Seek>(
     container: &UnparsedContainer<R>,
     trust: &TrustSet,
 ) -> Result<Authenticated, VerifyError> {
-    // 2. Authenticate the raw manifest bytes before anything parses them.
-    let key_id = verify_signature(container, trust)?.to_string();
+    // 2. Authenticate the raw manifest bytes before anything parses them: 2a,
+    //    the Ed25519 signature, then 2b, the ML-DSA-87 one. Both must verify,
+    //    and the first that does not is the verdict.
+    let ed25519_key_id = verify_signature(
+        SignatureAlgorithm::Ed25519,
+        container.raw_manifest_block(),
+        container.signature(),
+        container.key_id(),
+        trust,
+    )?
+    .to_string();
+    let ml_dsa_87_key_id = verify_signature(
+        SignatureAlgorithm::MlDsa87,
+        container.raw_manifest_block(),
+        container.ml_dsa_87_signature(),
+        container.ml_dsa_87_key_id(),
+        trust,
+    )?
+    .to_string();
 
     // 3. The version question, decided from stage one alone — before the body
     //    is decoded, so a manifest this build cannot make sense of is refused
@@ -1760,7 +1832,8 @@ pub(crate) fn authenticate_manifest<R: Read + Seek>(
 
     Ok(Authenticated {
         manifest,
-        key_id,
+        ed25519_key_id,
+        ml_dsa_87_key_id,
         manifest_sha256: Sha256::digest(container.raw_manifest_block()).into(),
     })
 }
@@ -1889,30 +1962,34 @@ fn usable_hint(block: &EnvelopeBlock) -> Option<&str> {
     std::str::from_utf8(bytes).ok()
 }
 
-/// Verifies the container's signature over its raw manifest bytes, trying the
-/// anchors in a fixed order: the hinted non-revoked anchor, then every other
-/// non-revoked one, then the revoked ones.
+/// Verifies the container's `algorithm` signature over its raw manifest bytes,
+/// trying the anchors in a fixed order: the hinted non-revoked anchor, then
+/// every other non-revoked one, then the revoked ones.
 ///
-/// The signature is Ed25519, so every step runs over the set's Ed25519 anchors
-/// alone: the hint is matched only against them, only they are tried, and a
-/// hint naming an ML-DSA-87 anchor names no anchor of this signature's
-/// algorithm. An ML-DSA-87 anchor is never tried against it.
+/// `signature` and `key_id` are the container's two envelope blocks for
+/// `algorithm`. Every step runs over the set's anchors of `algorithm` alone:
+/// the hint is matched only against them, only they are tried, and a hint
+/// naming an anchor of the other algorithm names no anchor of this one. An
+/// anchor of the other algorithm is never tried against this signature.
 ///
 /// The hint may change which anchor is tried first, and — when the package was
 /// going to be rejected regardless — which of two names the rejection carries.
-/// It can never change accept into reject: every non-revoked anchor is tried
-/// whatever the hint says.
+/// It can never change accept into reject: every non-revoked anchor of the
+/// algorithm is tried whatever the hint says.
 ///
 /// On acceptance it returns the `key_id` of the anchor that verified, which is
 /// that anchor's and never the hint's.
-fn verify_signature<'t, R: Read + Seek>(
-    container: &UnparsedContainer<R>,
+fn verify_signature<'t>(
+    algorithm: SignatureAlgorithm,
+    message: &[u8],
+    signature: &EnvelopeBlock,
+    key_id: &EnvelopeBlock,
     trust: &'t TrustSet,
 ) -> Result<&'t str, VerifyError> {
-    let signature = match container.signature() {
+    let signature = match signature {
         // An unsigned package is one this verifier cannot authenticate and
         // there is nothing to fall back to, so it is refused here.
-        EnvelopeBlock::Absent => return Err(VerifyError::BadSignature),
+        EnvelopeBlock::Absent => return Err(VerifyError::BadSignature { algorithm }),
         EnvelopeBlock::Present(bytes) => Some(bytes.as_slice()),
         // A signature block at any other length was never read, and it verifies
         // under no anchor. That is *all* it means: it is not short-circuited to
@@ -1921,8 +1998,7 @@ fn verify_signature<'t, R: Read + Seek>(
         // is `UnknownKeyId` whatever the signature's length was.
         EnvelopeBlock::WrongLength => None,
     };
-    let message = container.raw_manifest_block();
-    let hint = usable_hint(container.key_id());
+    let hint = usable_hint(key_id);
     let verifies = |anchor: &TrustAnchor| {
         signature.is_some_and(|signature| anchor.verifies(message, signature))
     };
@@ -1930,7 +2006,7 @@ fn verify_signature<'t, R: Read + Seek>(
         trust
             .anchors
             .iter()
-            .filter(|anchor| anchor.algorithm == SignatureAlgorithm::Ed25519)
+            .filter(move |anchor| anchor.algorithm == algorithm)
     };
 
     // 1. A usable hint naming a non-revoked anchor selects what to try first.
@@ -1957,21 +2033,23 @@ fn verify_signature<'t, R: Read + Seek>(
     for anchor in anchors().filter(|anchor| anchor.revoked) {
         if verifies(anchor) {
             return Err(VerifyError::RevokedKey {
+                algorithm,
                 key_id: anchor.key_id.clone(),
             });
         }
     }
 
-    // 4. Nothing verified. A usable hint naming no Ed25519 anchor at all —
-    //    revoked ones included — is the package naming a key we do not hold;
-    //    everything else is a signature we cannot attribute.
+    // 4. Nothing verified. A usable hint naming no anchor of this algorithm at
+    //    all — revoked ones included — is the package naming a key we do not
+    //    hold; everything else is a signature we cannot attribute.
     match hint {
         Some(hint) if !anchors().any(|anchor| anchor.key_id == hint) => {
             Err(VerifyError::UnknownKeyId {
+                algorithm,
                 key_id: hint.to_string(),
             })
         }
-        _ => Err(VerifyError::BadSignature),
+        _ => Err(VerifyError::BadSignature { algorithm }),
     }
 }
 
@@ -2353,8 +2431,8 @@ mod tests {
     use super::{
         BuildIdentifier, ED25519_SIGNATURE_LEN, ENVELOPE_BOUNDS, ImageReferences, ImageVerifyError,
         InputError, KEY_ID_HEX_LEN, MAX_BUILD_IDENTIFIER_BYTES, ML_DSA_87_PUBLIC_KEY_LEN,
-        ReferenceConflict, SignatureAlgorithm, TRUST_TARGET, TrustAnchor, TrustSet,
-        VerifiedPackage, VerifyError, VerifyRequest, is_safe_build_identifier, key_id,
+        ML_DSA_87_SIGNATURE_LEN, ReferenceConflict, SignatureAlgorithm, TRUST_TARGET, TrustAnchor,
+        TrustSet, VerifiedPackage, VerifyError, VerifyRequest, is_safe_build_identifier, key_id,
         verify_package,
     };
     use crate::image::{
@@ -2366,10 +2444,10 @@ mod tests {
         Disposition, IMAGE_DECLARATION_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
         MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION, ManifestError, TargetArch,
     };
-    use crate::payload::{
-        self, ArtifactInput, EnvelopeBlock, FORMAT_VERSION, MAGIC, PayloadError, Signed,
+    use crate::payload::{self, ArtifactInput, EnvelopeBlock, FORMAT_VERSION, MAGIC, PayloadError};
+    use crate::trust_fixture::{
+        hex_of, ml_dsa_companion_of, ml_dsa_keypair, ml_dsa_public_key_of, ml_dsa_sign, signed_by,
     };
-    use crate::trust_fixture::{hex_of, ml_dsa_keypair, ml_dsa_public_key_of};
 
     /// Component every fixture artifact belongs to, and the target a fixture
     /// request names.
@@ -2421,64 +2499,63 @@ mod tests {
         u64::try_from(bytes.len()).expect("a fixture is far smaller than u64::MAX")
     }
 
-    /// Encodes a footer of `version` by hand — magic, the version byte, then
-    /// the offset/length pairs that version records — so a fixture can state a
-    /// block layout the writer has no way to emit.
-    fn footer_bytes(version: u8, fields: [u64; 8]) -> Vec<u8> {
-        let pairs = if version >= FORMAT_VERSION { 8 } else { 4 };
+    /// Encodes a current-version footer by hand — magic, the version byte,
+    /// then the six offset/length pairs — so a fixture can state a block
+    /// layout the writer has no way to emit.
+    fn footer_bytes(fields: [u64; 12]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
-        out.push(version);
-        for field in fields.iter().take(pairs) {
+        out.push(FORMAT_VERSION);
+        for field in fields {
             out.extend_from_slice(&field.to_le_bytes());
         }
         out
     }
 
-    /// Assembles a `.pkg`: the present blocks adjacent in the fixed order, with
-    /// the manifest at offset `0`, then the footer.
-    fn assemble(
-        version: u8,
-        manifest: &[u8],
-        archive: &[u8],
-        signature: Option<&[u8]>,
-        hint: Option<&[u8]>,
-    ) -> Vec<u8> {
+    /// The four envelope blocks of a fixture, in the fixed order: Ed25519
+    /// signature, Ed25519 `key_id` hint, ML-DSA-87 signature, ML-DSA-87
+    /// `key_id` hint. `None` is the all-zero absent encoding.
+    type Envelope<'a> = [Option<&'a [u8]>; 4];
+
+    /// Assembles a format-3 `.pkg`: the present blocks adjacent in the fixed
+    /// order, with the manifest at offset `0`, then the footer.
+    fn assemble(manifest: &[u8], archive: &[u8], envelope: Envelope<'_>) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(manifest);
         out.extend_from_slice(archive);
-        let mut cursor = len_u64(manifest) + len_u64(archive);
-        let mut place = |block: Option<&[u8]>, out: &mut Vec<u8>| match block {
-            Some(bytes) => {
-                let offset = cursor;
+        let mut fields = [0u64; 12];
+        fields[..4].copy_from_slice(&[0, len_u64(manifest), len_u64(manifest), len_u64(archive)]);
+        for (index, block) in envelope.iter().enumerate() {
+            if let Some(bytes) = block {
+                fields[4 + 2 * index] = len_u64(&out);
+                fields[5 + 2 * index] = len_u64(bytes);
                 out.extend_from_slice(bytes);
-                cursor += len_u64(bytes);
-                (offset, len_u64(bytes))
             }
-            // The all-zero absent encoding, which is what the writer emits for
-            // both envelope pairs today.
-            None => (0, 0),
-        };
-        let (signature_offset, signature_len) = place(signature, &mut out);
-        let (hint_offset, hint_len) = place(hint, &mut out);
-        out.extend_from_slice(&footer_bytes(
-            version,
-            [
-                0,
-                len_u64(manifest),
-                len_u64(manifest),
-                len_u64(archive),
-                signature_offset,
-                signature_len,
-                hint_offset,
-                hint_len,
-            ],
-        ));
+        }
+        out.extend_from_slice(&footer_bytes(fields));
         out
     }
 
-    /// Signs `manifest` with `pair` and assembles a current-version `.pkg`
-    /// around it, carrying `hint` as its `key_id` block.
+    /// The ML-DSA-87 anchor of `pair`'s companion: the anchor the ML-DSA-87
+    /// signature of every package `pair` signs here verifies under.
+    fn companion(pair: &Ed25519KeyPair, revoked: bool) -> TrustAnchor {
+        TrustAnchor::new_ml_dsa_87(&ml_dsa_public_key_of(&ml_dsa_companion_of(pair)), revoked)
+    }
+
+    /// `pair`'s companion's ML-DSA-87 signature over `manifest`.
+    fn ml_dsa_signature(pair: &Ed25519KeyPair, manifest: &[u8]) -> Vec<u8> {
+        ml_dsa_sign(&ml_dsa_companion_of(pair), manifest)
+    }
+
+    /// The `key_id` of `pair`'s companion, as its ML-DSA-87 hint.
+    fn ml_dsa_key_id_of(pair: &Ed25519KeyPair) -> String {
+        key_id(&ml_dsa_public_key_of(&ml_dsa_companion_of(pair)))
+    }
+
+    /// Signs `manifest` with `pair` and with its companion and assembles a
+    /// current-version `.pkg` around both signatures, carrying `hint` as the
+    /// Ed25519 `key_id` block and the companion's own `key_id` as the ML-DSA-87
+    /// one.
     fn signed_pkg(
         pair: &Ed25519KeyPair,
         manifest: &[u8],
@@ -2486,12 +2563,17 @@ mod tests {
         hint: Option<&[u8]>,
     ) -> Vec<u8> {
         let signature = pair.sign(manifest);
+        let ml_dsa = ml_dsa_signature(pair, manifest);
+        let ml_dsa_hint = ml_dsa_key_id_of(pair);
         assemble(
-            FORMAT_VERSION,
             manifest,
             archive,
-            Some(signature.as_ref()),
-            hint,
+            [
+                Some(signature.as_ref()),
+                hint,
+                Some(&ml_dsa),
+                Some(ml_dsa_hint.as_bytes()),
+            ],
         )
     }
 
@@ -2598,9 +2680,12 @@ mod tests {
             .expect("distinct anchors build a trust set")
     }
 
-    /// A trust set trusting exactly `pair`.
+    /// A trust set trusting exactly `pair` and its companion.
     fn trusting(pair: &Ed25519KeyPair) -> TrustSet {
-        trust_of(vec![TrustAnchor::new(public_key_of(pair), false)])
+        trust_of(vec![
+            TrustAnchor::new(public_key_of(pair), false),
+            companion(pair, false),
+        ])
     }
 
     /// The request the default fixture satisfies.
@@ -2613,6 +2698,69 @@ mod tests {
     enum SparseBlock {
         Signature,
         KeyId,
+        MlDsaSignature,
+        MlDsaKeyId,
+    }
+
+    impl SparseBlock {
+        /// The block's position among the four envelope blocks.
+        fn index(self) -> usize {
+            match self {
+                Self::Signature => 0,
+                Self::KeyId => 1,
+                Self::MlDsaSignature => 2,
+                Self::MlDsaKeyId => 3,
+            }
+        }
+    }
+
+    /// Every written block of a sparse fixture at its absolute offset, the
+    /// sparse block's range, and where the footer starts.
+    type SparseLayout = (Vec<(u64, Vec<u8>)>, std::ops::Range<u64>, u64);
+
+    /// The layout of a signed-shaped `.pkg` whose `sparse` envelope block is
+    /// advertised at [`HOSTILE_BLOCK_LEN`] and never written: every block
+    /// that is written, at its absolute offset, the sparse block's range, and
+    /// where the footer starts. `blocks` are the four envelope blocks' real
+    /// bytes, the sparse one's ignored.
+    fn sparse_layout(
+        manifest: &[u8],
+        archive: &[u8],
+        blocks: [&[u8]; 4],
+        sparse: SparseBlock,
+    ) -> SparseLayout {
+        let mut head = manifest.to_vec();
+        head.extend_from_slice(archive);
+        let mut cursor = len_u64(&head);
+        let mut segments = vec![(0, head)];
+        let mut fields = [0u64; 12];
+        fields[..4].copy_from_slice(&[0, len_u64(manifest), len_u64(manifest), len_u64(archive)]);
+        let mut hole = 0..0;
+        for (index, block) in blocks.into_iter().enumerate() {
+            let len = if index == sparse.index() {
+                hole = cursor..cursor + HOSTILE_BLOCK_LEN;
+                HOSTILE_BLOCK_LEN
+            } else {
+                segments.push((cursor, block.to_vec()));
+                len_u64(block)
+            };
+            fields[4 + 2 * index] = cursor;
+            fields[5 + 2 * index] = len;
+            cursor += len;
+        }
+        segments.push((cursor, footer_bytes(fields)));
+        (segments, hole, cursor)
+    }
+
+    /// The four envelope blocks of a package `signer` signs over `manifest`,
+    /// each hinted with its own signer's `key_id`.
+    fn envelope_of(signer: &Ed25519KeyPair, manifest: &[u8]) -> [Vec<u8>; 4] {
+        [
+            signer.sign(manifest).as_ref().to_vec(),
+            key_id_of(signer).into_bytes(),
+            ml_dsa_signature(signer, manifest),
+            ml_dsa_key_id_of(signer).into_bytes(),
+        ]
     }
 
     /// A `Read + Seek` modelling a container with one enormous block that is
@@ -2680,52 +2828,19 @@ mod tests {
     }
 
     /// Assembles a signed-shaped `.pkg` whose `sparse` envelope block is
-    /// advertised at [`HOSTILE_BLOCK_LEN`] and never written, with `present`
-    /// as the other envelope block's real bytes.
+    /// advertised at [`HOSTILE_BLOCK_LEN`] and never written, with `blocks` as
+    /// the other envelope blocks' real bytes.
     fn sparse_pkg(
         manifest: &[u8],
         archive: &[u8],
-        present: &[u8],
+        blocks: [&[u8]; 4],
         sparse: SparseBlock,
     ) -> SparseContainer {
-        let mut head = manifest.to_vec();
-        head.extend_from_slice(archive);
-        let head_len = len_u64(&head);
-
-        let (signature_len, key_id_len) = match sparse {
-            SparseBlock::Signature => (HOSTILE_BLOCK_LEN, len_u64(present)),
-            SparseBlock::KeyId => (len_u64(present), HOSTILE_BLOCK_LEN),
-        };
-        let signature_offset = head_len;
-        let key_id_offset = signature_offset + signature_len;
-        let (present_offset, sparse_offset) = match sparse {
-            SparseBlock::Signature => (key_id_offset, signature_offset),
-            SparseBlock::KeyId => (signature_offset, key_id_offset),
-        };
-
-        let footer_start = key_id_offset + key_id_len;
-        let footer = footer_bytes(
-            FORMAT_VERSION,
-            [
-                0,
-                len_u64(manifest),
-                len_u64(manifest),
-                len_u64(archive),
-                signature_offset,
-                signature_len,
-                key_id_offset,
-                key_id_len,
-            ],
-        );
-        let len = footer_start + len_u64(&footer);
-
+        let (segments, sparse, footer_start) = sparse_layout(manifest, archive, blocks, sparse);
+        let len = footer_start + len_u64(&segments.last().expect("the footer").1);
         SparseContainer {
-            segments: vec![
-                (0, head),
-                (present_offset, present.to_vec()),
-                (footer_start, footer),
-            ],
-            sparse: sparse_offset..sparse_offset + HOSTILE_BLOCK_LEN,
+            segments,
+            sparse,
             len,
             pos: 0,
         }
@@ -2739,56 +2854,25 @@ mod tests {
     fn sparse_file_pkg(
         manifest: &[u8],
         archive: &[u8],
-        present: &[u8],
+        blocks: [&[u8]; 4],
         sparse: SparseBlock,
     ) -> std::fs::File {
         let mut file = tempfile::tempfile().expect("a temporary sparse fixture file is available");
-        let head_len = len_u64(manifest) + len_u64(archive);
-        let (signature_len, key_id_len) = match sparse {
-            SparseBlock::Signature => (HOSTILE_BLOCK_LEN, len_u64(present)),
-            SparseBlock::KeyId => (len_u64(present), HOSTILE_BLOCK_LEN),
-        };
-        let signature_offset = head_len;
-        let key_id_offset = signature_offset + signature_len;
-        let present_offset = match sparse {
-            SparseBlock::Signature => key_id_offset,
-            SparseBlock::KeyId => signature_offset,
-        };
-        let footer_start = key_id_offset + key_id_len;
-        let footer = footer_bytes(
-            FORMAT_VERSION,
-            [
-                0,
-                len_u64(manifest),
-                len_u64(manifest),
-                len_u64(archive),
-                signature_offset,
-                signature_len,
-                key_id_offset,
-                key_id_len,
-            ],
-        );
-
-        file.set_len(footer_start + len_u64(&footer))
+        let (segments, _, footer_start) = sparse_layout(manifest, archive, blocks, sparse);
+        let footer_len = len_u64(&segments.last().expect("the footer").1);
+        file.set_len(footer_start + footer_len)
             .expect("the fixture file is extended through its footer");
-        file.write_all(manifest)
-            .expect("the fixture manifest is written");
-        file.write_all(archive)
-            .expect("the fixture archive is written");
-        file.seek(SeekFrom::Start(present_offset))
-            .expect("the fixture seeks past its sparse block");
-        file.write_all(present)
-            .expect("the fixture's other envelope block is written");
-        file.seek(SeekFrom::Start(footer_start))
-            .expect("the fixture seeks to its footer");
-        file.write_all(&footer)
-            .expect("the fixture footer is written");
+        for (offset, bytes) in segments {
+            file.seek(SeekFrom::Start(offset))
+                .expect("the fixture seeks to a written block");
+            file.write_all(&bytes)
+                .expect("the fixture block is written");
+        }
         file.seek(SeekFrom::Start(0))
             .expect("the fixture rewinds before its bounded read");
 
-        // Writing the footer at the far side leaves the other envelope block
-        // as a filesystem hole: it is part of the input length but consumes no
-        // fixture bytes.
+        // Writing the blocks around the sparse one leaves it as a filesystem
+        // hole: it is part of the input length but consumes no fixture bytes.
         file
     }
 
@@ -2832,7 +2916,9 @@ mod tests {
         *byte ^= 0x20;
         assert!(matches!(
             refusal(&package, &trusting(&pair)),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
     }
 
@@ -2857,8 +2943,9 @@ mod tests {
 
     #[test]
     fn a_package_the_writer_emits_carries_no_signature_and_is_bad_signature() {
-        // Everything `append_trailer` writes has both envelope pairs absent, so
-        // unsigned packages exist today and this verifier has to answer them.
+        // Everything `append_trailer` writes has every envelope pair absent, so
+        // unsigned packages exist and this verifier has to answer them: for
+        // Ed25519, the signature it checks first.
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("app");
         std::fs::write(&source, ARTIFACT_BYTES).expect("write source file");
@@ -2881,7 +2968,9 @@ mod tests {
         let pair = keypair();
         assert!(matches!(
             refusal(&package, &trusting(&pair)),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
     }
 
@@ -2911,18 +3000,17 @@ mod tests {
             None,
             None,
             std::slice::from_ref(&input),
-            |manifest| {
-                Ok(Signed {
-                    signature: pair.sign(manifest).as_ref().to_vec(),
-                    key_id: expected_key_id.clone(),
-                })
-            },
+            |manifest| Ok(signed_by(&pair, manifest)),
         )
         .expect("the signed package writer should succeed");
         accepted(&package, &trusting(&pair));
         let package_payload = payload::open_package(Cursor::new(&package))
             .expect("the package must open after verification");
         assert_eq!(package_payload.key_id(), Some(expected_key_id.as_bytes()));
+        assert_eq!(
+            package_payload.ml_dsa_87_key_id(),
+            Some(ml_dsa_key_id_of(&pair).as_bytes())
+        );
 
         let mut installer = Vec::new();
         payload::append_trailer_signed(
@@ -2931,12 +3019,7 @@ mod tests {
             None,
             None,
             &[input],
-            |manifest| {
-                Ok(Signed {
-                    signature: pair.sign(manifest).as_ref().to_vec(),
-                    key_id: expected_key_id.clone(),
-                })
-            },
+            |manifest| Ok(signed_by(&pair, manifest)),
         )
         .expect("the signed installer writer should succeed");
         accepted(&installer, &trusting(&pair));
@@ -2952,85 +3035,56 @@ mod tests {
     }
 
     #[test]
-    fn a_version_one_container_is_bad_signature() {
-        // A version-1 footer has no envelope pairs at all, so every container
-        // written at it — the pre-versioned baseline shape included — is
-        // refused before any manifest check is reached.
+    fn a_version_one_or_two_container_is_an_unsupported_container_format() {
+        // A version-1 or version-2 footer is refused by the container read,
+        // before any signature is looked at: the pre-versioned baseline shape
+        // and every package signed with Ed25519 alone are formats this build
+        // does not read.
         let pair = keypair();
-        let package = assemble(1, &default_manifest(), &default_archive(), None, None);
-        assert!(matches!(
-            refusal(&package, &trusting(&pair)),
-            VerifyError::BadSignature
-        ));
-    }
-
-    #[test]
-    fn an_unsigned_baseline_is_bad_signature_whatever_its_image_key() {
-        // Genuine pre-versioned baseline manifests: no `format_version`, no
-        // `archive_members`, no `trust_set`, and no artifact `commit` or `spec`.
-        // Each variant differs from the valid one only by the `image` key the
-        // baseline forbids, so a verifier that parsed before authenticating
-        // would report that key rather than the missing signature.
-        let baseline_artifact = |image: Option<&str>| {
-            let image = image.map_or_else(String::new, |value| format!(r#""image":{value},"#));
-            format!(
-                r#"{{{image}"component":"{COMPONENT}","version":"{VERSION}","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"{MEMBER}","sha256":"{ARTIFACT_SHA256}"}}"#
-            )
-        };
-        let cases: [(&str, Option<&str>); 4] = [
-            ("no image key", None),
-            ("a null image", Some("null")),
-            ("an object image", Some(r#"{"reference":"example"}"#)),
-            ("a scalar image", Some(r#""scalar""#)),
-        ];
-        let pair = keypair();
-        let trust = trusting(&pair);
+        let manifest = default_manifest();
         let archive = default_archive();
+        let ed25519 = signed_by(&pair, &manifest).ed25519;
+        let mut version_1 = Vec::new();
+        payload::append_version_1_trailer(std::io::empty(), &mut version_1, &manifest, &archive)
+            .expect("the version-1 writer succeeds");
+        let mut unsigned_2 = Vec::new();
+        payload::append_version_2_trailer(
+            std::io::empty(),
+            &mut unsigned_2,
+            &manifest,
+            &archive,
+            None,
+        )
+        .expect("the version-2 writer succeeds");
+        let mut signed_2 = Vec::new();
+        payload::append_version_2_trailer(
+            std::io::empty(),
+            &mut signed_2,
+            &manifest,
+            &archive,
+            Some(&ed25519),
+        )
+        .expect("the version-2 writer succeeds");
 
-        for (label, image) in cases {
-            let manifest =
-                format!(r#"{{"artifacts":[{}]}}"#, baseline_artifact(image)).into_bytes();
-            let package = assemble(1, &manifest, &archive, None, None);
-
-            // The fixture is what it claims to be: a footer-v1 container with
-            // no envelope blocks, whose manifest parses as a baseline when the
-            // image key is absent and is refused for that key alone otherwise.
-            let container =
-                payload::read_package_container(Cursor::new(package.clone()), &ENVELOPE_BOUNDS)
-                    .expect("the fixture container reads");
-            assert_eq!(container.container_version(), 1, "{label}");
+        for (label, found, package) in [
+            ("version 1", 1u8, version_1),
+            ("unsigned version 2", 2, unsigned_2),
+            ("signed version 2", 2, signed_2),
+        ] {
+            let error = refusal(&package, &trusting(&pair));
             assert!(
-                matches!(container.signature(), EnvelopeBlock::Absent),
-                "{label}"
-            );
-            assert!(
-                matches!(container.key_id(), EnvelopeBlock::Absent),
-                "{label}"
-            );
-            let parsed = container.parse_unverified_manifest();
-            if image.is_none() {
-                let baseline = parsed.expect("the absent-image baseline parses");
-                assert_eq!(baseline.format_version(), None, "{label}");
-                assert_eq!(baseline.artifacts().len(), 1, "{label}");
-            } else {
-                assert!(
-                    matches!(
-                        parsed,
-                        Err(PayloadError::InvalidManifest(ManifestError::BaselineWithImage(ref path)))
-                            if path == MEMBER
-                    ),
-                    "{label}: the parse alone should refuse the image key, got {parsed:?}"
-                );
-            }
-
-            let error = refusal(&package, &trust);
-            assert!(
-                matches!(error, VerifyError::BadSignature),
+                matches!(
+                    error,
+                    VerifyError::Payload(PayloadError::UnsupportedContainerFormat {
+                        found: version,
+                        supported,
+                    }) if version == found && supported == [3]
+                ),
                 "{label}: got {error:?}"
             );
             assert!(
-                !matches!(error, VerifyError::Payload(_)),
-                "{label}: the signature verdict must precede every manifest fault"
+                error.to_string().contains("this build implements 3"),
+                "{label}: {error}"
             );
         }
     }
@@ -3041,7 +3095,9 @@ mod tests {
         let revoked = keypair();
         let trust = trust_of(vec![
             TrustAnchor::new(public_key_of(&signer), false),
+            companion(&signer, false),
             TrustAnchor::new(public_key_of(&revoked), true),
+            companion(&revoked, true),
         ]);
         let manifest = default_manifest();
         let archive = default_archive();
@@ -3083,59 +3139,77 @@ mod tests {
         // The footer advertises a signature far larger than any signature, and
         // the bytes are not there to read: `SparseContainer` panics if the
         // verifier so much as touches them, which is what a reader that
-        // allocated the block would then do. An Ed25519 signature is 64 bytes,
-        // so the length settles it without reading anything.
+        // allocated the block would then do. Each signature has one length,
+        // so the length settles it without reading anything — for the Ed25519
+        // block and for the ML-DSA-87 one alike.
         let signer = keypair();
-        let trust = trust_of(vec![TrustAnchor::new(public_key_of(&signer), false)]);
-        let hint = key_id(&public_key_of(&signer));
-        let package = sparse_pkg(
-            &default_manifest(),
-            &default_archive(),
-            hint.as_bytes(),
-            SparseBlock::Signature,
-        );
-        let error = verify_package(package, &trust, &request())
-            .expect_err("an unreadable signature cannot verify");
-        assert!(matches!(error, VerifyError::BadSignature), "got: {error:?}");
+        let trust = trusting(&signer);
+        let manifest = default_manifest();
+        let envelope = envelope_of(&signer, &manifest);
+        let blocks = |hint_at: Option<(usize, &'static str)>| {
+            let mut blocks: [&[u8]; 4] = [&envelope[0], &envelope[1], &envelope[2], &envelope[3]];
+            if let Some((index, hint)) = hint_at {
+                blocks[index] = hint.as_bytes();
+            }
+            blocks
+        };
+        for (sparse, algorithm, hint_index) in [
+            (SparseBlock::Signature, SignatureAlgorithm::Ed25519, 1),
+            (SparseBlock::MlDsaSignature, SignatureAlgorithm::MlDsa87, 3),
+        ] {
+            let package = sparse_pkg(&manifest, &default_archive(), blocks(None), sparse);
+            let error = verify_package(package, &trust, &request())
+                .expect_err("an unreadable signature cannot verify");
+            assert!(
+                matches!(error, VerifyError::BadSignature { algorithm: found } if found == algorithm),
+                "got: {error:?}"
+            );
 
-        // Refusing to read it is not the same as short-circuiting the verdict:
-        // the four-step order still names the rejection, so a usable hint
-        // naming no anchor is `UnknownKeyId` exactly as it would be for a
-        // 64-byte signature nothing verifies.
-        let package = sparse_pkg(
-            &default_manifest(),
-            &default_archive(),
-            STRANGER_KEY_ID.as_bytes(),
-            SparseBlock::Signature,
-        );
-        let error = verify_package(package, &trust, &request())
-            .expect_err("an unreadable signature cannot verify");
-        assert!(
-            matches!(error, VerifyError::UnknownKeyId { ref key_id } if key_id == STRANGER_KEY_ID),
-            "got: {error:?}"
-        );
+            // Refusing to read it is not the same as short-circuiting the
+            // verdict: the four-step order still names the rejection, so a
+            // usable hint naming no anchor is `UnknownKeyId` exactly as it
+            // would be for a signature of the right length nothing verifies.
+            let package = sparse_pkg(
+                &manifest,
+                &default_archive(),
+                blocks(Some((hint_index, STRANGER_KEY_ID))),
+                sparse,
+            );
+            let error = verify_package(package, &trust, &request())
+                .expect_err("an unreadable signature cannot verify");
+            assert!(
+                matches!(
+                    error,
+                    VerifyError::UnknownKeyId { algorithm: found, ref key_id }
+                        if found == algorithm && key_id == STRANGER_KEY_ID
+                ),
+                "got: {error:?}"
+            );
+        }
     }
 
     #[test]
     fn an_enormous_key_id_block_is_an_unusable_hint_and_cannot_deny() {
-        // The same hostile length on the block the hint rides in. A `key_id` is
+        // The same hostile length on a block a hint rides in. A `key_id` is
         // 64 characters, so this one is unusable — and an unusable hint is not
-        // a rejection: the authentic signature beside it still verifies, with
-        // the enormous block never read.
+        // a rejection: the authentic signatures beside it still verify, with
+        // the enormous block never read. Each of the two hint blocks in turn.
         let signer = keypair();
-        let trust = trust_of(vec![TrustAnchor::new(public_key_of(&signer), false)]);
+        let trust = trusting(&signer);
         let manifest = default_manifest();
-        let signature = signer.sign(&manifest);
-        let package = sparse_pkg(
-            &manifest,
-            &default_archive(),
-            signature.as_ref(),
-            SparseBlock::KeyId,
-        );
-        assert!(
-            verify_package(package, &trust, &request()).is_ok(),
-            "an unusable hint must not deny an authentic package"
-        );
+        let envelope = envelope_of(&signer, &manifest);
+        for sparse in [SparseBlock::KeyId, SparseBlock::MlDsaKeyId] {
+            let package = sparse_pkg(
+                &manifest,
+                &default_archive(),
+                [&envelope[0], &envelope[1], &envelope[2], &envelope[3]],
+                sparse,
+            );
+            assert!(
+                verify_package(package, &trust, &request()).is_ok(),
+                "an unusable hint must not deny an authentic package"
+            );
+        }
     }
 
     #[test]
@@ -3144,112 +3218,143 @@ mod tests {
         let archive = default_archive();
 
         let unsigned = payload::read_package_container(
-            Cursor::new(assemble(FORMAT_VERSION, &manifest, &archive, None, None)),
+            Cursor::new(assemble(&manifest, &archive, [None; 4])),
             &ENVELOPE_BOUNDS,
         )
         .expect("an unsigned package has bounded metadata");
         assert!(matches!(unsigned.signature(), EnvelopeBlock::Absent));
         assert!(matches!(unsigned.key_id(), EnvelopeBlock::Absent));
+        assert!(matches!(
+            unsigned.ml_dsa_87_signature(),
+            EnvelopeBlock::Absent
+        ));
+        assert!(matches!(unsigned.ml_dsa_87_key_id(), EnvelopeBlock::Absent));
 
         let signer = keypair();
-        let signature = signer.sign(&manifest);
-        let hint = key_id(&public_key_of(&signer));
+        let envelope = envelope_of(&signer, &manifest);
         let signed_container = payload::read_package_container(
-            Cursor::new(assemble(
-                FORMAT_VERSION,
-                &manifest,
-                &archive,
-                Some(signature.as_ref()),
-                Some(hint.as_bytes()),
-            )),
+            Cursor::new(signed_pkg(&signer, &manifest, &archive, Some(&envelope[1]))),
             &ENVELOPE_BOUNDS,
         )
         .expect("a signed package has bounded metadata");
         match signed_container.signature() {
-            EnvelopeBlock::Present(bytes) => assert_eq!(bytes, signature.as_ref()),
+            EnvelopeBlock::Present(bytes) => assert_eq!(bytes, &envelope[0]),
             block => panic!("signature should be present, got {block:?}"),
         }
         match signed_container.key_id() {
-            EnvelopeBlock::Present(bytes) => assert_eq!(bytes, hint.as_bytes()),
+            EnvelopeBlock::Present(bytes) => assert_eq!(bytes, &envelope[1]),
             block => panic!("key id should be present, got {block:?}"),
         }
+        match signed_container.ml_dsa_87_signature() {
+            EnvelopeBlock::Present(bytes) => {
+                assert_eq!(len_u64(bytes), ML_DSA_87_SIGNATURE_LEN);
+            }
+            block => panic!("ML-DSA-87 signature should be present, got {block:?}"),
+        }
+        match signed_container.ml_dsa_87_key_id() {
+            EnvelopeBlock::Present(bytes) => assert_eq!(bytes, &envelope[3]),
+            block => panic!("ML-DSA-87 key id should be present, got {block:?}"),
+        }
 
-        let wrong_signature = payload::read_package_container(
+        let wrong_lengths = payload::read_package_container(
             Cursor::new(assemble(
-                FORMAT_VERSION,
                 &manifest,
                 &archive,
-                Some(&[0; 63]),
-                None,
+                [
+                    Some(&[0; 63]),
+                    Some(&[b'a'; 63]),
+                    Some(&[0; 4626]),
+                    Some(&[b'a'; 65]),
+                ],
             )),
             &ENVELOPE_BOUNDS,
         )
-        .expect("a wrong signature length remains readable as metadata");
+        .expect("wrong envelope lengths remain readable as metadata");
         assert!(matches!(
-            wrong_signature.signature(),
+            wrong_lengths.signature(),
+            EnvelopeBlock::WrongLength
+        ));
+        assert!(matches!(wrong_lengths.key_id(), EnvelopeBlock::WrongLength));
+        assert!(matches!(
+            wrong_lengths.ml_dsa_87_signature(),
+            EnvelopeBlock::WrongLength
+        ));
+        assert!(matches!(
+            wrong_lengths.ml_dsa_87_key_id(),
             EnvelopeBlock::WrongLength
         ));
 
-        let wrong_key_id = payload::read_package_container(
-            Cursor::new(assemble(
-                FORMAT_VERSION,
-                &manifest,
-                &archive,
-                Some(signature.as_ref()),
-                Some(&[b'a'; 63]),
-            )),
-            &ENVELOPE_BOUNDS,
-        )
-        .expect("a wrong key-id length remains readable as metadata");
-        assert!(matches!(wrong_key_id.key_id(), EnvelopeBlock::WrongLength));
-
-        let mut half_zero = manifest.clone();
-        half_zero.extend_from_slice(&archive);
-        half_zero.extend_from_slice(&footer_bytes(
-            FORMAT_VERSION,
-            [
+        for half_zero_at in [4usize, 5, 6, 7, 8, 9, 10, 11] {
+            let mut half_zero = manifest.clone();
+            half_zero.extend_from_slice(&archive);
+            let mut fields = [0u64; 12];
+            fields[..4].copy_from_slice(&[
                 0,
                 len_u64(&manifest),
                 len_u64(&manifest),
                 len_u64(&archive),
-                1,
-                0,
-                0,
-                0,
-            ],
-        ));
-        let Err(error) = payload::read_package_container(Cursor::new(half_zero), &ENVELOPE_BOUNDS)
-        else {
-            panic!("a half-zero envelope pair must be malformed");
-        };
-        assert!(matches!(error, PayloadError::MalformedFooter { .. }));
+            ]);
+            fields[half_zero_at] = 1;
+            half_zero.extend_from_slice(&footer_bytes(fields));
+            let Err(error) =
+                payload::read_package_container(Cursor::new(half_zero), &ENVELOPE_BOUNDS)
+            else {
+                panic!("a half-zero envelope pair must be malformed");
+            };
+            assert!(matches!(error, PayloadError::MalformedFooter { .. }));
+        }
     }
 
     #[test]
     fn bounded_container_reader_never_reads_a_sparse_wrong_length_block() {
         let signer = keypair();
-        let hint = key_id(&public_key_of(&signer));
-        let container = payload::read_package_container(
-            sparse_file_pkg(
-                &default_manifest(),
-                &default_archive(),
-                hint.as_bytes(),
-                SparseBlock::Signature,
-            ),
-            &ENVELOPE_BOUNDS,
-        )
-        .expect("the hostile block length is reported without reading its bytes");
+        let manifest = default_manifest();
+        let envelope = envelope_of(&signer, &manifest);
+        let blocks: [&[u8]; 4] = [&envelope[0], &envelope[1], &envelope[2], &envelope[3]];
+        for sparse in [
+            SparseBlock::Signature,
+            SparseBlock::KeyId,
+            SparseBlock::MlDsaSignature,
+            SparseBlock::MlDsaKeyId,
+        ] {
+            let container = payload::read_package_container(
+                sparse_file_pkg(&manifest, &default_archive(), blocks, sparse),
+                &ENVELOPE_BOUNDS,
+            )
+            .expect("the hostile block length is reported without reading its bytes");
 
-        assert!(matches!(container.signature(), EnvelopeBlock::WrongLength));
-        assert!(
-            matches!(container.key_id(), EnvelopeBlock::Present(bytes) if bytes == hint.as_bytes())
-        );
+            let read = [
+                container.signature(),
+                container.key_id(),
+                container.ml_dsa_87_signature(),
+                container.ml_dsa_87_key_id(),
+            ];
+            for (index, block) in read.into_iter().enumerate() {
+                if index == sparse.index() {
+                    assert!(matches!(block, EnvelopeBlock::WrongLength));
+                } else {
+                    assert!(
+                        matches!(block, EnvelopeBlock::Present(bytes) if bytes == blocks[index])
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn exported_envelope_lengths_are_the_verifiers_bounds() {
         assert_eq!(ENVELOPE_BOUNDS.signature_len, ED25519_SIGNATURE_LEN);
         assert_eq!(ENVELOPE_BOUNDS.key_id_len, KEY_ID_HEX_LEN);
+        assert_eq!(
+            ENVELOPE_BOUNDS.ml_dsa_87_signature_len,
+            ML_DSA_87_SIGNATURE_LEN
+        );
+        assert_eq!(ENVELOPE_BOUNDS.ml_dsa_87_key_id_len, KEY_ID_HEX_LEN);
+        assert_eq!(ML_DSA_87_SIGNATURE_LEN, 4627);
+        assert_eq!(
+            usize::try_from(ML_DSA_87_SIGNATURE_LEN).expect("fits"),
+            aws_lc_rs::signature::ML_DSA_87_SIGNING.signature_len()
+        );
     }
 
     #[test]
@@ -3263,7 +3368,9 @@ mod tests {
         let signer = keypair();
         let trust = trust_of(vec![
             TrustAnchor::new(public_key_of(&decoy), false),
+            companion(&decoy, false),
             TrustAnchor::new(public_key_of(&signer), false),
+            companion(&signer, false),
         ]);
         let hint = key_id(&public_key_of(&decoy));
         let package = signed_pkg(
@@ -3281,7 +3388,9 @@ mod tests {
         let revoked = keypair();
         let trust = trust_of(vec![
             TrustAnchor::new(public_key_of(&signer), false),
+            companion(&signer, false),
             TrustAnchor::new(public_key_of(&revoked), true),
+            companion(&revoked, true),
         ]);
         // Hinted at the *non-revoked* anchor, so the verdict is read off the
         // anchor that actually verified rather than off the footer.
@@ -3295,7 +3404,7 @@ mod tests {
         let expected = key_id(&public_key_of(&revoked));
         assert!(matches!(
             refusal(&package, &trust),
-            VerifyError::RevokedKey { key_id } if key_id == expected
+            VerifyError::RevokedKey { algorithm: SignatureAlgorithm::Ed25519, key_id } if key_id == expected
         ));
     }
 
@@ -3312,8 +3421,303 @@ mod tests {
         );
         assert!(matches!(
             refusal(&package, &trust),
-            VerifyError::UnknownKeyId { key_id } if key_id == hint
+            VerifyError::UnknownKeyId { algorithm: SignatureAlgorithm::Ed25519, key_id } if key_id == hint
         ));
+    }
+
+    /// What [`package_with`] puts in one envelope pair.
+    #[derive(Clone, Copy)]
+    enum Block<'a> {
+        /// The default fixture's own block.
+        Kept,
+        /// The all-zero absent pair.
+        Absent,
+        /// These bytes instead.
+        Bytes(&'a [u8]),
+    }
+
+    /// The default fixture's four envelope blocks from `signer`, each one
+    /// replaced where `replace` says, assembled into a package.
+    fn package_with(signer: &Ed25519KeyPair, replace: [Block<'_>; 4]) -> Vec<u8> {
+        let manifest = default_manifest();
+        let envelope = envelope_of(signer, &manifest);
+        let mut blocks: Envelope<'_> = [
+            Some(&envelope[0]),
+            Some(&envelope[1]),
+            Some(&envelope[2]),
+            Some(&envelope[3]),
+        ];
+        for (block, replacement) in blocks.iter_mut().zip(replace) {
+            match replacement {
+                Block::Kept => {}
+                Block::Absent => *block = None,
+                Block::Bytes(bytes) => *block = Some(bytes),
+            }
+        }
+        assemble(&manifest, &default_archive(), blocks)
+    }
+
+    /// Asserts `error` is `BadSignature` for `algorithm`.
+    #[track_caller]
+    fn assert_bad_signature(error: &VerifyError, algorithm: SignatureAlgorithm) {
+        assert!(
+            matches!(error, VerifyError::BadSignature { algorithm: found } if *found == algorithm),
+            "expected BadSignature for {algorithm}, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_signed_with_both_keys_verifies_and_one_signature_alone_never_does() {
+        let signer = keypair();
+        let trust = trusting(&signer);
+        accepted(&package_with(&signer, [Block::Kept; 4]), &trust);
+
+        // The ML-DSA-87 pairs absent: the Ed25519 signature verifies, and the
+        // verdict is the missing one's.
+        let ed25519_only = package_with(
+            &signer,
+            [Block::Kept, Block::Kept, Block::Absent, Block::Absent],
+        );
+        assert_bad_signature(&refusal(&ed25519_only, &trust), SignatureAlgorithm::MlDsa87);
+
+        // The Ed25519 pairs absent, the ML-DSA-87 one valid.
+        let ml_dsa_only = package_with(
+            &signer,
+            [Block::Absent, Block::Absent, Block::Kept, Block::Kept],
+        );
+        assert_bad_signature(&refusal(&ml_dsa_only, &trust), SignatureAlgorithm::Ed25519);
+
+        // Both absent.
+        let unsigned = package_with(&signer, [Block::Absent; 4]);
+        assert_bad_signature(&refusal(&unsigned, &trust), SignatureAlgorithm::Ed25519);
+    }
+
+    #[test]
+    fn a_flipped_byte_in_either_signature_is_that_algorithms_bad_signature() {
+        let signer = keypair();
+        let trust = trusting(&signer);
+        let envelope = envelope_of(&signer, &default_manifest());
+        let ed25519 = flipped(&envelope[0]);
+        let ml_dsa = flipped(&envelope[2]);
+
+        let package = package_with(
+            &signer,
+            [
+                Block::Bytes(&ed25519),
+                Block::Kept,
+                Block::Kept,
+                Block::Kept,
+            ],
+        );
+        assert_bad_signature(&refusal(&package, &trust), SignatureAlgorithm::Ed25519);
+
+        let package = package_with(
+            &signer,
+            [Block::Kept, Block::Kept, Block::Bytes(&ml_dsa), Block::Kept],
+        );
+        assert_bad_signature(&refusal(&package, &trust), SignatureAlgorithm::MlDsa87);
+
+        // Both bad: the first in the fixed order is the verdict.
+        let package = package_with(
+            &signer,
+            [
+                Block::Bytes(&ed25519),
+                Block::Kept,
+                Block::Bytes(&ml_dsa),
+                Block::Kept,
+            ],
+        );
+        assert_bad_signature(&refusal(&package, &trust), SignatureAlgorithm::Ed25519);
+    }
+
+    #[test]
+    fn signatures_swapped_between_their_pairs_are_ed25519_bad_signature() {
+        // Each block now sits in the other algorithm's pair, at the other
+        // algorithm's length: the Ed25519 one is read as `WrongLength` and
+        // verifies under nothing, and that is the first verdict.
+        let signer = keypair();
+        let envelope = envelope_of(&signer, &default_manifest());
+        let package = package_with(
+            &signer,
+            [
+                Block::Bytes(&envelope[2]),
+                Block::Kept,
+                Block::Bytes(&envelope[0]),
+                Block::Kept,
+            ],
+        );
+        assert_bad_signature(
+            &refusal(&package, &trusting(&signer)),
+            SignatureAlgorithm::Ed25519,
+        );
+    }
+
+    #[test]
+    fn an_ml_dsa_87_signature_over_the_manifest_digest_is_bad_signature() {
+        // Pure ML-DSA-87 signs the message itself. A signature over its
+        // SHA-256 — what a pre-hash scheme would sign — is a valid signature
+        // over other bytes, and verifies under nothing.
+        let signer = keypair();
+        let manifest = default_manifest();
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&manifest).into();
+        let over_digest = ml_dsa_signature(&signer, &digest);
+        let package = package_with(
+            &signer,
+            [
+                Block::Kept,
+                Block::Kept,
+                Block::Bytes(&over_digest),
+                Block::Kept,
+            ],
+        );
+        assert_bad_signature(
+            &refusal(&package, &trusting(&signer)),
+            SignatureAlgorithm::MlDsa87,
+        );
+    }
+
+    #[test]
+    fn an_ml_dsa_87_signature_block_of_another_length_is_bad_signature_and_never_read() {
+        // A 4,626-byte block, one short of an ML-DSA-87 signature, from a
+        // source that panics if its bytes are read: the length alone decides.
+        let signer = keypair();
+        let short = vec![0x6b; 4626];
+        let bytes = package_with(
+            &signer,
+            [Block::Kept, Block::Kept, Block::Bytes(&short), Block::Kept],
+        );
+        let start = default_manifest().len()
+            + default_archive().len()
+            + usize::try_from(ED25519_SIGNATURE_LEN + KEY_ID_HEX_LEN).expect("fits");
+        let end = start + short.len();
+        let package = SparseContainer {
+            segments: vec![
+                (0, bytes.get(..start).expect("the head").to_vec()),
+                (
+                    len_u64(&bytes[..end]),
+                    bytes.get(end..).expect("the tail").to_vec(),
+                ),
+            ],
+            sparse: len_u64(&bytes[..start])..len_u64(&bytes[..end]),
+            len: len_u64(&bytes),
+            pos: 0,
+        };
+        let error = verify_package(package, &trusting(&signer), &request())
+            .expect_err("a short signature cannot verify");
+        assert_bad_signature(&error, SignatureAlgorithm::MlDsa87);
+    }
+
+    #[test]
+    fn an_ml_dsa_87_hint_naming_an_ed25519_anchor_is_ml_dsa_87_unknown_key_id() {
+        // The ML-DSA-87 signer is absent from the set, and its hint names an
+        // anchor the set does hold — of the other algorithm. The ML-DSA-87
+        // signature is looked up among ML-DSA-87 anchors alone, so the package
+        // names a key we do not hold.
+        let signer = keypair();
+        let trust = trust_of(vec![
+            TrustAnchor::new(public_key_of(&signer), false),
+            ml_dsa_anchor(false),
+        ]);
+        let ed25519_id = key_id_of(&signer);
+        let package = package_with(
+            &signer,
+            [
+                Block::Kept,
+                Block::Kept,
+                Block::Kept,
+                Block::Bytes(ed25519_id.as_bytes()),
+            ],
+        );
+        assert!(matches!(
+            refusal(&package, &trust),
+            VerifyError::UnknownKeyId { algorithm: SignatureAlgorithm::MlDsa87, ref key_id }
+                if *key_id == ed25519_id
+        ));
+    }
+
+    #[test]
+    fn a_revoked_ml_dsa_87_signer_is_ml_dsa_87_revoked_key() {
+        // A live ML-DSA-87 anchor beside the revoked signer is tried first,
+        // and does not verify; only then is the revoked one tried.
+        let signer = keypair();
+        let trust = trust_of(vec![
+            TrustAnchor::new(public_key_of(&signer), false),
+            ml_dsa_anchor(false),
+            companion(&signer, true),
+        ]);
+        let expected = ml_dsa_key_id_of(&signer);
+        assert!(matches!(
+            refusal(&default_pkg(&signer), &trust),
+            VerifyError::RevokedKey { algorithm: SignatureAlgorithm::MlDsa87, ref key_id }
+                if *key_id == expected
+        ));
+    }
+
+    #[test]
+    fn no_ml_dsa_87_hint_turns_accept_into_reject() {
+        // A hint naming another live ML-DSA-87 anchor, an unusable one and
+        // none at all: the fallback still finds the signer.
+        let signer = keypair();
+        let decoy = ml_dsa_anchor(false);
+        let trust = trust_of(vec![
+            TrustAnchor::new(public_key_of(&signer), false),
+            decoy.clone(),
+            companion(&signer, false),
+        ]);
+        let uppercased = ml_dsa_key_id_of(&signer).to_uppercase();
+        let short = vec![b'a'; KEY_ID_BLOCK_BYTES - 1];
+        let hints: [(&str, Option<&[u8]>); 5] = [
+            ("another live anchor's id", Some(decoy.key_id().as_bytes())),
+            ("an id in no anchor", Some(STRANGER_KEY_ID.as_bytes())),
+            ("uppercased", Some(uppercased.as_bytes())),
+            ("short", Some(&short)),
+            ("removed entirely", None),
+        ];
+        for (label, hint) in hints {
+            let package = package_with(
+                &signer,
+                [
+                    Block::Kept,
+                    Block::Kept,
+                    Block::Kept,
+                    hint.map_or(Block::Absent, Block::Bytes),
+                ],
+            );
+            assert!(
+                verify_package(Cursor::new(package), &trust, &request()).is_ok(),
+                "an ML-DSA-87 hint that is {label} must not deny an authentic package"
+            );
+        }
+    }
+
+    #[test]
+    fn the_signature_verdicts_name_the_algorithm() {
+        let key_id = STRANGER_KEY_ID.to_string();
+        assert_eq!(
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::MlDsa87
+            }
+            .to_string(),
+            "no trust anchor verifies the package's ML-DSA-87 signature"
+        );
+        assert_eq!(
+            VerifyError::UnknownKeyId {
+                algorithm: SignatureAlgorithm::Ed25519,
+                key_id: key_id.clone(),
+            }
+            .to_string(),
+            format!(
+                "the package names Ed25519 key id `{key_id}`, which is in no Ed25519 trust anchor"
+            )
+        );
+        assert_eq!(
+            VerifyError::RevokedKey {
+                algorithm: SignatureAlgorithm::MlDsa87,
+                key_id: key_id.clone(),
+            }
+            .to_string(),
+            format!("the package's ML-DSA-87 signature is by revoked key `{key_id}`")
+        );
     }
 
     /// A live ML-DSA-87 anchor over a freshly minted key.
@@ -3337,6 +3741,7 @@ mod tests {
             ml_dsa_anchor(false),
             ml_dsa_anchor(true),
             TrustAnchor::new(public_key_of(&signer), false),
+            companion(&signer, false),
         ]);
         assert!(verify_package(Cursor::new(package), &trust, &request()).is_ok());
     }
@@ -3360,7 +3765,7 @@ mod tests {
         );
         assert!(matches!(
             refusal(&package, &trust),
-            VerifyError::UnknownKeyId { key_id } if key_id == ml_dsa.key_id()
+            VerifyError::UnknownKeyId { algorithm: SignatureAlgorithm::Ed25519, key_id } if key_id == ml_dsa.key_id()
         ));
     }
 
@@ -3380,7 +3785,7 @@ mod tests {
             assert!(
                 matches!(
                     refusal(&package, &trust),
-                    VerifyError::UnknownKeyId { ref key_id } if key_id == hint
+                    VerifyError::UnknownKeyId { algorithm: SignatureAlgorithm::Ed25519, ref key_id } if key_id == hint
                 ),
                 "a usable hint {hint} names no Ed25519 anchor"
             );
@@ -3388,7 +3793,9 @@ mod tests {
         let package = signed_pkg(&signer, &default_manifest(), &default_archive(), None);
         assert!(matches!(
             refusal(&package, &trust),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
     }
 
@@ -3409,9 +3816,10 @@ mod tests {
         ] {
             let mut anchors = ml_dsa;
             anchors.push(TrustAnchor::new(public_key_of(&revoked), true));
+            anchors.push(companion(&revoked, true));
             assert!(matches!(
                 refusal(&package, &trust_of(anchors)),
-                VerifyError::RevokedKey { ref key_id } if *key_id == expected
+                VerifyError::RevokedKey { algorithm: SignatureAlgorithm::Ed25519, ref key_id } if *key_id == expected
             ));
         }
     }
@@ -3426,6 +3834,7 @@ mod tests {
         let trust = trust_of(vec![
             TrustAnchor::new(public_key_of(&keypair()), false),
             TrustAnchor::new(public_key_of(&revoked), true),
+            companion(&revoked, true),
         ]);
         let hint = key_id(&public_key_of(&revoked));
         let package = signed_pkg(
@@ -3436,7 +3845,9 @@ mod tests {
         );
         assert!(matches!(
             refusal(&package, &trust),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
     }
 
@@ -3453,7 +3864,9 @@ mod tests {
         );
         assert!(matches!(
             refusal(&package, &trusting(&known)),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
     }
 
@@ -3463,7 +3876,9 @@ mod tests {
         let package = signed_pkg(&stranger, &default_manifest(), &default_archive(), None);
         assert!(matches!(
             refusal(&package, &trusting(&keypair())),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
     }
 
@@ -3666,7 +4081,10 @@ mod tests {
 
         let floor = MAX_MANIFEST_FORMAT_VERSION + 1;
         let trust = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             Vec::new(),
             floor,
             0,
@@ -3709,7 +4127,10 @@ mod tests {
 
         let floor = MANIFEST_FORMAT_VERSION;
         let trust = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             Vec::new(),
             floor,
             0,
@@ -4077,7 +4498,10 @@ mod tests {
         // confounded by a target disagreement.
         let pair = keypair();
         let trust = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             vec![(
                 COMPONENT.to_string(),
                 VERSION.to_string(),
@@ -4100,7 +4524,10 @@ mod tests {
         // thing".
         let pair = keypair();
         let trust = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             vec![(
                 COMPONENT.to_string(),
                 VERSION.to_string(),
@@ -4140,7 +4567,10 @@ mod tests {
         );
         let package = signed_pkg(&pair, &manifest, &default_archive(), None);
         let trust = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             vec![(
                 "other".to_string(),
                 VERSION.to_string(),
@@ -4184,7 +4614,10 @@ mod tests {
         let manifest = manifest_json(&[(MEMBER, len_u64(ARTIFACT_BYTES))], &[artifact]);
         let package = signed_pkg(&pair, &manifest, &default_archive(), None);
         let trust = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             Vec::new(),
             MIN_MANIFEST_FORMAT_VERSION,
             ACTIVE,
@@ -4234,7 +4667,10 @@ mod tests {
         .into_bytes();
         let package = signed_pkg(&pair, &manifest, &default_archive(), None);
         let trust = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             Vec::new(),
             MIN_MANIFEST_FORMAT_VERSION,
             ACTIVE,
@@ -4944,7 +5380,10 @@ mod tests {
         let package = package_of(&pair, &[image_artifact_json("images/web.tar", &arm)]);
 
         let withdrawn = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             vec![(
                 COMPONENT.to_string(),
                 VERSION.to_string(),
@@ -4984,11 +5423,16 @@ mod tests {
         let stranger = signed_pkg(&keypair(), &manifest, &default_archive(), None);
         assert!(matches!(
             verify_err(&stranger, &trusting(&pair), &namespaced()),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
         // Below an injected floor.
         let floor = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             Vec::new(),
             MANIFEST_FORMAT_VERSION + 1,
             0,
@@ -5190,7 +5634,10 @@ mod tests {
         );
         let package = package_of_at(&pair, IMAGE_DECLARATION_FORMAT_VERSION - 1, &[legacy]);
         let withdrawn = TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&pair), false)],
+            vec![
+                TrustAnchor::new(public_key_of(&pair), false),
+                companion(&pair, false),
+            ],
             vec![(
                 COMPONENT.to_string(),
                 VERSION.to_string(),
@@ -5265,23 +5712,27 @@ mod tests {
     /// are placeholder bytes: this stage reads no archive.
     const SIGNED_V6_PACKAGE: &[u8] =
         include_bytes!("../assets/test-fixtures/signed-v6-placeholder-images/package.pkg");
-    /// The raw Ed25519 public key that signed it, in hex. Only this half was
-    /// kept: the fixture is test trust and nothing else, and its private key
-    /// was discarded once the package was written.
-    const SIGNED_V6_PUBLIC_KEY: &str =
-        include_str!("../assets/test-fixtures/signed-v6-placeholder-images/public-key.hex");
+    /// The raw Ed25519 and ML-DSA-87 public keys that signed it, in hex.
+    /// Only these halves were kept: the fixture is test trust and nothing
+    /// else, and its private keys were discarded once it was re-framed.
+    const SIGNED_V6_ED25519_PUBLIC_KEY: &str =
+        include_str!("../assets/test-fixtures/signed-v6-placeholder-images/ed25519-public-key.hex");
+    const SIGNED_V6_ML_DSA_87_PUBLIC_KEY: &str = include_str!(
+        "../assets/test-fixtures/signed-v6-placeholder-images/ml-dsa-87-public-key.hex"
+    );
 
     fn signed_v6_trust() -> TrustSet {
-        let hex = SIGNED_V6_PUBLIC_KEY.trim();
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|at| {
-                u8::from_str_radix(hex.get(at..at + 2).expect("an even-length key"), 16)
-                    .expect("hex")
-            })
-            .collect();
-        let key: [u8; 32] = bytes.try_into().expect("a 32-byte key");
-        trust_of(vec![TrustAnchor::new(key, false)])
+        let ed25519: [u8; 32] = decode_hex(SIGNED_V6_ED25519_PUBLIC_KEY.trim())
+            .try_into()
+            .expect("a 32-byte key");
+        let ml_dsa: [u8; ML_DSA_87_PUBLIC_KEY_LEN] =
+            decode_hex(SIGNED_V6_ML_DSA_87_PUBLIC_KEY.trim())
+                .try_into()
+                .expect("a raw ML-DSA-87 key");
+        trust_of(vec![
+            TrustAnchor::new(ed25519, false),
+            TrustAnchor::new_ml_dsa_87(&ml_dsa, false),
+        ])
     }
 
     #[test]
@@ -5390,6 +5841,19 @@ mod tests {
     /// implementation reproduces it from the same seed and message.
     const KNOWN_ANSWER_SIGNATURE: &str =
         include_str!("../assets/test-fixtures/ed25519-known-answer/signature.hex");
+    /// The ML-DSA-87 interoperability vector made with OpenSSL 3.5 (see the
+    /// README beside it): its message, which is [`KNOWN_ANSWER_MANIFEST`]'s
+    /// bytes, the raw public key, a pure ML-DSA-87 signature with an empty
+    /// context, and one with the context string `deploy-core`, all but the
+    /// message in hex.
+    const ML_DSA_KNOWN_ANSWER_MESSAGE: &[u8] =
+        include_bytes!("../assets/test-fixtures/ml-dsa-87-known-answer/message.bin");
+    const ML_DSA_KNOWN_ANSWER_PUBLIC_KEY: &str =
+        include_str!("../assets/test-fixtures/ml-dsa-87-known-answer/public-key.hex");
+    const ML_DSA_KNOWN_ANSWER_SIGNATURE: &str =
+        include_str!("../assets/test-fixtures/ml-dsa-87-known-answer/signature.hex");
+    const ML_DSA_KNOWN_ANSWER_CONTEXT_SIGNATURE: &str =
+        include_str!("../assets/test-fixtures/ml-dsa-87-known-answer/context-signature.hex");
 
     fn decode_hex(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -5442,30 +5906,74 @@ mod tests {
         let anchor = TrustAnchor::new(public_key, false);
         assert!(anchor.verifies(KNOWN_ANSWER_MANIFEST, &signature));
 
-        // Through the verifier, from a package around exactly those bytes.
+        // Through the verifier, from a package around exactly those bytes,
+        // carrying the ML-DSA-87 known answer over the same bytes beside it:
+        // every signature in it was made outside this crate.
+        let (ml_dsa_anchor, ml_dsa_signature) = ml_dsa_known_answer();
         let hint = key_id(&public_key);
-        let package = assemble(
-            FORMAT_VERSION,
-            KNOWN_ANSWER_MANIFEST,
-            &default_archive(),
-            Some(&signature),
-            Some(hint.as_bytes()),
-        );
-        let trust = trust_of(vec![anchor]);
-        let verified = accepted(&package, &trust);
+        let package_signed = |ed25519: &[u8], ml_dsa_87: &[u8]| {
+            assemble(
+                KNOWN_ANSWER_MANIFEST,
+                &default_archive(),
+                [
+                    Some(ed25519),
+                    Some(hint.as_bytes()),
+                    Some(ml_dsa_87),
+                    Some(ml_dsa_anchor.key_id().as_bytes()),
+                ],
+            )
+        };
+        let trust = trust_of(vec![anchor, ml_dsa_anchor.clone()]);
+        let verified = accepted(&package_signed(&signature, &ml_dsa_signature), &trust);
         assert_eq!(verified.manifest().artifacts().len(), 1);
 
-        let tampered = assemble(
-            FORMAT_VERSION,
-            KNOWN_ANSWER_MANIFEST,
-            &default_archive(),
-            Some(&flipped(&signature)),
-            Some(hint.as_bytes()),
-        );
+        let tampered = package_signed(&flipped(&signature), &ml_dsa_signature);
         assert!(matches!(
             refusal(&tampered, &trust),
-            VerifyError::BadSignature
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::Ed25519
+            }
         ));
+        let tampered = package_signed(&signature, &flipped(&ml_dsa_signature));
+        assert!(matches!(
+            refusal(&tampered, &trust),
+            VerifyError::BadSignature {
+                algorithm: SignatureAlgorithm::MlDsa87
+            }
+        ));
+    }
+
+    /// The ML-DSA-87 known answer's anchor and its empty-context signature.
+    fn ml_dsa_known_answer() -> (TrustAnchor, Vec<u8>) {
+        let public_key: [u8; ML_DSA_87_PUBLIC_KEY_LEN] =
+            decode_hex(ML_DSA_KNOWN_ANSWER_PUBLIC_KEY.trim())
+                .try_into()
+                .expect("a raw ML-DSA-87 public key");
+        let signature = decode_hex(ML_DSA_KNOWN_ANSWER_SIGNATURE.trim());
+        assert_eq!(len_u64(&signature), ML_DSA_87_SIGNATURE_LEN);
+        (TrustAnchor::new_ml_dsa_87(&public_key, false), signature)
+    }
+
+    #[test]
+    fn the_ml_dsa_87_known_answer_verifies_and_its_context_signature_does_not() {
+        // OpenSSL 3.5 made both signatures under one key over one message.
+        // The verifier is pure ML-DSA-87 with an empty context, so it accepts
+        // the first and refuses the second, whose context string FIPS 204
+        // binds into what was signed.
+        assert_eq!(ML_DSA_KNOWN_ANSWER_MESSAGE, KNOWN_ANSWER_MANIFEST);
+        let (anchor, signature) = ml_dsa_known_answer();
+        assert_eq!(anchor.algorithm(), SignatureAlgorithm::MlDsa87);
+        assert!(anchor.verifies(ML_DSA_KNOWN_ANSWER_MESSAGE, &signature));
+        assert!(!anchor.verifies(ML_DSA_KNOWN_ANSWER_MESSAGE, &flipped(&signature)));
+        assert!(!anchor.verifies(b"another message", &signature));
+
+        let context_signature = decode_hex(ML_DSA_KNOWN_ANSWER_CONTEXT_SIGNATURE.trim());
+        assert_eq!(len_u64(&context_signature), ML_DSA_87_SIGNATURE_LEN);
+        assert!(!anchor.verifies(ML_DSA_KNOWN_ANSWER_MESSAGE, &context_signature));
+
+        // Nor does an Ed25519 anchor ever verify it, whatever its key.
+        let ed25519 = TrustAnchor::new(public_key_of(&keypair()), false);
+        assert!(!ed25519.verifies(ML_DSA_KNOWN_ANSWER_MESSAGE, &signature));
     }
 
     // ---- The statement checks as one unit --------------------------------
@@ -5475,8 +5983,8 @@ mod tests {
         use super::{
             ARTIFACT_BYTES, ARTIFACT_SHA256, COMMIT, COMPONENT, Ed25519KeyPair, ImagePlatform,
             MEMBER, TRUST_TARGET, TrustAnchor, TrustSet, VERSION, VerifyError, VerifyRequest,
-            artifact_json, declaration, default_artifact, image_artifact_json, keypair, len_u64,
-            manifest_json, namespaced, public_key_of, signed_pkg, verify_err,
+            artifact_json, companion, declaration, default_artifact, image_artifact_json, keypair,
+            len_u64, manifest_json, namespaced, public_key_of, signed_pkg, verify_err,
         };
         use crate::image::ImageArchitecture;
         use crate::manifest::PayloadManifest;
@@ -5497,7 +6005,10 @@ mod tests {
 
         fn trust(pair: &Ed25519KeyPair, withdrawn: &[(&str, &str, &str)], epoch: u64) -> TrustSet {
             TrustSet::new(
-                vec![TrustAnchor::new(public_key_of(pair), false)],
+                vec![
+                    TrustAnchor::new(public_key_of(pair), false),
+                    companion(pair, false),
+                ],
                 withdrawn
                     .iter()
                     .map(|(a, b, c)| ((*a).to_string(), (*b).to_string(), (*c).to_string()))

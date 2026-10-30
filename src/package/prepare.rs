@@ -22,8 +22,8 @@ use super::{
 use crate::manifest::{PayloadManifest, TargetArch};
 use crate::payload::{
     ArtifactInput, ED25519_SIGNATURE_LEN, FOOTER_SIZE, FORMAT_VERSION, KEY_ID_HEX_LEN,
-    MemberLength, MemberLengthFault, PayloadError, SignerError, derive_manifest, to_hex,
-    write_archive_block,
+    ML_DSA_87_SIGNATURE_LEN, MemberLength, MemberLengthFault, PayloadError, SignerError,
+    derive_manifest, to_hex, write_archive_block,
 };
 use crate::retain::{PublishedFileName, RetentionError, RetentionScope, publish_directory, step};
 use crate::verify::{VerifyRequest, check_statements, map_manifest_error};
@@ -32,8 +32,10 @@ use crate::verify::{VerifyRequest, check_statements, map_manifest_error};
 mod tests;
 
 /// Bytes a finalized standalone package adds around the manifest and the
-/// archive block: the Ed25519 signature, its key ID and the current footer.
-const ENVELOPE_OVERHEAD: usize = ED25519_SIGNATURE_LEN + KEY_ID_HEX_LEN + FOOTER_SIZE;
+/// archive block: the Ed25519 signature and its key ID, the ML-DSA-87
+/// signature and its key ID, and the current footer — 4,924 in all.
+const ENVELOPE_OVERHEAD: usize =
+    ED25519_SIGNATURE_LEN + KEY_ID_HEX_LEN + ML_DSA_87_SIGNATURE_LEN + KEY_ID_HEX_LEN + FOOTER_SIZE;
 
 /// Prepares an **unsigned** standalone package from `inputs`: exactly one raw
 /// manifest block (M) and one compressed archive block (A), validated against

@@ -62,7 +62,7 @@ pub(super) mod tests;
 ///   that limit.
 /// - [`ContentError::LimitExceeded`] naming `RawManifest` or
 ///   `CompressedArchive` when the footer advertises a block longer than that
-///   limit, decided before the block is read and before the signature.
+///   limit, decided before the block is read and before either signature.
 /// - [`ContentError::Verify`] carrying exactly the verdict
 ///   [`verify_package`](crate::verify::verify_package) gives the same bytes.
 /// - [`ContentError::ArchitectureMismatch`] for the first artifact, in
@@ -636,8 +636,8 @@ pub enum ContentError {
     /// [`verify_upload`](super::verify_upload) could not derive the build to
     /// verify from an authenticated manifest.
     ///
-    /// Reachable only from that entry point, and only after the signature has
-    /// verified.
+    /// Reachable only from that entry point, and only after both signatures
+    /// have verified.
     #[error(transparent)]
     Upload(UploadRefusal),
 }
