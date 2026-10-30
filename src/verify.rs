@@ -99,7 +99,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::path::Path;
 
-use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
+use aws_lc_rs::signature::{ED25519, ED25519_PUBLIC_KEY_LEN, UnparsedPublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::image::{
@@ -148,6 +148,12 @@ pub const KEY_ID_HEX_LEN: u64 = 64;
 /// answers one from its length rather than reading it.
 pub const ED25519_SIGNATURE_LEN: u64 = 64;
 
+/// Number of bytes a raw ML-DSA-87 (FIPS 204) public key is.
+///
+/// The raw encoding and nothing else: an SPKI or DER wrapper around the same
+/// key has another length, so a key of this length is never a wrapped one.
+pub const ML_DSA_87_PUBLIC_KEY_LEN: usize = 2592;
+
 /// The lengths at which this verifier reads the container's envelope blocks.
 ///
 /// Both blocks are read before anything has been authenticated, from a footer
@@ -167,9 +173,8 @@ pub const ENVELOPE_BOUNDS: EnvelopeBounds = EnvelopeBounds {
 /// rather than characters.
 const MAX_BUILD_IDENTIFIER_BYTES: usize = 128;
 
-/// Derives the `key_id` of an Ed25519 public key: the lowercase-hex SHA-256 of
-/// the 32 raw public-key bytes, rendered in full: 64 ASCII characters,
-/// untruncated.
+/// Derives the `key_id` of a public key: the lowercase-hex SHA-256 of the raw
+/// public-key bytes, rendered in full: 64 ASCII characters, untruncated.
 ///
 /// One producer writes this value and two independent verifiers compare it byte
 /// for byte, so the derivation is fixed rather than conventional and this is the
@@ -178,14 +183,16 @@ const MAX_BUILD_IDENTIFIER_BYTES: usize = 128;
 /// second hand-rolled formatting site is precisely how a producer and a verifier
 /// come to disagree.
 ///
-/// The input is the raw key: not an SPKI or DER wrapper, not the seed, never the
-/// private key. The fixed-size array carries that requirement in the type rather
-/// than as a runtime check.
+/// The input is the raw key of either [`SignatureAlgorithm`] — the 32 bytes of
+/// an Ed25519 key or the [`ML_DSA_87_PUBLIC_KEY_LEN`] bytes of an ML-DSA-87 one
+/// — and never an SPKI or DER wrapper, the seed, or the private key. Nothing
+/// here can tell a wrapper from a raw key, so a caller derives the id only from
+/// a key whose length it has already checked against its algorithm.
 ///
 /// It is never truncated, because `key_id` doubles as an anchor index where a
 /// collision would silently select the wrong key.
 #[must_use]
-pub fn key_id(public_key: &[u8; 32]) -> String {
+pub fn key_id(public_key: &[u8]) -> String {
     payload::sha256_hex(public_key)
 }
 
@@ -236,6 +243,46 @@ impl std::fmt::Display for BuildIdentifier {
             Self::Component => "component",
             Self::Version => "version",
             Self::Commit => "commit",
+        };
+        f.write_str(name)
+    }
+}
+
+/// A package signature algorithm, and the algorithm of the anchor a signature
+/// of it is verified under.
+///
+/// A package carries one signature of each, over the same raw manifest block,
+/// so a cryptanalytic break of one algorithm alone is not enough to forge one.
+/// The serde spellings are a trust-set document's `algorithm` values; nothing
+/// else is accepted in their place, case variants included. The trust-set
+/// reader takes the value as a string before matching it, so the derive's
+/// externally tagged object form is not accepted there either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+pub enum SignatureAlgorithm {
+    /// Ed25519, over a 32-byte raw public key.
+    #[serde(rename = "ed25519")]
+    Ed25519,
+    /// Pure ML-DSA-87 (FIPS 204), over a [`ML_DSA_87_PUBLIC_KEY_LEN`]-byte raw
+    /// public key.
+    #[serde(rename = "ml-dsa-87")]
+    MlDsa87,
+}
+
+impl SignatureAlgorithm {
+    /// Returns the number of bytes a raw public key of this algorithm is.
+    pub(crate) const fn public_key_len(self) -> usize {
+        match self {
+            Self::Ed25519 => ED25519_PUBLIC_KEY_LEN,
+            Self::MlDsa87 => ML_DSA_87_PUBLIC_KEY_LEN,
+        }
+    }
+}
+
+impl std::fmt::Display for SignatureAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Ed25519 => "Ed25519",
+            Self::MlDsa87 => "ML-DSA-87",
         };
         f.write_str(name)
     }
@@ -292,15 +339,21 @@ pub enum InputError {
 /// [`VerifyError::RevokedKey`] from [`VerifyError::BadSignature`] means
 /// verifying *under* the revoked key, so an input shape that dropped it could
 /// not answer the question.
+///
+/// Every anchor is of one [`SignatureAlgorithm`], and a signature is only ever
+/// looked up among the anchors of its own algorithm.
 #[derive(Debug, Clone)]
 pub struct TrustAnchor {
-    public_key: [u8; 32],
+    algorithm: SignatureAlgorithm,
+    /// The raw key, at exactly the length of `algorithm`: each constructor takes
+    /// a fixed-size array, so the length is carried by the type it came in as.
+    public_key: Box<[u8]>,
     revoked: bool,
     key_id: String,
 }
 
 impl TrustAnchor {
-    /// Creates an anchor from its raw Ed25519 public key and revocation flag,
+    /// Creates an Ed25519 anchor from its raw public key and revocation flag,
     /// deriving the `key_id` itself.
     ///
     /// The id is never supplied: a caller cannot hand in one that disagrees
@@ -308,17 +361,40 @@ impl TrustAnchor {
     /// derivation site to drift from [`key_id`].
     #[must_use]
     pub fn new(public_key: [u8; 32], revoked: bool) -> Self {
+        Self::of(SignatureAlgorithm::Ed25519, Box::new(public_key), revoked)
+    }
+
+    /// Creates an ML-DSA-87 anchor from its raw public key and revocation flag,
+    /// deriving the `key_id` itself on the same terms as [`TrustAnchor::new`].
+    #[must_use]
+    pub fn new_ml_dsa_87(public_key: &[u8; ML_DSA_87_PUBLIC_KEY_LEN], revoked: bool) -> Self {
+        Self::of(
+            SignatureAlgorithm::MlDsa87,
+            Box::from(public_key.as_slice()),
+            revoked,
+        )
+    }
+
+    fn of(algorithm: SignatureAlgorithm, public_key: Box<[u8]>, revoked: bool) -> Self {
         let key_id = key_id(&public_key);
         Self {
+            algorithm,
             public_key,
             revoked,
             key_id,
         }
     }
 
-    /// Returns the anchor's raw Ed25519 public key.
+    /// Returns the algorithm this anchor's key is of.
     #[must_use]
-    pub fn public_key(&self) -> &[u8; 32] {
+    pub fn algorithm(&self) -> SignatureAlgorithm {
+        self.algorithm
+    }
+
+    /// Returns the anchor's raw public key: 32 bytes for an Ed25519 anchor,
+    /// [`ML_DSA_87_PUBLIC_KEY_LEN`] for an ML-DSA-87 one.
+    #[must_use]
+    pub fn public_key(&self) -> &[u8] {
         &self.public_key
     }
 
@@ -335,8 +411,11 @@ impl TrustAnchor {
         &self.key_id
     }
 
-    /// Reports whether `signature` verifies over `message` under this anchor's
-    /// key.
+    /// Reports whether the Ed25519 `signature` verifies over `message` under
+    /// this anchor's key.
+    ///
+    /// Ed25519 only: [`verify_signature`] calls it on the set's Ed25519 anchors
+    /// and on no other, so an ML-DSA-87 key is never handed to it.
     fn verifies(&self, message: &[u8], signature: &[u8]) -> bool {
         UnparsedPublicKey::new(&ED25519, &self.public_key)
             .verify(message, signature)
@@ -623,13 +702,17 @@ impl VerifyRequest {
     /// delivered document before anything has authenticated it. That decode is
     /// permitted and it is bounded:
     ///
-    /// - it is **permissive**, and it reads `anchors` (each entry's `key_id`,
-    ///   `public_key` and `revoked`) and `epoch` and **no other field** —
-    ///   those two because they are the only ones this call consumes: `anchors`
-    ///   supplies the candidate anchors and `epoch` in decimal is this
-    ///   request's `version`. The request's other two parts need no parse at
-    ///   all: `target` is [`TRUST_TARGET`] and `commit` is the document
-    ///   member's digest over the bytes just read;
+    /// - it is **permissive**, and it reads `anchors` (each entry's
+    ///   `algorithm`, `public_key` and `revoked`, never its `key_id`, which the
+    ///   anchor derives from the key) and `epoch` and **no other field**,
+    ///   `trust_set_version` included — those two because they are the only
+    ///   ones this call consumes: `anchors` supplies the candidate anchors and
+    ///   `epoch` in decimal is this request's `version`. An entry naming no
+    ///   `algorithm`, an unknown one, or a key that is not exactly that
+    ///   algorithm's length fails the decode, so a version 1 document, whose
+    ///   anchors name no algorithm, ends there. The request's other two parts
+    ///   need no parse at all: `target` is [`TRUST_TARGET`] and `commit` is
+    ///   the document member's digest over the bytes just read;
     /// - it is **not** the refusing reader in
     ///   [`crate::trust_set`]. Running that here would be a defect: it would
     ///   report a parse refusal where a signature failure belongs, and would
@@ -1810,6 +1893,11 @@ fn usable_hint(block: &EnvelopeBlock) -> Option<&str> {
 /// anchors in a fixed order: the hinted non-revoked anchor, then every other
 /// non-revoked one, then the revoked ones.
 ///
+/// The signature is Ed25519, so every step runs over the set's Ed25519 anchors
+/// alone: the hint is matched only against them, only they are tried, and a
+/// hint naming an ML-DSA-87 anchor names no anchor of this signature's
+/// algorithm. An ML-DSA-87 anchor is never tried against it.
+///
 /// The hint may change which anchor is tried first, and — when the package was
 /// going to be rejected regardless — which of two names the rejection carries.
 /// It can never change accept into reject: every non-revoked anchor is tried
@@ -1838,13 +1926,16 @@ fn verify_signature<'t, R: Read + Seek>(
     let verifies = |anchor: &TrustAnchor| {
         signature.is_some_and(|signature| anchor.verifies(message, signature))
     };
+    let anchors = || {
+        trust
+            .anchors
+            .iter()
+            .filter(|anchor| anchor.algorithm == SignatureAlgorithm::Ed25519)
+    };
 
     // 1. A usable hint naming a non-revoked anchor selects what to try first.
     if let Some(hint) = hint
-        && let Some(anchor) = trust
-            .anchors
-            .iter()
-            .find(|anchor| !anchor.revoked && anchor.key_id == hint)
+        && let Some(anchor) = anchors().find(|anchor| !anchor.revoked && anchor.key_id == hint)
         && verifies(anchor)
     {
         return Ok(&anchor.key_id);
@@ -1854,7 +1945,7 @@ fn verify_signature<'t, R: Read + Seek>(
     //    that verifies means accept, which is what makes the hint unable to
     //    deny. Re-trying the hinted anchor here costs one verification and
     //    keeps the fallback a single unconditional loop.
-    for anchor in trust.anchors.iter().filter(|anchor| !anchor.revoked) {
+    for anchor in anchors().filter(|anchor| !anchor.revoked) {
         if verifies(anchor) {
             return Ok(&anchor.key_id);
         }
@@ -1863,7 +1954,7 @@ fn verify_signature<'t, R: Read + Seek>(
     // 3. Only now the revoked anchors: a package that verifies under one really
     //    was signed by a revoked key, which is a different verdict from a
     //    signature nobody can attribute.
-    for anchor in trust.anchors.iter().filter(|anchor| anchor.revoked) {
+    for anchor in anchors().filter(|anchor| anchor.revoked) {
         if verifies(anchor) {
             return Err(VerifyError::RevokedKey {
                 key_id: anchor.key_id.clone(),
@@ -1871,11 +1962,11 @@ fn verify_signature<'t, R: Read + Seek>(
         }
     }
 
-    // 4. Nothing verified. A usable hint naming no anchor at all — revoked ones
-    //    included — is the package naming a key we do not hold; everything else
-    //    is a signature we cannot attribute.
+    // 4. Nothing verified. A usable hint naming no Ed25519 anchor at all —
+    //    revoked ones included — is the package naming a key we do not hold;
+    //    everything else is a signature we cannot attribute.
     match hint {
-        Some(hint) if !trust.anchors.iter().any(|anchor| anchor.key_id == hint) => {
+        Some(hint) if !anchors().any(|anchor| anchor.key_id == hint) => {
             Err(VerifyError::UnknownKeyId {
                 key_id: hint.to_string(),
             })
@@ -2261,9 +2352,10 @@ mod tests {
 
     use super::{
         BuildIdentifier, ED25519_SIGNATURE_LEN, ENVELOPE_BOUNDS, ImageReferences, ImageVerifyError,
-        InputError, KEY_ID_HEX_LEN, MAX_BUILD_IDENTIFIER_BYTES, ReferenceConflict, TRUST_TARGET,
-        TrustAnchor, TrustSet, VerifiedPackage, VerifyError, VerifyRequest,
-        is_safe_build_identifier, key_id, verify_package,
+        InputError, KEY_ID_HEX_LEN, MAX_BUILD_IDENTIFIER_BYTES, ML_DSA_87_PUBLIC_KEY_LEN,
+        ReferenceConflict, SignatureAlgorithm, TRUST_TARGET, TrustAnchor, TrustSet,
+        VerifiedPackage, VerifyError, VerifyRequest, is_safe_build_identifier, key_id,
+        verify_package,
     };
     use crate::image::{
         ImageArchitecture, ImageDeclaration, ImageDeclarationError, ImageOs, ImageOwner,
@@ -2277,6 +2369,7 @@ mod tests {
     use crate::payload::{
         self, ArtifactInput, EnvelopeBlock, FORMAT_VERSION, MAGIC, PayloadError, Signed,
     };
+    use crate::trust_fixture::{hex_of, ml_dsa_keypair, ml_dsa_public_key_of};
 
     /// Component every fixture artifact belongs to, and the target a fixture
     /// request names.
@@ -3223,6 +3316,106 @@ mod tests {
         ));
     }
 
+    /// A live ML-DSA-87 anchor over a freshly minted key.
+    fn ml_dsa_anchor(revoked: bool) -> TrustAnchor {
+        TrustAnchor::new_ml_dsa_87(&ml_dsa_public_key_of(&ml_dsa_keypair()), revoked)
+    }
+
+    #[test]
+    fn an_ed25519_signer_verifies_under_a_set_also_holding_ml_dsa_87_anchors() {
+        let signer = keypair();
+        let hint = key_id_of(&signer);
+        let package = signed_pkg(
+            &signer,
+            &default_manifest(),
+            &default_archive(),
+            Some(hint.as_bytes()),
+        );
+        // The ML-DSA-87 anchors before the signer, so the signer is not merely
+        // the first anchor tried.
+        let trust = trust_of(vec![
+            ml_dsa_anchor(false),
+            ml_dsa_anchor(true),
+            TrustAnchor::new(public_key_of(&signer), false),
+        ]);
+        assert!(verify_package(Cursor::new(package), &trust, &request()).is_ok());
+    }
+
+    #[test]
+    fn a_hint_naming_an_ml_dsa_87_anchor_names_no_anchor_of_the_signatures_algorithm() {
+        // The signer is absent and the hint names an anchor the set does hold,
+        // but of the other algorithm: the Ed25519 signature is looked up only
+        // among Ed25519 anchors, so the package names a key we do not hold.
+        let stranger = keypair();
+        let ml_dsa = ml_dsa_anchor(false);
+        let trust = trust_of(vec![
+            TrustAnchor::new(public_key_of(&keypair()), false),
+            ml_dsa.clone(),
+        ]);
+        let package = signed_pkg(
+            &stranger,
+            &default_manifest(),
+            &default_archive(),
+            Some(ml_dsa.key_id().as_bytes()),
+        );
+        assert!(matches!(
+            refusal(&package, &trust),
+            VerifyError::UnknownKeyId { key_id } if key_id == ml_dsa.key_id()
+        ));
+    }
+
+    #[test]
+    fn a_set_holding_only_ml_dsa_87_anchors_attributes_no_ed25519_signature() {
+        let signer = keypair();
+        let live = ml_dsa_anchor(false);
+        let trust = trust_of(vec![live.clone(), ml_dsa_anchor(true)]);
+        let signers_id = key_id_of(&signer);
+        for hint in [signers_id.as_str(), live.key_id()] {
+            let package = signed_pkg(
+                &signer,
+                &default_manifest(),
+                &default_archive(),
+                Some(hint.as_bytes()),
+            );
+            assert!(
+                matches!(
+                    refusal(&package, &trust),
+                    VerifyError::UnknownKeyId { ref key_id } if key_id == hint
+                ),
+                "a usable hint {hint} names no Ed25519 anchor"
+            );
+        }
+        let package = signed_pkg(&signer, &default_manifest(), &default_archive(), None);
+        assert!(matches!(
+            refusal(&package, &trust),
+            VerifyError::BadSignature
+        ));
+    }
+
+    #[test]
+    fn a_revoked_ed25519_signer_is_revoked_key_whatever_ml_dsa_87_anchors_the_set_holds() {
+        let revoked = keypair();
+        let expected = key_id_of(&revoked);
+        let package = signed_pkg(
+            &revoked,
+            &default_manifest(),
+            &default_archive(),
+            Some(expected.as_bytes()),
+        );
+        for ml_dsa in [
+            vec![],
+            vec![ml_dsa_anchor(false)],
+            vec![ml_dsa_anchor(true), ml_dsa_anchor(false)],
+        ] {
+            let mut anchors = ml_dsa;
+            anchors.push(TrustAnchor::new(public_key_of(&revoked), true));
+            assert!(matches!(
+                refusal(&package, &trust_of(anchors)),
+                VerifyError::RevokedKey { ref key_id } if *key_id == expected
+            ));
+        }
+    }
+
     #[test]
     fn a_hint_naming_a_revoked_anchor_that_does_not_verify_is_bad_signature() {
         // A revoked anchor is still an anchor the set holds, so a hint naming
@@ -3796,7 +3989,72 @@ mod tests {
         let anchor = TrustAnchor::new(public_key, false);
         assert_eq!(anchor.key_id(), key_id(&public_key));
         assert_eq!(anchor.public_key(), &public_key);
+        assert_eq!(anchor.algorithm(), SignatureAlgorithm::Ed25519);
         assert!(!anchor.is_revoked());
+    }
+
+    #[test]
+    fn an_ml_dsa_87_anchors_key_id_is_the_sha256_of_its_raw_key() {
+        // SHA-256 over the 2,592 bytes `i % 256` for `i` in `0..2592`,
+        // computed outside this crate.
+        const PATTERN_SHA256: &str =
+            "78b91acdc934546ac7822b9e9a0357c93fe06f495a145d40babb8ca5cae1ac03";
+        let mut public_key = [0_u8; ML_DSA_87_PUBLIC_KEY_LEN];
+        for (slot, byte) in public_key.iter_mut().zip((0..=u8::MAX).cycle()) {
+            *slot = byte;
+        }
+        let anchor = TrustAnchor::new_ml_dsa_87(&public_key, false);
+        assert_eq!(anchor.key_id(), PATTERN_SHA256);
+        assert_eq!(key_id(&public_key), PATTERN_SHA256);
+        assert_eq!(anchor.algorithm(), SignatureAlgorithm::MlDsa87);
+        assert_eq!(anchor.public_key(), public_key.as_slice());
+        assert!(!anchor.is_revoked());
+        assert!(TrustAnchor::new_ml_dsa_87(&public_key, true).is_revoked());
+
+        // And a real key, against a second SHA-256 implementation.
+        let real = ml_dsa_public_key_of(&ml_dsa_keypair());
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &real);
+        assert_eq!(
+            TrustAnchor::new_ml_dsa_87(&real, false).key_id(),
+            hex_of(digest.as_ref())
+        );
+    }
+
+    #[test]
+    fn two_anchors_sharing_an_ml_dsa_87_key_are_refused() {
+        let public_key = ml_dsa_public_key_of(&ml_dsa_keypair());
+        let error = TrustSet::new(
+            vec![
+                TrustAnchor::new_ml_dsa_87(&public_key, false),
+                TrustAnchor::new_ml_dsa_87(&public_key, true),
+            ],
+            Vec::new(),
+            MIN_MANIFEST_FORMAT_VERSION,
+            0,
+        )
+        .expect_err("two anchors sharing a key must be refused");
+        assert!(
+            matches!(error, InputError::DuplicateAnchor { ref key_id } if *key_id == super::key_id(&public_key))
+        );
+    }
+
+    #[test]
+    fn signature_algorithms_display_and_deserialize_by_their_own_names() {
+        assert_eq!(SignatureAlgorithm::Ed25519.to_string(), "Ed25519");
+        assert_eq!(SignatureAlgorithm::MlDsa87.to_string(), "ML-DSA-87");
+        for (json, expected) in [
+            (r#""ed25519""#, SignatureAlgorithm::Ed25519),
+            (r#""ml-dsa-87""#, SignatureAlgorithm::MlDsa87),
+        ] {
+            let parsed: SignatureAlgorithm = serde_json::from_str(json).expect("a known spelling");
+            assert_eq!(parsed, expected);
+        }
+        for json in [r#""Ed25519""#, r#""ML-DSA-87""#, r#""ml-dsa-65""#, "1"] {
+            assert!(
+                serde_json::from_str::<SignatureAlgorithm>(json).is_err(),
+                "{json}"
+            );
+        }
     }
 
     #[test]

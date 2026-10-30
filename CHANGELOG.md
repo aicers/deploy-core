@@ -6,6 +6,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `verify::SignatureAlgorithm`, `Ed25519` or `MlDsa87`, names a package
+  signature algorithm, and `verify::ML_DSA_87_PUBLIC_KEY_LEN` is the 2,592 bytes
+  of a raw ML-DSA-87 public key.
+
 ### Changed
 
 - `Executor::run`, `Executor::run_with_input`, `Executor::open_channel` and
@@ -34,6 +40,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   methods; both were `ExecutorError::Connection` before. `ExecutorError` is not
   `#[non_exhaustive]`, so a `match` over it without a wildcard arm must handle
   the two new variants.
+- The trust-set generation document is version 2. Every anchor carries an
+  `algorithm`, `ed25519` or `ml-dsa-87`, and its `public_key` is that
+  algorithm's raw public key in lowercase hex: 64 characters for Ed25519, 5,184
+  for ML-DSA-87. A document must carry at least one non-revoked anchor of each
+  algorithm and is refused with the new
+  `TrustSetDocumentError::MissingLiveAnchor` otherwise. A version 1 document is
+  refused and nothing converts it: every `release_trust` admission door refuses
+  to admit one, and every function that reads an installed version 1 generation
+  refuses it with `TrustSetDocumentError::UnsupportedVersion`.
+  `trust_set::TrustSetAnchor` gains the `algorithm` field, and
+  `TrustSetDocumentError::MalformedPublicKey` names the algorithm.
+- `verify::TrustAnchor` carries its algorithm. `TrustAnchor::new` still builds
+  an Ed25519 anchor, the new `TrustAnchor::new_ml_dsa_87` builds an ML-DSA-87
+  one, `TrustAnchor::algorithm` says which, and `TrustAnchor::public_key`
+  returns `&[u8]` instead of `&[u8; 32]`. `verify::key_id` takes any raw public
+  key as `&[u8]`. A package's `key_id` hint, and every anchor tried for its
+  Ed25519 signature, are taken only from the trust set's Ed25519 anchors, so a
+  hint naming an ML-DSA-87 anchor is `VerifyError::UnknownKeyId`.
 
 ### Fixed
 

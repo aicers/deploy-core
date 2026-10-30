@@ -17,7 +17,7 @@
 //! path: every fixture key pair is minted afresh from the system RNG.
 
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
 use tar::{Builder, EntryType, Header};
 use zstd::Encoder;
 
@@ -30,7 +30,7 @@ use crate::trust_set::{
     ANCHORS_FIELD, EPOCH_FIELD, TRUST_SET_MEMBER, TRUST_SET_VERSION, TRUST_SET_VERSION_FIELD,
     WITHDRAWN_BUILDS_FIELD, member_digest,
 };
-use crate::verify::{TRUST_TARGET, key_id};
+use crate::verify::{ML_DSA_87_PUBLIC_KEY_LEN, SignatureAlgorithm, TRUST_TARGET, key_id};
 
 /// Epoch every well-formed fixture generation carries unless a test names its
 /// own.
@@ -54,6 +54,30 @@ pub(crate) fn public_key_of(pair: &Ed25519KeyPair) -> [u8; 32] {
         .expect("an ed25519 public key is 32 bytes")
 }
 
+/// Mints an ephemeral ML-DSA-87 key pair.
+///
+/// Only its public key is ever used: the containers these fixtures mint are
+/// signed with an Ed25519 pair alone.
+pub(crate) fn ml_dsa_keypair() -> PqdsaKeyPair {
+    PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).expect("key generation should succeed")
+}
+
+/// Returns an ML-DSA-87 key pair's raw public key.
+pub(crate) fn ml_dsa_public_key_of(pair: &PqdsaKeyPair) -> [u8; ML_DSA_87_PUBLIC_KEY_LEN] {
+    pair.public_key()
+        .as_ref()
+        .try_into()
+        .expect("an ML-DSA-87 public key is 2,592 bytes")
+}
+
+/// Returns how a document spells `algorithm`.
+pub(crate) fn algorithm_name(algorithm: SignatureAlgorithm) -> &'static str {
+    match algorithm {
+        SignatureAlgorithm::Ed25519 => "ed25519",
+        SignatureAlgorithm::MlDsa87 => "ml-dsa-87",
+    }
+}
+
 /// Renders bytes as the lowercase hex a document writes them as.
 pub(crate) fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -75,15 +99,57 @@ pub(crate) fn array(items: &[String]) -> String {
 
 /// Renders one anchor entry verbatim, so a fixture can state a `key_id` or a
 /// `public_key` no derivation would produce.
-pub(crate) fn anchor_json(key_id: &str, public_key: &str, revoked: bool) -> String {
-    format!(r#"{{"key_id":"{key_id}","public_key":"{public_key}","revoked":{revoked}}}"#)
+pub(crate) fn anchor_json(
+    algorithm: SignatureAlgorithm,
+    key_id: &str,
+    public_key: &str,
+    revoked: bool,
+) -> String {
+    let algorithm = algorithm_name(algorithm);
+    format!(
+        r#"{{"algorithm":"{algorithm}","key_id":"{key_id}","public_key":"{public_key}","revoked":{revoked}}}"#
+    )
 }
 
-/// The anchor entry `pair` really writes: its `key_id` derived from its own
-/// `public_key`.
+/// The Ed25519 anchor entry `pair` really writes: its `key_id` derived from
+/// its own `public_key`.
 pub(crate) fn anchor_of(pair: &Ed25519KeyPair, revoked: bool) -> String {
     let public_key = public_key_of(pair);
-    anchor_json(&key_id(&public_key), &hex_of(&public_key), revoked)
+    anchor_json(
+        SignatureAlgorithm::Ed25519,
+        &key_id(&public_key),
+        &hex_of(&public_key),
+        revoked,
+    )
+}
+
+/// The anchor entry `pair` would have written in a version 1 document: the
+/// same entry with no `algorithm`, which no reader of this build accepts.
+pub(crate) fn version_1_anchor_of(pair: &Ed25519KeyPair, revoked: bool) -> String {
+    let public_key = public_key_of(pair);
+    format!(
+        r#"{{"key_id":"{}","public_key":"{}","revoked":{revoked}}}"#,
+        key_id(&public_key),
+        hex_of(&public_key)
+    )
+}
+
+/// The ML-DSA-87 anchor entry `pair` really writes, on the terms of
+/// [`anchor_of`].
+pub(crate) fn ml_dsa_anchor_of(pair: &PqdsaKeyPair, revoked: bool) -> String {
+    let public_key = ml_dsa_public_key_of(pair);
+    anchor_json(
+        SignatureAlgorithm::MlDsa87,
+        &key_id(&public_key),
+        &hex_of(&public_key),
+        revoked,
+    )
+}
+
+/// A live ML-DSA-87 anchor entry over a freshly minted key, for a document
+/// whose ML-DSA-87 half nothing else looks at.
+pub(crate) fn live_ml_dsa_anchor() -> String {
+    ml_dsa_anchor_of(&ml_dsa_keypair(), false)
 }
 
 /// Renders one withdrawn-build entry verbatim.
@@ -107,25 +173,35 @@ pub(crate) struct Fields {
 }
 
 impl Fields {
-    /// A well-formed generation trusting `pair` alone.
+    /// A well-formed generation trusting `pair` as its one Ed25519 anchor,
+    /// beside one live ML-DSA-87 anchor over a freshly minted key.
     pub(crate) fn new(pair: &Ed25519KeyPair) -> Self {
         Self {
             trust_set_version: Some(TRUST_SET_VERSION.to_string()),
             epoch: Some(EPOCH.to_string()),
             min_manifest_format_version: Some(MIN_MANIFEST_FORMAT_VERSION.to_string()),
-            anchors: Some(array(&[anchor_of(pair, false)])),
+            anchors: Some(array(&[anchor_of(pair, false), live_ml_dsa_anchor()])),
             withdrawn_builds: Some(array(&[])),
             extra: Vec::new(),
         }
     }
 
-    /// A well-formed generation carrying exactly `anchors`.
+    /// A generation carrying exactly `anchors`, and otherwise well-formed.
     pub(crate) fn anchored(anchors: &[String]) -> Self {
         let pair = keypair();
         Self {
             anchors: Some(array(anchors)),
             ..Self::new(&pair)
         }
+    }
+
+    /// A generation carrying `ed25519` — the Ed25519 half under test — and,
+    /// after them, one live ML-DSA-87 anchor over a freshly minted key, so the
+    /// document's ML-DSA-87 half is well-formed.
+    pub(crate) fn with_ed25519_anchors(ed25519: &[String]) -> Self {
+        let mut anchors = ed25519.to_vec();
+        anchors.push(live_ml_dsa_anchor());
+        Self::anchored(&anchors)
     }
 
     pub(crate) fn render(&self) -> Vec<u8> {
@@ -149,8 +225,8 @@ impl Fields {
     }
 }
 
-/// The document a well-formed fixture carries: one live anchor, nothing
-/// withdrawn.
+/// The document a well-formed fixture carries: one live Ed25519 anchor, `pair`,
+/// one live ML-DSA-87 anchor, nothing withdrawn.
 pub(crate) fn default_document(pair: &Ed25519KeyPair) -> Vec<u8> {
     Fields::new(pair).render()
 }
