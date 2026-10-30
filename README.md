@@ -73,8 +73,9 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
 - **trust_set** — the generation document that verifier's injected material is
   delivered as, and the reader that refuses a malformed one rather than
   repairing it: a version gate, a structural decode that admits no unknown
-  field, and the semantic checks over the anchors and withdrawn builds. It
-  opens no file and performs no I/O.
+  field, and the semantic checks over the anchors and withdrawn builds. Each
+  anchor is typed `ed25519` or `ml-dsa-87`, and a generation needs a non-revoked
+  anchor of each. It opens no file and performs no I/O.
 - **release_trust** — the on-host release-trust tree that document is installed
   into: a sibling of the mTLS tree holding `active` and `gen-<n>/`, where one
   generation is the delivered container, the verified member and a one-integer

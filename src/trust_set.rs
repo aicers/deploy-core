@@ -16,10 +16,18 @@
 //!
 //! One generation is one UTF-8 JSON object carried in a member named
 //! `TRUST_SET_MEMBER`, with exactly the five fields of [`TrustSetDocument`]
-//! and no others. The numeric domains are the verifier's own —
+//! and no others, and each anchor entry carries exactly the four fields of
+//! [`TrustSetAnchor`]: its `algorithm` (`ed25519` or `ml-dsa-87`), its
+//! `key_id`, its raw `public_key` in lowercase hex and its `revoked` flag. The
+//! schema is version 2; a version 1 document, whose anchors named no
+//! algorithm, is refused by the version gate and nothing converts it. The
+//! numeric domains are the verifier's own —
 //! [`TrustSet::new`](crate::verify::TrustSet::new) takes a `u64` `epoch` and a
 //! `u32` manifest floor — because a document is not the place to widen a type
 //! the code that consumes it has already fixed.
+//!
+//! A generation must carry a non-revoked anchor of **each** algorithm, because
+//! every package is signed with both and a verifier requires both.
 //!
 //! `min_manifest_format_version` is carried through at **any** `u32`, `0` and
 //! values above this build's manifest range included. The floor is release
@@ -55,7 +63,10 @@
 //!    the same silent divergence the unknown-field rule exists to prevent. An
 //!    unknown field is determined explicitly from the object's key set rather
 //!    than by matching a [`serde_json::Error`] message;
-//! 3. **the semantic checks**, in the order `check_document` applies them.
+//! 3. **the semantic checks**, in the order `check_document` applies them: the
+//!    `epoch`, the anchor list as a whole — not empty, not wholly revoked, then
+//!    a live anchor of each algorithm, Ed25519 first — then each anchor, then
+//!    each withdrawn entry.
 //!
 //! # The envelope
 //!
@@ -90,10 +101,12 @@
 //! the same decode and verify against the same candidate set. (Both are
 //! crate-private, so they are code spans rather than intra-doc links: this
 //! module is public, and a public doc linking to a private item is
-//! `rustdoc::private_intra_doc_links`.) It reads `anchors` and `epoch` and no
-//! other field,
-//! it is **not** this module's refusing reader, and it admits nothing: nothing
-//! it produces is stored, returned or becomes the generation. Admission is
+//! `rustdoc::private_intra_doc_links`.) It reads `epoch` and each anchor's
+//! `algorithm`, `public_key` and `revoked`, and no other field,
+//! `trust_set_version` included, so a version 1 document, whose anchors name
+//! no algorithm, fails it before the version gate ever runs. It is **not**
+//! this module's refusing reader, and it admits nothing: nothing it produces
+//! is stored, returned or becomes the generation. Admission is
 //! `verify_package` returning `Ok`, after which `read_trust_set_document`
 //! parses the member bytes again, from scratch, and the generation is built from
 //! *that* parse.
@@ -108,9 +121,13 @@
 use std::collections::HashSet;
 
 use serde::Deserialize;
+use serde::de::IntoDeserializer;
 
 use crate::payload;
-use crate::verify::{BuildIdentifier, TrustAnchor, TrustSet, is_safe_build_identifier, key_id};
+use crate::verify::{
+    BuildIdentifier, ML_DSA_87_PUBLIC_KEY_LEN, SignatureAlgorithm, TrustAnchor, TrustSet,
+    is_safe_build_identifier, key_id,
+};
 
 /// The one `trust_set_version` this reader implements.
 ///
@@ -118,7 +135,11 @@ use crate::verify::{BuildIdentifier, TrustAnchor, TrustSet, is_safe_build_identi
 /// `format_version` floor a document carries: the two version numbers move
 /// independently, and conflating them would tie a schema addition here to a
 /// manifest schema addition there.
-pub(crate) const TRUST_SET_VERSION: u32 = 1;
+///
+/// Version 1, whose anchors were untyped Ed25519 keys, is refused like any
+/// other version this reader does not implement: there is no second reader and
+/// no conversion.
+pub(crate) const TRUST_SET_VERSION: u32 = 2;
 
 /// Archive member the generation document is carried in.
 ///
@@ -131,11 +152,13 @@ pub(crate) const TRUST_SET_VERSION: u32 = 1;
 /// member's name on the wire and its name on disk cannot drift apart.
 pub(crate) const TRUST_SET_MEMBER: &str = "trust-set.json";
 
-/// Number of ASCII characters 32 bytes rendered as lowercase hex is.
+/// Number of ASCII characters 32 bytes rendered as lowercase hex is: the width
+/// of a `key_id`.
 ///
-/// Both `key_id` and `public_key` are fixed-width lowercase hex, which makes
-/// length and charset a single check and leaves no separate "decoded to the
-/// wrong number of bytes" case: 64 lowercase hex characters **is** 32 bytes.
+/// Both `key_id` and `public_key` are fixed-width lowercase hex — a
+/// `public_key` at its algorithm's width — which makes length and charset a
+/// single check and leaves no separate "decoded to the wrong number of bytes"
+/// case: 64 lowercase hex characters **is** 32 bytes.
 const HEX_32_LEN: usize = 64;
 
 /// Name of the field the version gate reads, and the only field it types.
@@ -147,6 +170,10 @@ pub(crate) const EPOCH_FIELD: &str = "epoch";
 /// Name of the anchor array, as both a decoded field and an unknown-field
 /// location.
 pub(crate) const ANCHORS_FIELD: &str = "anchors";
+
+/// Name of an anchor entry's algorithm field, which the pre-verification decode
+/// reads too.
+const ALGORITHM_FIELD: &str = "algorithm";
 
 /// Name of an anchor entry's raw key field, which the pre-verification decode
 /// reads too.
@@ -178,7 +205,7 @@ const TOP_LEVEL_FIELDS: [&str; 5] = [
 ];
 
 /// Every field an anchor entry may carry.
-const ANCHOR_FIELDS: [&str; 3] = ["key_id", PUBLIC_KEY_FIELD, REVOKED_FIELD];
+const ANCHOR_FIELDS: [&str; 4] = [ALGORITHM_FIELD, "key_id", PUBLIC_KEY_FIELD, REVOKED_FIELD];
 
 /// Every field a withdrawn-build entry may carry.
 const WITHDRAWN_BUILD_FIELDS: [&str; 3] = ["package_id", "version", "commit"];
@@ -194,9 +221,10 @@ const WITHDRAWN_BUILD_FIELDS: [&str; 3] = ["package_id", "version", "commit"];
 ///
 /// A value of this type that came out of `read_trust_set_document` has passed
 /// `check_document`, so its `epoch` is non-zero and its anchors are
-/// well-formed, distinct and not all revoked. The fields are public because this
-/// type appears in the signatures of items this crate exports to a root daemon
-/// that links it and cannot construct anything from the installer's repository.
+/// well-formed, distinct, and include a non-revoked anchor of each
+/// [`SignatureAlgorithm`]. The fields are public because this type appears in
+/// the signatures of items this crate exports to a root daemon that links it
+/// and cannot construct anything from the installer's repository.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustSetDocument {
@@ -227,17 +255,26 @@ pub struct TrustSetDocument {
 
 /// One anchor entry of a [`TrustSetDocument`], as it is written.
 ///
-/// A revoked anchor **keeps its `public_key`**: the verifier has to verify
-/// *under* a revoked key to tell a revoked signer from a bad signature, so an
-/// entry shape that dropped it could not answer the question.
+/// All four fields are required. A revoked anchor **keeps its `public_key`**:
+/// the verifier has to verify *under* a revoked key to tell a revoked signer
+/// from a bad signature, so an entry shape that dropped it could not answer the
+/// question.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustSetAnchor {
-    /// The key's index, which [`key_id`] derives from `public_key`: 64
-    /// lowercase-hex characters, untruncated.
+    /// The algorithm the key is of, written as the string `ed25519` or
+    /// `ml-dsa-87`.
+    #[serde(deserialize_with = "deserialize_algorithm")]
+    pub algorithm: SignatureAlgorithm,
+
+    /// The key's index, which [`key_id`] derives from the raw bytes of
+    /// `public_key`: 64 lowercase-hex characters, untruncated, for either
+    /// algorithm.
     pub key_id: String,
 
-    /// The 32 raw Ed25519 public-key bytes, as 64 lowercase-hex characters.
+    /// The raw public key of its `algorithm`, in lowercase hex: 32 bytes as 64
+    /// characters for Ed25519, [`ML_DSA_87_PUBLIC_KEY_LEN`] bytes as 5,184 for
+    /// ML-DSA-87. Never an SPKI or DER wrapper, which has another length.
     pub public_key: String,
 
     /// Whether this generation delivers the key as revoked.
@@ -355,6 +392,17 @@ pub enum TrustSetDocumentError {
     #[error("every anchor in the trust generation document is revoked")]
     AllAnchorsRevoked,
 
+    /// The document carries no non-revoked anchor of `algorithm`.
+    ///
+    /// A generation is valid only with at least one live anchor of each
+    /// algorithm, because every package is signed with both and a verifier
+    /// requires both.
+    #[error("the trust generation document carries no non-revoked {algorithm} anchor")]
+    MissingLiveAnchor {
+        /// The algorithm with no live anchor.
+        algorithm: SignatureAlgorithm,
+    },
+
     /// An anchor's `key_id` is not exactly 64 lowercase-hex characters.
     ///
     /// Uppercase hex is refused rather than folded, because [`key_id`] emits
@@ -365,10 +413,19 @@ pub enum TrustSetDocumentError {
         key_id: String,
     },
 
-    /// An anchor's `public_key` is not exactly 64 lowercase-hex characters,
-    /// equivalently not 32 bytes.
-    #[error("anchor `public_key` `{public_key}` is not {HEX_32_LEN} lowercase-hex characters")]
+    /// An anchor's `public_key` is not exactly its `algorithm`'s key length in
+    /// lowercase hex: 64 characters for Ed25519, 5,184 for ML-DSA-87.
+    ///
+    /// The message names the algorithm and the expected length and does not
+    /// render the value, which for an ML-DSA-87 key runs to thousands of
+    /// characters.
+    #[error(
+        "anchor `public_key` for {algorithm} is not {} lowercase-hex characters",
+        public_key_hex_len(*.algorithm)
+    )]
     MalformedPublicKey {
+        /// The algorithm the anchor declared.
+        algorithm: SignatureAlgorithm,
         /// The refused value.
         public_key: String,
     },
@@ -430,8 +487,8 @@ pub(crate) fn member_digest(bytes: &[u8]) -> String {
 }
 
 /// Decodes the two fields a self-admission consumes out of document bytes
-/// **nothing has vouched for yet**: every anchor's raw key and revocation flag,
-/// and the `epoch`.
+/// **nothing has vouched for yet**: every anchor's algorithm, raw key and
+/// revocation flag, and the `epoch`.
 ///
 /// This is the one decode permitted before verification, and the crate has
 /// exactly one copy of it — this one. Both the release-trust installer's
@@ -448,10 +505,17 @@ pub(crate) fn member_digest(bytes: &[u8]) -> String {
 /// produces is stored or becomes the generation; see
 /// `VerifyRequest::for_trust_self_admission`.
 ///
+/// No other field is read, `trust_set_version` included: this decode does not
+/// know which schema the bytes claim to be. A version 1 document therefore ends
+/// here at every admission path, because its anchors name no `algorithm`; a
+/// document labelled `1` whose anchors are typed passes this decode and is
+/// refused by [`read_trust_set_document`]'s version gate once verified.
+///
 /// Returns `None` — never a [`TrustSetDocumentError`], whose contract is "this
 /// is what a *verified* document said" — when the bytes are not a JSON object,
 /// when `epoch` is absent or is not an unsigned integer, when `anchors` is
-/// absent or is not an array, or when any entry fails to yield 32 key bytes and
+/// absent or is not an array, or when any entry fails to yield a known
+/// `algorithm`, a key of exactly that algorithm's length in lowercase hex, and
 /// a boolean flag. The decode is all-or-nothing: a caller names that failure
 /// with its own error type.
 pub(crate) fn provisional_anchors_and_epoch(bytes: &[u8]) -> Option<(Vec<TrustAnchor>, u64)> {
@@ -464,14 +528,17 @@ pub(crate) fn provisional_anchors_and_epoch(bytes: &[u8]) -> Option<(Vec<TrustAn
         .and_then(serde_json::Value::as_array)?;
     let mut anchors = Vec::with_capacity(entries.len());
     for entry in entries {
+        let algorithm = entry
+            .get(ALGORITHM_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|name| algorithm_named(name).ok())?;
         let public_key = entry
             .get(PUBLIC_KEY_FIELD)
-            .and_then(serde_json::Value::as_str)
-            .and_then(decode_lowercase_hex_32)?;
+            .and_then(serde_json::Value::as_str)?;
         let revoked = entry
             .get(REVOKED_FIELD)
             .and_then(serde_json::Value::as_bool)?;
-        anchors.push(TrustAnchor::new(public_key, revoked));
+        anchors.push(anchor_of(algorithm, public_key, revoked)?);
     }
     Some((anchors, epoch))
 }
@@ -517,17 +584,60 @@ pub(crate) fn self_admission_candidate(bytes: &[u8]) -> Option<(TrustSet, u64)> 
 /// [`TrustSetDocument`] that already passed [`read_trust_set_document`], so it
 /// exists to convert rather than to parse. It returns `Option` all the same
 /// because `public_key` is carried as text: `check_document` has already proved
-/// every entry decodes, which makes `None` unreachable through the reader, and
-/// an unreachable arm is answered by the caller rather than by a panic.
+/// every entry decodes to its algorithm's key bytes, which makes `None`
+/// unreachable through the reader, and an unreachable arm is answered by the
+/// caller rather than by a panic.
 pub(crate) fn document_anchors(document: &TrustSetDocument) -> Option<Vec<TrustAnchor>> {
     document
         .anchors
         .iter()
-        .map(|anchor| {
-            decode_lowercase_hex_32(&anchor.public_key)
-                .map(|public_key| TrustAnchor::new(public_key, anchor.revoked))
-        })
+        .map(|anchor| anchor_of(anchor.algorithm, &anchor.public_key, anchor.revoked))
         .collect()
+}
+
+/// Reads an anchor's `algorithm` field, which a document writes only as a
+/// string.
+///
+/// [`SignatureAlgorithm`]'s derived deserializer also accepts serde's externally
+/// tagged form, an object such as `{"ed25519":null}`, which is no document
+/// spelling. Taking a string first leaves exactly the two names, and any other
+/// shape is [`TrustSetDocumentError::Decode`].
+fn deserialize_algorithm<'de, D>(deserializer: D) -> Result<SignatureAlgorithm, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    algorithm_named(&name).map_err(serde::de::Error::custom)
+}
+
+/// Returns the [`SignatureAlgorithm`] a document's `algorithm` string names.
+///
+/// The one place the document spellings are matched, shared by the reader's
+/// field and the pre-verification decode, so the two cannot accept different
+/// values.
+fn algorithm_named(name: &str) -> Result<SignatureAlgorithm, serde::de::value::Error> {
+    SignatureAlgorithm::deserialize(name.into_deserializer())
+}
+
+/// Builds the verifier's anchor of `algorithm` out of the lowercase hex of its
+/// raw key, or `None` when the hex is not exactly that algorithm's key length.
+///
+/// The one place a document's key text becomes a [`TrustAnchor`], so the
+/// provisional decode and the conversion of a verified document cannot pick a
+/// constructor differently.
+fn anchor_of(
+    algorithm: SignatureAlgorithm,
+    public_key: &str,
+    revoked: bool,
+) -> Option<TrustAnchor> {
+    let bytes = decode_lowercase_hex(public_key, algorithm.public_key_len())?;
+    Some(match algorithm {
+        SignatureAlgorithm::Ed25519 => TrustAnchor::new(bytes.as_slice().try_into().ok()?, revoked),
+        SignatureAlgorithm::MlDsa87 => {
+            let key: &[u8; ML_DSA_87_PUBLIC_KEY_LEN] = bytes.as_slice().try_into().ok()?;
+            TrustAnchor::new_ml_dsa_87(key, revoked)
+        }
+    })
 }
 
 /// Reads a trust-set generation document out of `bytes`, refusing anything it
@@ -666,9 +776,12 @@ pub(crate) fn decode_document(bytes: &[u8]) -> Result<TrustSetDocument, TrustSet
 /// the anchor list as a whole, then each anchor, then each withdrawn entry.
 ///
 /// The order is the contract: a document carrying two of these faults is refused
-/// for the earlier one. Per anchor it is `key_id` shape, `public_key` shape,
-/// derivation agreement, then duplication; per withdrawn entry it is the
-/// identifier predicate, then duplication.
+/// for the earlier one. The list as a whole is: not empty, not wholly revoked,
+/// then a non-revoked anchor of each algorithm, Ed25519 before ML-DSA-87 — all
+/// decided before any single anchor is looked at. Per anchor it is `key_id`
+/// shape, `public_key` shape at the anchor's algorithm's length, derivation
+/// agreement, then duplication, which spans both algorithms; per withdrawn entry
+/// it is the identifier predicate, then duplication.
 pub(crate) fn check_document(document: &TrustSetDocument) -> Result<(), TrustSetDocumentError> {
     if document.epoch == 0 {
         return Err(TrustSetDocumentError::AbsentEpoch);
@@ -683,16 +796,28 @@ pub(crate) fn check_document(document: &TrustSetDocument) -> Result<(), TrustSet
     if document.anchors.iter().all(|anchor| anchor.revoked) {
         return Err(TrustSetDocumentError::AllAnchorsRevoked);
     }
+    for algorithm in [SignatureAlgorithm::Ed25519, SignatureAlgorithm::MlDsa87] {
+        if !document
+            .anchors
+            .iter()
+            .any(|anchor| anchor.algorithm == algorithm && !anchor.revoked)
+        {
+            return Err(TrustSetDocumentError::MissingLiveAnchor { algorithm });
+        }
+    }
 
     let mut seen: HashSet<&str> = HashSet::with_capacity(document.anchors.len());
     for anchor in &document.anchors {
-        if !is_lowercase_hex_32(&anchor.key_id) {
+        if !is_lowercase_hex(&anchor.key_id, HEX_32_LEN / 2) {
             return Err(TrustSetDocumentError::MalformedKeyId {
                 key_id: anchor.key_id.clone(),
             });
         }
-        let Some(public_key) = decode_lowercase_hex_32(&anchor.public_key) else {
+        let Some(public_key) =
+            decode_lowercase_hex(&anchor.public_key, anchor.algorithm.public_key_len())
+        else {
             return Err(TrustSetDocumentError::MalformedPublicKey {
+                algorithm: anchor.algorithm,
                 public_key: anchor.public_key.clone(),
             });
         };
@@ -755,29 +880,34 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-/// Reports whether `value` is exactly [`HEX_32_LEN`] lowercase-hex characters.
-fn is_lowercase_hex_32(value: &str) -> bool {
-    value.len() == HEX_32_LEN && value.bytes().all(|byte| hex_nibble(byte).is_some())
+/// Returns how many lowercase-hex characters a raw `algorithm` public key is
+/// written as.
+const fn public_key_hex_len(algorithm: SignatureAlgorithm) -> usize {
+    algorithm.public_key_len() * 2
 }
 
-/// Decodes exactly [`HEX_32_LEN`] lowercase-hex characters into the 32 bytes
-/// they are, or `None` at any other length, on any uppercase or non-hex
+/// Reports whether `value` is exactly `byte_len` bytes in lowercase hex, which
+/// is `2 * byte_len` characters.
+fn is_lowercase_hex(value: &str, byte_len: usize) -> bool {
+    value.len() == byte_len * 2 && value.bytes().all(|byte| hex_nibble(byte).is_some())
+}
+
+/// Decodes exactly `byte_len` bytes' worth of lowercase-hex characters into the
+/// bytes they are, or `None` at any other length, on any uppercase or non-hex
 /// character.
 ///
-/// The same check [`is_lowercase_hex_32`] makes, and the decoded bytes besides,
+/// The same check [`is_lowercase_hex`] makes, and the decoded bytes besides,
 /// so a caller that needs the key material does not test the shape twice.
-fn decode_lowercase_hex_32(value: &str) -> Option<[u8; 32]> {
-    if value.len() != HEX_32_LEN {
+fn decode_lowercase_hex(value: &str, byte_len: usize) -> Option<Vec<u8>> {
+    if value.len() != byte_len * 2 {
         return None;
     }
-    let bytes = value.as_bytes();
-    let mut out = [0_u8; 32];
-    for (index, slot) in out.iter_mut().enumerate() {
-        let high = hex_nibble(*bytes.get(index * 2)?)?;
-        let low = hex_nibble(*bytes.get(index * 2 + 1)?)?;
-        *slot = (high << 4) | low;
-    }
-    Some(out)
+    // The length is even, checked above, so the remainder is empty.
+    let (pairs, _) = value.as_bytes().as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|&[high, low]| Some((hex_nibble(high)? << 4) | hex_nibble(low)?))
+        .collect()
 }
 
 #[cfg(test)]
@@ -791,8 +921,10 @@ mod tests {
     // container, and the install-time admission paths built on them will too.
     use crate::trust_fixture::{
         EPOCH, Fields, anchor_json, anchor_of, array, default_document, generation_pkg, hex_of,
-        keypair, pkg_naming, public_key_of, withdrawn_json,
+        keypair, live_ml_dsa_anchor, ml_dsa_anchor_of, ml_dsa_keypair, ml_dsa_public_key_of,
+        pkg_naming, public_key_of, version_1_anchor_of, withdrawn_json,
     };
+    use crate::verify::SignatureAlgorithm::{Ed25519, MlDsa87};
     use crate::verify::{
         TRUST_TARGET, VerifiedPackage, VerifyError, VerifyRequest, verify_package,
     };
@@ -849,11 +981,55 @@ mod tests {
             MIN_MANIFEST_FORMAT_VERSION
         );
         assert_eq!(document.withdrawn_builds, [] as [WithdrawnBuild; 0]);
-        let anchor = document.anchors.first().expect("one anchor");
-        assert_eq!(document.anchors.len(), 1);
+        let [anchor, ml_dsa] = document.anchors.as_slice() else {
+            panic!("two anchors, got {:?}", document.anchors);
+        };
+        assert_eq!(anchor.algorithm, Ed25519);
         assert_eq!(anchor.key_id, key_id(&public_key_of(&pair)));
         assert_eq!(anchor.public_key, hex_of(&public_key_of(&pair)));
         assert!(!anchor.revoked);
+        assert_eq!(ml_dsa.algorithm, MlDsa87);
+        assert_eq!(ml_dsa.public_key.len(), 2 * ML_DSA_87_PUBLIC_KEY_LEN);
+        assert!(!ml_dsa.revoked);
+    }
+
+    #[test]
+    fn a_document_carrying_one_live_anchor_of_each_algorithm_is_read_with_both_typed() {
+        let pair = keypair();
+        let ml_dsa = ml_dsa_keypair();
+        let ml_dsa_key = ml_dsa_public_key_of(&ml_dsa);
+        let member =
+            Fields::anchored(&[ml_dsa_anchor_of(&ml_dsa, false), anchor_of(&pair, false)]).render();
+
+        let document = accepted(&member);
+        let algorithms: Vec<SignatureAlgorithm> = document
+            .anchors
+            .iter()
+            .map(|anchor| anchor.algorithm)
+            .collect();
+        assert_eq!(algorithms, [MlDsa87, Ed25519]);
+        let entry = document.anchors.first().expect("the ML-DSA-87 anchor");
+        assert_eq!(entry.key_id, key_id(&ml_dsa_key));
+        assert_eq!(entry.public_key, hex_of(&ml_dsa_key));
+
+        let anchors = document_anchors(&document).expect("a verified document converts");
+        let typed: Vec<(SignatureAlgorithm, &str)> = anchors
+            .iter()
+            .map(|anchor| (anchor.algorithm(), anchor.key_id()))
+            .collect();
+        let ml_dsa_id = key_id(&ml_dsa_key);
+        let ed25519_id = key_id(&public_key_of(&pair));
+        assert_eq!(
+            typed,
+            [
+                (MlDsa87, ml_dsa_id.as_str()),
+                (Ed25519, ed25519_id.as_str())
+            ]
+        );
+        assert_eq!(
+            anchors.first().map(TrustAnchor::public_key),
+            Some(ml_dsa_key.as_slice())
+        );
     }
 
     #[test]
@@ -950,6 +1126,31 @@ mod tests {
     }
 
     #[test]
+    fn a_document_labelled_version_1_is_refused_for_its_version_whatever_its_anchors() {
+        let pair = keypair();
+        let version_1_shaped = Fields {
+            trust_set_version: Some("1".to_string()),
+            anchors: Some(array(&[version_1_anchor_of(&pair, false)])),
+            ..Fields::new(&pair)
+        };
+        let version_2_shaped = Fields {
+            trust_set_version: Some("1".to_string()),
+            ..Fields::new(&pair)
+        };
+        for (shape, fields) in [("1", version_1_shaped), ("2", version_2_shaped)] {
+            let err = refusal(&fields.render());
+            assert!(
+                matches!(err, TrustSetDocumentError::UnsupportedVersion { found: 1 }),
+                "a version {shape}-shaped document labelled 1, got {err:?}"
+            );
+            assert!(
+                err.to_string().ends_with("which implements 2"),
+                "the message names this build's version: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn the_version_gate_wins_over_every_later_fault() {
         // An unknown top-level field, a malformed anchor entry and an absent
         // `epoch` all at once: a document written to a later schema is expected
@@ -957,7 +1158,12 @@ mod tests {
         let fields = Fields {
             trust_set_version: Some((TRUST_SET_VERSION + 1).to_string()),
             epoch: None,
-            anchors: Some(array(&[anchor_json("not hex", "not hex either", false)])),
+            anchors: Some(array(&[anchor_json(
+                Ed25519,
+                "not hex",
+                "not hex either",
+                false,
+            )])),
             extra: vec![r#""revocations":[]"#.to_string()],
             ..Fields::anchored(&[])
         };
@@ -986,16 +1192,48 @@ mod tests {
         let pair = keypair();
         let public_key = public_key_of(&pair);
         let anchor = format!(
-            r#"{{"key_id":"{}","public_key":"{}","revoked":false,"expires":"never"}}"#,
+            r#"{{"algorithm":"ed25519","key_id":"{}","public_key":"{}","revoked":false,"expires":"never"}}"#,
             key_id(&public_key),
             hex_of(&public_key)
         );
-        let fields = Fields::anchored(&[anchor]);
+        let fields = Fields::with_ed25519_anchors(&[anchor]);
         assert!(matches!(
             refusal(&fields.render()),
             TrustSetDocumentError::UnknownField { location, field }
                 if location.contains(ANCHORS_FIELD) && field == "expires"
         ));
+    }
+
+    #[test]
+    fn an_absent_or_unknown_anchor_algorithm_is_a_decode_refusal() {
+        // The document spellings are exact: a case variant, another ML-DSA
+        // parameter set and a number are each a value of the wrong shape.
+        let pair = keypair();
+        let public_key = public_key_of(&pair);
+        let rest = format!(
+            r#""key_id":"{}","public_key":"{}","revoked":false"#,
+            key_id(&public_key),
+            hex_of(&public_key)
+        );
+        for algorithm in [
+            None,
+            Some(r#""ML-DSA-87""#),
+            Some(r#""ml-dsa-65""#),
+            Some(r#""Ed25519""#),
+            Some("1"),
+            Some(r#"{"ed25519":null}"#),
+            Some(r#"{"ml-dsa-87":null}"#),
+        ] {
+            let anchor = match algorithm {
+                None => format!("{{{rest}}}"),
+                Some(algorithm) => format!(r#"{{"algorithm":{algorithm},{rest}}}"#),
+            };
+            let fields = Fields::with_ed25519_anchors(&[anchor]);
+            assert!(
+                matches!(refusal(&fields.render()), TrustSetDocumentError::Decode(_)),
+                "algorithm {algorithm:?} should be a decode refusal"
+            );
+        }
     }
 
     #[test]
@@ -1158,10 +1396,57 @@ mod tests {
     }
 
     #[test]
+    fn a_document_without_a_live_anchor_of_one_algorithm_is_refused_for_that_algorithm() {
+        let pair = keypair();
+        let ml_dsa = ml_dsa_keypair();
+        for (anchors, missing) in [
+            (vec![anchor_of(&pair, false)], MlDsa87),
+            (
+                vec![anchor_of(&pair, false), ml_dsa_anchor_of(&ml_dsa, true)],
+                MlDsa87,
+            ),
+            (vec![ml_dsa_anchor_of(&ml_dsa, false)], Ed25519),
+            (
+                vec![anchor_of(&pair, true), ml_dsa_anchor_of(&ml_dsa, false)],
+                Ed25519,
+            ),
+        ] {
+            let err = refusal(&Fields::anchored(&anchors).render());
+            assert!(
+                matches!(
+                    err,
+                    TrustSetDocumentError::MissingLiveAnchor { algorithm } if algorithm == missing
+                ),
+                "expected no live {missing} anchor, got {err:?}"
+            );
+        }
+        let err = refusal(&Fields::anchored(&[anchor_of(&pair, false)]).render());
+        assert_eq!(
+            err.to_string(),
+            "the trust generation document carries no non-revoked ML-DSA-87 anchor"
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_live_anchor_of_either_algorithm_is_wholly_revoked() {
+        // Every anchor revoked is the only way to have a live anchor of neither
+        // algorithm, and the list as a whole is answered first.
+        let fields = Fields::anchored(&[
+            anchor_of(&keypair(), true),
+            ml_dsa_anchor_of(&ml_dsa_keypair(), true),
+        ]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::AllAnchorsRevoked
+        ));
+    }
+
+    #[test]
     fn a_revoked_anchor_beside_a_live_one_is_accepted_and_keeps_its_public_key() {
         let live = keypair();
         let revoked = keypair();
-        let fields = Fields::anchored(&[anchor_of(&live, false), anchor_of(&revoked, true)]);
+        let fields =
+            Fields::with_ed25519_anchors(&[anchor_of(&live, false), anchor_of(&revoked, true)]);
         let document = accepted(&fields.render());
         let entry = document
             .anchors
@@ -1180,19 +1465,89 @@ mod tests {
         let hex = hex_of(&public_key);
 
         for key_id_value in [derived.to_uppercase(), derived[..62].to_string()] {
-            let fields = Fields::anchored(&[anchor_json(&key_id_value, &hex, false)]);
+            let fields =
+                Fields::with_ed25519_anchors(&[anchor_json(Ed25519, &key_id_value, &hex, false)]);
             assert!(matches!(
                 refusal(&fields.render()),
                 TrustSetDocumentError::MalformedKeyId { .. }
             ));
         }
         for public_key_value in [hex.to_uppercase(), hex[..62].to_string()] {
-            let fields = Fields::anchored(&[anchor_json(&derived, &public_key_value, false)]);
+            let fields = Fields::with_ed25519_anchors(&[anchor_json(
+                Ed25519,
+                &derived,
+                &public_key_value,
+                false,
+            )]);
             assert!(matches!(
                 refusal(&fields.render()),
-                TrustSetDocumentError::MalformedPublicKey { .. }
+                TrustSetDocumentError::MalformedPublicKey {
+                    algorithm: Ed25519,
+                    ..
+                }
             ));
         }
+    }
+
+    #[test]
+    fn a_public_key_not_at_its_own_algorithms_length_is_refused_for_that_algorithm() {
+        // Each algorithm's key at the other's length, and each in uppercase:
+        // the length is the algorithm's, never whichever one the hex happens
+        // to have, and the message carries neither key.
+        let ed25519 = public_key_of(&keypair());
+        let ml_dsa = ml_dsa_public_key_of(&ml_dsa_keypair());
+        let ed25519_hex = hex_of(&ed25519);
+        let ml_dsa_hex = hex_of(&ml_dsa);
+        let live_ed25519 = anchor_of(&keypair(), false);
+        for (algorithm, raw, value, expected) in [
+            (Ed25519, ml_dsa.as_slice(), ml_dsa_hex.clone(), "64"),
+            (MlDsa87, ed25519.as_slice(), ed25519_hex.clone(), "5184"),
+            (
+                Ed25519,
+                ed25519.as_slice(),
+                ed25519_hex.to_uppercase(),
+                "64",
+            ),
+            (
+                MlDsa87,
+                ml_dsa.as_slice(),
+                ml_dsa_hex.to_uppercase(),
+                "5184",
+            ),
+        ] {
+            let entry = anchor_json(algorithm, &key_id(raw), &value, false);
+            let fields = Fields::anchored(&[entry, live_ed25519.clone(), live_ml_dsa_anchor()]);
+            let err = refusal(&fields.render());
+            assert!(
+                matches!(
+                    err,
+                    TrustSetDocumentError::MalformedPublicKey { algorithm: named, .. }
+                        if named == algorithm
+                ),
+                "{algorithm} key of {} characters, got {err:?}",
+                value.len()
+            );
+            let message = err.to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "anchor `public_key` for {algorithm} is not {expected} lowercase-hex characters"
+                )
+            );
+            assert!(!message.contains(&value), "the message renders no key");
+        }
+    }
+
+    #[test]
+    fn an_ml_dsa_87_key_id_that_its_public_key_does_not_derive_is_refused() {
+        let ml_dsa = ml_dsa_public_key_of(&ml_dsa_keypair());
+        let entry = anchor_json(MlDsa87, STRANGER_KEY_ID, &hex_of(&ml_dsa), false);
+        let fields = Fields::anchored(&[anchor_of(&keypair(), false), entry]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::KeyIdMismatch { declared, derived }
+                if declared == STRANGER_KEY_ID && derived == key_id(&ml_dsa)
+        ));
     }
 
     #[test]
@@ -1201,7 +1556,12 @@ mod tests {
         // which key it names, and the reader answers that on its own.
         let pair = keypair();
         let public_key = public_key_of(&pair);
-        let fields = Fields::anchored(&[anchor_json(STRANGER_KEY_ID, &hex_of(&public_key), false)]);
+        let fields = Fields::with_ed25519_anchors(&[anchor_json(
+            Ed25519,
+            STRANGER_KEY_ID,
+            &hex_of(&public_key),
+            false,
+        )]);
         let member = fields.render();
         let package = generation_pkg(&pair, &member, EPOCH);
         self_admit(&package, &member).expect("the container itself verifies");
@@ -1217,7 +1577,7 @@ mod tests {
     fn a_repeated_key_id_is_refused() {
         let pair = keypair();
         let entry = anchor_of(&pair, false);
-        let fields = Fields::anchored(&[entry.clone(), entry]);
+        let fields = Fields::with_ed25519_anchors(&[entry.clone(), entry]);
         assert!(matches!(
             refusal(&fields.render()),
             TrustSetDocumentError::DuplicateKeyId { key_id: id }
@@ -1288,27 +1648,56 @@ mod tests {
             TrustSetDocumentError::AbsentEpoch
         ));
 
-        // A wholly revoked list precedes the per-anchor checks.
-        let fields = Fields::anchored(&[anchor_json("not hex", "not hex either", true)]);
+        // A wholly revoked list precedes the per-anchor checks, and precedes
+        // the missing live anchor of each algorithm it also is.
+        let fields = Fields::anchored(&[
+            anchor_json(Ed25519, "not hex", "not hex either", true),
+            ml_dsa_anchor_of(&ml_dsa_keypair(), true),
+        ]);
         assert!(matches!(
             refusal(&fields.render()),
             TrustSetDocumentError::AllAnchorsRevoked
         ));
 
+        // A missing live anchor of an algorithm precedes the per-anchor checks.
+        let fields = Fields::anchored(&[anchor_json(Ed25519, "not hex", &hex, false)]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::MissingLiveAnchor { algorithm: MlDsa87 }
+        ));
+        let fields = Fields::anchored(&[
+            anchor_json(Ed25519, "not hex", &hex, true),
+            live_ml_dsa_anchor(),
+        ]);
+        assert!(matches!(
+            refusal(&fields.render()),
+            TrustSetDocumentError::MissingLiveAnchor { algorithm: Ed25519 }
+        ));
+
         // Within an anchor: the `key_id` shape, then the `public_key` shape,
         // then the derivation, then duplication.
-        let fields = Fields::anchored(&[anchor_json(&derived.to_uppercase(), "not hex", false)]);
+        let fields = Fields::with_ed25519_anchors(&[anchor_json(
+            Ed25519,
+            &derived.to_uppercase(),
+            "not hex",
+            false,
+        )]);
         assert!(matches!(
             refusal(&fields.render()),
             TrustSetDocumentError::MalformedKeyId { .. }
         ));
-        let fields = Fields::anchored(&[anchor_json(STRANGER_KEY_ID, "not hex", false)]);
+        let fields = Fields::with_ed25519_anchors(&[anchor_json(
+            Ed25519,
+            STRANGER_KEY_ID,
+            "not hex",
+            false,
+        )]);
         assert!(matches!(
             refusal(&fields.render()),
             TrustSetDocumentError::MalformedPublicKey { .. }
         ));
-        let entry = anchor_json(STRANGER_KEY_ID, &hex, false);
-        let fields = Fields::anchored(&[entry.clone(), entry]);
+        let entry = anchor_json(Ed25519, STRANGER_KEY_ID, &hex, false);
+        let fields = Fields::with_ed25519_anchors(&[entry.clone(), entry]);
         assert!(matches!(
             refusal(&fields.render()),
             TrustSetDocumentError::KeyIdMismatch { .. }
@@ -1319,7 +1708,7 @@ mod tests {
         let withdrawn = withdrawn_json("example", "1.0.0", "abc");
         let fields = Fields {
             withdrawn_builds: Some(array(&[withdrawn.clone(), withdrawn])),
-            ..Fields::anchored(&[anchor_json("not hex", &hex, false)])
+            ..Fields::with_ed25519_anchors(&[anchor_json(Ed25519, "not hex", &hex, false)])
         };
         assert!(matches!(
             refusal(&fields.render()),
@@ -1412,7 +1801,8 @@ mod tests {
         let live = keypair();
         let revoked = keypair();
         let member =
-            Fields::anchored(&[anchor_of(&live, false), anchor_of(&revoked, true)]).render();
+            Fields::with_ed25519_anchors(&[anchor_of(&live, false), anchor_of(&revoked, true)])
+                .render();
         let package = generation_pkg(&revoked, &member, EPOCH);
         assert!(matches!(
             self_admit(&package, &member).expect_err("the generation should be refused"),
@@ -1473,5 +1863,105 @@ mod tests {
         .render();
         let package = generation_pkg(&pair, &member, EPOCH);
         self_admit(&package, &member).expect("the withdrawn list governs later packages only");
+    }
+
+    #[test]
+    fn the_provisional_decode_types_each_anchor_of_a_version_2_document() {
+        let pair = keypair();
+        let ml_dsa = ml_dsa_keypair();
+        let ml_dsa_key = ml_dsa_public_key_of(&ml_dsa);
+        let member = Fields::anchored(&[
+            anchor_of(&pair, false),
+            ml_dsa_anchor_of(&ml_dsa, true),
+            live_ml_dsa_anchor(),
+        ])
+        .render();
+
+        let (anchors, epoch) =
+            provisional_anchors_and_epoch(&member).expect("a version 2 document decodes");
+        assert_eq!(epoch, EPOCH);
+        let [ed25519, revoked, _] = anchors.as_slice() else {
+            panic!("three anchors, got {anchors:?}");
+        };
+        assert_eq!(ed25519.algorithm(), Ed25519);
+        assert_eq!(ed25519.public_key(), public_key_of(&pair).as_slice());
+        assert!(!ed25519.is_revoked());
+        assert_eq!(revoked.algorithm(), MlDsa87);
+        assert_eq!(revoked.public_key(), ml_dsa_key.as_slice());
+        assert_eq!(revoked.key_id(), key_id(&ml_dsa_key));
+        assert!(revoked.is_revoked());
+    }
+
+    #[test]
+    fn the_provisional_decode_refuses_a_version_1_document_and_each_malformed_anchor() {
+        let pair = keypair();
+        let ed25519 = public_key_of(&pair);
+        let ml_dsa = ml_dsa_public_key_of(&ml_dsa_keypair());
+        let anchor = |algorithm: &str, public_key: &[u8]| {
+            format!(
+                r#"{{"algorithm":{algorithm},"key_id":"{}","public_key":"{}","revoked":false}}"#,
+                key_id(public_key),
+                hex_of(public_key)
+            )
+        };
+        let version_1 = Fields {
+            trust_set_version: Some("1".to_string()),
+            anchors: Some(array(&[version_1_anchor_of(&pair, false)])),
+            ..Fields::new(&pair)
+        };
+        let mut cases = vec![("a version 1 document", version_1)];
+        for (case, entry) in [
+            (
+                "an anchor without `algorithm`",
+                version_1_anchor_of(&pair, false),
+            ),
+            ("an unknown algorithm", anchor(r#""ml-dsa-65""#, &ml_dsa)),
+            ("a case variant", anchor(r#""ML-DSA-87""#, &ml_dsa)),
+            ("a numeric algorithm", anchor("1", &ed25519)),
+            (
+                "an Ed25519 algorithm as a tagged object",
+                anchor(r#"{"ed25519":null}"#, &ed25519),
+            ),
+            (
+                "an ML-DSA-87 algorithm as a tagged object",
+                anchor(r#"{"ml-dsa-87":null}"#, &ml_dsa),
+            ),
+            (
+                "an Ed25519 key at ML-DSA-87 length",
+                anchor(r#""ed25519""#, &ml_dsa),
+            ),
+            (
+                "an ML-DSA-87 key at Ed25519 length",
+                anchor(r#""ml-dsa-87""#, &ed25519),
+            ),
+            (
+                "an Ed25519 key one byte short",
+                anchor(r#""ed25519""#, ed25519.get(1..).expect("31 bytes")),
+            ),
+            (
+                "an ML-DSA-87 key one byte short",
+                anchor(r#""ml-dsa-87""#, ml_dsa.get(1..).expect("2,591 bytes")),
+            ),
+        ] {
+            cases.push((
+                case,
+                Fields::anchored(&[anchor_of(&pair, false), live_ml_dsa_anchor(), entry]),
+            ));
+        }
+        for (case, fields) in cases {
+            assert!(
+                provisional_anchors_and_epoch(&fields.render()).is_none(),
+                "{case} should not decode provisionally"
+            );
+        }
+
+        // Labelled `1` with typed anchors, the decode passes: it reads no
+        // version, and the refusing reader is what answers for it.
+        let labelled = Fields {
+            trust_set_version: Some("1".to_string()),
+            ..Fields::new(&pair)
+        }
+        .render();
+        assert!(provisional_anchors_and_epoch(&labelled).is_some());
     }
 }

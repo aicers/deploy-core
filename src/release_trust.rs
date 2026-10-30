@@ -223,15 +223,22 @@ pub enum ReleaseTrustError {
     /// [`ReleaseTrustError::Document`]: at this point in the sequence nothing has
     /// vouched for the bytes, and dressing an unauthenticated parse up as a
     /// verdict about a real generation is what that separation exists to prevent.
+    ///
+    /// A version 1 document ends here at every admission door: the decode
+    /// requires each anchor to name its `algorithm`, which a version 1 anchor
+    /// does not, and it reads no `trust_set_version` that could refuse the
+    /// document any earlier.
     #[error("the staged trust generation document did not decode before verification")]
     ProvisionalDecode,
 
-    /// An anchor of an otherwise well-formed document did not yield 32 key
-    /// bytes.
+    /// An anchor of an otherwise well-formed document did not decode to its
+    /// algorithm's key bytes.
     ///
     /// The refusing reader's own checks make this unreachable through
     /// `read_trust_set_document`; it is refused rather than unwrapped.
-    #[error("an anchor of the active trust generation document does not decode to 32 key bytes")]
+    #[error(
+        "an anchor of the active trust generation document does not decode to its algorithm's key bytes"
+    )]
     MalformedAnchorKey,
 
     /// The tree holds no generation at all, so there is nothing to build a trust
@@ -2158,11 +2165,13 @@ mod tests {
     use crate::roxyd_trust::Activation;
     use crate::trust_fixture::{
         Fields, anchor_json, anchor_of, array, default_document, generation_pkg,
-        generation_pkg_member_named, hex_of, keypair, pkg_naming, public_key_of, withdrawn_json,
+        generation_pkg_member_named, hex_of, keypair, live_ml_dsa_anchor, ml_dsa_anchor_of,
+        ml_dsa_keypair, pkg_naming, public_key_of, version_1_anchor_of, withdrawn_json,
     };
     use crate::trust_set::{
         TRUST_SET_MEMBER, TrustSetDocumentError, member_digest, read_trust_set_document,
     };
+    use crate::verify::SignatureAlgorithm::{Ed25519, MlDsa87};
     use crate::verify::{
         TRUST_TARGET, TrustSet, VerifyError, VerifyRequest, key_id, verify_package,
     };
@@ -2595,7 +2604,7 @@ mod tests {
             "the readable record still names the previous generation",
         );
         let active = active_trust_set(&t.root).expect("the previous generation still resolves");
-        assert_eq!(active.anchors().len(), 1);
+        assert_eq!(active.anchors().len(), 2, "one anchor of each algorithm");
 
         // A subsequent installation supersedes it, and at no point did the
         // readable record name a different epoch than the readable document.
@@ -2773,7 +2782,11 @@ mod tests {
         let revoked = keypair();
         let fields = Fields {
             epoch: Some(NEXT_EPOCH.to_string()),
-            anchors: Some(array(&[anchor_of(&live, false), anchor_of(&revoked, true)])),
+            anchors: Some(array(&[
+                anchor_of(&live, false),
+                anchor_of(&revoked, true),
+                live_ml_dsa_anchor(),
+            ])),
             ..Fields::new(&live)
         };
         let member = fields.render();
@@ -2946,7 +2959,11 @@ mod tests {
             &live,
             &Fields {
                 epoch: Some(SEED_EPOCH.to_string()),
-                anchors: Some(array(&[anchor_of(&live, false), anchor_of(&revoked, true)])),
+                anchors: Some(array(&[
+                    anchor_of(&live, false),
+                    anchor_of(&revoked, true),
+                    live_ml_dsa_anchor(),
+                ])),
                 ..Fields::new(&live)
             },
             SEED_EPOCH,
@@ -2954,7 +2971,7 @@ mod tests {
         generation.install(&t.root).expect("seed");
 
         let trust = active_trust_set(&t.root).expect("the active generation resolves");
-        assert_eq!(trust.anchors().len(), 2);
+        assert_eq!(trust.anchors().len(), 3);
 
         // An ordinary package the live anchor signed.
         let payload = default_document(&live);
@@ -3081,7 +3098,11 @@ mod tests {
         assert!(admitted.activation.changed, "the tree was empty");
         assert_eq!(admitted.epoch, SEED_EPOCH);
         assert_eq!(admitted.document.epoch, SEED_EPOCH);
-        assert_eq!(admitted.document.anchors.len(), 1);
+        assert_eq!(
+            admitted.document.anchors.len(),
+            2,
+            "one anchor of each algorithm"
+        );
 
         assert_active_is(&t.root, 1);
         let active = active_link(&t.root);
@@ -3224,8 +3245,9 @@ mod tests {
         let member = Fields {
             epoch: Some(SEED_EPOCH.to_string()),
             anchors: Some(array(&[
-                anchor_json(&key_id(&public_key_of(&pair)), &shared, false),
-                anchor_json(&key_id(&public_key_of(&stranger)), &shared, false),
+                anchor_json(Ed25519, &key_id(&public_key_of(&pair)), &shared, false),
+                anchor_json(Ed25519, &key_id(&public_key_of(&stranger)), &shared, false),
+                live_ml_dsa_anchor(),
             ])),
             ..Fields::new(&pair)
         }
@@ -3254,10 +3276,12 @@ mod tests {
             anchors: Some(array(&[
                 anchor_of(&pair, false),
                 anchor_json(
+                    Ed25519,
                     &key_id(&public_key_of(&pair)),
                     &hex_of(&public_key_of(&stranger)),
                     false,
                 ),
+                live_ml_dsa_anchor(),
             ])),
             ..Fields::new(&pair)
         }
@@ -3610,7 +3634,11 @@ mod tests {
 
         let by_revoked_member = Fields {
             epoch: Some(SEED_EPOCH.to_string()),
-            anchors: Some(array(&[anchor_of(&pair, false), anchor_of(&revoked, true)])),
+            anchors: Some(array(&[
+                anchor_of(&pair, false),
+                anchor_of(&revoked, true),
+                live_ml_dsa_anchor(),
+            ])),
             ..Fields::new(&pair)
         }
         .render();
@@ -3986,7 +4014,7 @@ mod tests {
         ] {
             let trust =
                 active_trust_set(&t.root).expect("the following stat resolves a generation");
-            assert_eq!(trust.anchors().len(), 1);
+            assert_eq!(trust.anchors().len(), 2);
             assert_eq!(read_active_epoch(&t.root).expect("read"), Some(SEED_EPOCH));
         }
     }
@@ -4870,7 +4898,11 @@ mod tests {
 
         let by_revoked_member = Fields {
             epoch: Some(NEXT_EPOCH.to_string()),
-            anchors: Some(array(&[anchor_of(&pair, false), anchor_of(&revoked, true)])),
+            anchors: Some(array(&[
+                anchor_of(&pair, false),
+                anchor_of(&revoked, true),
+                live_ml_dsa_anchor(),
+            ])),
             ..Fields::new(&pair)
         }
         .render();
@@ -5488,6 +5520,7 @@ mod tests {
         let ids: Vec<&str> = trust
             .anchors()
             .iter()
+            .filter(|anchor| anchor.algorithm() == Ed25519)
             .map(crate::verify::TrustAnchor::key_id)
             .collect();
         assert_eq!(ids, [key_id(&public_key_of(signer)).as_str()]);
@@ -5614,5 +5647,233 @@ mod tests {
                 Some(generation)
             );
         }
+    }
+
+    /// The six admission doors, each driven onto the tree it needs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Door {
+        Seed,
+        Replace,
+        Bootstrap,
+        Rebootstrap,
+        Accept,
+        Chain,
+    }
+
+    const DOORS: [Door; 6] = [
+        Door::Seed,
+        Door::Replace,
+        Door::Bootstrap,
+        Door::Rebootstrap,
+        Door::Accept,
+        Door::Chain,
+    ];
+
+    impl Door {
+        /// Whether the door verifies a generation under its own document's
+        /// anchors rather than under the active generation's.
+        fn self_admitting(self) -> bool {
+            !matches!(self, Self::Accept | Self::Chain)
+        }
+
+        /// Drives `package`, a generation at [`NEXT_EPOCH`] signed by `pair`,
+        /// through this door, and returns the epoch it admitted or the refusal.
+        ///
+        /// The two install-onto-empty doors start from an empty tree, the join
+        /// material already in place for the bootstrap; the other four start
+        /// from a tree seeded at [`SEED_EPOCH`] with a generation trusting
+        /// `pair`, which a runtime accept verifies `package` under. A refusal is
+        /// asserted to leave the tree exactly as it was: its `active` target, its
+        /// `gen-<n>` directories and everything in them.
+        fn drive(self, pair: &Ed25519KeyPair, package: &[u8]) -> Result<u64, ReleaseTrustError> {
+            let t = match self {
+                Self::Seed | Self::Bootstrap => tree(),
+                Self::Replace | Self::Rebootstrap | Self::Accept | Self::Chain => {
+                    seeded_tree(&Generation::new(pair, SEED_EPOCH))
+                }
+            };
+            let root = &t.root;
+            if self == Self::Bootstrap {
+                std::fs::write(join_generation_file(root), package).expect("join material");
+            }
+            let before = snapshot(root);
+            let result = match self {
+                Self::Seed => admit_seed_generation(root, package),
+                Self::Replace => replace_generation(root, package),
+                Self::Bootstrap => bootstrap_from_join_material(root, None),
+                Self::Rebootstrap => rebootstrap_generation(
+                    root,
+                    package,
+                    RebootstrapAuthorization::asserting_last_confirmed_epoch(SEED_EPOCH),
+                    None,
+                ),
+                Self::Accept => accept_generation(root, package),
+                Self::Chain => match accept_generation_chain(root, &[package]) {
+                    Ok(replay) => {
+                        assert_eq!(replay.completed, 1);
+                        Ok(replay.last.expect("one step was accepted"))
+                    }
+                    Err(err) => {
+                        assert_eq!(err.completed, 0, "the first step raised it");
+                        assert!(err.last.is_none());
+                        Err(err.source)
+                    }
+                },
+            };
+            match result {
+                Ok(admitted) => {
+                    assert_eq!(read_active_epoch(root).expect("read"), Some(admitted.epoch));
+                    Ok(admitted.epoch)
+                }
+                Err(err) => {
+                    assert_eq!(snapshot(root), before, "{self:?} changed the tree");
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// A generation at [`NEXT_EPOCH`] carrying exactly `anchors`, signed by
+    /// `pair`.
+    fn next_generation_anchored(pair: &Ed25519KeyPair, anchors: &[String]) -> Vec<u8> {
+        Generation::from_fields(
+            pair,
+            &Fields {
+                epoch: Some(NEXT_EPOCH.to_string()),
+                anchors: Some(array(anchors)),
+                ..Fields::new(pair)
+            },
+            NEXT_EPOCH,
+        )
+        .package
+    }
+
+    #[test]
+    fn every_door_admits_a_well_formed_version_2_generation() {
+        let pair = keypair();
+        let package = Generation::new(&pair, NEXT_EPOCH).package;
+        for door in DOORS {
+            assert_eq!(
+                door.drive(&pair, &package).expect("admitted"),
+                NEXT_EPOCH,
+                "{door:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_door_refuses_a_generation_with_no_live_ml_dsa_87_anchor() {
+        let pair = keypair();
+        for anchors in [
+            vec![anchor_of(&pair, false)],
+            vec![
+                anchor_of(&pair, false),
+                ml_dsa_anchor_of(&ml_dsa_keypair(), true),
+            ],
+        ] {
+            let package = next_generation_anchored(&pair, &anchors);
+            for door in DOORS {
+                let err = door.drive(&pair, &package).expect_err("refused");
+                assert!(
+                    matches!(
+                        err,
+                        ReleaseTrustError::Document(TrustSetDocumentError::MissingLiveAnchor {
+                            algorithm: MlDsa87
+                        })
+                    ),
+                    "{door:?}: got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_generation_whose_only_ed25519_anchor_is_its_revoked_signer_is_refused_at_every_door() {
+        // The runtime doors verify under the active generation, where the
+        // signer is live, and the reader then refuses the document; the
+        // self-admitting doors verify under the document's own anchors, where
+        // no live key of its own signed it.
+        let pair = keypair();
+        let package =
+            next_generation_anchored(&pair, &[anchor_of(&pair, true), live_ml_dsa_anchor()]);
+        let signer = key_id(&public_key_of(&pair));
+        for door in DOORS {
+            let err = door.drive(&pair, &package).expect_err("refused");
+            if door.self_admitting() {
+                assert!(
+                    matches!(
+                        err,
+                        ReleaseTrustError::Verify(VerifyError::RevokedKey { ref key_id })
+                            if *key_id == signer
+                    ),
+                    "{door:?}: got {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        err,
+                        ReleaseTrustError::Document(TrustSetDocumentError::MissingLiveAnchor {
+                            algorithm: Ed25519
+                        })
+                    ),
+                    "{door:?}: got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_door_refuses_a_version_1_generation_before_verifying_it() {
+        let pair = keypair();
+        let package = Generation::from_fields(
+            &pair,
+            &Fields {
+                trust_set_version: Some("1".to_string()),
+                epoch: Some(NEXT_EPOCH.to_string()),
+                anchors: Some(array(&[version_1_anchor_of(&pair, false)])),
+                ..Fields::new(&pair)
+            },
+            NEXT_EPOCH,
+        )
+        .package;
+        for door in DOORS {
+            let err = door.drive(&pair, &package).expect_err("refused");
+            assert!(
+                matches!(err, ReleaseTrustError::ProvisionalDecode),
+                "{door:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_installed_version_1_generation_is_refused_by_every_reader_of_the_active_one() {
+        // No door installs one any more, so the document is written into the
+        // tree directly, under an otherwise well-formed generation.
+        let pair = keypair();
+        let t = seeded_tree(&Generation::new(&pair, SEED_EPOCH));
+        let version_1 = Fields {
+            trust_set_version: Some("1".to_string()),
+            epoch: Some(SEED_EPOCH.to_string()),
+            anchors: Some(array(&[version_1_anchor_of(&pair, false)])),
+            ..Fields::new(&pair)
+        }
+        .render();
+        overwrite_active(&t.root, TRUST_SET_MEMBER, &version_1);
+        let unsupported = |err: &ReleaseTrustError| {
+            matches!(
+                err,
+                ReleaseTrustError::Document(TrustSetDocumentError::UnsupportedVersion { found: 1 })
+            )
+        };
+
+        let err = active_trust_set(&t.root).expect_err("refused");
+        assert!(unsupported(&err), "active_trust_set: got {err:?}");
+        let err = read_generation_state(&t.root).expect_err("refused");
+        assert!(unsupported(&err), "read_generation_state: got {err:?}");
+        let before = snapshot(&t.root);
+        let err = accept_generation(&t.root, &Generation::new(&pair, NEXT_EPOCH).package)
+            .expect_err("refused");
+        assert!(unsupported(&err), "accept_generation: got {err:?}");
+        assert_eq!(snapshot(&t.root), before);
     }
 }

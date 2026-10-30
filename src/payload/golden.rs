@@ -230,12 +230,7 @@ fn key() -> Ed25519KeyPair {
 fn stamp(pair: &Ed25519KeyPair, manifest: &[u8]) -> Signed {
     Signed {
         signature: pair.sign(manifest).as_ref().to_vec(),
-        key_id: crate::verify::key_id(
-            pair.public_key()
-                .as_ref()
-                .try_into()
-                .expect("a 32-byte public key"),
-        ),
+        key_id: crate::verify::key_id(pair.public_key().as_ref()),
     }
 }
 
