@@ -14,10 +14,17 @@
 //! another repository.
 //!
 //! No key material is committed to the repository and none is read from a fixed
-//! path: every fixture key pair is minted afresh from the system RNG.
+//! path: every fixture Ed25519 key pair is minted afresh from the system RNG,
+//! and the ML-DSA-87 pair beside it is derived from its private key (see
+//! [`ml_dsa_companion_of`]).
+//!
+//! A container is format 3 and dual-signed: the Ed25519 pair a fixture is
+//! given signs it, and so does that pair's ML-DSA-87 companion, whose anchor
+//! the default document lists beside the Ed25519 one.
 
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
+use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 use zstd::Encoder;
 
@@ -25,12 +32,14 @@ use crate::manifest::{
     ArchiveMember, ArtifactKind, Disposition, MIN_MANIFEST_FORMAT_VERSION, PayloadArtifact,
     PayloadManifest, TargetArch,
 };
-use crate::payload::{FORMAT_VERSION, MAGIC};
+use crate::payload::{DetachedSignature, FORMAT_VERSION, MAGIC, ML_DSA_87_SIGNATURE_LEN, Signed};
 use crate::trust_set::{
     ANCHORS_FIELD, EPOCH_FIELD, TRUST_SET_MEMBER, TRUST_SET_VERSION, TRUST_SET_VERSION_FIELD,
     WITHDRAWN_BUILDS_FIELD, member_digest,
 };
-use crate::verify::{ML_DSA_87_PUBLIC_KEY_LEN, SignatureAlgorithm, TRUST_TARGET, key_id};
+use crate::verify::{
+    ML_DSA_87_PUBLIC_KEY_LEN, SignatureAlgorithm, TRUST_TARGET, TrustAnchor, key_id,
+};
 
 /// Epoch every well-formed fixture generation carries unless a test names its
 /// own.
@@ -38,6 +47,10 @@ pub(crate) const EPOCH: u64 = 7;
 
 /// zstd level the fixture archive writer uses; it only has to round-trip.
 const FIXTURE_ZSTD_LEVEL: i32 = 3;
+
+/// What an Ed25519 fixture pair signs to derive its ML-DSA-87 companion's
+/// seed.
+const COMPANION_SEED_LABEL: &[u8] = b"deploy-core test fixture: ML-DSA-87 companion seed";
 
 /// Mints an ephemeral Ed25519 key pair.
 pub(crate) fn keypair() -> Ed25519KeyPair {
@@ -54,12 +67,58 @@ pub(crate) fn public_key_of(pair: &Ed25519KeyPair) -> [u8; 32] {
         .expect("an ed25519 public key is 32 bytes")
 }
 
-/// Mints an ephemeral ML-DSA-87 key pair.
-///
-/// Only its public key is ever used: the containers these fixtures mint are
-/// signed with an Ed25519 pair alone.
+/// Mints an ephemeral ML-DSA-87 key pair, unrelated to any Ed25519 pair.
 pub(crate) fn ml_dsa_keypair() -> PqdsaKeyPair {
     PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).expect("key generation should succeed")
+}
+
+/// Returns the ML-DSA-87 key pair that accompanies the Ed25519 `pair` in every
+/// fixture: the second signer of each container `pair` signs, and the
+/// ML-DSA-87 anchor of [`default_document`].
+///
+/// Its seed is the SHA-256 of `pair`'s signature over a fixed label. Ed25519
+/// signing is deterministic, so the same pair always yields the same companion
+/// — a test holding `pair` holds both keys, with no second value to thread
+/// through — and nobody without `pair`'s private key can derive it.
+pub(crate) fn ml_dsa_companion_of(pair: &Ed25519KeyPair) -> PqdsaKeyPair {
+    let seed = Sha256::digest(pair.sign(COMPANION_SEED_LABEL).as_ref());
+    PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &seed).expect("a 32-byte seed is an ML-DSA-87 seed")
+}
+
+/// Signs `message` with pure ML-DSA-87 under `pair`.
+pub(crate) fn ml_dsa_sign(pair: &PqdsaKeyPair, message: &[u8]) -> Vec<u8> {
+    let mut signature = vec![0; ML_DSA_87_SIGNATURE_LEN];
+    let written = pair
+        .sign(message, &mut signature)
+        .expect("signing into a buffer of the signature length succeeds");
+    signature.truncate(written);
+    signature
+}
+
+/// Returns both signatures over `message` — `pair`'s Ed25519 one and its
+/// [companion](ml_dsa_companion_of)'s ML-DSA-87 one — with their `key_id`s,
+/// as a signer holding both keys returns them.
+pub(crate) fn signed_by(pair: &Ed25519KeyPair, message: &[u8]) -> Signed {
+    let companion = ml_dsa_companion_of(pair);
+    Signed {
+        ed25519: DetachedSignature {
+            signature: pair.sign(message).as_ref().to_vec(),
+            key_id: key_id(&public_key_of(pair)),
+        },
+        ml_dsa_87: DetachedSignature {
+            signature: ml_dsa_sign(&companion, message),
+            key_id: key_id(&ml_dsa_public_key_of(&companion)),
+        },
+    }
+}
+
+/// Returns the two live anchors a package `pair` signs verifies under:
+/// `pair`'s Ed25519 key, then its companion's ML-DSA-87 key.
+pub(crate) fn anchors_of(pair: &Ed25519KeyPair) -> Vec<TrustAnchor> {
+    vec![
+        TrustAnchor::new(public_key_of(pair), false),
+        TrustAnchor::new_ml_dsa_87(&ml_dsa_public_key_of(&ml_dsa_companion_of(pair)), false),
+    ]
 }
 
 /// Returns an ML-DSA-87 key pair's raw public key.
@@ -147,9 +206,17 @@ pub(crate) fn ml_dsa_anchor_of(pair: &PqdsaKeyPair, revoked: bool) -> String {
 }
 
 /// A live ML-DSA-87 anchor entry over a freshly minted key, for a document
-/// whose ML-DSA-87 half nothing else looks at.
+/// whose ML-DSA-87 half nothing else looks at. A container whose ML-DSA-87
+/// signature has to verify needs [`companion_anchor_of`] instead.
 pub(crate) fn live_ml_dsa_anchor() -> String {
     ml_dsa_anchor_of(&ml_dsa_keypair(), false)
+}
+
+/// The ML-DSA-87 anchor entry of `pair`'s [companion](ml_dsa_companion_of):
+/// the anchor the ML-DSA-87 signature of a container `pair` signs verifies
+/// under.
+pub(crate) fn companion_anchor_of(pair: &Ed25519KeyPair, revoked: bool) -> String {
+    ml_dsa_anchor_of(&ml_dsa_companion_of(pair), revoked)
 }
 
 /// Renders one withdrawn-build entry verbatim.
@@ -173,14 +240,18 @@ pub(crate) struct Fields {
 }
 
 impl Fields {
-    /// A well-formed generation trusting `pair` as its one Ed25519 anchor,
-    /// beside one live ML-DSA-87 anchor over a freshly minted key.
+    /// A well-formed generation trusting `pair` as its one Ed25519 anchor and
+    /// `pair`'s [companion](ml_dsa_companion_of) as its one ML-DSA-87 anchor,
+    /// so a container `pair` signs verifies under it.
     pub(crate) fn new(pair: &Ed25519KeyPair) -> Self {
         Self {
             trust_set_version: Some(TRUST_SET_VERSION.to_string()),
             epoch: Some(EPOCH.to_string()),
             min_manifest_format_version: Some(MIN_MANIFEST_FORMAT_VERSION.to_string()),
-            anchors: Some(array(&[anchor_of(pair, false), live_ml_dsa_anchor()])),
+            anchors: Some(array(&[
+                anchor_of(pair, false),
+                companion_anchor_of(pair, false),
+            ])),
             withdrawn_builds: Some(array(&[])),
             extra: Vec::new(),
         }
@@ -226,7 +297,7 @@ impl Fields {
 }
 
 /// The document a well-formed fixture carries: one live Ed25519 anchor, `pair`,
-/// one live ML-DSA-87 anchor, nothing withdrawn.
+/// one live ML-DSA-87 anchor, `pair`'s companion, nothing withdrawn.
 pub(crate) fn default_document(pair: &Ed25519KeyPair) -> Vec<u8> {
     Fields::new(pair).render()
 }
@@ -289,8 +360,8 @@ fn manifest_json(
 }
 
 /// Encodes a current-version footer by hand: magic, the version byte, then the
-/// four offset/length pairs it records.
-fn footer_bytes(fields: [u64; 8]) -> Vec<u8> {
+/// six offset/length pairs it records.
+fn footer_bytes(fields: [u64; 12]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.push(FORMAT_VERSION);
@@ -300,29 +371,40 @@ fn footer_bytes(fields: [u64; 8]) -> Vec<u8> {
     out
 }
 
-/// Assembles a signed `.pkg`: the manifest at offset `0`, the archive, the
-/// signature over the manifest's raw bytes, the signer's `key_id` hint, then the
-/// footer.
-fn signed_pkg(pair: &Ed25519KeyPair, manifest: &[u8], archive: &[u8]) -> Vec<u8> {
-    let signature = pair.sign(manifest);
-    let hint = key_id(&public_key_of(pair));
+/// Which signatures a fixture container carries.
+#[derive(Clone, Copy)]
+enum Signers {
+    /// Both: the Ed25519 pair's and its companion's.
+    Both,
+    /// The Ed25519 pair's alone, with both ML-DSA-87 pairs absent.
+    Ed25519Only,
+}
+
+/// Assembles a signed format-3 `.pkg`: the manifest at offset `0`, the
+/// archive, then for each signature carried its bytes over the manifest's raw
+/// bytes and its signer's `key_id` hint — Ed25519 first — then the footer.
+fn signed_pkg(pair: &Ed25519KeyPair, manifest: &[u8], archive: &[u8], signers: Signers) -> Vec<u8> {
+    let Signed { ed25519, ml_dsa_87 } = signed_by(pair, manifest);
+    let mut envelope = vec![ed25519];
+    if let Signers::Both = signers {
+        envelope.push(ml_dsa_87);
+    }
+
     let mut out = Vec::new();
     out.extend_from_slice(manifest);
     out.extend_from_slice(archive);
-    let signature_offset = len_u64(manifest) + len_u64(archive);
-    out.extend_from_slice(signature.as_ref());
-    let hint_offset = signature_offset + len_u64(signature.as_ref());
-    out.extend_from_slice(hint.as_bytes());
-    out.extend_from_slice(&footer_bytes([
-        0,
-        len_u64(manifest),
-        len_u64(manifest),
-        len_u64(archive),
-        signature_offset,
-        len_u64(signature.as_ref()),
-        hint_offset,
-        len_u64(hint.as_bytes()),
-    ]));
+    let mut fields = [0u64; 12];
+    fields[..4].copy_from_slice(&[0, len_u64(manifest), len_u64(manifest), len_u64(archive)]);
+    for (index, detached) in envelope.iter().enumerate() {
+        let at = 4 + 4 * index;
+        fields[at] = len_u64(&out);
+        fields[at + 1] = len_u64(&detached.signature);
+        out.extend_from_slice(&detached.signature);
+        fields[at + 2] = len_u64(&out);
+        fields[at + 3] = len_u64(detached.key_id.as_bytes());
+        out.extend_from_slice(detached.key_id.as_bytes());
+    }
+    out.extend_from_slice(&footer_bytes(fields));
     out
 }
 
@@ -336,11 +418,13 @@ fn pkg_carrying(
     component: &str,
     version: &str,
     commit: &str,
+    signers: Signers,
 ) -> Vec<u8> {
     signed_pkg(
         pair,
         &manifest_json(member_name, component, version, commit, member),
         &archive_of(member_name, member),
+        signers,
     )
 }
 
@@ -353,7 +437,15 @@ pub(crate) fn pkg_naming(
     version: &str,
     commit: &str,
 ) -> Vec<u8> {
-    pkg_carrying(pair, TRUST_SET_MEMBER, member, component, version, commit)
+    pkg_carrying(
+        pair,
+        TRUST_SET_MEMBER,
+        member,
+        component,
+        version,
+        commit,
+        Signers::Both,
+    )
 }
 
 /// A generation container built to the envelope contract: the reserved target,
@@ -365,6 +457,24 @@ pub(crate) fn generation_pkg(pair: &Ed25519KeyPair, member: &[u8], epoch: u64) -
         TRUST_TARGET,
         &epoch.to_string(),
         &member_digest(member),
+    )
+}
+
+/// A generation container built to the envelope contract and signed by `pair`
+/// alone: format 3, its Ed25519 pairs present and both ML-DSA-87 pairs absent.
+pub(crate) fn generation_pkg_ed25519_only(
+    pair: &Ed25519KeyPair,
+    member: &[u8],
+    epoch: u64,
+) -> Vec<u8> {
+    pkg_carrying(
+        pair,
+        TRUST_SET_MEMBER,
+        member,
+        TRUST_TARGET,
+        &epoch.to_string(),
+        &member_digest(member),
+        Signers::Ed25519Only,
     )
 }
 
@@ -388,5 +498,6 @@ pub(crate) fn generation_pkg_member_named(
         TRUST_TARGET,
         &epoch.to_string(),
         &member_digest(member),
+        Signers::Both,
     )
 }

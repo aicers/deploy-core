@@ -11,6 +11,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `verify::SignatureAlgorithm`, `Ed25519` or `MlDsa87`, names a package
   signature algorithm, and `verify::ML_DSA_87_PUBLIC_KEY_LEN` is the 2,592 bytes
   of a raw ML-DSA-87 public key.
+- `verify::ML_DSA_87_SIGNATURE_LEN` (4,627), `payload::DetachedSignature`,
+  `package::VerifiedUpload::ml_dsa_87_key_id`, and `ml_dsa_87_signature` and
+  `ml_dsa_87_key_id` on `payload::UnparsedContainer` and `payload::Payload`.
+- `payload::append_version_2_trailer`, under `test-support`, writes a format-2
+  container for tests that show it refused.
 
 ### Changed
 
@@ -58,6 +63,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   key as `&[u8]`. A package's `key_id` hint, and every anchor tried for its
   Ed25519 signature, are taken only from the trust set's Ed25519 anchors, so a
   hint naming an ML-DSA-87 anchor is `VerifyError::UnknownKeyId`.
+- Packages and payloads are container format 3: `payload::FORMAT_VERSION` is 3
+  and `payload::FOOTER_SIZE` is 105. The footer adds an ML-DSA-87 signature pair
+  and an ML-DSA-87 `key_id` pair after the Ed25519 ones, and every writer writes
+  format 3. Format 1 and 2 containers are refused by every reader and by
+  `rewrap_trailer` with `PayloadError::UnsupportedContainerFormat`; nothing
+  converts them.
+- A package is verified only when both of its signatures verify: Ed25519, and
+  pure ML-DSA-87 (FIPS 204, empty context), each over the raw manifest block and
+  under a non-revoked trust anchor of its own algorithm, with each `key_id` hint
+  looked up among that algorithm's anchors. A package with one signature, or one
+  invalid signature, is refused, and so is a trust generation.
+  `VerifyError::BadSignature`, `UnknownKeyId` and `RevokedKey` carry the
+  `algorithm` of the signature they refuse; `BadSignature` is no longer a unit
+  variant.
+- `payload::Signed` carries both signatures, as `ed25519` and `ml_dsa_87`, each
+  a `DetachedSignature` with its `signature` and `key_id`; the signing callbacks
+  of `append_trailer_signed` and `package::prepare_sign_finalize`, and
+  `package::finalize_package`, take it. `PayloadError::InvalidSignatureLength`
+  and `InvalidKeyId` name the algorithm.
+- The `Package` resource limit's default is 64 GiB + 16 MiB + 4,924 bytes, for
+  the larger envelope.
 
 ### Fixed
 

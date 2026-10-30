@@ -37,9 +37,9 @@ mod tests;
 ///
 /// This holds no key, signs nothing, and takes no source path: the container
 /// is built only from what `prepared` retained. M is never reserialized and A
-/// is never recompressed. `signed` must be a signature over **raw M** — not
-/// over its digest or any reserialization — as an independently authorized
-/// signer returned it.
+/// is never recompressed. `signed` must be both signatures over **raw M** —
+/// the Ed25519 one and the pure ML-DSA-87 one, neither over its digest or any
+/// reserialization — as an independently authorized signer returned them.
 ///
 /// The steps run in this order, and the first failure is the result:
 ///
@@ -48,14 +48,16 @@ mod tests;
 ///    `request` and `target_arch`;
 /// 2. **rehash** — the SHA-256 and length of M and of A, streamed from the
 ///    retained copy, are recomputed and compared with `expected_binding`;
-/// 3. **framing** — `signed` must be a 64-byte signature and a 64-character
-///    lowercase-hex key ID, checked before any storage is created;
+/// 3. **framing** — `signed` must be a 64-byte Ed25519 signature and a
+///    4,627-byte ML-DSA-87 signature, each with a 64-character lowercase-hex
+///    key ID, checked before any storage is created;
 /// 4. **budget** — a fresh private scope is created under `staging_parent`,
 ///    its disk budget the configured `RetainedDisk` less the storage
 ///    `prepared` still keeps alive;
-/// 5. **assembly** — M, then A block by block, then the signature, the key ID
-///    and a footer with `manifest_offset` 0, are written into one private
-///    snapshot bounded by `Package`;
+/// 5. **assembly** — M, then A block by block, then the Ed25519 signature and
+///    its key ID, the ML-DSA-87 signature and its key ID, and a format-3
+///    footer with `manifest_offset` 0, are written into one private snapshot
+///    bounded by `Package`;
 /// 6. **verification** — that snapshot goes through every step
 ///    [`verify_contents`](super::verify_contents) runs after its own
 ///    snapshot, under `trust`, `request` and `target_arch`, with each verdict
@@ -119,9 +121,9 @@ mod tests;
 ///   assembly, a full filesystem included.
 /// - Every verdict [`verify_contents`](super::verify_contents) gives the
 ///   same container from bounded authentication onwards, as
-///   [`PackageWriteError::Content`]: a signature over anything but M is
-///   [`VerifyError::BadSignature`](crate::verify::VerifyError::BadSignature),
-///   and a key outside `trust`, a revoked key, a withdrawn build, a trust
+///   [`PackageWriteError::Content`]: either signature over anything but M is
+///   [`VerifyError::BadSignature`](crate::verify::VerifyError::BadSignature)
+///   for its algorithm, Ed25519 checked first, and a key outside `trust`, a revoked key, a withdrawn build, a trust
 ///   floor above the manifest format and a stale trust epoch are the
 ///   existing [`VerifyError`](crate::verify::VerifyError) variants.
 // The signature is the one the finalization contract fixes: the prepared
@@ -160,7 +162,8 @@ pub fn finalize_package(
     };
     let scope = scope_with_budget(limits, budget, staging_parent)?;
 
-    // 5. Assemble M ‖ A ‖ signature ‖ key ID ‖ footer.
+    // 5. Assemble M ‖ A ‖ Ed25519 signature ‖ key ID ‖ ML-DSA-87 signature ‖
+    //    key ID ‖ footer.
     let container = assemble(&scope, prepared, expected_binding, signed, limits)
         .map_err(|error| configured_disk(error, configured))?;
     #[cfg(test)]
@@ -185,8 +188,9 @@ pub fn finalize_package(
 /// preparation's checks, then every finalization check including the full
 /// verification pipeline under `trust` — and returns byte-identical output.
 /// There is no unsigned shortcut, no default key and no trust bypass: `trust`
-/// must anchor the key `sign` signs with. `sign` receives the raw manifest
-/// bytes, the convention
+/// must anchor both keys `sign` signs with, the Ed25519 one and the ML-DSA-87
+/// one. `sign` receives the raw manifest bytes and returns both signatures
+/// over them, the convention
 /// [`append_trailer_signed`](crate::payload::append_trailer_signed) uses. The
 /// prepared package stays alive until finalization returns, so the disk
 /// accounting is exactly that of the three-step composition, and it is
@@ -195,8 +199,8 @@ pub fn finalize_package(
 /// # Signed fixtures
 ///
 /// This is the complete API for constructing genuinely signed image-declaring
-/// packages in a consumer's tests: with a test key minted per test and a
-/// `TrustSet` anchoring only it, and — under the `test-support` feature, in
+/// packages in a consumer's tests: with an Ed25519 and an ML-DSA-87 test key
+/// minted per test and a `TrustSet` anchoring only those two, and — under the `test-support` feature, in
 /// `[dev-dependencies]` only — real image archives from
 /// `image::test_support::SyntheticImageArchiveBuilder`, the result passes
 /// every final check a production package does. Production signing is

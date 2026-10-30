@@ -116,6 +116,7 @@ struct UploadIdentity {
     commit: String,
     target_arch: TargetArch,
     key_id: String,
+    ml_dsa_87_key_id: String,
     manifest_sha256: [u8; 32],
 }
 
@@ -149,7 +150,8 @@ fn upload_contents<R: Read + Seek>(
         authenticated:
             Authenticated {
                 manifest,
-                key_id,
+                ed25519_key_id,
+                ml_dsa_87_key_id,
                 manifest_sha256,
             },
         archive_offset,
@@ -174,7 +176,8 @@ fn upload_contents<R: Read + Seek>(
         version: first.version.clone(),
         commit: commit.to_string(),
         target_arch: first.target_arch,
-        key_id,
+        key_id: ed25519_key_id,
+        ml_dsa_87_key_id,
         manifest_sha256,
     };
 
@@ -220,6 +223,7 @@ pub struct VerifiedUpload {
     commit: String,
     target_arch: TargetArch,
     key_id: String,
+    ml_dsa_87_key_id: String,
     manifest_sha256: [u8; 32],
     package_sha256: [u8; 32],
     package_len: u64,
@@ -237,6 +241,7 @@ impl VerifiedUpload {
             commit,
             target_arch,
             key_id,
+            ml_dsa_87_key_id,
             manifest_sha256,
         } = identity;
         VerifiedUpload {
@@ -246,6 +251,7 @@ impl VerifiedUpload {
             commit,
             target_arch,
             key_id,
+            ml_dsa_87_key_id,
             manifest_sha256,
             package_sha256,
             package_len,
@@ -288,12 +294,20 @@ impl VerifiedUpload {
         self.target_arch
     }
 
-    /// Returns the `key_id` of the trust anchor whose key verified the
-    /// signature — never the container's hint, which may name another anchor
-    /// or none.
+    /// Returns the `key_id` of the Ed25519 trust anchor whose key verified
+    /// the package's Ed25519 signature — never the container's hint, which may
+    /// name another anchor or none.
     #[must_use]
     pub fn key_id(&self) -> &str {
         &self.key_id
+    }
+
+    /// Returns the `key_id` of the ML-DSA-87 trust anchor whose key verified
+    /// the package's ML-DSA-87 signature, on the terms of
+    /// [`key_id`](Self::key_id).
+    #[must_use]
+    pub fn ml_dsa_87_key_id(&self) -> &str {
+        &self.ml_dsa_87_key_id
     }
 
     /// Returns the SHA-256 of the raw manifest block, exactly as it was read

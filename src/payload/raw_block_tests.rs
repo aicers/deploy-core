@@ -1,7 +1,7 @@
 //! The raw-block accessors on [`UnparsedContainer`]: the container version,
 //! the manifest block and the archive block exactly as the writers emitted
-//! them, and the version-1 fixture writer that reaches them through the real
-//! reader.
+//! them, and the retired-format fixture writers whose output the real reader
+//! refuses.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -11,10 +11,11 @@ use std::path::Path;
 use std::rc::Rc;
 
 use super::{
-    ArtifactInput, ED25519_SIGNATURE_LEN, EnvelopeBlock, EnvelopeBounds, FOOTER_SIZE,
-    FORMAT_VERSION, Footer, KEY_ID_HEX_LEN, MemberLength, PayloadError, Signed, UnparsedContainer,
-    append_trailer, append_trailer_signed, append_version_1_trailer, open, read_package_container,
-    rewrap_trailer, sha256_hex, write_archive_block,
+    ArtifactInput, DetachedSignature, ED25519_SIGNATURE_LEN, EnvelopeBlock, EnvelopeBounds,
+    FOOTER_FIELDS, FOOTER_SIZE, FORMAT_VERSION, Footer, KEY_ID_HEX_LEN, ML_DSA_87_SIGNATURE_LEN,
+    MemberLength, PayloadError, Signed, UnparsedContainer, append_trailer, append_trailer_signed,
+    append_version_1_trailer, append_version_2_trailer, open, read_package_container,
+    rewrap_trailer, write_archive_block,
 };
 use crate::manifest::{ArtifactKind, Disposition, TargetArch};
 use crate::verify::ENVELOPE_BOUNDS;
@@ -87,8 +88,14 @@ fn signed(dir: &Path) -> (Vec<u8>, Vec<u8>) {
         |manifest| {
             handed = manifest.to_vec();
             Ok(Signed {
-                signature: vec![0x5a; ED25519_SIGNATURE_LEN],
-                key_id: "a".repeat(KEY_ID_HEX_LEN),
+                ed25519: DetachedSignature {
+                    signature: vec![0x5a; ED25519_SIGNATURE_LEN],
+                    key_id: "a".repeat(KEY_ID_HEX_LEN),
+                },
+                ml_dsa_87: DetachedSignature {
+                    signature: vec![0x6b; ML_DSA_87_SIGNATURE_LEN],
+                    key_id: "b".repeat(KEY_ID_HEX_LEN),
+                },
             })
         },
     )
@@ -107,6 +114,14 @@ fn version_1(base: &[u8], manifest: &[u8], archive: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     append_version_1_trailer(Cursor::new(base), &mut out, manifest, archive)
         .expect("the version-1 writer succeeds");
+    out
+}
+
+/// An unsigned version-2 container over arbitrary blocks.
+fn version_2(base: &[u8], manifest: &[u8], archive: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    append_version_2_trailer(Cursor::new(base), &mut out, manifest, archive, None)
+        .expect("the version-2 writer succeeds");
     out
 }
 
@@ -141,8 +156,9 @@ fn assert_blocks<R: Read + Seek>(
 
 /// A current-format container over arbitrary blocks, with envelope blocks of
 /// whatever length is given and an empty one recorded absent:
-/// `base ‖ manifest ‖ archive ‖ signature ‖ key_id ‖ footer`.
-fn version_2(manifest: &[u8], archive: &[u8], signature: &[u8], key_id: &[u8]) -> Vec<u8> {
+/// `base ‖ manifest ‖ archive ‖ signature ‖ key_id ‖ ML-DSA-87 signature ‖
+/// ML-DSA-87 key_id ‖ footer`.
+fn version_3(manifest: &[u8], archive: &[u8], envelope: [&[u8]; 4]) -> Vec<u8> {
     let len = |bytes: &[u8]| u64::try_from(bytes.len()).expect("a fixture length fits a u64");
     let manifest_offset = len(BASE);
     let archive_offset = manifest_offset + len(manifest);
@@ -155,20 +171,24 @@ fn version_2(manifest: &[u8], archive: &[u8], signature: &[u8], key_id: &[u8]) -
             (offset, len(bytes))
         }
     };
-    let (signature_offset, signature_len) = pair(archive_offset + len(archive), signature);
-    let (key_id_offset, key_id_len) = pair(archive_offset + len(archive) + len(signature), key_id);
-    let footer = Footer {
-        version: FORMAT_VERSION,
-        manifest_offset,
-        manifest_len: len(manifest),
-        archive_offset,
-        archive_len: len(archive),
-        signature_offset,
-        signature_len,
-        key_id_offset,
-        key_id_len,
-    };
-    [BASE, manifest, archive, signature, key_id, &footer.encode()].concat()
+    let mut fields = [0; FOOTER_FIELDS];
+    fields[..4].copy_from_slice(&[manifest_offset, len(manifest), archive_offset, len(archive)]);
+    let mut cursor = archive_offset + len(archive);
+    for (index, block) in envelope.iter().enumerate() {
+        let (offset, block_len) = pair(cursor, block);
+        fields[4 + 2 * index] = offset;
+        fields[5 + 2 * index] = block_len;
+        cursor += len(block);
+    }
+    let footer = Footer::from_fields(FORMAT_VERSION, fields);
+    [
+        BASE,
+        manifest,
+        archive,
+        &envelope.concat(),
+        &footer.encode(),
+    ]
+    .concat()
 }
 
 /// What a [`RecordingSource`] saw, shared so a test can read it while the
@@ -235,20 +255,26 @@ impl Seek for RecordingSource {
 }
 
 #[test]
-fn a_version_1_container_reports_1_and_a_current_one_reports_2() {
+fn a_container_that_opens_reports_3_and_a_retired_one_never_opens() {
     let dir = tempfile::tempdir().expect("tempdir");
     let current = unsigned(dir.path());
-    assert_eq!(container(&current).container_version(), 2);
+    assert_eq!(container(&current).container_version(), 3);
     assert_eq!(container(&current).container_version(), FORMAT_VERSION);
-
-    let legacy = version_1(BASE, UNPARSABLE, NOT_AN_ARCHIVE);
-    assert_eq!(container(&legacy).container_version(), 1);
-    // Rewrapping keeps each container at its own version.
-    assert_eq!(container(&rewrapped(&legacy)).container_version(), 1);
     assert_eq!(
         container(&rewrapped(&current)).container_version(),
         FORMAT_VERSION
     );
+
+    for (found, legacy) in [
+        (1u8, version_1(BASE, UNPARSABLE, NOT_AN_ARCHIVE)),
+        (2, version_2(BASE, UNPARSABLE, NOT_AN_ARCHIVE)),
+    ] {
+        assert!(matches!(
+            read_package_container(Cursor::new(legacy.as_slice()), &ENVELOPE_BOUNDS),
+            Err(PayloadError::UnsupportedContainerFormat { found: refused, supported })
+                if refused == found && supported == [3]
+        ));
+    }
 }
 
 #[test]
@@ -318,12 +344,6 @@ fn the_raw_archive_block_is_the_one_the_writer_emitted_and_survives_a_rewrap() {
         // A second reader re-seeks and yields the same block again.
         assert_eq!(archive_of(&mut container), archive, "{label}");
     }
-
-    // The same holds for a version-1 container rewrapped at version 1.
-    let legacy = version_1(BASE, &handed, &archive);
-    let moved = rewrapped(&legacy);
-    let mut moved = container(&moved);
-    assert_blocks(&mut moved, &handed, &archive);
 }
 
 #[test]
@@ -407,15 +427,27 @@ fn the_accessors_answer_whatever_the_envelope_state() {
     // Both blocks present at lengths the release format cannot use: the
     // bounded read reports them without reading them, and the raw blocks are
     // still there.
-    let wrong = version_2(
+    let wrong = version_3(
         UNPARSABLE,
         &archive,
-        &[0x5a; ED25519_SIGNATURE_LEN + 1],
-        &[b'a'; KEY_ID_HEX_LEN - 1],
+        [
+            &[0x5a; ED25519_SIGNATURE_LEN + 1],
+            &[b'a'; KEY_ID_HEX_LEN - 1],
+            &[0x6b; ML_DSA_87_SIGNATURE_LEN - 1],
+            &[b'b'; KEY_ID_HEX_LEN + 1],
+        ],
     );
     let mut read = container(&wrong);
     assert!(matches!(read.signature(), EnvelopeBlock::WrongLength));
     assert!(matches!(read.key_id(), EnvelopeBlock::WrongLength));
+    assert!(matches!(
+        read.ml_dsa_87_signature(),
+        EnvelopeBlock::WrongLength
+    ));
+    assert!(matches!(
+        read.ml_dsa_87_key_id(),
+        EnvelopeBlock::WrongLength
+    ));
     assert_eq!(read.container_version(), FORMAT_VERSION);
     assert_blocks(&mut read, UNPARSABLE, &archive);
 
@@ -426,28 +458,57 @@ fn the_accessors_answer_whatever_the_envelope_state() {
     let bounds = EnvelopeBounds {
         signature_len: 1,
         key_id_len: 1,
+        ml_dsa_87_signature_len: 1,
+        ml_dsa_87_key_id_len: 1,
     };
     let mut read = read_package_container(Cursor::new(bytes.as_slice()), &bounds)
         .expect("the container reads");
     assert!(matches!(read.signature(), EnvelopeBlock::WrongLength));
     assert!(matches!(read.key_id(), EnvelopeBlock::WrongLength));
+    assert!(matches!(
+        read.ml_dsa_87_signature(),
+        EnvelopeBlock::WrongLength
+    ));
+    assert!(matches!(
+        read.ml_dsa_87_key_id(),
+        EnvelopeBlock::WrongLength
+    ));
     assert_blocks(&mut read, &handed, &archive);
 
     // Present at the bounded lengths, and absent.
     let mut read = container(&bytes);
     assert!(matches!(read.signature(), EnvelopeBlock::Present(_)));
+    assert!(matches!(
+        read.ml_dsa_87_signature(),
+        EnvelopeBlock::Present(_)
+    ));
+    assert!(matches!(read.ml_dsa_87_key_id(), EnvelopeBlock::Present(_)));
     assert_blocks(&mut read, &handed, &archive);
     let bytes = unsigned(dir.path());
     let mut read = container(&bytes);
     assert!(matches!(read.signature(), EnvelopeBlock::Absent));
+    assert!(matches!(read.ml_dsa_87_signature(), EnvelopeBlock::Absent));
+    assert!(matches!(read.ml_dsa_87_key_id(), EnvelopeBlock::Absent));
     assert_blocks(&mut read, &handed, &archive);
 }
 
 #[test]
 fn the_accessors_answer_for_a_manifest_that_does_not_parse() {
     for (label, bytes) in [
-        ("version 1", version_1(BASE, UNPARSABLE, NOT_AN_ARCHIVE)),
-        ("version 2", version_2(UNPARSABLE, NOT_AN_ARCHIVE, &[], &[])),
+        ("unsigned", version_3(UNPARSABLE, NOT_AN_ARCHIVE, [&[]; 4])),
+        (
+            "signed",
+            version_3(
+                UNPARSABLE,
+                NOT_AN_ARCHIVE,
+                [
+                    &[0x5a; ED25519_SIGNATURE_LEN],
+                    &[b'a'; KEY_ID_HEX_LEN],
+                    &[0x6b; ML_DSA_87_SIGNATURE_LEN],
+                    &[b'b'; KEY_ID_HEX_LEN],
+                ],
+            ),
+        ),
     ] {
         let mut read = container(&bytes);
         assert!(
@@ -462,52 +523,68 @@ fn the_accessors_answer_for_a_manifest_that_does_not_parse() {
 }
 
 #[test]
-fn the_version_1_writer_frames_a_container_the_real_readers_accept() {
-    // A genuine pre-versioned baseline: no `format_version`, no bound member
-    // list, no `commit`, over an archive the writer's own archive block
-    // produces — the shape every published version-1 payload has.
+fn the_retired_writers_frame_containers_every_real_reader_refuses() {
+    // The version-1 and version-2 writers exist so a dependent crate's tests
+    // can show an old container refused: their output is framed at the
+    // retired format's own footer size, and the real readers refuse it by
+    // name, with nothing opened and nothing extracted.
     let archive = expected_archive();
-    let manifest = format!(
-        r#"{{"artifacts":[{{"component":"example","version":"1.0.0","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"{MEMBER}","sha256":"{}"}}]}}"#,
-        sha256_hex(MEMBER_BYTES)
+    let manifest = b"{}".to_vec();
+    let ed25519 = DetachedSignature {
+        signature: vec![0x5a; ED25519_SIGNATURE_LEN],
+        key_id: "a".repeat(KEY_ID_HEX_LEN),
+    };
+    let mut signed_2 = Vec::new();
+    append_version_2_trailer(
+        Cursor::new(BASE),
+        &mut signed_2,
+        &manifest,
+        &archive,
+        Some(&ed25519),
     )
-    .into_bytes();
+    .expect("the version-2 writer succeeds");
 
-    let bytes = version_1(BASE, &manifest, &archive);
-    let mut read = container(&bytes);
-    assert_eq!(read.container_version(), 1);
-    assert!(matches!(read.signature(), EnvelopeBlock::Absent));
-    assert!(matches!(read.key_id(), EnvelopeBlock::Absent));
-    let parsed = read
-        .parse_unverified_manifest()
-        .expect("the baseline parses");
-    assert_eq!(parsed.format_version(), None);
-    assert_blocks(&mut read, &manifest, &archive);
-
-    // The layout is the version-1 one: the blocks follow the base and a
-    // 41-byte footer closes the file.
-    assert_eq!(
-        bytes.len(),
-        BASE.len() + manifest.len() + archive.len() + 41
-    );
-
-    // `open` accepts it too, down to extracting the artifact.
-    let mut payload = open(Cursor::new(bytes))
-        .expect("the payload opens")
-        .expect("a payload is present");
-    let dest = tempfile::tempdir().expect("tempdir");
-    payload
-        .extract_to(dest.path())
-        .expect("the payload extracts");
-    assert_eq!(
-        std::fs::read(dest.path().join(MEMBER)).expect("the artifact is on disk"),
-        MEMBER_BYTES
-    );
+    for (label, found, bytes, footer_len, envelope_len) in [
+        (
+            "version 1",
+            1u8,
+            version_1(BASE, &manifest, &archive),
+            41,
+            0,
+        ),
+        ("version 2", 2, version_2(BASE, &manifest, &archive), 73, 0),
+        ("signed version 2", 2, signed_2, 73, 128),
+    ] {
+        assert_eq!(
+            bytes.len(),
+            BASE.len() + manifest.len() + archive.len() + envelope_len + footer_len,
+            "{label}"
+        );
+        assert_eq!(
+            bytes.get(BASE.len()..BASE.len() + manifest.len()),
+            Some(manifest.as_slice()),
+            "{label}"
+        );
+        let refused = |error: &PayloadError| {
+            matches!(
+                error,
+                PayloadError::UnsupportedContainerFormat { found: version, supported }
+                    if *version == found && *supported == [3]
+            )
+        };
+        let error = read_package_container(Cursor::new(bytes.as_slice()), &ENVELOPE_BOUNDS)
+            .err()
+            .expect("the bounded read refuses it");
+        assert!(refused(&error), "{label}: {error:?}");
+        let error = open(Cursor::new(bytes.as_slice())).expect_err("open refuses it");
+        assert!(refused(&error), "{label}: {error:?}");
+    }
 
     // An empty base writes a `.pkg` whose manifest starts at offset 0.
     let pkg = version_1(&[], &manifest, &archive);
     assert_eq!(pkg.get(..manifest.len()), Some(manifest.as_slice()));
-    assert_blocks(&mut container(&pkg), &manifest, &archive);
+    let pkg = version_2(&[], &manifest, &archive);
+    assert_eq!(pkg.get(..manifest.len()), Some(manifest.as_slice()));
 }
 
 #[test]

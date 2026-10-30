@@ -7,20 +7,26 @@
 //! against the same zstd records the pre-refactor bytes without that drift. Every combination of base, pinset, trust set and
 //! signing is compared byte for byte, including sources whose length changes
 //! between the hash pass and the archive pass.
+//!
+//! The reference writes container format 3: it is the expected output, and
+//! the format-3 change deliberately changed the output. ML-DSA-87 signing is
+//! randomized, so each manifest is signed once and both writers are handed
+//! that same [`Signed`].
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
 use tar::{Builder, EntryType, Header};
 use zstd::Encoder;
 
 use super::{
-    ArtifactInput, CountingWriter, ED25519_SIGNATURE_LEN, FOOTER_SIZE, FORMAT_VERSION, Footer,
-    KEY_ID_HEX_LEN, MAGIC, PayloadError, Signed, SignerError, ZSTD_LEVEL, append_trailer,
-    append_trailer_signed, hash_copy, rewrap_trailer, validate_signed,
+    ArtifactInput, CountingWriter, DetachedSignature, ED25519_SIGNATURE_LEN, FOOTER_SIZE,
+    FORMAT_VERSION, Footer, KEY_ID_HEX_LEN, MAGIC, ML_DSA_87_SIGNATURE_LEN, PayloadError, Signed,
+    SignerError, ZSTD_LEVEL, append_trailer, append_trailer_signed, hash_copy, rewrap_trailer,
+    validate_signed,
 };
 use crate::image::{
     ImageArchitecture, ImageDeclaration, ImageOs, ImageOwner, ImagePlatform, ImageProvenance,
@@ -41,6 +47,9 @@ type Hook = Box<dyn FnMut()>;
 
 thread_local! {
     static BETWEEN_PASSES: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    /// Every manifest signed on this thread, and the one ML-DSA-87 signature
+    /// over it: signing is randomized, so a second call must not sign again.
+    static ML_DSA_SIGNATURES: RefCell<HashMap<Vec<u8>, Vec<u8>>> = RefCell::new(HashMap::new());
 }
 
 /// Runs the hook a test arranged between the writer's hash pass and its
@@ -133,29 +142,30 @@ where
         counter.count()
     };
 
-    let (signature_offset, signature_len, key_id_offset, key_id_len) = match signed {
-        Some(signed) => {
-            let signature_len = ED25519_SIGNATURE_LEN as u64;
-            let key_id_len = KEY_ID_HEX_LEN as u64;
-            let signature_offset = archive_offset + archive_len;
-            out.write_all(&signed.signature)?;
-            let key_id_offset = signature_offset + signature_len;
-            out.write_all(signed.key_id.as_bytes())?;
-            (signature_offset, signature_len, key_id_offset, key_id_len)
+    let mut fields = [0u64; 12];
+    fields[..4].copy_from_slice(&[manifest_offset, manifest_len, archive_offset, archive_len]);
+    if let Some(signed) = signed {
+        let mut cursor = archive_offset + archive_len;
+        let blocks: [&[u8]; 4] = [
+            &signed.ed25519.signature,
+            signed.ed25519.key_id.as_bytes(),
+            &signed.ml_dsa_87.signature,
+            signed.ml_dsa_87.key_id.as_bytes(),
+        ];
+        let lens = [
+            ED25519_SIGNATURE_LEN,
+            KEY_ID_HEX_LEN,
+            ML_DSA_87_SIGNATURE_LEN,
+            KEY_ID_HEX_LEN,
+        ];
+        for (index, (block, len)) in blocks.into_iter().zip(lens).enumerate() {
+            out.write_all(block)?;
+            fields[4 + 2 * index] = cursor;
+            fields[5 + 2 * index] = len as u64;
+            cursor += len as u64;
         }
-        None => (0, 0, 0, 0),
-    };
-    let footer = Footer {
-        version: FORMAT_VERSION,
-        manifest_offset,
-        manifest_len,
-        archive_offset,
-        archive_len,
-        signature_offset,
-        signature_len,
-        key_id_offset,
-        key_id_len,
-    };
+    }
+    let footer = Footer::from_fields(FORMAT_VERSION, fields);
     out.write_all(&footer.encode())?;
     Ok(())
 }
@@ -227,10 +237,36 @@ fn key() -> Ed25519KeyPair {
     Ed25519KeyPair::from_seed_unchecked(&SEED).expect("a fixed test seed")
 }
 
+fn ml_dsa_key() -> PqdsaKeyPair {
+    PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &SEED).expect("a fixed test seed")
+}
+
+/// Both signatures over `manifest`. The ML-DSA-87 one is made once per
+/// manifest and handed out again on every later call, so the live writer and
+/// the reference receive the same bytes.
 fn stamp(pair: &Ed25519KeyPair, manifest: &[u8]) -> Signed {
+    let ml_dsa = ml_dsa_key();
+    let ml_dsa_signature = ML_DSA_SIGNATURES.with(|memo| {
+        memo.borrow_mut()
+            .entry(manifest.to_vec())
+            .or_insert_with(|| {
+                let mut signature = vec![0; ML_DSA_87_SIGNATURE_LEN];
+                ml_dsa
+                    .sign(manifest, &mut signature)
+                    .expect("signing succeeds");
+                signature
+            })
+            .clone()
+    });
     Signed {
-        signature: pair.sign(manifest).as_ref().to_vec(),
-        key_id: crate::verify::key_id(pair.public_key().as_ref()),
+        ed25519: DetachedSignature {
+            signature: pair.sign(manifest).as_ref().to_vec(),
+            key_id: crate::verify::key_id(pair.public_key().as_ref()),
+        },
+        ml_dsa_87: DetachedSignature {
+            signature: ml_dsa_signature,
+            key_id: crate::verify::key_id(ml_dsa.public_key().as_ref()),
+        },
     }
 }
 
@@ -405,12 +441,12 @@ fn a_source_changing_length_between_passes_writes_what_it_always_did() {
     }
 }
 
-/// The footer's eight fields.
-fn footer_fields(bytes: &[u8]) -> [u64; 8] {
+/// The footer's twelve fields.
+fn footer_fields(bytes: &[u8]) -> [u64; 12] {
     let footer = &bytes[bytes.len() - FOOTER_SIZE..];
     assert_eq!(&footer[..MAGIC.len()], MAGIC);
     assert_eq!(footer[MAGIC.len()], FORMAT_VERSION);
-    let mut fields = [0u64; 8];
+    let mut fields = [0u64; 12];
     for (at, field) in fields.iter_mut().enumerate() {
         let start = MAGIC.len() + 1 + at * 8;
         *field = u64::from_le_bytes(footer[start..start + 8].try_into().expect("8 bytes"));
@@ -433,6 +469,10 @@ fn a_nonempty_base_puts_the_manifest_after_it() {
             _,
             key_id_offset,
             _,
+            ml_dsa_87_signature_offset,
+            _,
+            ml_dsa_87_key_id_offset,
+            _,
         ] = footer_fields(&output);
         assert_eq!(manifest_offset, case.base.len() as u64);
         assert_eq!(&output[..case.base.len()], case.base);
@@ -443,8 +483,24 @@ fn a_nonempty_base_puts_the_manifest_after_it() {
                 key_id_offset,
                 signature_offset + ED25519_SIGNATURE_LEN as u64
             );
+            assert_eq!(
+                ml_dsa_87_signature_offset,
+                key_id_offset + KEY_ID_HEX_LEN as u64
+            );
+            assert_eq!(
+                ml_dsa_87_key_id_offset,
+                ml_dsa_87_signature_offset + ML_DSA_87_SIGNATURE_LEN as u64
+            );
         } else {
-            assert_eq!((signature_offset, key_id_offset), (0, 0));
+            assert_eq!(
+                (
+                    signature_offset,
+                    key_id_offset,
+                    ml_dsa_87_signature_offset,
+                    ml_dsa_87_key_id_offset
+                ),
+                (0, 0, 0, 0)
+            );
         }
     }
 }
@@ -507,11 +563,20 @@ fn a_writer_failing_partway_keeps_what_it_accepted_as_before() {
             _,
             key_id_offset,
             _,
+            ml_dsa_87_signature_offset,
+            _,
+            ml_dsa_87_key_id_offset,
+            _,
         ] = footer_fields(&full);
         let footer_start = (full.len() - FOOTER_SIZE) as u64;
         let mut points = vec![archive_offset + archive_len / 2, footer_start + 5];
         if case.signed {
-            points.extend([signature_offset + 10, key_id_offset + 10]);
+            points.extend([
+                signature_offset + 10,
+                key_id_offset + 10,
+                ml_dsa_87_signature_offset + 10,
+                ml_dsa_87_key_id_offset + 10,
+            ]);
         }
         for point in points {
             let mut live_out = FailAfter::new(point);

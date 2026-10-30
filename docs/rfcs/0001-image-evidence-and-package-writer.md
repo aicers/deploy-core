@@ -133,7 +133,7 @@ New APIs use `ContentLimits` with private fields, a `Default` profile below, and
 | --- | --- |
 | Raw manifest M | 16 MiB |
 | Compressed archive A | 64 GiB |
-| Complete standalone package | 64 GiB + 16 MiB + 201 bytes (64-byte signature, 64-byte key ID, 73-byte footer) |
+| Complete standalone package | 64 GiB + 16 MiB + 4,924 bytes (64-byte Ed25519 signature, 4,627-byte ML-DSA-87 signature, two 64-byte key IDs, 105-byte footer) |
 | Outer artifacts/members | 1,024 |
 | Sum of outer uncompressed member bytes | 128 GiB |
 | One image archive / one stored layer blob / one decoded layer stream | 32 GiB / 16 GiB / 16 GiB |

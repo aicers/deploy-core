@@ -11,9 +11,9 @@ use crate::package::contents::tests::fixture::{
     manifest_bytes, mixed, package, undeclared_manifest_bytes, unsigned,
 };
 use crate::package::{ContentLimits, LimitResource, verify_contents};
-use crate::trust_fixture::{default_document, generation_pkg, keypair, public_key_of};
+use crate::trust_fixture::{anchors_of, default_document, generation_pkg, keypair, public_key_of};
 use crate::verify::{
-    ImageVerifyError, TRUST_TARGET, TrustAnchor, TrustSet, UploadRequest, VerifyError,
+    ImageVerifyError, SignatureAlgorithm, TRUST_TARGET, TrustSet, UploadRequest, VerifyError,
     VerifyRequest, key_id,
 };
 
@@ -178,8 +178,8 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 fn every_signature_failure_outranks_every_upload_refusal() {
     let signer = Signer::new();
     let stranger = Signer::new();
-    let revoked = TrustSet::new(vec![signer.anchor(true)], Vec::new(), 0, 0)
-        .expect("a revoked-only trust set");
+    let revoked =
+        TrustSet::new(signer.anchors(true), Vec::new(), 0, 0).expect("a revoked-only trust set");
 
     let refusable: [(&str, Vec<Art>); 4] = [
         ("no artifacts", Vec::new()),
@@ -227,7 +227,9 @@ fn every_signature_failure_outranks_every_upload_refusal() {
         assert!(
             matches!(
                 refused(&unsigned, &signer.trust()),
-                ContentError::Verify(VerifyError::BadSignature)
+                ContentError::Verify(VerifyError::BadSignature {
+                    algorithm: SignatureAlgorithm::Ed25519
+                })
             ),
             "{label}: unsigned"
         );
@@ -236,7 +238,9 @@ fn every_signature_failure_outranks_every_upload_refusal() {
         assert!(
             matches!(
                 refused(&flipped, &signer.trust()),
-                ContentError::Verify(VerifyError::BadSignature)
+                ContentError::Verify(VerifyError::BadSignature {
+                    algorithm: SignatureAlgorithm::Ed25519
+                })
             ),
             "{label}: a flipped signature bit"
         );
@@ -245,7 +249,7 @@ fn every_signature_failure_outranks_every_upload_refusal() {
         assert!(
             matches!(
                 refused(&unknown, &signer.trust()),
-                ContentError::Verify(VerifyError::UnknownKeyId { key_id })
+                ContentError::Verify(VerifyError::UnknownKeyId { algorithm: SignatureAlgorithm::Ed25519, key_id })
                     if key_id == stranger.key_id()
             ),
             "{label}: an unknown key"
@@ -254,7 +258,7 @@ fn every_signature_failure_outranks_every_upload_refusal() {
         assert!(
             matches!(
                 refused(&valid, &revoked),
-                ContentError::Verify(VerifyError::RevokedKey { key_id })
+                ContentError::Verify(VerifyError::RevokedKey { algorithm: SignatureAlgorithm::Ed25519, key_id })
                     if key_id == signer.key_id()
             ),
             "{label}: a revoked key"
@@ -404,7 +408,7 @@ fn every_fixture_gets_the_verdict_verify_contents_gives_its_true_build() {
         ),
         first.clone(),
     ));
-    let floor = TrustSet::new(vec![signer.anchor(false)], Vec::new(), u32::MAX, 0)
+    let floor = TrustSet::new(signer.anchors(false), Vec::new(), u32::MAX, 0)
         .expect("a trust set with a floor");
     cases.push((
         "below the format floor",
@@ -440,6 +444,8 @@ fn assert_identity(verified: &VerifiedUpload, arts: &[Art], signer: &Signer, byt
     assert_eq!(verified.commit(), first.commit);
     assert_eq!(verified.target_arch(), first.arch);
     assert_eq!(verified.key_id(), signer.key_id());
+    assert_eq!(verified.ml_dsa_87_key_id(), signer.ml_dsa_87_key_id());
+    assert_ne!(verified.key_id(), verified.ml_dsa_87_key_id());
     assert_eq!(verified.manifest(), &fixture::manifest(arts));
     assert_eq!(verified.manifest_sha256(), &sha256(&manifest_bytes(arts)));
     assert_eq!(verified.package_sha256(), &sha256(bytes));
@@ -465,7 +471,7 @@ fn the_key_id_is_the_verifying_anchors_whatever_the_hint_says() {
     // The other anchor first, so a verifier trusting the hint or the first
     // anchor would name it.
     let trust = TrustSet::new(
-        vec![other.anchor(false), signer.anchor(false)],
+        [other.anchors(false), signer.anchors(false)].concat(),
         Vec::new(),
         0,
         0,
@@ -486,6 +492,11 @@ fn the_key_id_is_the_verifying_anchors_whatever_the_hint_says() {
         let verified = upload(&bytes, &trust).expect("the package verifies");
         assert_identity(&verified, &arts, &signer, &bytes);
         assert_ne!(verified.key_id(), other.key_id(), "hint {hint:?}");
+        assert_ne!(
+            verified.ml_dsa_87_key_id(),
+            other.ml_dsa_87_key_id(),
+            "hint {hint:?}"
+        );
     }
 }
 
@@ -496,13 +507,7 @@ fn the_key_id_is_the_verifying_anchors_whatever_the_hint_says() {
 #[test]
 fn a_signed_trust_generation_is_a_reserved_target() {
     let pair = keypair();
-    let trust = TrustSet::new(
-        vec![TrustAnchor::new(public_key_of(&pair), false)],
-        Vec::new(),
-        0,
-        1,
-    )
-    .expect("a trust set");
+    let trust = TrustSet::new(anchors_of(&pair), Vec::new(), 0, 1).expect("a trust set");
     let bytes = generation_pkg(&pair, &default_document(&pair), 4711);
     assert!(matches!(
         refused(&bytes, &trust),
@@ -513,7 +518,7 @@ fn a_signed_trust_generation_is_a_reserved_target() {
     let stranger = Signer::new();
     assert!(matches!(
         refused(&bytes, &stranger.trust()),
-        ContentError::Verify(VerifyError::UnknownKeyId { key_id: id })
+        ContentError::Verify(VerifyError::UnknownKeyId { algorithm: SignatureAlgorithm::Ed25519, key_id: id })
             if id == key_id(&public_key_of(&pair))
     ));
 }

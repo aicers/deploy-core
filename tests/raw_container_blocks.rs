@@ -1,6 +1,7 @@
 //! A dependent crate hashing a container's raw blocks through the public API
 //! alone: the container version, the manifest block and a stream over the
-//! archive block, across a rewrap and at both container versions.
+//! archive block, across a rewrap — and the retired container formats the
+//! test-support writers produce, refused by the same readers.
 
 use std::collections::BTreeSet;
 use std::io::{Cursor, Read};
@@ -77,22 +78,53 @@ fn the_raw_blocks_survive_a_rewrap_onto_another_base() {
 
 #[cfg(feature = "test-support")]
 #[test]
-fn a_version_1_fixture_reads_through_the_real_reader() {
-    use deploy_core::payload::{EnvelopeBlock, append_version_1_trailer};
+fn retired_format_fixtures_are_refused_through_the_real_readers() {
+    use deploy_core::payload::{
+        DetachedSignature, PayloadError, append_version_1_trailer, append_version_2_trailer, open,
+    };
 
     let manifest = b"a manifest block nothing parses";
     let archive = b"an archive block nothing decompresses";
-    let mut container = Vec::new();
-    append_version_1_trailer(Cursor::new(BASE), &mut container, manifest, archive)
+    let ed25519 = DetachedSignature {
+        signature: vec![0x5a; 64],
+        key_id: "a".repeat(64),
+    };
+    let mut version_1 = Vec::new();
+    append_version_1_trailer(Cursor::new(BASE), &mut version_1, manifest, archive)
         .expect("the fixture is written");
+    let mut unsigned_2 = Vec::new();
+    append_version_2_trailer(Cursor::new(BASE), &mut unsigned_2, manifest, archive, None)
+        .expect("the fixture is written");
+    let mut signed_2 = Vec::new();
+    append_version_2_trailer(
+        Cursor::new(BASE),
+        &mut signed_2,
+        manifest,
+        archive,
+        Some(&ed25519),
+    )
+    .expect("the fixture is written");
 
-    let read = read_package_container(Cursor::new(container.as_slice()), &ENVELOPE_BOUNDS)
-        .expect("the fixture reads");
-    assert!(matches!(read.signature(), EnvelopeBlock::Absent));
-    assert!(matches!(read.key_id(), EnvelopeBlock::Absent));
-    assert!(read.parse_unverified_manifest().is_err());
-
-    let blocks = (1, manifest.to_vec(), archive.to_vec());
-    assert_eq!(raw_blocks(&container), blocks);
-    assert_eq!(raw_blocks(&rewrapped(&container)), blocks);
+    for (found, container) in [(1u8, version_1), (2, unsigned_2), (2, signed_2)] {
+        let refused = |error: &PayloadError| {
+            matches!(
+                error,
+                PayloadError::UnsupportedContainerFormat { found: version, supported }
+                    if *version == found && *supported == [FORMAT_VERSION]
+            )
+        };
+        let error = read_package_container(Cursor::new(container.as_slice()), &ENVELOPE_BOUNDS)
+            .err()
+            .expect("the bounded reader refuses it");
+        assert!(refused(&error), "{error:?}");
+        let error = open(Cursor::new(container.as_slice())).expect_err("open refuses it");
+        assert!(refused(&error), "{error:?}");
+        let error = rewrap_trailer(
+            Cursor::new(container.as_slice()),
+            Cursor::new(OTHER_BASE),
+            &mut Vec::new(),
+        )
+        .expect_err("rewrap refuses it");
+        assert!(refused(&error), "{error:?}");
+    }
 }

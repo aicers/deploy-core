@@ -529,9 +529,9 @@ fn material(package: &[u8], member: &[u8], epoch: u64) -> [GenerationFile; 3] {
 /// trust set [`self_admission_candidate`] fixes argument for argument, a
 /// self-admission request whose `commit` is the digest of the staged member's own
 /// bytes, [`verify_package`] over the re-opened staged container, and only then
-/// the refusing reader and the staged `epoch` record. One extra Ed25519
-/// verification is a negligible price for closing the same TOCTOU the mTLS
-/// validator closes.
+/// the refusing reader and the staged `epoch` record. One extra verification of
+/// both signatures, Ed25519 and ML-DSA-87, is a negligible price for closing the
+/// same TOCTOU the mTLS validator closes.
 ///
 /// # Errors
 ///
@@ -1277,11 +1277,12 @@ fn admit_onto_empty_tree<'a>(
 ///
 /// It proves the delivered document is internally consistent and was not mutated
 /// in transit: the container walks whole, its members hash as its signed manifest
-/// binds them, the manifest's signature verifies under an anchor the document
-/// itself carries, and the document survives the refusing reader.
+/// binds them, both of the manifest's signatures, Ed25519 and ML-DSA-87, verify
+/// under anchors of their own algorithms the document itself carries, and the
+/// document survives the refusing reader.
 ///
 /// It does **not** prove authenticity. An attacker who replaces the whole
-/// document, anchors included, and signs the container with a key that document
+/// document, anchors included, and signs the container with keys that document
 /// names passes every step here, because a self-admitted generation is by
 /// definition checked against itself. Authenticity rests on the operator-mediated
 /// channel that delivered the bytes, exactly as the mTLS CA anchor's does.
@@ -2164,9 +2165,10 @@ mod tests {
     use crate::manifest::MAX_MANIFEST_FORMAT_VERSION;
     use crate::roxyd_trust::Activation;
     use crate::trust_fixture::{
-        Fields, anchor_json, anchor_of, array, default_document, generation_pkg,
-        generation_pkg_member_named, hex_of, keypair, live_ml_dsa_anchor, ml_dsa_anchor_of,
-        ml_dsa_keypair, pkg_naming, public_key_of, version_1_anchor_of, withdrawn_json,
+        Fields, anchor_json, anchor_of, array, companion_anchor_of, default_document,
+        generation_pkg, generation_pkg_ed25519_only, generation_pkg_member_named, hex_of, keypair,
+        live_ml_dsa_anchor, ml_dsa_anchor_of, ml_dsa_companion_of, ml_dsa_keypair,
+        ml_dsa_public_key_of, pkg_naming, public_key_of, version_1_anchor_of, withdrawn_json,
     };
     use crate::trust_set::{
         TRUST_SET_MEMBER, TrustSetDocumentError, member_digest, read_trust_set_document,
@@ -2762,7 +2764,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ReleaseTrustError::Verify(VerifyError::UnknownKeyId { key_id: ref id })
+                ReleaseTrustError::Verify(VerifyError::UnknownKeyId { algorithm: Ed25519, key_id: ref id })
                     if *id == key_id(&public_key_of(&stranger))
             ),
             "got {err:?}",
@@ -2797,7 +2799,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ReleaseTrustError::Verify(VerifyError::RevokedKey { key_id: ref id })
+                ReleaseTrustError::Verify(VerifyError::RevokedKey { algorithm: Ed25519, key_id: ref id })
                     if *id == key_id(&public_key_of(&revoked))
             ),
             "the staged anchors' `revoked` flags reach the candidate set, got {err:?}",
@@ -2962,7 +2964,7 @@ mod tests {
                 anchors: Some(array(&[
                     anchor_of(&live, false),
                     anchor_of(&revoked, true),
-                    live_ml_dsa_anchor(),
+                    companion_anchor_of(&live, false),
                 ])),
                 ..Fields::new(&live)
             },
@@ -2985,7 +2987,7 @@ mod tests {
         assert!(matches!(
             verify_package(Cursor::new(by_revoked), &trust, &request)
                 .expect_err("the signer is revoked"),
-            VerifyError::RevokedKey { key_id: id } if id == key_id(&public_key_of(&revoked))
+            VerifyError::RevokedKey { algorithm: Ed25519, key_id: id } if id == key_id(&public_key_of(&revoked))
         ));
     }
 
@@ -3227,7 +3229,10 @@ mod tests {
         let err = admit_seed_generation(&t.root, &mutated)
             .expect_err("the signature no longer covers this manifest");
         assert!(
-            matches!(err, ReleaseTrustError::Verify(VerifyError::BadSignature)),
+            matches!(
+                err,
+                ReleaseTrustError::Verify(VerifyError::BadSignature { algorithm: Ed25519 })
+            ),
             "got {err:?}",
         );
         assert_nothing_installed(&t.root, &[]);
@@ -3281,7 +3286,7 @@ mod tests {
                     &hex_of(&public_key_of(&stranger)),
                     false,
                 ),
-                live_ml_dsa_anchor(),
+                companion_anchor_of(&pair, false),
             ])),
             ..Fields::new(&pair)
         }
@@ -4344,7 +4349,7 @@ mod tests {
         assert!(
             matches!(
                 verdict(&err.source),
-                VerifyError::UnknownKeyId { key_id: id }
+                VerifyError::UnknownKeyId { algorithm: Ed25519, key_id: id }
                     if *id == key_id(&public_key_of(&successor))
             ),
             "got {:?}",
@@ -5763,27 +5768,95 @@ mod tests {
 
     #[test]
     fn every_door_refuses_a_generation_with_no_live_ml_dsa_87_anchor() {
+        // The runtime doors verify under the active generation, where the
+        // signer's ML-DSA-87 key is live, and the reader then refuses the
+        // document. The self-admitting doors verify under the document's own
+        // anchors, among which no live ML-DSA-87 key signed it: the ML-DSA-87
+        // signature is that verdict, before the reader is reached.
         let pair = keypair();
-        for anchors in [
-            vec![anchor_of(&pair, false)],
-            vec![
-                anchor_of(&pair, false),
-                ml_dsa_anchor_of(&ml_dsa_keypair(), true),
-            ],
+        let companion = key_id(&ml_dsa_public_key_of(&ml_dsa_companion_of(&pair)));
+        for (anchors, revoked_signer) in [
+            (vec![anchor_of(&pair, false)], false),
+            (
+                vec![
+                    anchor_of(&pair, false),
+                    ml_dsa_anchor_of(&ml_dsa_keypair(), true),
+                ],
+                false,
+            ),
+            (
+                vec![anchor_of(&pair, false), companion_anchor_of(&pair, true)],
+                true,
+            ),
         ] {
             let package = next_generation_anchored(&pair, &anchors);
             for door in DOORS {
                 let err = door.drive(&pair, &package).expect_err("refused");
-                assert!(
-                    matches!(
-                        err,
-                        ReleaseTrustError::Document(TrustSetDocumentError::MissingLiveAnchor {
-                            algorithm: MlDsa87
-                        })
-                    ),
-                    "{door:?}: got {err:?}"
-                );
+                if !door.self_admitting() {
+                    assert!(
+                        matches!(
+                            err,
+                            ReleaseTrustError::Document(TrustSetDocumentError::MissingLiveAnchor {
+                                algorithm: MlDsa87
+                            })
+                        ),
+                        "{door:?}: got {err:?}"
+                    );
+                } else if revoked_signer {
+                    assert!(
+                        matches!(
+                            err,
+                            ReleaseTrustError::Verify(VerifyError::RevokedKey { algorithm: MlDsa87, ref key_id })
+                                if *key_id == companion
+                        ),
+                        "{door:?}: got {err:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            err,
+                            ReleaseTrustError::Verify(VerifyError::UnknownKeyId { algorithm: MlDsa87, ref key_id })
+                                if *key_id == companion
+                        ),
+                        "{door:?}: got {err:?}"
+                    );
+                }
             }
+        }
+    }
+
+    #[test]
+    fn every_door_refuses_a_generation_signed_with_ed25519_alone() {
+        // A format-3 container whose Ed25519 pairs are present and whose
+        // ML-DSA-87 pairs are absent, over a document every door would
+        // otherwise admit. Its Ed25519 signature verifies, at every door;
+        // the missing one is the verdict, and the tree is left as it was.
+        let pair = keypair();
+        let member = Fields {
+            epoch: Some(NEXT_EPOCH.to_string()),
+            ..Fields::new(&pair)
+        }
+        .render();
+        let package = generation_pkg_ed25519_only(&pair, &member, NEXT_EPOCH);
+        for door in DOORS {
+            let err = door.drive(&pair, &package).expect_err("refused");
+            assert!(
+                matches!(
+                    err,
+                    ReleaseTrustError::Verify(VerifyError::BadSignature { algorithm: MlDsa87 })
+                ),
+                "{door:?}: got {err:?}"
+            );
+        }
+
+        // The same document, signed by both keys, is admitted by every door.
+        let package = generation_pkg(&pair, &member, NEXT_EPOCH);
+        for door in DOORS {
+            assert_eq!(
+                door.drive(&pair, &package).expect("admitted"),
+                NEXT_EPOCH,
+                "{door:?}"
+            );
         }
     }
 
@@ -5803,7 +5876,7 @@ mod tests {
                 assert!(
                     matches!(
                         err,
-                        ReleaseTrustError::Verify(VerifyError::RevokedKey { ref key_id })
+                        ReleaseTrustError::Verify(VerifyError::RevokedKey { algorithm: Ed25519, ref key_id })
                             if *key_id == signer
                     ),
                     "{door:?}: got {err:?}"

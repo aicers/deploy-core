@@ -768,8 +768,9 @@ limit_resources! {
     /// Bytes of one package's compressed archive block.
     CompressedArchive => compressed_archive, "compressed archive", 64 * GIB;
     /// Bytes of one whole package file: the archive block, the manifest and
-    /// the fixed-size envelope around them.
-    Package => package, "package", 64 * GIB + 16 * MIB + 201;
+    /// the fixed-size envelope around them — both signatures, both key IDs
+    /// and the footer, 4,924 bytes.
+    Package => package, "package", 64 * GIB + 16 * MIB + 4924;
     /// Members of one package's outer archive.
     OuterMembers => outer_members, "outer members", 1024;
     /// Uncompressed bytes across every member of one package's outer archive.

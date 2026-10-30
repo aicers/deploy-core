@@ -5,12 +5,13 @@
 //! finalization it composes — followed by a full re-verification of the
 //! published file.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
 use deploy_core::image::test_support::{
     LayerCompression, SyntheticImageArchiveBuilder, SyntheticLayer,
 };
@@ -25,10 +26,14 @@ use deploy_core::package::{
     VerifiedImages, finalize_package, prepare_package, prepare_sign_finalize, reopen_prepared,
     verify_contents,
 };
-use deploy_core::payload::{ArtifactInput, Signed};
-use deploy_core::verify::{
-    ImageVerifyError, TRUST_TARGET, TrustAnchor, TrustSet, VerifyError, VerifyRequest, key_id,
+use deploy_core::payload::{
+    ArtifactInput, DetachedSignature, EnvelopeBlock, FOOTER_SIZE, PayloadError, Signed,
 };
+use deploy_core::verify::{
+    ENVELOPE_BOUNDS, ImageVerifyError, ML_DSA_87_PUBLIC_KEY_LEN, ML_DSA_87_SIGNATURE_LEN,
+    TRUST_TARGET, TrustAnchor, TrustSet, VerifyError, VerifyRequest, key_id, verify_package,
+};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[path = "../examples/write_signed_v6_fixture/fixture.rs"]
@@ -45,9 +50,17 @@ const SELECTED: &str = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 // Test key and directories
 // ---------------------------------------------------------------------------
 
-/// An Ed25519 key minted for one test, and the trust set anchoring only it.
+/// An Ed25519 and an ML-DSA-87 key minted for one test, and the trust set
+/// anchoring only those two.
+///
+/// ML-DSA-87 signing is randomized, so the signature this signer makes over
+/// a message is kept and handed out again: two flows signing the same
+/// manifest produce the same package, as a detached signer answering the same
+/// request twice from its records would.
 struct TestSigner {
     pair: Ed25519KeyPair,
+    ml_dsa: PqdsaKeyPair,
+    ml_dsa_signatures: RefCell<HashMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl TestSigner {
@@ -55,6 +68,8 @@ impl TestSigner {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("a fresh test key");
         TestSigner {
             pair: Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("the key parses"),
+            ml_dsa: PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).expect("a fresh test key"),
+            ml_dsa_signatures: RefCell::new(HashMap::new()),
         }
     }
 
@@ -66,25 +81,57 @@ impl TestSigner {
             .expect("a 32-byte key")
     }
 
+    fn ml_dsa_public_key(&self) -> [u8; ML_DSA_87_PUBLIC_KEY_LEN] {
+        self.ml_dsa
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("a raw ML-DSA-87 key")
+    }
+
     fn trust_at(&self, epoch: u64) -> TrustSet {
         TrustSet::new(
-            vec![TrustAnchor::new(self.public_key(), false)],
+            vec![
+                TrustAnchor::new(self.public_key(), false),
+                TrustAnchor::new_ml_dsa_87(&self.ml_dsa_public_key(), false),
+            ],
             Vec::new(),
             0,
             epoch,
         )
-        .expect("a one-anchor trust set")
+        .expect("a two-anchor trust set")
     }
 
     fn trust(&self) -> TrustSet {
         self.trust_at(0)
     }
 
-    /// Signs the raw manifest bytes, never a digest of them.
+    /// Signs the raw manifest bytes with both keys, never a digest of them.
     fn sign(&self, manifest: &[u8]) -> Signed {
+        let ml_dsa = self
+            .ml_dsa_signatures
+            .borrow_mut()
+            .entry(manifest.to_vec())
+            .or_insert_with(|| {
+                let mut signature =
+                    vec![0; usize::try_from(ML_DSA_87_SIGNATURE_LEN).expect("fits")];
+                let written = self
+                    .ml_dsa
+                    .sign(manifest, &mut signature)
+                    .expect("signing succeeds");
+                signature.truncate(written);
+                signature
+            })
+            .clone();
         Signed {
-            signature: self.pair.sign(manifest).as_ref().to_vec(),
-            key_id: key_id(&self.public_key()),
+            ed25519: DetachedSignature {
+                signature: self.pair.sign(manifest).as_ref().to_vec(),
+                key_id: key_id(&self.public_key()),
+            },
+            ml_dsa_87: DetachedSignature {
+                signature: ml_dsa,
+                key_id: key_id(&self.ml_dsa_public_key()),
+            },
         }
     }
 }
@@ -599,27 +646,171 @@ fn a_reserved_trust_package_finalizes_and_reverifies_under_its_epoch() {
     publish_and_reverify(&finalized, &signer.trust_at(4), &request, arch);
 }
 
-/// Reads the checked-in package under `assets/test-fixtures/<name>`, and the
-/// trust set anchoring only the public key kept beside it.
-fn checked_in(name: &str) -> (Vec<u8>, TrustSet) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+/// The directory of the checked-in fixture `name`.
+fn fixture_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets/test-fixtures")
-        .join(name);
-    let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
-    let key_hex = std::fs::read_to_string(dir.join("public-key.hex")).expect("its key");
-    let key_hex = key_hex.trim();
-    let key: Vec<u8> = (0..key_hex.len())
+        .join(name)
+}
+
+/// Reads the raw key held as lowercase hex in `file` under `dir`.
+fn read_key(dir: &Path, file: &str) -> Vec<u8> {
+    let hex = std::fs::read_to_string(dir.join(file)).expect("its key");
+    let hex = hex.trim();
+    (0..hex.len())
         .step_by(2)
-        .map(|at| u8::from_str_radix(&key_hex[at..at + 2], 16).expect("hex"))
-        .collect();
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// Reads the checked-in package under `assets/test-fixtures/<name>`, and the
+/// trust set anchoring only the two public keys kept beside it.
+fn checked_in(name: &str) -> (Vec<u8>, TrustSet) {
+    let dir = fixture_dir(name);
+    let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
+    let ml_dsa: [u8; ML_DSA_87_PUBLIC_KEY_LEN] = read_key(&dir, "ml-dsa-87-public-key.hex")
+        .try_into()
+        .expect("a raw ML-DSA-87 key");
     let trust = TrustSet::new(
-        vec![TrustAnchor::new(key.try_into().expect("32 bytes"), false)],
+        vec![
+            TrustAnchor::new(
+                read_key(&dir, "ed25519-public-key.hex")
+                    .try_into()
+                    .expect("32 bytes"),
+                false,
+            ),
+            TrustAnchor::new_ml_dsa_87(&ml_dsa, false),
+        ],
         Vec::new(),
         0,
         0,
     )
     .expect("a trust set");
     (package, trust)
+}
+
+/// The length of a format-3 package's manifest and archive blocks together,
+/// which start at offset 0 and sit adjacent: the bytes a re-framing kept.
+fn blocks_len(package: &[u8]) -> usize {
+    let footer = &package[package.len() - FOOTER_SIZE..];
+    assert_eq!(footer[8], 3, "a format-3 footer");
+    let field = |at: usize| {
+        let start = 9 + 8 * at;
+        usize::try_from(u64::from_le_bytes(
+            footer[start..start + 8].try_into().expect("8 bytes"),
+        ))
+        .expect("fits")
+    };
+    assert_eq!(field(0), 0, "the manifest starts the package");
+    assert_eq!(field(2), field(1), "the archive follows the manifest");
+    field(1) + field(3)
+}
+
+/// SHA-256 of the manifest block and archive block of `signed-v6-images` as
+/// they stood in the format-2 package before it was re-framed — its first
+/// 3,618 bytes. No format-2 copy of that package is kept, so its blocks are
+/// pinned by this digest.
+const SIGNED_V6_FORMAT_2_BLOCKS_SHA256: &str =
+    "63fe142ce717c93ddefe2723e718f4ddfbe05b8746e97f89d2bb4c593ca6a72b";
+
+#[test]
+fn the_re_framed_signed_v6_package_keeps_its_format_6_blocks() {
+    let (package, trust) = checked_in("signed-v6-images");
+    assert!(package.starts_with(br#"{"format_version":6,"#));
+    let blocks = &package[..blocks_len(&package)];
+    assert_eq!(blocks.len(), 3618);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(blocks)),
+        SIGNED_V6_FORMAT_2_BLOCKS_SHA256
+    );
+
+    // Both signatures are present at their lengths, and the package verifies
+    // under its two keys.
+    let container =
+        deploy_core::payload::read_package_container(Cursor::new(&package), &ENVELOPE_BOUNDS)
+            .expect("a format-3 container");
+    assert_eq!(container.container_version(), 3);
+    assert!(matches!(container.signature(), EnvelopeBlock::Present(_)));
+    assert!(matches!(
+        container.ml_dsa_87_signature(),
+        EnvelopeBlock::Present(_)
+    ));
+    let request = fixture::request().expect("the example's request");
+    verify_package(Cursor::new(&package), &trust, &request).expect("its signatures verify");
+}
+
+#[test]
+fn the_re_framed_placeholder_package_keeps_the_format_2_packages_blocks() {
+    let (package, trust) = checked_in("signed-v6-placeholder-images");
+    let format_2 =
+        std::fs::read(fixture_dir("signed-v6-placeholder-images").join("format-2/package.pkg"))
+            .expect("the format-2 package");
+    let len = blocks_len(&package);
+    assert_eq!(package[..len], format_2[..len]);
+    assert!(package.starts_with(br#"{"format_version":6,"#));
+
+    // Its metadata verifies under its two keys.
+    let manifest = deploy_core::payload::open_package(Cursor::new(&package))
+        .expect("the fixture opens")
+        .manifest()
+        .clone();
+    let first = &manifest.artifacts()[0];
+    let request = VerifyRequest::for_namespaced_package(
+        &first.component,
+        &first.version,
+        first.commit.as_deref().expect("a commit"),
+        NAMESPACE,
+    )
+    .expect("a request");
+    verify_package(Cursor::new(&package), &trust, &request).expect("its metadata verifies");
+}
+
+#[test]
+fn the_checked_in_format_2_package_is_refused_by_name() {
+    let dir = fixture_dir("signed-v6-placeholder-images").join("format-2");
+    let package = std::fs::read(dir.join("package.pkg")).expect("the format-2 package");
+    let key: [u8; 32] = read_key(&dir, "public-key.hex")
+        .try_into()
+        .expect("32 bytes");
+    let trust =
+        TrustSet::new(vec![TrustAnchor::new(key, false)], Vec::new(), 0, 0).expect("a trust set");
+    let request = VerifyRequest::for_namespaced_package(COMPONENT, VERSION, COMMIT, NAMESPACE)
+        .expect("a request");
+    let refused = |error: &PayloadError| {
+        matches!(
+            error,
+            PayloadError::UnsupportedContainerFormat { found: 2, supported } if *supported == [3]
+        )
+    };
+
+    let error = deploy_core::payload::open_package(Cursor::new(&package))
+        .expect_err("open_package refuses it");
+    assert!(refused(&error), "open_package: {error:?}");
+    assert!(
+        error.to_string().contains("this build implements 3"),
+        "{error}"
+    );
+    let error =
+        deploy_core::payload::read_package_container(Cursor::new(&package), &ENVELOPE_BOUNDS)
+            .err()
+            .expect("read_package_container refuses it");
+    assert!(refused(&error), "read_package_container: {error:?}");
+    match verify_package(Cursor::new(&package), &trust, &request) {
+        Err(VerifyError::Payload(ref error)) if refused(error) => {}
+        other => panic!("verify_package: {:?}", other.err()),
+    }
+    let staging = Dir::new();
+    match verify_contents(
+        Cursor::new(&package),
+        &trust,
+        &request,
+        TargetArch::X86_64,
+        &ContentLimits::default(),
+        staging.path(),
+    ) {
+        Err(ContentError::Verify(VerifyError::Payload(ref error))) if refused(error) => {}
+        other => panic!("verify_contents: {:?}", other.err()),
+    }
 }
 
 /// The checked-in signed format-6 package the `write_signed_v6_fixture`

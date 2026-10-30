@@ -5,13 +5,34 @@ use std::io::{Seek as _, SeekFrom, Write as _};
 
 use deploy_core::manifest::{ArtifactKind, Disposition, TargetArch};
 use deploy_core::payload::{
-    ArtifactInput, EnvelopeBlock, PayloadError, Signed, append_trailer, append_trailer_signed,
-    open, read_package_container,
+    ArtifactInput, DetachedSignature, EnvelopeBlock, PayloadError, Signed, append_trailer,
+    append_trailer_signed, open, read_package_container,
 };
 #[cfg(feature = "test-support")]
 use deploy_core::payload::{FOOTER_SIZE, widen_envelope_blocks};
-use deploy_core::verify::{ED25519_SIGNATURE_LEN, ENVELOPE_BOUNDS, KEY_ID_HEX_LEN};
+use deploy_core::verify::{
+    ED25519_SIGNATURE_LEN, ENVELOPE_BOUNDS, KEY_ID_HEX_LEN, ML_DSA_87_SIGNATURE_LEN,
+};
 use tempfile::tempdir;
+
+fn len(bound: u64) -> usize {
+    usize::try_from(bound).expect("a fixed envelope length fits usize")
+}
+
+/// A signer return of the right shape for both algorithms, verifying under
+/// nothing: these tests read metadata and trust nothing.
+fn fake_signed() -> Signed {
+    Signed {
+        ed25519: DetachedSignature {
+            signature: vec![0x5a; len(ED25519_SIGNATURE_LEN)],
+            key_id: "a".repeat(len(KEY_ID_HEX_LEN)),
+        },
+        ml_dsa_87: DetachedSignature {
+            signature: vec![0x6b; len(ML_DSA_87_SIGNATURE_LEN)],
+            key_id: "b".repeat(len(KEY_ID_HEX_LEN)),
+        },
+    }
+}
 
 #[test]
 fn a_consumer_can_read_bounded_metadata_without_a_trust_set() {
@@ -30,19 +51,10 @@ fn a_consumer_can_read_bounded_metadata_without_a_trust_set() {
         image: None,
         source,
     }];
-    let signature = vec![
-        0x5a;
-        usize::try_from(ED25519_SIGNATURE_LEN)
-            .expect("the fixed signature length fits usize")
-    ];
-    let key_id =
-        "a".repeat(usize::try_from(KEY_ID_HEX_LEN).expect("the fixed key-id length fits usize"));
+    let signed = fake_signed();
     let mut package = Vec::new();
     append_trailer_signed(empty(), &mut package, None, None, &inputs, |_| {
-        Ok(Signed {
-            signature: signature.clone(),
-            key_id: key_id.clone(),
-        })
+        Ok(fake_signed())
     })
     .expect("the signed fixture package is written");
 
@@ -50,11 +62,19 @@ fn a_consumer_can_read_bounded_metadata_without_a_trust_set() {
         .expect("a consumer can read bounded metadata without a trust set");
     assert!(matches!(
         container.signature(),
-        EnvelopeBlock::Present(bytes) if bytes == &signature
+        EnvelopeBlock::Present(bytes) if *bytes == signed.ed25519.signature
     ));
     assert!(matches!(
         container.key_id(),
-        EnvelopeBlock::Present(bytes) if bytes == key_id.as_bytes()
+        EnvelopeBlock::Present(bytes) if bytes == signed.ed25519.key_id.as_bytes()
+    ));
+    assert!(matches!(
+        container.ml_dsa_87_signature(),
+        EnvelopeBlock::Present(bytes) if *bytes == signed.ml_dsa_87.signature
+    ));
+    assert!(matches!(
+        container.ml_dsa_87_key_id(),
+        EnvelopeBlock::Present(bytes) if bytes == signed.ml_dsa_87.key_id.as_bytes()
     ));
     assert_eq!(
         container
@@ -106,7 +126,8 @@ fn a_consumer_can_parse_an_unsigned_bounded_manifest() {
 #[cfg(feature = "test-support")]
 #[test]
 fn a_consumer_can_write_the_widened_fixture_sparsely() {
-    const ADVERTISED_LEN: u64 = 1_024;
+    // Wider than the widest block, the 4,627-byte ML-DSA-87 signature.
+    const ADVERTISED_LEN: u64 = 8_192;
 
     let tempdir = tempdir().expect("a temporary fixture directory is available");
     let source = tempdir.path().join("fixture");
@@ -125,16 +146,7 @@ fn a_consumer_can_write_the_widened_fixture_sparsely() {
     }];
     let mut package = Vec::new();
     append_trailer_signed(empty(), &mut package, None, None, &inputs, |_| {
-        Ok(Signed {
-            signature: vec![
-                0x5a;
-                usize::try_from(ED25519_SIGNATURE_LEN)
-                    .expect("the fixed signature length fits usize")
-            ],
-            key_id: "a".repeat(
-                usize::try_from(KEY_ID_HEX_LEN).expect("the fixed key-id length fits usize"),
-            ),
-        })
+        Ok(fake_signed())
     })
     .expect("the signed fixture package is written");
     let compact = widen_envelope_blocks(&package, ADVERTISED_LEN);
@@ -150,8 +162,7 @@ fn a_consumer_can_write_the_widened_fixture_sparsely() {
     .expect("the compact fixture prefix is written");
     let footer_offset = u64::try_from(prefix_len)
         .expect("the prefix length fits u64")
-        .checked_add(ADVERTISED_LEN)
-        .and_then(|offset| offset.checked_add(ADVERTISED_LEN))
+        .checked_add(4 * ADVERTISED_LEN)
         .expect("the sparse fixture footer offset fits u64");
     file.seek(SeekFrom::Start(footer_offset))
         .expect("the sparse fixture seeks past the envelope blocks");
@@ -168,6 +179,14 @@ fn a_consumer_can_write_the_widened_fixture_sparsely() {
         .expect("the bounded reader opens the sparse fixture");
     assert!(matches!(container.signature(), EnvelopeBlock::WrongLength));
     assert!(matches!(container.key_id(), EnvelopeBlock::WrongLength));
+    assert!(matches!(
+        container.ml_dsa_87_signature(),
+        EnvelopeBlock::WrongLength
+    ));
+    assert!(matches!(
+        container.ml_dsa_87_key_id(),
+        EnvelopeBlock::WrongLength
+    ));
     assert!(
         container.parse_unverified_manifest().is_ok(),
         "the sparse envelope does not affect the manifest"

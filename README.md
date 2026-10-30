@@ -27,10 +27,11 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   plus a host-resolved render context into unit text and a unit file name, and
   the placement check that says whether the artifact belongs on this host.
 - **verify** — the one package verifier the control plane and the root daemon
-  both reach a verdict through: the Ed25519 signature over the raw manifest
-  bytes, the trust anchors and withdrawn builds a caller injects, the
-  namespace-scoped request a package declaring images is verified under, and
-  the error taxonomy downstream repositories match on.
+  both reach a verdict through: the two signatures over the raw manifest
+  bytes, Ed25519 and pure ML-DSA-87, both required and each under a trust
+  anchor of its own algorithm, the trust anchors and withdrawn builds a caller
+  injects, the namespace-scoped request a package declaring images is verified
+  under, and the error taxonomy downstream repositories match on.
 - **package** — full-content verification: `verify_contents` copies a signed
   package once into private retained storage, authenticates that copy with
   exactly the verdicts **verify** gives, requires one requested architecture,
@@ -59,17 +60,18 @@ Product-neutral deploy primitives shared by an installer and an on-host root age
   Detached finalization closes the loop without holding a key:
   `finalize_package` holds a prepared package to the caller's saved binding,
   rehashes both blocks, assembles the signed container from exactly those
-  bytes and an Ed25519 signature over the raw manifest, and runs the full
-  `verify_contents` pipeline over it under the caller's own trust, returning
-  the `FinalizedPackage` that direct installation and store publication both
-  consume. `prepare_sign_finalize` composes the three steps with one signing
-  callback, validating identically. An upload hop, which knows only its
-  deployment namespace in advance, uses `verify_upload`: the same pipeline
-  with the build and architecture taken from the manifest's first artifact
-  entry once its signature has verified, returning metadata only — the
-  authenticated manifest, the derived build, the verifying anchor's `key_id`
-  and the manifest and package digests — under a disk budget,
-  `upload_staging_bound`, a caller can compute and reserve before the call.
+  bytes and an Ed25519 and an ML-DSA-87 signature over the raw manifest, and
+  runs the full `verify_contents` pipeline over it under the caller's own
+  trust, returning the `FinalizedPackage` that direct installation and store
+  publication both consume. `prepare_sign_finalize` composes the three steps
+  with one signing callback, validating identically. An upload hop, which
+  knows only its deployment namespace in advance, uses `verify_upload`: the
+  same pipeline with the build and architecture taken from the manifest's
+  first artifact entry once both its signatures have verified, returning
+  metadata only — the authenticated manifest, the derived build, the two
+  verifying anchors' `key_id`s and the manifest and package digests — under a
+  disk budget, `upload_staging_bound`, a caller can compute and reserve before
+  the call.
 - **trust_set** — the generation document that verifier's injected material is
   delivered as, and the reader that refuses a malformed one rather than
   repairing it: a version gate, a structural decode that admits no unknown

@@ -1,11 +1,12 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io::{Cursor, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use aws_lc_rs::signature::Ed25519KeyPair;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, PqdsaKeyPair};
 use serde_json::{Value, json};
 
 use super::super::contents::tests::fixture::{Art, COMMIT, COMPONENT, NAMESPACE, VERSION};
@@ -16,59 +17,101 @@ use super::super::prepare_fixture::{
 use super::super::{PublicationOperation, VerifiedImages, reopen_prepared};
 use super::*;
 use crate::manifest::{ArtifactKind, MANIFEST_FORMAT_VERSION, PayloadManifest};
-use crate::payload::{FOOTER_SIZE, FORMAT_VERSION, MAGIC, append_trailer_signed, counters};
+use crate::payload::{
+    DetachedSignature, FOOTER_SIZE, FORMAT_VERSION, MAGIC, append_trailer_signed, counters,
+};
 use crate::retain::fault::{self, Seam, Step};
-use crate::trust_fixture::{keypair, public_key_of};
-use crate::verify::{TRUST_TARGET, TrustAnchor, VerifyError, key_id, verify_package};
+use crate::trust_fixture::{
+    keypair, ml_dsa_companion_of, ml_dsa_public_key_of, ml_dsa_sign, public_key_of,
+};
+use crate::verify::ML_DSA_87_PUBLIC_KEY_LEN;
+use crate::verify::{
+    SignatureAlgorithm, TRUST_TARGET, TrustAnchor, VerifyError, key_id, verify_package,
+};
 
 const CHILD_DIR: &str = "DEPLOY_CORE_FINALIZE_CHILD_DIR";
 const CHILD_BINDING: &str = "DEPLOY_CORE_FINALIZE_CHILD_BINDING";
 const CHILD_STAGING: &str = "DEPLOY_CORE_FINALIZE_CHILD_STAGING";
 const CHILD_SIGNATURE: &str = "DEPLOY_CORE_FINALIZE_CHILD_SIGNATURE";
 const CHILD_KEY: &str = "DEPLOY_CORE_FINALIZE_CHILD_KEY";
+const CHILD_ML_DSA_SIGNATURE: &str = "DEPLOY_CORE_FINALIZE_CHILD_ML_DSA_SIGNATURE";
+const CHILD_ML_DSA_KEY: &str = "DEPLOY_CORE_FINALIZE_CHILD_ML_DSA_KEY";
 const CHILD_OUTPUT: &str = "DEPLOY_CORE_FINALIZE_CHILD_OUTPUT";
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/// A signing key minted for one test.
+/// A signing key pair of each algorithm, minted for one test.
+///
+/// ML-DSA-87 signing is randomized, so the one signature this key makes over
+/// a message is kept and handed out again: two finalizations of the same
+/// package compare byte for byte.
 struct Key {
     pair: Ed25519KeyPair,
+    ml_dsa: PqdsaKeyPair,
+    ml_dsa_signatures: RefCell<HashMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl Key {
     fn new() -> Key {
-        Key { pair: keypair() }
+        let pair = keypair();
+        let ml_dsa = ml_dsa_companion_of(&pair);
+        Key {
+            pair,
+            ml_dsa,
+            ml_dsa_signatures: RefCell::new(HashMap::new()),
+        }
     }
 
     fn public(&self) -> [u8; 32] {
         public_key_of(&self.pair)
     }
 
+    fn ml_dsa_public(&self) -> [u8; ML_DSA_87_PUBLIC_KEY_LEN] {
+        ml_dsa_public_key_of(&self.ml_dsa)
+    }
+
+    /// The Ed25519 key's `key_id`.
     fn id(&self) -> String {
         key_id(&self.public())
     }
 
-    fn anchor(&self, revoked: bool) -> TrustAnchor {
-        TrustAnchor::new(self.public(), revoked)
+    /// Both of this key's anchors, Ed25519 first, each `revoked` or not.
+    fn anchors(&self, revoked: bool) -> Vec<TrustAnchor> {
+        vec![
+            TrustAnchor::new(self.public(), revoked),
+            TrustAnchor::new_ml_dsa_87(&self.ml_dsa_public(), revoked),
+        ]
     }
 
-    /// Signs `message` and names this key.
+    /// Signs `message` with both keys and names each.
     fn sign(&self, message: &[u8]) -> Signed {
         self.sign_as(message, &self.id())
     }
 
-    /// Signs `message` and names `hint` as the key.
+    /// Signs `message` with both keys and names `hint` as the Ed25519 key;
+    /// the ML-DSA-87 key is named as itself.
     fn sign_as(&self, message: &[u8], hint: &str) -> Signed {
         Signed {
-            signature: self.pair.sign(message).as_ref().to_vec(),
-            key_id: hint.to_string(),
+            ed25519: DetachedSignature {
+                signature: self.pair.sign(message).as_ref().to_vec(),
+                key_id: hint.to_string(),
+            },
+            ml_dsa_87: DetachedSignature {
+                signature: self
+                    .ml_dsa_signatures
+                    .borrow_mut()
+                    .entry(message.to_vec())
+                    .or_insert_with(|| ml_dsa_sign(&self.ml_dsa, message))
+                    .clone(),
+                key_id: key_id(self.ml_dsa.public_key().as_ref()),
+            },
         }
     }
 
     fn trust(&self) -> TrustSet {
-        trust(vec![self.anchor(false)])
+        trust(self.anchors(false))
     }
 }
 
@@ -77,9 +120,13 @@ fn trust(anchors: Vec<TrustAnchor>) -> TrustSet {
 }
 
 fn copy(signed: &Signed) -> Signed {
+    let copy = |detached: &DetachedSignature| DetachedSignature {
+        signature: detached.signature.clone(),
+        key_id: detached.key_id.clone(),
+    };
     Signed {
-        signature: signed.signature.clone(),
-        key_id: signed.key_id.clone(),
+        ed25519: copy(&signed.ed25519),
+        ml_dsa_87: copy(&signed.ml_dsa_87),
     }
 }
 
@@ -104,7 +151,8 @@ fn finalize(
     )
 }
 
-/// `M ‖ A ‖ signature ‖ key ID ‖ footer`, through the shared tail writer.
+/// `M ‖ A ‖ the four envelope blocks ‖ footer`, through the shared tail
+/// writer.
 fn assemble_bytes(manifest: &[u8], archive: &[u8], signed: &Signed) -> Vec<u8> {
     let mut out = manifest.to_vec();
     out.extend_from_slice(archive);
@@ -119,12 +167,12 @@ fn assemble_bytes(manifest: &[u8], archive: &[u8], signed: &Signed) -> Vec<u8> {
     out
 }
 
-/// The footer's version and its eight fields.
-fn footer_of(bytes: &[u8]) -> (u8, [u64; 8]) {
+/// The footer's version and its twelve fields.
+fn footer_of(bytes: &[u8]) -> (u8, [u64; 12]) {
     let footer = &bytes[bytes.len() - FOOTER_SIZE..];
     assert_eq!(&footer[..MAGIC.len()], MAGIC);
     let version = footer[MAGIC.len()];
-    let mut fields = [0u64; 8];
+    let mut fields = [0u64; 12];
     for (at, field) in fields.iter_mut().enumerate() {
         let start = MAGIC.len() + 1 + at * 8;
         *field = u64::from_le_bytes(footer[start..start + 8].try_into().unwrap());
@@ -288,6 +336,9 @@ fn scope_steps(record: &[Step]) -> Vec<Step> {
 // Positives
 // ---------------------------------------------------------------------------
 
+// The four envelope blocks and the twelve footer fields are checked one by
+// one; a helper would only move the list.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn six_images_finalize_into_exactly_the_prepared_blocks() {
     for arch in [TargetArch::X86_64, TargetArch::Aarch64] {
@@ -316,13 +367,41 @@ fn six_images_finalize_into_exactly_the_prepared_blocks() {
         let a = archive.len();
         assert_eq!(&bytes[..m], manifest);
         assert_eq!(&bytes[m..m + a], &archive[..]);
-        assert_eq!(&bytes[m + a..m + a + 64], &signed.signature[..]);
-        assert_eq!(&bytes[m + a + 64..m + a + 128], signed.key_id.as_bytes());
-        assert_eq!(bytes.len(), m + a + 128 + FOOTER_SIZE);
+        assert_eq!(&bytes[m + a..m + a + 64], &signed.ed25519.signature[..]);
+        assert_eq!(
+            &bytes[m + a + 64..m + a + 128],
+            signed.ed25519.key_id.as_bytes()
+        );
+        assert_eq!(
+            &bytes[m + a + 128..m + a + 4755],
+            &signed.ml_dsa_87.signature[..]
+        );
+        assert_eq!(
+            &bytes[m + a + 4755..m + a + 4819],
+            signed.ml_dsa_87.key_id.as_bytes()
+        );
+        assert_eq!(bytes.len(), m + a + 4819 + FOOTER_SIZE);
         let (version, fields) = footer_of(&bytes);
         assert_eq!(version, FORMAT_VERSION);
+        assert_eq!(version, 3);
         let (m, a) = (m as u64, a as u64);
-        assert_eq!(fields, [0, m, m, a, m + a, 64, m + a + 64, 64]);
+        assert_eq!(
+            fields,
+            [
+                0,
+                m,
+                m,
+                a,
+                m + a,
+                64,
+                m + a + 64,
+                64,
+                m + a + 128,
+                4627,
+                m + a + 4755,
+                64
+            ]
+        );
 
         // The same object, not a copy.
         assert!(std::ptr::eq(
@@ -433,8 +512,10 @@ fn a_child_process_finalizes_what_the_parent_prepared() {
         .env(CHILD_DIR, &dir)
         .env(CHILD_BINDING, &saved)
         .env(CHILD_STAGING, staging.path())
-        .env(CHILD_SIGNATURE, to_hex(&signed.signature))
+        .env(CHILD_SIGNATURE, to_hex(&signed.ed25519.signature))
         .env(CHILD_KEY, to_hex(&case.key.public()))
+        .env(CHILD_ML_DSA_SIGNATURE, to_hex(&signed.ml_dsa_87.signature))
+        .env(CHILD_ML_DSA_KEY, to_hex(&case.key.ml_dsa_public()))
         .env(CHILD_OUTPUT, &output)
         .output()
         .expect("the child runs");
@@ -459,23 +540,47 @@ fn a_child_process_finalizes_what_the_parent_prepared() {
 /// the parent passed its values.
 #[test]
 fn child_finalizes_a_reopened_preparation() {
-    let (Ok(dir), Ok(binding), Ok(staging), Ok(signature), Ok(key), Ok(output)) = (
+    let (
+        Ok(dir),
+        Ok(binding),
+        Ok(staging),
+        Ok(signature),
+        Ok(key),
+        Ok(ml_dsa_signature),
+        Ok(ml_dsa_key),
+        Ok(output),
+    ) = (
         std::env::var(CHILD_DIR),
         std::env::var(CHILD_BINDING),
         std::env::var(CHILD_STAGING),
         std::env::var(CHILD_SIGNATURE),
         std::env::var(CHILD_KEY),
+        std::env::var(CHILD_ML_DSA_SIGNATURE),
+        std::env::var(CHILD_ML_DSA_KEY),
         std::env::var(CHILD_OUTPUT),
-    ) else {
+    )
+    else {
         return;
     };
     let binding = PreparationBinding::from_record_bytes(binding.as_bytes()).expect("parses");
     let key: [u8; 32] = from_hex(&key).try_into().expect("a 32-byte key");
+    let ml_dsa_key: [u8; ML_DSA_87_PUBLIC_KEY_LEN] = from_hex(&ml_dsa_key)
+        .try_into()
+        .expect("a raw ML-DSA-87 key");
     let signed = Signed {
-        signature: from_hex(&signature),
-        key_id: key_id(&key),
+        ed25519: DetachedSignature {
+            signature: from_hex(&signature),
+            key_id: key_id(&key),
+        },
+        ml_dsa_87: DetachedSignature {
+            signature: from_hex(&ml_dsa_signature),
+            key_id: key_id(&ml_dsa_key),
+        },
     };
-    let trust = trust(vec![TrustAnchor::new(key, false)]);
+    let trust = trust(vec![
+        TrustAnchor::new(key, false),
+        TrustAnchor::new_ml_dsa_87(&ml_dsa_key, false),
+    ]);
     let limits = ContentLimits::default();
     let reopened = reopen_prepared(
         Path::new(&dir),
@@ -864,10 +969,22 @@ fn malformed_signature_framing_is_refused_before_any_scope_exists() {
     let case = Case::new();
     let manifest = case.package().manifest_bytes();
     let mut short = case.signed();
-    short.signature.pop();
+    short.ed25519.signature.pop();
     let mut uppercase = case.signed();
-    uppercase.key_id = uppercase.key_id.to_uppercase();
-    for signed in [short, uppercase] {
+    uppercase.ed25519.key_id = uppercase.ed25519.key_id.to_uppercase();
+    let mut short_ml_dsa = case.signed();
+    short_ml_dsa.ml_dsa_87.signature.pop();
+    let mut long_ml_dsa = case.signed();
+    long_ml_dsa.ml_dsa_87.signature.push(0);
+    let mut ml_dsa_uppercase = case.signed();
+    ml_dsa_uppercase.ml_dsa_87.key_id = ml_dsa_uppercase.ml_dsa_87.key_id.to_uppercase();
+    for signed in [
+        short,
+        uppercase,
+        short_ml_dsa,
+        long_ml_dsa,
+        ml_dsa_uppercase,
+    ] {
         let expected = crate::payload::validate_signed(&signed).expect_err("malformed");
         let seam = fault::install(Seam::new());
         let result = finalize(
@@ -920,8 +1037,8 @@ fn a_package_limit_the_tail_would_cross_is_refused() {
     let case = Case::new();
     let blocks =
         case.package().binding().manifest_length() + case.package().binding().archive_length();
-    let container = blocks + 128 + FOOTER_SIZE as u64;
-    // M and A fit, and the signature, key ID and footer cross.
+    let container = blocks + 4819 + FOOTER_SIZE as u64;
+    // M and A fit, and the signatures, key IDs and footer cross.
     let tight = limits(LimitResource::Package, blocks + 100);
     let error = case.refused(finalize(
         case.package(),
@@ -976,7 +1093,49 @@ fn a_signature_over_anything_but_raw_m_is_a_bad_signature() {
     for message in [&digest[..], &reserialized[..]] {
         let verdict =
             same_verdict_as_verify_package(&case, &case.key.sign(message), &case.key.trust());
-        assert!(matches!(verdict, VerifyError::BadSignature), "{verdict:?}");
+        assert!(
+            matches!(
+                verdict,
+                VerifyError::BadSignature {
+                    algorithm: SignatureAlgorithm::Ed25519
+                }
+            ),
+            "{verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn one_signature_over_anything_but_raw_m_is_that_algorithms_bad_signature() {
+    // The two signatures must both be over raw M: a signer that returns one
+    // over M and the other over its digest is refused for the other.
+    let case = Case::new();
+    let manifest = case.package().manifest_bytes();
+    let digest: [u8; 32] = Sha256::digest(manifest).into();
+    let over_m = case.key.sign(manifest);
+    let over_digest = case.key.sign(&digest);
+
+    for (signed, algorithm) in [
+        (
+            Signed {
+                ed25519: over_m.ed25519,
+                ml_dsa_87: over_digest.ml_dsa_87,
+            },
+            SignatureAlgorithm::MlDsa87,
+        ),
+        (
+            Signed {
+                ed25519: over_digest.ed25519,
+                ml_dsa_87: over_m.ml_dsa_87,
+            },
+            SignatureAlgorithm::Ed25519,
+        ),
+    ] {
+        let verdict = same_verdict_as_verify_package(&case, &signed, &case.key.trust());
+        assert!(
+            matches!(verdict, VerifyError::BadSignature { algorithm: found } if found == algorithm),
+            "{verdict:?}"
+        );
     }
 }
 
@@ -995,7 +1154,7 @@ fn a_key_outside_the_trust_is_refused_as_verify_package_refuses_it() {
 fn a_revoked_key_is_refused() {
     let case = Case::new();
     let verdict =
-        same_verdict_as_verify_package(&case, &case.signed(), &trust(vec![case.key.anchor(true)]));
+        same_verdict_as_verify_package(&case, &case.signed(), &trust(case.key.anchors(true)));
     assert!(
         matches!(verdict, VerifyError::RevokedKey { .. }),
         "{verdict:?}"
@@ -1006,7 +1165,7 @@ fn a_revoked_key_is_refused() {
 fn a_withdrawn_build_is_refused() {
     let case = Case::new();
     let trust = TrustSet::new(
-        vec![case.key.anchor(false)],
+        case.key.anchors(false),
         vec![(
             COMPONENT.to_string(),
             VERSION.to_string(),
@@ -1027,7 +1186,7 @@ fn a_withdrawn_build_is_refused() {
 fn a_trust_floor_above_the_format_is_refused() {
     let case = Case::new();
     let floor = MANIFEST_FORMAT_VERSION + 1;
-    let trust = TrustSet::new(vec![case.key.anchor(false)], Vec::new(), floor, 0).expect("trust");
+    let trust = TrustSet::new(case.key.anchors(false), Vec::new(), floor, 0).expect("trust");
     let verdict = same_verdict_as_verify_package(&case, &case.signed(), &trust);
     assert!(
         matches!(
@@ -1061,7 +1220,7 @@ fn a_trust_package_finalizes_only_past_the_active_epoch() {
     let signed = key.sign(ready.package.manifest_bytes());
     let staging = Dir::new();
     let at = |epoch| {
-        let trust = TrustSet::new(vec![key.anchor(false)], Vec::new(), 0, epoch).expect("trust");
+        let trust = TrustSet::new(key.anchors(false), Vec::new(), 0, epoch).expect("trust");
         finalize_package(
             &ready.package,
             ready.package.binding(),
@@ -1187,9 +1346,9 @@ fn the_key_hint_selects_and_never_denies_exactly_as_verify_package() {
     let bytes = case.bytes(&signed);
 
     for (anchors, accepted) in [
-        (vec![a.anchor(false), b.anchor(false)], true),
-        (vec![a.anchor(false)], false),
-        (vec![b.anchor(false)], true),
+        ([a.anchors(false), b.anchors(false)].concat(), true),
+        (a.anchors(false), false),
+        (b.anchors(false), true),
     ] {
         let trust = trust(anchors);
         let legacy = verify_package(Cursor::new(&bytes), &trust, &request());

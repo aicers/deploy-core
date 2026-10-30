@@ -13,7 +13,7 @@ const GIB: u64 = 1024 * MIB;
 const TABLE: &[(LimitResource, u64)] = &[
     (LimitResource::RawManifest, 16 * MIB),
     (LimitResource::CompressedArchive, 64 * GIB),
-    (LimitResource::Package, 64 * GIB + 16 * MIB + 201),
+    (LimitResource::Package, 64 * GIB + 16 * MIB + 4924),
     (LimitResource::OuterMembers, 1024),
     (LimitResource::OuterUncompressedTotal, 128 * GIB),
     (LimitResource::ImageArchive, 32 * GIB),

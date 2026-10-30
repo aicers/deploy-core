@@ -21,8 +21,20 @@ use crate::retain::fault::{self, Seam, Step};
 use crate::verify::statement_order::recorded;
 use crate::verify::{Statement, TRUST_TARGET, VerifyError, verify_package};
 
-/// The bytes a finalized package adds around M and A.
-const OVERHEAD: u64 = 201;
+/// The bytes a finalized package adds around M and A: a 64-byte Ed25519
+/// signature, a 4,627-byte ML-DSA-87 signature, two 64-byte key IDs and the
+/// 105-byte footer.
+const OVERHEAD: u64 = 64 + 4627 + 64 + 64 + 105;
+
+#[test]
+fn the_envelope_overhead_is_both_signatures_both_key_ids_and_the_footer() {
+    assert_eq!(OVERHEAD, 4924);
+    assert_eq!(ENVELOPE_OVERHEAD as u64, OVERHEAD);
+    assert_eq!(
+        ContentLimits::default().get(LimitResource::Package),
+        64 * (1 << 30) + 16 * (1 << 20) + OVERHEAD
+    );
+}
 
 #[track_caller]
 fn limit_of(error: &PackageWriteError) -> (LimitResource, u64) {
@@ -400,16 +412,25 @@ fn the_checked_in_placeholder_images_are_the_verifiers_verdict() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets/test-fixtures/signed-v6-placeholder-images");
     let package = std::fs::read(dir.join("package.pkg")).expect("the fixture");
-    let key_hex = std::fs::read_to_string(dir.join("public-key.hex")).expect("its key");
-    let key: Vec<u8> = (0..key_hex.trim().len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&key_hex[at..at + 2], 16).expect("hex"))
-        .collect();
+    let key = |file: &str| -> Vec<u8> {
+        let hex = std::fs::read_to_string(dir.join(file)).expect("its key");
+        let hex = hex.trim();
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+            .collect()
+    };
+    let ml_dsa: [u8; crate::verify::ML_DSA_87_PUBLIC_KEY_LEN] = key("ml-dsa-87-public-key.hex")
+        .try_into()
+        .expect("a raw ML-DSA-87 key");
     let trust = crate::verify::TrustSet::new(
-        vec![crate::verify::TrustAnchor::new(
-            key.try_into().expect("32 bytes"),
-            false,
-        )],
+        vec![
+            crate::verify::TrustAnchor::new(
+                key("ed25519-public-key.hex").try_into().expect("32 bytes"),
+                false,
+            ),
+            crate::verify::TrustAnchor::new_ml_dsa_87(&ml_dsa, false),
+        ],
         Vec::new(),
         0,
         0,

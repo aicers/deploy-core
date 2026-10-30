@@ -20,8 +20,10 @@ use crate::image::{
 use crate::manifest::{
     ArchiveMember, ArtifactKind, Disposition, PayloadArtifact, PayloadManifest, TargetArch,
 };
-use crate::payload::{FORMAT_VERSION, MAGIC, sha256_hex};
-use crate::trust_fixture::{keypair, public_key_of};
+use crate::payload::{FORMAT_VERSION, MAGIC, Signed, sha256_hex};
+use crate::trust_fixture::{
+    keypair, ml_dsa_companion_of, ml_dsa_public_key_of, public_key_of, signed_by,
+};
 use crate::verify::{TrustAnchor, TrustSet, VerifyRequest, key_id};
 
 pub(crate) const COMPONENT: &str = "example-app";
@@ -29,7 +31,7 @@ pub(crate) const VERSION: &str = "1.0.0";
 pub(crate) const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 pub(crate) const NAMESPACE: &str = "example-product";
 
-/// A key pair and the trust set anchoring it.
+/// A key pair of each algorithm and the trust set anchoring both.
 pub(crate) struct Signer {
     pair: Ed25519KeyPair,
 }
@@ -48,53 +50,55 @@ impl Signer {
         withdrawn: Vec<(String, String, String)>,
         epoch: u64,
     ) -> TrustSet {
-        TrustSet::new(
-            vec![TrustAnchor::new(public_key_of(&self.pair), false)],
-            withdrawn,
-            0,
-            epoch,
-        )
-        .expect("a one-anchor trust set")
+        TrustSet::new(self.anchors(false), withdrawn, 0, epoch).expect("a two-anchor trust set")
     }
 
     /// Assembles a signed `.pkg` from a raw manifest block and archive block.
     pub(crate) fn container(&self, manifest: &[u8], archive: &[u8]) -> Vec<u8> {
-        let signature = self.pair.sign(manifest);
-        container(manifest, archive, signature.as_ref(), &self.hint())
+        self.container_hinted(manifest, archive, &self.key_id())
     }
 
-    /// Assembles a `.pkg` whose signature verifies under no key.
+    /// Assembles a `.pkg` whose Ed25519 signature verifies under no key.
     pub(crate) fn badly_signed(&self, manifest: &[u8], archive: &[u8]) -> Vec<u8> {
-        let mut signature = self.pair.sign(manifest).as_ref().to_vec();
-        if let Some(byte) = signature.first_mut() {
+        let mut signed = signed_by(&self.pair, manifest);
+        if let Some(byte) = signed.ed25519.signature.first_mut() {
             *byte ^= 0xff;
         }
-        container(manifest, archive, &signature, &self.hint())
+        container(manifest, archive, &signed)
     }
 
-    /// Assembles a signed `.pkg` whose `key_id` block holds `hint` verbatim.
+    /// Assembles a signed `.pkg` whose Ed25519 `key_id` block holds `hint`
+    /// verbatim.
     pub(crate) fn container_hinted(&self, manifest: &[u8], archive: &[u8], hint: &str) -> Vec<u8> {
-        let signature = self.pair.sign(manifest);
-        container(manifest, archive, signature.as_ref(), hint)
+        let mut signed = signed_by(&self.pair, manifest);
+        signed.ed25519.key_id = hint.to_string();
+        container(manifest, archive, &signed)
     }
 
-    /// This signer's anchor, revoked or not.
-    pub(crate) fn anchor(&self, revoked: bool) -> TrustAnchor {
-        TrustAnchor::new(public_key_of(&self.pair), revoked)
+    /// This signer's two anchors, Ed25519 first, each revoked or not.
+    pub(crate) fn anchors(&self, revoked: bool) -> Vec<TrustAnchor> {
+        vec![
+            TrustAnchor::new(public_key_of(&self.pair), revoked),
+            TrustAnchor::new_ml_dsa_87(
+                &ml_dsa_public_key_of(&ml_dsa_companion_of(&self.pair)),
+                revoked,
+            ),
+        ]
     }
 
-    /// The `key_id` of this signer's anchor.
+    /// The `key_id` of this signer's Ed25519 anchor.
     pub(crate) fn key_id(&self) -> String {
-        self.hint()
+        key_id(&public_key_of(&self.pair))
     }
 
-    fn hint(&self) -> String {
-        key_id(&public_key_of(&self.pair))
+    /// The `key_id` of this signer's ML-DSA-87 anchor.
+    pub(crate) fn ml_dsa_87_key_id(&self) -> String {
+        key_id(&ml_dsa_public_key_of(&ml_dsa_companion_of(&self.pair)))
     }
 }
 
-/// Assembles a `.pkg` carrying no signature block and no `key_id` block: the
-/// footer records the absent pair for both.
+/// Assembles a `.pkg` carrying no envelope block: the footer records the
+/// absent pair for all four.
 pub(crate) fn unsigned(manifest: &[u8], archive: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(manifest);
@@ -108,6 +112,10 @@ pub(crate) fn unsigned(manifest: &[u8], archive: &[u8]) -> Vec<u8> {
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
     ]));
     out
 }
@@ -117,7 +125,7 @@ fn len_u64(bytes: &[u8]) -> u64 {
 }
 
 /// The footer of a current-version container.
-pub(crate) fn footer(fields: [u64; 8]) -> Vec<u8> {
+pub(crate) fn footer(fields: [u64; 12]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.push(FORMAT_VERSION);
@@ -127,24 +135,26 @@ pub(crate) fn footer(fields: [u64; 8]) -> Vec<u8> {
     out
 }
 
-fn container(manifest: &[u8], archive: &[u8], signature: &[u8], hint: &str) -> Vec<u8> {
+/// Assembles `M ‖ A ‖ the four envelope blocks of `signed` ‖ footer`, every
+/// block written verbatim.
+fn container(manifest: &[u8], archive: &[u8], signed: &Signed) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(manifest);
     out.extend_from_slice(archive);
-    let signature_offset = len_u64(manifest) + len_u64(archive);
-    out.extend_from_slice(signature);
-    let hint_offset = signature_offset + len_u64(signature);
-    out.extend_from_slice(hint.as_bytes());
-    out.extend_from_slice(&footer([
-        0,
-        len_u64(manifest),
-        len_u64(manifest),
-        len_u64(archive),
-        signature_offset,
-        len_u64(signature),
-        hint_offset,
-        len_u64(hint.as_bytes()),
-    ]));
+    let mut fields = [0u64; 12];
+    fields[..4].copy_from_slice(&[0, len_u64(manifest), len_u64(manifest), len_u64(archive)]);
+    let blocks = [
+        signed.ed25519.signature.as_slice(),
+        signed.ed25519.key_id.as_bytes(),
+        signed.ml_dsa_87.signature.as_slice(),
+        signed.ml_dsa_87.key_id.as_bytes(),
+    ];
+    for (index, block) in blocks.into_iter().enumerate() {
+        fields[4 + 2 * index] = len_u64(&out);
+        fields[5 + 2 * index] = len_u64(block);
+        out.extend_from_slice(block);
+    }
+    out.extend_from_slice(&footer(fields));
     out
 }
 
