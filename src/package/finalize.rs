@@ -30,10 +30,11 @@ use crate::verify::{TrustSet, VerifyRequest};
 #[cfg(test)]
 mod tests;
 
-/// Finalizes a prepared package with a detached signature: assembles the
-/// signed standalone container from exactly the prepared manifest block (M),
-/// the prepared archive block (A), `signed` and the current footer, and runs
-/// the full [`verify_contents`](super::verify_contents) pipeline over it.
+/// Finalizes a prepared package with its two detached signatures: assembles
+/// the signed standalone container from exactly the prepared manifest block
+/// (M), the prepared archive block (A), the Ed25519 and ML-DSA-87 signatures
+/// in `signed` and the current footer, and runs the full
+/// [`verify_contents`](super::verify_contents) pipeline over it.
 ///
 /// This holds no key, signs nothing, and takes no source path: the container
 /// is built only from what `prepared` retained. M is never reserialized and A
@@ -65,17 +66,23 @@ mod tests;
 ///
 /// # Signer correlation and trust
 ///
-/// [`Signed`] carries only a signature and a key ID. Correlating the signer's
-/// response with the request it answers — its request ID, run and attempt,
-/// record hash — is the caller's job, done before this call; nothing here
-/// verifies workflow provenance or reads response metadata as trust.
+/// [`Signed`] carries only two signatures over the same raw M — the Ed25519
+/// one and the ML-DSA-87 one — each with its own key ID. Correlating the
+/// signer's response with the request it answers — its request ID, run and
+/// attempt, record hash — is the caller's job, done before this call; nothing
+/// here verifies workflow provenance or reads response metadata as trust.
 ///
-/// The signature is verified exactly as
-/// [`verify_package`](crate::verify::verify_package) verifies it: a usable
-/// key-ID hint only chooses which non-revoked anchor is tried first, every
-/// other non-revoked anchor is tried after it, so the hint can never deny a
-/// valid signature, and a key ID alone never confers trust. A caller that
-/// needs one exact signer supplies a `trust` holding only that key's anchor.
+/// Both signatures are verified exactly as
+/// [`verify_package`](crate::verify::verify_package) verifies them, Ed25519
+/// first and then ML-DSA-87, and both must verify. Each is searched for only
+/// among `trust`'s anchors of its own algorithm: its usable key-ID hint only
+/// chooses which non-revoked anchor of that algorithm is tried first, and
+/// every other non-revoked anchor of that algorithm is tried after it, so a
+/// hint can never deny a valid signature, and a key ID alone never confers
+/// trust. A caller that needs exact signers names the intended signer for
+/// each algorithm and supplies a `trust` holding only those two anchors — the
+/// Ed25519 one and the ML-DSA-87 one; a set holding only one of them can
+/// authenticate no package.
 ///
 /// Nothing earlier lets a check be skipped: not the preparation's own
 /// validation, not the signer's response, not a matching digest.
@@ -421,8 +428,9 @@ fn configured_disk(error: PackageWriteError, configured: u64) -> PackageWriteErr
     }
 }
 
-/// A signed standalone package, assembled from a prepared package and a
-/// detached signature and then verified in full.
+/// A signed standalone package, assembled from a prepared package and both
+/// its detached signatures — Ed25519 and ML-DSA-87 — and then verified in
+/// full.
 ///
 /// It exists only as [`finalize_package`] or [`prepare_sign_finalize`]
 /// returns it, after every check has passed. It holds the
