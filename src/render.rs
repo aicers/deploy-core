@@ -30,7 +30,8 @@
 use crate::executor::ServiceAccount;
 use crate::manifest::ArtifactKind;
 use crate::module_spec::{
-    Arg, ModuleSpec, ModuleSpecError, PlacementClass, RenderVar, UnitTemplate, is_dns_label,
+    Arg, Capability, MemlockLimit, ModuleSpec, ModuleSpecError, PlacementClass,
+    PrivilegeProfileName, RenderVar, RunAs, SupplementaryGroup, UnitTemplate, is_dns_label,
     validate,
 };
 use crate::systemd::{self, UnitValue, is_representable};
@@ -108,7 +109,21 @@ pub struct RenderContext<'a> {
     /// This is a [`ServiceAccount`] rather than a string precisely so an
     /// account name read from operator input or off the host cannot become the
     /// identity a service runs as.
+    ///
+    /// A unit rendered with a selected [`Self::privilege_profile`] follows the
+    /// profile's
+    /// [`PrivilegeProfile::run_as`](crate::module_spec::PrivilegeProfile::run_as)
+    /// instead of the template's, and a selected profile that does not run as
+    /// root needs `Some`.
     pub service_account: Option<ServiceAccount>,
+    /// The privilege profile the caller selected for this instance, or `None`
+    /// for a template without [`UnitTemplate::privilege_profiles`].
+    ///
+    /// A template declaring profiles renders only with one of them selected
+    /// here; there is no default, so `None` against such a template is
+    /// [`RenderError::MissingPrivilegeProfile`]. A selection against a
+    /// template declaring none is [`RenderError::UnexpectedPrivilegeProfile`].
+    pub privilege_profile: Option<PrivilegeProfileName>,
     /// Unit-file-name prefix. A DNS label.
     pub namespace: &'a str,
     /// Unit-file-name service keyword. A DNS label.
@@ -234,6 +249,38 @@ pub enum RenderError {
     /// [`RenderContext::service_account`].
     #[error("the unit declares supplementary groups yet renders no `User=` line")]
     SupplementaryGroupsWithoutUser,
+    /// The template declares [`UnitTemplate::privilege_profiles`] and the
+    /// context selects none in [`RenderContext::privilege_profile`]. There is
+    /// no default profile to fall back to.
+    #[error("the unit declares privilege profiles and the context selects none")]
+    MissingPrivilegeProfile,
+    /// The context selects a privilege profile the template does not declare.
+    #[error(
+        "the context selects the privilege profile `{profile:?}`, which the unit does not declare"
+    )]
+    UndeclaredPrivilegeProfile {
+        /// The selected profile.
+        profile: PrivilegeProfileName,
+    },
+    /// The context selects a privilege profile for a template that declares
+    /// none.
+    #[error(
+        "the context selects the privilege profile `{profile:?}` for a unit that declares no privilege profiles"
+    )]
+    UnexpectedPrivilegeProfile {
+        /// The selected profile.
+        profile: PrivilegeProfileName,
+    },
+    /// The selected privilege profile does not run as root and the context
+    /// supplies no [`RenderContext::service_account`], so the unit would
+    /// render no `User=` line and run as root with only a bounding set.
+    #[error(
+        "the selected privilege profile `{profile:?}` does not run as root yet renders no `User=` line"
+    )]
+    PrivilegeProfileWithoutUser {
+        /// The selected profile.
+        profile: PrivilegeProfileName,
+    },
     /// The declared placement class does not hold on this host.
     #[error("a `{class:?}` artifact does not belong on this host: {reason}")]
     PlacementRefused {
@@ -275,6 +322,19 @@ pub enum RenderError {
 /// context whose [`RenderContext::service_account`] is `None` returns
 /// [`RenderError::SupplementaryGroupsWithoutUser`] rather than dropping the
 /// line.
+///
+/// The privilege-profile selection is resolved before any text is built. A
+/// template declaring [`UnitTemplate::privilege_profiles`] with no
+/// [`RenderContext::privilege_profile`] returns
+/// [`RenderError::MissingPrivilegeProfile`], a selection the template does not
+/// declare returns [`RenderError::UndeclaredPrivilegeProfile`], a selection
+/// against a template declaring no profile returns
+/// [`RenderError::UnexpectedPrivilegeProfile`], and a selected profile that
+/// does not run as root in a context whose
+/// [`RenderContext::service_account`] is `None` returns
+/// [`RenderError::PrivilegeProfileWithoutUser`]. A spec declaring no unit
+/// still returns `Ok(None)` whatever is selected, since there is no template
+/// to select from.
 pub fn render_unit(
     spec: &ModuleSpec,
     context: &RenderContext<'_>,
@@ -283,10 +343,76 @@ pub fn render_unit(
     let Some(unit) = spec.unit.as_ref() else {
         return Ok(None);
     };
+    let privileges = resolve_privileges(unit, context)?;
 
     let file_name = unit_file_name(context)?;
-    let text = render_text(unit, context)?;
+    let text = render_text(unit, &privileges, context)?;
     Ok(Some(RenderedUnit { file_name, text }))
+}
+
+/// The privilege lines a unit renders with: the template's own account and
+/// groups, or the selected profile's in their place.
+struct Privileges<'a> {
+    /// The account the unit declares it runs as.
+    run_as: Option<RunAs>,
+    /// The groups its account additionally joins.
+    supplementary_groups: &'a [SupplementaryGroup],
+    /// The capabilities a selected non-root profile keeps, or `None` when no
+    /// profile is selected or the selected one runs as root, either of which
+    /// renders no capability line at all.
+    capabilities: Option<&'a [Capability]>,
+    /// `LimitMEMLOCK=`, when a selected non-root profile sets it.
+    limit_memlock: Option<MemlockLimit>,
+}
+
+/// Resolves the caller's privilege-profile selection against `unit`, refusing
+/// any selection that does not name exactly one declared profile of a
+/// template declaring profiles.
+fn resolve_privileges<'a>(
+    unit: &'a UnitTemplate,
+    context: &RenderContext<'_>,
+) -> Result<Privileges<'a>, RenderError> {
+    let Some(selected) = context.privilege_profile else {
+        if unit.privilege_profiles.is_empty() {
+            return Ok(Privileges {
+                run_as: unit.run_as,
+                supplementary_groups: &unit.supplementary_groups,
+                capabilities: None,
+                limit_memlock: None,
+            });
+        }
+        return Err(RenderError::MissingPrivilegeProfile);
+    };
+    if unit.privilege_profiles.is_empty() {
+        return Err(RenderError::UnexpectedPrivilegeProfile { profile: selected });
+    }
+    let profile = unit
+        .privilege_profiles
+        .iter()
+        .find(|profile| profile.name == selected)
+        .ok_or(RenderError::UndeclaredPrivilegeProfile { profile: selected })?;
+    if profile.run_as.is_some() {
+        // Validation leaves a root profile nothing but its identity, and a
+        // root-run unit renders exactly what a template declaring `run_as`
+        // renders.
+        return Ok(Privileges {
+            run_as: profile.run_as,
+            supplementary_groups: &[],
+            capabilities: None,
+            limit_memlock: None,
+        });
+    }
+    // Without a `User=` line the unit would run as root with only a bounding
+    // set, which is no profile the package declared.
+    if context.service_account.is_none() {
+        return Err(RenderError::PrivilegeProfileWithoutUser { profile: selected });
+    }
+    Ok(Privileges {
+        run_as: None,
+        supplementary_groups: &profile.supplementary_groups,
+        capabilities: Some(&profile.ambient_capabilities),
+        limit_memlock: profile.limit_memlock,
+    })
 }
 
 /// Reports whether an artifact declaring `class` may be installed on a host
@@ -359,7 +485,11 @@ fn check_label(field: NameField, value: &str) -> Result<(), RenderError> {
 ///
 /// The order is not chosen here: it is read off that record's documentation,
 /// which is the single owner of the layout.
-fn render_text(unit: &UnitTemplate, context: &RenderContext<'_>) -> Result<String, RenderError> {
+fn render_text(
+    unit: &UnitTemplate,
+    privileges: &Privileges<'_>,
+    context: &RenderContext<'_>,
+) -> Result<String, RenderError> {
     let mut lines = vec![
         "[Unit]".to_string(),
         format!(
@@ -379,25 +509,41 @@ fn render_text(unit: &UnitTemplate, context: &RenderContext<'_>) -> Result<Strin
     // The account is a closed compile-time constant, exactly like a
     // `SystemdTarget`'s unit-file spelling, so it is emitted as it stands
     // rather than through the escaping rule that package-declared values need.
-    // A unit declaring `run_as` takes the line away whatever account is
-    // supplied.
-    let account = context.service_account.filter(|_| unit.run_as.is_none());
+    // A unit declaring `run_as`, itself or through its selected profile,
+    // takes the line away whatever account is supplied.
+    let account = context
+        .service_account
+        .filter(|_| privileges.run_as.is_none());
     if let Some(account) = account {
         lines.push(format!("User={}", account.as_str()));
     }
     // The groups are closed compile-time constants too. They qualify the
     // account on the `User=` line, so a unit that renders none is refused
     // rather than left to run as root with the line silently dropped.
-    if !unit.supplementary_groups.is_empty() {
+    if !privileges.supplementary_groups.is_empty() {
         if account.is_none() {
             return Err(RenderError::SupplementaryGroupsWithoutUser);
         }
-        let groups: Vec<&str> = unit
+        let groups: Vec<&str> = privileges
             .supplementary_groups
             .iter()
             .map(|group| group.as_unit_str())
             .collect();
         lines.push(format!("SupplementaryGroups={}", groups.join(" ")));
+    }
+    // Closed compile-time constants as well. The bounding set is written even
+    // when empty, because a bare `CapabilityBoundingSet=` is what drops every
+    // capability the profile does not keep.
+    if let Some(capabilities) = privileges.capabilities {
+        let spelled: Vec<&str> = capabilities
+            .iter()
+            .map(|capability| capability.as_unit_str())
+            .collect();
+        let spelled = spelled.join(" ");
+        if !capabilities.is_empty() {
+            lines.push(format!("AmbientCapabilities={spelled}"));
+        }
+        lines.push(format!("CapabilityBoundingSet={spelled}"));
     }
     lines.push(format!(
         "ExecStart={}",
@@ -425,6 +571,9 @@ fn render_text(unit: &UnitTemplate, context: &RenderContext<'_>) -> Result<Strin
     lines.push(format!("RestartSec={}", unit.restart_sec));
     if let Some(limit_nofile) = unit.limit_nofile {
         lines.push(format!("LimitNOFILE={limit_nofile}"));
+    }
+    if let Some(limit_memlock) = privileges.limit_memlock {
+        lines.push(format!("LimitMEMLOCK={}", limit_memlock.as_unit_str()));
     }
     if unit.protect_home {
         lines.push("ProtectHome=yes".to_string());
@@ -537,8 +686,9 @@ mod tests {
     use crate::executor::ServiceAccount;
     use crate::manifest::ArtifactKind;
     use crate::module_spec::{
-        Arg, ModuleSpec, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec,
-        RenderVar, RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate,
+        Arg, Capability, MemlockLimit, ModuleSpec, ModuleSpecError, PlacementClass,
+        PrivilegeProfile, PrivilegeProfileName, RegistrationTemplate, ReloadSpec, RenderVar,
+        RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate,
     };
 
     /// `RestartSec=` value both shipped anchors carry.
@@ -590,6 +740,7 @@ mod tests {
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
+            privilege_profiles: Vec::new(),
         }
     }
 
@@ -626,6 +777,7 @@ mod tests {
             protect_home: true,
             private_tmp: true,
             no_new_privileges: true,
+            privilege_profiles: Vec::new(),
         }
     }
 
@@ -664,6 +816,7 @@ mod tests {
             ca_bundle_path: UNUSED,
             manager_endpoint: Some(UNUSED),
             service_account: Some(ServiceAccount::Security),
+            privilege_profile: None,
             namespace: "clumit-security",
             service_name: "review",
             instance: None,
@@ -688,6 +841,7 @@ mod tests {
             // a caller having none to supply.
             manager_endpoint: None,
             service_account: None,
+            privilege_profile: None,
             namespace: "clumit-security",
             service_name: "roxyd",
             instance: None,
@@ -902,6 +1056,242 @@ WantedBy=multi-user.target
                     RenderError::InvalidSpec(ModuleSpecError::SupplementaryGroupsWithRunAs)
                 ),
                 "account {account:?} got: {error:?}"
+            );
+        }
+    }
+
+    /// The review anchor declaring the four profiles of the issue's test
+    /// plan, in declared order.
+    fn review_unit_with_profiles() -> UnitTemplate {
+        let mut unit = review_unit();
+        unit.privilege_profiles = vec![
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Root,
+                run_as: Some(RunAs::Root),
+                ambient_capabilities: Vec::new(),
+                limit_memlock: None,
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Replay,
+                run_as: None,
+                ambient_capabilities: Vec::new(),
+                limit_memlock: None,
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::AfPacket,
+                run_as: None,
+                ambient_capabilities: vec![Capability::NetRaw, Capability::NetAdmin],
+                limit_memlock: Some(MemlockLimit::Infinity),
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Dpdk,
+                run_as: None,
+                ambient_capabilities: Vec::new(),
+                limit_memlock: Some(MemlockLimit::Infinity),
+                supplementary_groups: vec![SupplementaryGroup::SecurityVfio],
+            },
+        ];
+        unit
+    }
+
+    /// The review context selecting `profile`.
+    fn review_context_selecting(profile: PrivilegeProfileName) -> RenderContext<'static> {
+        RenderContext {
+            privilege_profile: Some(profile),
+            ..review_context()
+        }
+    }
+
+    /// The review anchor's golden with `service` as its whole `[Service]`
+    /// body, so each profile's golden differs from the anchor's only there.
+    fn review_golden_with_service(service: &str) -> String {
+        format!(
+            "\
+[Unit]
+Description=Clumit Security review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+{service}
+[Install]
+WantedBy=multi-user.target
+"
+        )
+    }
+
+    #[test]
+    fn each_privilege_profile_renders_its_own_service_section() {
+        const ROOT_LINES: &str = "\
+ExecStart=/opt/clumit-security/bin/review /etc/clumit-security/review.toml
+WorkingDirectory=/var/lib/clumit-security/review/data
+Restart=always
+RestartSec=5
+";
+        let cases = [
+            (PrivilegeProfileName::Root, ROOT_LINES.to_string()),
+            (
+                PrivilegeProfileName::Replay,
+                format!("User=clumit-security\nCapabilityBoundingSet=\n{ROOT_LINES}"),
+            ),
+            (
+                PrivilegeProfileName::AfPacket,
+                format!(
+                    "User=clumit-security\n\
+                     AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN\n\
+                     CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN\n\
+                     {ROOT_LINES}LimitMEMLOCK=infinity\n"
+                ),
+            ),
+            (
+                PrivilegeProfileName::Dpdk,
+                format!(
+                    "User=clumit-security\n\
+                     SupplementaryGroups=clumit-security-vfio\n\
+                     CapabilityBoundingSet=\n\
+                     {ROOT_LINES}LimitMEMLOCK=infinity\n"
+                ),
+            ),
+        ];
+        let declared = spec(Some(review_unit_with_profiles()));
+        // `[Unit]` and `[Install]` are the review anchor's own.
+        let anchor = rendered(&spec(Some(review_unit())), &review_context()).text;
+        assert_eq!(
+            anchor,
+            review_golden_with_service(&format!("User=clumit-security\n{ROOT_LINES}"))
+        );
+        for (profile, service) in cases {
+            let unit = rendered(&declared, &review_context_selecting(profile));
+            assert_eq!(
+                unit.text,
+                review_golden_with_service(&service),
+                "profile {profile:?}"
+            );
+            assert_eq!(unit.file_name, "clumit-security-review.service");
+            assert!(!unit.text.contains(UNUSED), "got: {}", unit.text);
+        }
+    }
+
+    #[test]
+    fn the_memlock_limit_follows_limit_nofile_and_precedes_the_sandbox_booleans() {
+        let mut unit = review_unit_with_profiles();
+        unit.limit_nofile = Some(8000);
+        unit.protect_home = true;
+        unit.private_tmp = true;
+        unit.no_new_privileges = true;
+        let text = rendered(
+            &spec(Some(unit)),
+            &review_context_selecting(PrivilegeProfileName::AfPacket),
+        )
+        .text;
+        assert!(
+            text.contains(
+                "RestartSec=5\nLimitNOFILE=8000\nLimitMEMLOCK=infinity\nProtectHome=yes\n\
+                 PrivateTmp=yes\nNoNewPrivileges=yes\n\n[Install]\n"
+            ),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_root_profile_renders_what_run_as_root_renders() {
+        let declared = spec(Some(review_unit_with_profiles()));
+        let mut run_as_root = review_unit();
+        run_as_root.run_as = Some(RunAs::Root);
+        let run_as_root = spec(Some(run_as_root));
+        for account in [None, Some(ServiceAccount::Security)] {
+            let selecting = RenderContext {
+                service_account: account,
+                ..review_context_selecting(PrivilegeProfileName::Root)
+            };
+            let unselected = RenderContext {
+                service_account: account,
+                ..review_context()
+            };
+            let text = rendered(&declared, &selecting).text;
+            assert_eq!(
+                text,
+                rendered(&run_as_root, &unselected).text,
+                "account {account:?}"
+            );
+            assert!(!text.contains("User="), "account {account:?} got: {text}");
+        }
+    }
+
+    #[test]
+    fn a_template_with_profiles_and_no_selection_is_refused() {
+        let error = render_unit(&spec(Some(review_unit_with_profiles())), &review_context())
+            .expect_err("no selection must not render");
+        assert!(
+            matches!(error, RenderError::MissingPrivilegeProfile),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_the_template_does_not_declare_is_refused() {
+        let mut unit = review_unit_with_profiles();
+        unit.privilege_profiles
+            .retain(|profile| profile.name != PrivilegeProfileName::Dpdk);
+        let error = render_unit(
+            &spec(Some(unit)),
+            &review_context_selecting(PrivilegeProfileName::Dpdk),
+        )
+        .expect_err("an undeclared selection must not render");
+        assert!(
+            matches!(
+                error,
+                RenderError::UndeclaredPrivilegeProfile {
+                    profile: PrivilegeProfileName::Dpdk
+                }
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_for_a_template_without_profiles_is_refused() {
+        let error = render_unit(
+            &spec(Some(review_unit())),
+            &review_context_selecting(PrivilegeProfileName::Replay),
+        )
+        .expect_err("a selection without profiles must not render");
+        assert!(
+            matches!(
+                error,
+                RenderError::UnexpectedPrivilegeProfile {
+                    profile: PrivilegeProfileName::Replay
+                }
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_root_profile_without_an_account_is_refused() {
+        // `dpdk` declares groups too, and still reports the profile rather
+        // than the groups: the profile check comes first.
+        for profile in [
+            PrivilegeProfileName::Replay,
+            PrivilegeProfileName::AfPacket,
+            PrivilegeProfileName::Dpdk,
+        ] {
+            let context = RenderContext {
+                service_account: None,
+                ..review_context_selecting(profile)
+            };
+            let error = render_unit(&spec(Some(review_unit_with_profiles())), &context)
+                .expect_err("a non-root profile without an account must not render");
+            assert!(
+                matches!(
+                    error,
+                    RenderError::PrivilegeProfileWithoutUser { profile: refused }
+                        if refused == profile
+                ),
+                "profile {profile:?} got: {error:?}"
             );
         }
     }
@@ -1165,6 +1555,19 @@ WantedBy=multi-user.target
                 "{kind:?} got: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_spec_declaring_no_unit_is_answered_with_none_whatever_profile_is_selected() {
+        let context = RenderContext {
+            kind: ArtifactKind::StaticAssets,
+            ..review_context_selecting(PrivilegeProfileName::Replay)
+        };
+        assert!(
+            render_unit(&spec(None), &context)
+                .expect("a unit-less spec is not a failure")
+                .is_none()
+        );
     }
 
     #[test]

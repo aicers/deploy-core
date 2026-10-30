@@ -27,9 +27,11 @@
 //! publication receipts that package content is read and published through. It
 //! carries **no** product concept — no component catalog, no per-component
 //! renderers — except for [`config_template`], the deliberate configuration
-//! template catalog exception decided in bootler RFC 0004 §4. Everything else
-//! remains product-neutral, so both the installer and the per-machine root daemon
-//! depend on it and share a single implementation rather than shelling out to a CLI.
+//! template catalog exception decided in bootler RFC 0004 §4, and the closed
+//! privilege-profile vocabulary of [`module_spec`], which must be closed in the
+//! crate that validates and renders a unit. Everything else remains
+//! product-neutral, so both the installer and the per-machine root daemon depend
+//! on it and share a single implementation rather than shelling out to a CLI.
 //!
 //! The product-specific install/update orchestration, the component catalog, and
 //! the per-component rendering stay in the installer crate, which depends on this
