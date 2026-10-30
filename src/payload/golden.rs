@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, PqdsaKeyPair};
 use tar::{Builder, EntryType, Header};
 use zstd::Encoder;
 
@@ -34,19 +34,21 @@ use crate::image::{
 };
 use crate::manifest::PayloadManifest;
 use crate::manifest::{ArchiveMember, ArtifactKind, Disposition, PayloadArtifact, TargetArch};
+use crate::trust_fixture::{keypair, ml_dsa_keypair, ml_dsa_sign};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const BASE: &[u8] = b"#!/bin/false\na base executable\n";
 const PINSET: &str =
     "bootler.pinset.v1:sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const GENERATION: &[u8] = b"an opaque signed generation container";
-/// A fixed test seed, so a signed output is reproducible across runs.
-const SEED: [u8; 32] = [7; 32];
 
 type Hook = Box<dyn FnMut()>;
 
 thread_local! {
     static BETWEEN_PASSES: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    /// This thread's two key pairs, minted on first use, so the live writer
+    /// and the reference sign under the same keys within a test.
+    static SIGNER: (Ed25519KeyPair, PqdsaKeyPair) = (keypair(), ml_dsa_keypair());
     /// Every manifest signed on this thread, and the one ML-DSA-87 signature
     /// over it: signing is randomized, so a second call must not sign again.
     static ML_DSA_SIGNATURES: RefCell<HashMap<Vec<u8>, Vec<u8>>> = RefCell::new(HashMap::new());
@@ -233,41 +235,28 @@ fn inputs(dir: &Path) -> Vec<ArtifactInput> {
     ]
 }
 
-fn key() -> Ed25519KeyPair {
-    Ed25519KeyPair::from_seed_unchecked(&SEED).expect("a fixed test seed")
-}
-
-fn ml_dsa_key() -> PqdsaKeyPair {
-    PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &SEED).expect("a fixed test seed")
-}
-
-/// Both signatures over `manifest`. The ML-DSA-87 one is made once per
-/// manifest and handed out again on every later call, so the live writer and
-/// the reference receive the same bytes.
-fn stamp(pair: &Ed25519KeyPair, manifest: &[u8]) -> Signed {
-    let ml_dsa = ml_dsa_key();
-    let ml_dsa_signature = ML_DSA_SIGNATURES.with(|memo| {
-        memo.borrow_mut()
-            .entry(manifest.to_vec())
-            .or_insert_with(|| {
-                let mut signature = vec![0; ML_DSA_87_SIGNATURE_LEN];
-                ml_dsa
-                    .sign(manifest, &mut signature)
-                    .expect("signing succeeds");
-                signature
-            })
-            .clone()
-    });
-    Signed {
-        ed25519: DetachedSignature {
-            signature: pair.sign(manifest).as_ref().to_vec(),
-            key_id: crate::verify::key_id(pair.public_key().as_ref()),
-        },
-        ml_dsa_87: DetachedSignature {
-            signature: ml_dsa_signature,
-            key_id: crate::verify::key_id(ml_dsa.public_key().as_ref()),
-        },
-    }
+/// Both signatures over `manifest`, by this thread's [`SIGNER`]. The
+/// ML-DSA-87 one is made once per manifest and handed out again on every later
+/// call, so the live writer and the reference receive the same bytes.
+fn stamp(manifest: &[u8]) -> Signed {
+    SIGNER.with(|(pair, ml_dsa)| {
+        let ml_dsa_signature = ML_DSA_SIGNATURES.with(|memo| {
+            memo.borrow_mut()
+                .entry(manifest.to_vec())
+                .or_insert_with(|| ml_dsa_sign(ml_dsa, manifest))
+                .clone()
+        });
+        Signed {
+            ed25519: DetachedSignature {
+                signature: pair.sign(manifest).as_ref().to_vec(),
+                key_id: crate::verify::key_id(pair.public_key().as_ref()),
+            },
+            ml_dsa_87: DetachedSignature {
+                signature: ml_dsa_signature,
+                key_id: crate::verify::key_id(ml_dsa.public_key().as_ref()),
+            },
+        }
+    })
 }
 
 struct Case {
@@ -304,14 +293,13 @@ fn live(case: &Case, inputs: &[ArtifactInput]) -> Result<Vec<u8>, PayloadError> 
 
 fn live_into<W: Write>(case: &Case, inputs: &[ArtifactInput], out: W) -> Result<(), PayloadError> {
     if case.signed {
-        let pair = key();
         append_trailer_signed(
             Cursor::new(case.base),
             out,
             case.pinset,
             case.trust_set,
             inputs,
-            |manifest| Ok(stamp(&pair, manifest)),
+            |manifest| Ok(stamp(manifest)),
         )
     } else {
         append_trailer(
@@ -335,14 +323,13 @@ fn reference_into<W: Write>(
     inputs: &[ArtifactInput],
     out: W,
 ) -> Result<(), PayloadError> {
-    let pair = key();
     reference_append(
         Cursor::new(case.base),
         out,
         case.pinset,
         case.trust_set,
         inputs,
-        |manifest| Ok(case.signed.then(|| stamp(&pair, manifest))),
+        |manifest| Ok(case.signed.then(|| stamp(manifest))),
     )
 }
 
