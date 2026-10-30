@@ -544,6 +544,11 @@ Where the crate handles key material or secrets:
 - It carries no product concept — no component catalog, no
   per-component renderers — except for `config_template`, the deliberate
   configuration template catalog exception decided in bootler RFC 0004 §4.
+  The privilege-profile vocabulary in `module_spec` (`PrivilegeProfileName`
+  and the closed enums a profile is built from) and
+  `SupplementaryGroup::SecurityVfio` are a second deliberate exception: the
+  crate that validates and renders a unit must close that vocabulary, so
+  package data can never name an arbitrary capability, group or account.
   Keep everything else product-neutral: anything else that names a product
   belongs in the caller.
 - Certificate verification lives in `src/roxyd_trust.rs`, which drives

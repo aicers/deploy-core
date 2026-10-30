@@ -4072,6 +4072,7 @@ mod tests {
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,
+                privilege_profiles: Vec::new(),
             }),
             registration: RegistrationTemplate {
                 package_id: "example".to_string(),

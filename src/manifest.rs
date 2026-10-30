@@ -38,7 +38,7 @@ use crate::module_spec::{ModuleSpec, ModuleSpecError};
 /// ceiling is below *V*. The ceiling therefore equals this constant or exceeds
 /// it by exactly one, and never falls below it, since a build never stamps a
 /// version it cannot read; a test holds the pair to that at compile time.
-pub const MANIFEST_FORMAT_VERSION: u32 = 8;
+pub const MANIFEST_FORMAT_VERSION: u32 = 9;
 
 /// Inclusive floor of the `format_version` range this build accepts.
 ///
@@ -59,7 +59,7 @@ pub const MIN_MANIFEST_FORMAT_VERSION: u32 = 3;
 /// never falls below it. A manifest naming anything newer is refused for its
 /// version alone rather than failing as an opaque decode error somewhere
 /// inside it.
-pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 8;
+pub const MAX_MANIFEST_FORMAT_VERSION: u32 = 9;
 
 /// First `format_version` at which a container image artifact carries an
 /// [`ImageDeclaration`].
@@ -83,6 +83,17 @@ pub const SUPPLEMENTARY_GROUPS_FORMAT_VERSION: u32 = 8;
 // A reader must understand every version whose content it gates, or the gate
 // would refuse content this build cannot read in the first place.
 const _: () = assert!(SUPPLEMENTARY_GROUPS_FORMAT_VERSION <= MAX_MANIFEST_FORMAT_VERSION);
+
+/// First `format_version` at which a unit template may declare
+/// [`UnitTemplate::privilege_profiles`](crate::module_spec::UnitTemplate::privilege_profiles).
+///
+/// A manifest stamped below it that declares a non-empty list is refused,
+/// because a reader of that format would not know the field: content
+/// introduced at a version is never carried in a manifest stamped below it.
+pub const PRIVILEGE_PROFILES_FORMAT_VERSION: u32 = 9;
+
+// As for the groups gate: a reader must understand the version it gates.
+const _: () = assert!(PRIVILEGE_PROFILES_FORMAT_VERSION <= MAX_MANIFEST_FORMAT_VERSION);
 
 /// Reports whether a reader ceiling of `max` may ship beside a producer stamp
 /// of `current` under the readers-first rule stated on
@@ -349,6 +360,17 @@ pub enum ManifestError {
         "artifact `{archive_path}` declares supplementary groups, which manifest format version {format_version} cannot carry"
     )]
     SupplementaryGroupsBeforeFormat {
+        /// `archive_path` of the offending artifact.
+        archive_path: String,
+        /// The manifest's `format_version`.
+        format_version: u32,
+    },
+    /// A manifest below [`PRIVILEGE_PROFILES_FORMAT_VERSION`] had an artifact
+    /// whose unit declares privilege profiles.
+    #[error(
+        "artifact `{archive_path}` declares privilege profiles, which manifest format version {format_version} cannot carry"
+    )]
+    PrivilegeProfilesBeforeFormat {
         /// `archive_path` of the offending artifact.
         archive_path: String,
         /// The manifest's `format_version`.
@@ -646,6 +668,33 @@ fn raw_parts(artifacts: Vec<RawArtifact>) -> Vec<(PayloadArtifact, ImageSource)>
     artifacts.into_iter().map(RawArtifact::into_parts).collect()
 }
 
+/// Refuses a unit declaring content its manifest's `format_version` is
+/// stamped below, right after the spec validator in `from_parts`: non-empty
+/// supplementary groups, then non-empty privilege profiles.
+fn check_spec_format(
+    spec: &ModuleSpec,
+    format_version: Option<u32>,
+    archive_path: &str,
+) -> Result<(), ManifestError> {
+    let (Some(format_version), Some(unit)) = (format_version, spec.unit.as_ref()) else {
+        return Ok(());
+    };
+    if format_version < SUPPLEMENTARY_GROUPS_FORMAT_VERSION && !unit.supplementary_groups.is_empty()
+    {
+        return Err(ManifestError::SupplementaryGroupsBeforeFormat {
+            archive_path: archive_path.to_string(),
+            format_version,
+        });
+    }
+    if format_version < PRIVILEGE_PROFILES_FORMAT_VERSION && !unit.privilege_profiles.is_empty() {
+        return Err(ManifestError::PrivilegeProfilesBeforeFormat {
+            archive_path: archive_path.to_string(),
+            format_version,
+        });
+    }
+    Ok(())
+}
+
 /// Resolves an artifact's image declaration at the end of that artifact's
 /// checks in `from_parts`.
 ///
@@ -921,8 +970,10 @@ impl PayloadManifest {
     /// Returns [`ManifestError`] when an artifact carries no dispositions, uses
     /// an unsafe `archive_path`, shares an `archive_path` with another artifact,
     /// carries no valid `commit`, declares a [`ModuleSpec`] that violates a
-    /// spec rule or declares supplementary groups the stamped format cannot
-    /// carry ([`ManifestError::SupplementaryGroupsBeforeFormat`]), is a
+    /// spec rule, declares supplementary groups the stamped format cannot
+    /// carry ([`ManifestError::SupplementaryGroupsBeforeFormat`]) or privilege
+    /// profiles it cannot carry
+    /// ([`ManifestError::PrivilegeProfilesBeforeFormat`]), is a
     /// container image without a valid [`ImageDeclaration`]
     /// ([`ManifestError::MissingImageDeclaration`],
     /// [`ManifestError::InvalidImageDeclaration`]), or is any other kind and
@@ -1015,8 +1066,10 @@ impl PayloadManifest {
     /// key, [`ManifestError::ImageDecode`] when a declaration does not decode,
     /// [`ManifestError::SupplementaryGroupsBeforeFormat`] when a unit of a
     /// manifest below [`SUPPLEMENTARY_GROUPS_FORMAT_VERSION`] declares
-    /// supplementary groups, or any validation error [`PayloadManifest::new`]
-    /// raises.
+    /// supplementary groups,
+    /// [`ManifestError::PrivilegeProfilesBeforeFormat`] when a unit of a
+    /// manifest below [`PRIVILEGE_PROFILES_FORMAT_VERSION`] declares privilege
+    /// profiles, or any validation error [`PayloadManifest::new`] raises.
     ///
     /// The `image` key is not a term of the baseline conjunction: stage 1 is
     /// unchanged by it, and an unversioned manifest carrying one is refused at
@@ -1145,19 +1198,7 @@ impl PayloadManifest {
                         source,
                     },
                 )?;
-                let declares_groups = spec
-                    .unit
-                    .as_ref()
-                    .is_some_and(|unit| !unit.supplementary_groups.is_empty());
-                if let Some(format_version) = format_version
-                    && format_version < SUPPLEMENTARY_GROUPS_FORMAT_VERSION
-                    && declares_groups
-                {
-                    return Err(ManifestError::SupplementaryGroupsBeforeFormat {
-                        archive_path: artifact.archive_path.clone(),
-                        format_version,
-                    });
-                }
+                check_spec_format(spec, format_version, &artifact.archive_path)?;
             }
             // Last of this artifact's checks, and before the next artifact's
             // first: an earlier artifact's fault or an earlier check on this
@@ -1241,9 +1282,9 @@ mod tests {
         ArchiveMember, ArtifactKind, Disposition, GIT_COMMIT_HEX_LEN,
         IMAGE_DECLARATION_FORMAT_VERSION, IMAGE_DIGEST_HEX_LEN, LEGACY_UNVERSIONED_FOOTER_VERSION,
         MANIFEST_FORMAT_VERSION, MAX_MANIFEST_FORMAT_VERSION, MIN_MANIFEST_FORMAT_VERSION,
-        ManifestError, ModuleSpec, PayloadArtifact, PayloadManifest,
-        SUPPLEMENTARY_GROUPS_FORMAT_VERSION, TargetArch, is_pre_versioned_baseline,
-        is_readers_first_window, is_valid_commit,
+        ManifestError, ModuleSpec, PRIVILEGE_PROFILES_FORMAT_VERSION, PayloadArtifact,
+        PayloadManifest, SUPPLEMENTARY_GROUPS_FORMAT_VERSION, TargetArch,
+        is_pre_versioned_baseline, is_readers_first_window, is_valid_commit,
     };
     use crate::executor::ServiceAccount;
     use crate::image::{
@@ -1251,8 +1292,9 @@ mod tests {
         ImagePlatform, ImageProvenance, ProductBuildProvenance, ReferenceLifecycle, SegmentField,
     };
     use crate::module_spec::{
-        Arg, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec, RenderVar,
-        RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate,
+        Arg, Capability, MemlockLimit, ModuleSpecError, PlacementClass, PrivilegeProfile,
+        PrivilegeProfileName, RegistrationTemplate, ReloadSpec, RenderVar, RestartPolicy, RunAs,
+        SupplementaryGroup, SystemdTarget, UnitTemplate,
     };
     use crate::render::{RenderContext, RenderError, render_unit};
 
@@ -1479,6 +1521,7 @@ mod tests {
                 protect_home: true,
                 private_tmp: true,
                 no_new_privileges: true,
+                privilege_profiles: Vec::new(),
             }),
             registration: RegistrationTemplate {
                 package_id: "example".to_string(),
@@ -1711,6 +1754,8 @@ mod tests {
         // Supplementary groups begin above the floor too, so the window holds
         // formats that cannot carry them as well as the ones that can.
         const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < SUPPLEMENTARY_GROUPS_FORMAT_VERSION);
+        // And so do privilege profiles.
+        const _: () = assert!(MIN_MANIFEST_FORMAT_VERSION < PRIVILEGE_PROFILES_FORMAT_VERSION);
     }
 
     #[test]
@@ -2554,6 +2599,7 @@ mod tests {
             ca_bundle_path: "/var/lib/c/ca-bundle.pem",
             manager_endpoint,
             service_account: None,
+            privilege_profile: None,
             namespace: "c",
             service_name: "c",
             instance: None,
@@ -2680,8 +2726,12 @@ mod tests {
     }
 
     /// Parses a current-version manifest whose one `c` unit is `unit`, and
-    /// renders it with the product account supplied.
-    fn render_current_version_unit(unit: &str) -> String {
+    /// renders it with the product account supplied and `privilege_profile`
+    /// selected.
+    fn render_current_version_unit(
+        unit: &str,
+        privilege_profile: Option<PrivilegeProfileName>,
+    ) -> String {
         let entry = entry_json_with_spec("bin/c", Some(GIT_COMMIT), &spec_json(unit));
         let json = format!(
             r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{MEMBERS_JSON}"artifacts":[{entry}]}}"#
@@ -2697,6 +2747,7 @@ mod tests {
             .expect("the spec is carried");
         let context = RenderContext {
             service_account: Some(ServiceAccount::Security),
+            privilege_profile,
             ..read_path_context(None)
         };
         render_unit(spec, &context)
@@ -2713,14 +2764,14 @@ mod tests {
         let declared = unit_json(VALID_EXEC_START)
             .replace(r#""restart_sec":5,"#, r#""restart_sec":5,"run_as":"root","#);
         assert_eq!(
-            render_current_version_unit(&declared),
+            render_current_version_unit(&declared, None),
             "[Unit]\nDescription=C\n\n[Service]\nExecStart=/opt/c/bin/c\nRestart=always\n\
              RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
         );
 
         // The same unit without the key runs as the supplied account.
         assert_eq!(
-            render_current_version_unit(&unit_json(VALID_EXEC_START)),
+            render_current_version_unit(&unit_json(VALID_EXEC_START), None),
             "[Unit]\nDescription=C\n\n[Service]\nUser=clumit-security\nExecStart=/opt/c/bin/c\n\
              Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
         );
@@ -2791,7 +2842,7 @@ mod tests {
         // the manifest, the read path accepts it, and the renderer puts the
         // line right after the caller's `User=`.
         assert_eq!(
-            render_current_version_unit(&unit_json_with_groups(r#"["adm"]"#)),
+            render_current_version_unit(&unit_json_with_groups(r#"["adm"]"#), None),
             "[Unit]\nDescription=C\n\n[Service]\nUser=clumit-security\n\
              SupplementaryGroups=adm\nExecStart=/opt/c/bin/c\nRestart=always\n\
              RestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
@@ -2938,6 +2989,238 @@ mod tests {
         let restored = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
             .expect("the producer's manifest must parse");
         assert_eq!(restored, manifest);
+    }
+
+    /// The four profiles of the issue's test plan, in declared order, as the
+    /// wire form of a `privilege_profiles` member.
+    const PROFILES_JSON: &str = r#""privilege_profiles":[{"name":"root","run_as":"root"},{"name":"replay"},{"name":"af-packet","ambient_capabilities":["net-raw","net-admin"],"limit_memlock":"infinity"},{"name":"dpdk","limit_memlock":"infinity","supplementary_groups":["clumit-security-vfio"]}]"#;
+
+    /// The `c` fixture's unit with `profiles` — a `"privilege_profiles":...`
+    /// member — added after `no_new_privileges`, where the field serializes.
+    fn unit_json_with_profiles(profiles: &str) -> String {
+        unit_json(VALID_EXEC_START).replace(
+            r#""no_new_privileges":false}"#,
+            &format!(r#""no_new_privileges":false,{profiles}}}"#),
+        )
+    }
+
+    /// [`PROFILES_JSON`] as records.
+    fn four_profiles() -> Vec<PrivilegeProfile> {
+        vec![
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Root,
+                run_as: Some(RunAs::Root),
+                ambient_capabilities: Vec::new(),
+                limit_memlock: None,
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Replay,
+                run_as: None,
+                ambient_capabilities: Vec::new(),
+                limit_memlock: None,
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::AfPacket,
+                run_as: None,
+                ambient_capabilities: vec![Capability::NetRaw, Capability::NetAdmin],
+                limit_memlock: Some(MemlockLimit::Infinity),
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Dpdk,
+                run_as: None,
+                ambient_capabilities: Vec::new(),
+                limit_memlock: Some(MemlockLimit::Infinity),
+                supplementary_groups: vec![SupplementaryGroup::SecurityVfio],
+            },
+        ]
+    }
+
+    #[test]
+    fn a_manifest_at_the_current_version_renders_each_privilege_profile() {
+        // Wire-driven like the groups test above: the key crosses the
+        // manifest, the read path accepts it, and each selection renders its
+        // own `[Service]` lines.
+        let declared = unit_json_with_profiles(PROFILES_JSON);
+        let cases = [
+            (
+                PrivilegeProfileName::Root,
+                "ExecStart=/opt/c/bin/c\nRestart=always\nRestartSec=5\n",
+            ),
+            (
+                PrivilegeProfileName::Replay,
+                "User=clumit-security\nCapabilityBoundingSet=\nExecStart=/opt/c/bin/c\n\
+                 Restart=always\nRestartSec=5\n",
+            ),
+            (
+                PrivilegeProfileName::AfPacket,
+                "User=clumit-security\nAmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN\n\
+                 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN\nExecStart=/opt/c/bin/c\n\
+                 Restart=always\nRestartSec=5\nLimitMEMLOCK=infinity\n",
+            ),
+            (
+                PrivilegeProfileName::Dpdk,
+                "User=clumit-security\nSupplementaryGroups=clumit-security-vfio\n\
+                 CapabilityBoundingSet=\nExecStart=/opt/c/bin/c\nRestart=always\n\
+                 RestartSec=5\nLimitMEMLOCK=infinity\n",
+            ),
+        ];
+        for (profile, service) in cases {
+            assert_eq!(
+                render_current_version_unit(&declared, Some(profile)),
+                format!(
+                    "[Unit]\nDescription=C\n\n[Service]\n{service}\n\
+                     [Install]\nWantedBy=multi-user.target\n"
+                ),
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn privilege_profiles_are_refused_in_a_manifest_stamped_below_their_version() {
+        let declaring = unit_json_with_profiles(PROFILES_JSON);
+        for version in MIN_MANIFEST_FORMAT_VERSION..PRIVILEGE_PROFILES_FORMAT_VERSION {
+            let json = manifest_json_with_unit(version, &declaring);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("profiles below their version must be refused");
+            assert!(
+                matches!(
+                    error,
+                    ManifestError::PrivilegeProfilesBeforeFormat {
+                        ref archive_path,
+                        format_version,
+                    } if archive_path == "bin/c" && format_version == version
+                ),
+                "version {version}: got {error:?}"
+            );
+
+            // The typed door refuses it identically.
+            let error = serde_json::from_str::<PayloadManifest>(&json)
+                .expect_err("the derived decode must refuse it too");
+            assert!(
+                error.to_string().contains("privilege profiles"),
+                "version {version}: got {error}"
+            );
+        }
+
+        // An empty list is absence, which every version can express.
+        for version in MIN_MANIFEST_FORMAT_VERSION..=MAX_MANIFEST_FORMAT_VERSION {
+            let json = manifest_json_with_unit(
+                version,
+                &unit_json_with_profiles(r#""privilege_profiles":[]"#),
+            );
+            PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .unwrap_or_else(|error| panic!("version {version} must parse: {error}"));
+            serde_json::from_str::<PayloadManifest>(&json)
+                .unwrap_or_else(|error| panic!("version {version} must decode: {error}"));
+        }
+    }
+
+    #[test]
+    fn the_read_path_refuses_an_invalid_profile_set() {
+        let cases: [(String, RuleCheck); 3] = [
+            (
+                unit_json_with_profiles(
+                    r#""privilege_profiles":[{"name":"replay"},{"name":"replay"}]"#,
+                ),
+                |error| {
+                    matches!(
+                        error,
+                        ModuleSpecError::DuplicatePrivilegeProfile(PrivilegeProfileName::Replay)
+                    )
+                },
+            ),
+            (
+                unit_json_with_profiles(r#""privilege_profiles":[{"name":"root"}]"#),
+                |error| {
+                    matches!(
+                        error,
+                        ModuleSpecError::RunAsMismatchesProfileName(PrivilegeProfileName::Root)
+                    )
+                },
+            ),
+            (
+                unit_json_with_groups(r#"["clumit-security-vfio"]"#),
+                |error| matches!(error, ModuleSpecError::SecurityVfioOutsideProfile),
+            ),
+        ];
+        for (unit, is_expected) in cases {
+            let json = manifest_json_with_unit(MANIFEST_FORMAT_VERSION, &unit);
+            let error = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect_err("an invalid profile set must be refused on read");
+            let ManifestError::InvalidSpec {
+                ref archive_path,
+                ref source,
+            } = error
+            else {
+                panic!("unit {unit}: expected a spec rejection, got {error:?}");
+            };
+            assert_eq!(archive_path, "bin/c");
+            assert!(is_expected(source), "unit {unit}: got {source:?}");
+        }
+
+        // The VFIO group outside a profile is refused at every version, with
+        // or without profiles beside it, and as that rule rather than as a
+        // version gate.
+        let vfio = unit_json_with_groups(r#"["clumit-security-vfio"]"#);
+        let vfio_beside_profiles = vfio.replace(
+            r#""no_new_privileges":false}"#,
+            &format!(r#""no_new_privileges":false,{PROFILES_JSON}}}"#),
+        );
+        for version in MIN_MANIFEST_FORMAT_VERSION..=MAX_MANIFEST_FORMAT_VERSION {
+            for unit in [&vfio, &vfio_beside_profiles] {
+                let json = manifest_json_with_unit(version, unit);
+                let error =
+                    PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                        .expect_err("the group outside a profile must be refused");
+                assert!(
+                    matches!(
+                        error,
+                        ManifestError::InvalidSpec {
+                            source: ModuleSpecError::SecurityVfioOutsideProfile,
+                            ..
+                        }
+                    ),
+                    "version {version} unit {unit}: got {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_producer_writes_declared_profiles_and_reads_them_back() {
+        let mut spec = module_spec();
+        let unit = spec.unit.as_mut().expect("fixture carries a unit");
+        unit.run_as = None;
+        unit.privilege_profiles = four_profiles();
+        let mut declaring = artifact(
+            "bin/native",
+            ArtifactKind::NativeBinary,
+            &[Disposition::Install],
+        );
+        declaring.spec = Some(spec);
+        let manifest =
+            manifest_of(None, vec![declaring]).expect("the producer accepts declared profiles");
+        assert_eq!(
+            manifest.format_version(),
+            Some(PRIVILEGE_PROFILES_FORMAT_VERSION)
+        );
+        let json = serde_json::to_string(&manifest).expect("serialization should succeed");
+        assert!(
+            json.contains(&format!(r#""no_new_privileges":true,{PROFILES_JSON}}}"#)),
+            "got: {json}"
+        );
+        let restored = PayloadManifest::parse(json.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+            .expect("the producer's manifest must parse");
+        assert_eq!(restored, manifest);
+        // And the bytes survive a second trip unchanged.
+        assert_eq!(
+            serde_json::to_string(&restored).expect("serialization should succeed"),
+            json
+        );
     }
 
     #[test]

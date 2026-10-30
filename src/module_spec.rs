@@ -13,16 +13,20 @@
 //! fails to deserialize rather than rendering an empty string or a literal
 //! `{{config}}` into a root-executed `ExecStart=`. There is deliberately no
 //! free-form directive field, no raw unit-text field, and no way for package
-//! data to name a service account or an arbitrary group: a unit may only
-//! declare, through the closed [`RunAs`], that it runs as root, and, through
-//! the closed [`SupplementaryGroup`] list, which of a fixed set of groups its
-//! account additionally joins.
+//! data to name a service account, an arbitrary group or an arbitrary
+//! capability: a unit may only declare, through the closed [`RunAs`], that it
+//! runs as root, through the closed [`SupplementaryGroup`] list, which of a
+//! fixed set of groups its account additionally joins, and, through
+//! [`PrivilegeProfile`]s, the alternative privilege sets one of which the
+//! caller selects per instance at render time. A profile names its account,
+//! capabilities, memory-lock limit and groups only from closed enums too.
 //!
 //! [`validate`] enforces every rule in this module and is invoked from this
 //! crate's manifest read path, so a consumer that never links an installer
 //! still refuses a malformed spec before acting on it.
 
 use std::collections::BTreeSet;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -43,9 +47,11 @@ const MAX_CONTAINER_NAME_LEN: usize = 255;
 /// second copy could disagree with it — and carries neither a service account
 /// (a closed compile-time enum that can never come from package data) nor a
 /// unit file name (derived host-side by the renderer). A unit may only declare,
-/// through [`UnitTemplate::run_as`], that it runs as root, and, through
+/// through [`UnitTemplate::run_as`], that it runs as root, through
 /// [`UnitTemplate::supplementary_groups`], which groups from the closed
-/// [`SupplementaryGroup`] list its account additionally joins.
+/// [`SupplementaryGroup`] list its account additionally joins, and, through
+/// [`UnitTemplate::privilege_profiles`], the privilege sets a caller selects
+/// among per instance. Nothing in the spec says which profile applies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleSpec {
@@ -81,13 +87,37 @@ pub struct ModuleSpec {
 /// 2. `[Service]` — `User=` (only when [`Self::run_as`] is absent and the
 ///    consumer supplies an account), then one `SupplementaryGroups=` line
 ///    carrying every [`Self::supplementary_groups`] element's unit spelling in
-///    declared order, joined by one space, then `ExecStart=`, `ExecReload=`,
-///    `WorkingDirectory=`, one `Environment=` line per [`Self::environment`]
-///    entry in declared order, `Restart=`, `RestartSec=`, `LimitNOFILE=`, then
-///    `ProtectHome=yes`, `PrivateTmp=yes` and `NoNewPrivileges=yes`, each
-///    emitted only when its flag is `true`.
+///    declared order, joined by one space, then `AmbientCapabilities=` and
+///    `CapabilityBoundingSet=` (from a selected privilege profile, below),
+///    then `ExecStart=`, `ExecReload=`, `WorkingDirectory=`, one
+///    `Environment=` line per [`Self::environment`] entry in declared order,
+///    `Restart=`, `RestartSec=`, `LimitNOFILE=`, `LimitMEMLOCK=` (from a
+///    selected privilege profile), then `ProtectHome=yes`, `PrivateTmp=yes`
+///    and `NoNewPrivileges=yes`, each emitted only when its flag is `true`.
 /// 3. `[Install]` — one `WantedBy=` line per [`Self::wanted_by`] element in
 ///    declared order.
+///
+/// # Privilege profiles
+///
+/// A template declaring [`Self::privilege_profiles`] renders only with one of
+/// them selected by the caller, and the selected [`PrivilegeProfile`] stands
+/// in for the template's own [`Self::run_as`] and
+/// [`Self::supplementary_groups`], which such a template leaves absent and
+/// empty:
+///
+/// - `User=` follows the profile's [`PrivilegeProfile::run_as`] exactly as it
+///   follows [`Self::run_as`], and `SupplementaryGroups=` lists the profile's
+///   [`PrivilegeProfile::supplementary_groups`].
+/// - A profile whose `run_as` is absent then emits `AmbientCapabilities=` with
+///   its [`PrivilegeProfile::ambient_capabilities`]' unit spellings in declared
+///   order, joined by one space, only when there is at least one, and
+///   `CapabilityBoundingSet=` with the same list always — bare when the list is
+///   empty, which drops every capability.
+/// - `LimitMEMLOCK=` carries [`PrivilegeProfile::limit_memlock`] when the
+///   profile sets it.
+/// - A profile whose `run_as` is [`RunAs::Root`] renders exactly what a
+///   template declaring `run_as` renders: no `User=`, no capability line and
+///   no `LimitMEMLOCK=`.
 ///
 /// `User=` is deliberately **not** a field here — the account is a closed
 /// compile-time enum that package data can never name, and [`Self::run_as`]
@@ -148,6 +178,9 @@ pub struct UnitTemplate {
     /// A consumer that creates a directory such a unit works in must create it
     /// root-owned and closed to other accounts, because a root service follows
     /// a link another account plants there.
+    ///
+    /// Refused beside [`Self::privilege_profiles`], where each profile declares
+    /// its own account instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_as: Option<RunAs>,
     /// Groups the unit's account additionally joins, in declared order.
@@ -165,6 +198,11 @@ pub struct UnitTemplate {
     /// dropping the line. A manifest stamped below
     /// [`crate::manifest::SUPPLEMENTARY_GROUPS_FORMAT_VERSION`] cannot carry
     /// a non-empty list.
+    ///
+    /// A non-empty list is also refused beside [`Self::privilege_profiles`],
+    /// where each profile declares its own groups, and
+    /// [`SupplementaryGroup::SecurityVfio`] is refused here at every version:
+    /// only a profile may name it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supplementary_groups: Vec<SupplementaryGroup>,
     /// Emits `ProtectHome=yes` when set.
@@ -173,6 +211,166 @@ pub struct UnitTemplate {
     pub private_tmp: bool,
     /// Emits `NoNewPrivileges=yes` when set.
     pub no_new_privileges: bool,
+    /// The privilege sets this unit may run with, one of which the caller
+    /// selects per instance at render time.
+    ///
+    /// Empty means the unit renders as every unit rendered before this field
+    /// existed does, from [`Self::run_as`] and [`Self::supplementary_groups`],
+    /// and a caller selects nothing. A non-empty list is refused beside either
+    /// of those two fields, every profile carries a distinct name, and nothing
+    /// in the package says which profile applies: a caller that selects none
+    /// is refused rather than given a default. A manifest stamped below
+    /// [`crate::manifest::PRIVILEGE_PROFILES_FORMAT_VERSION`] cannot carry a
+    /// non-empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub privilege_profiles: Vec<PrivilegeProfile>,
+}
+
+impl UnitTemplate {
+    /// Returns the names of the declared privilege profiles in declared order,
+    /// empty when the template declares none.
+    #[must_use]
+    pub fn privilege_profile_names(&self) -> Vec<PrivilegeProfileName> {
+        self.privilege_profiles
+            .iter()
+            .map(|profile| profile.name)
+            .collect()
+    }
+}
+
+/// One privilege set a unit may run with: its account, the capabilities it
+/// keeps, its memory-lock limit and the groups its account joins.
+///
+/// Every field is a closed vocabulary, so a profile can never name an
+/// arbitrary account, capability or group. A profile named
+/// [`PrivilegeProfileName::Root`] declares [`RunAs::Root`] and nothing else;
+/// every other profile runs as the caller's account, keeps exactly
+/// [`Self::ambient_capabilities`] in its bounding set, and may raise its
+/// memory-lock limit and join groups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivilegeProfile {
+    /// The profile's name, which is also the selection a caller passes.
+    pub name: PrivilegeProfileName,
+    /// The account the unit runs as under this profile: [`RunAs::Root`]
+    /// exactly when [`Self::name`] is [`PrivilegeProfileName::Root`], and
+    /// absent otherwise, meaning the caller's account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<RunAs>,
+    /// Capabilities the unit keeps, in declared order. They render as both
+    /// `AmbientCapabilities=` and `CapabilityBoundingSet=`, so a capability
+    /// not listed here is dropped from the bounding set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ambient_capabilities: Vec<Capability>,
+    /// `LimitMEMLOCK=`, when the profile raises it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_memlock: Option<MemlockLimit>,
+    /// Groups the unit's account additionally joins under this profile, in
+    /// declared order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_groups: Vec<SupplementaryGroup>,
+}
+
+/// The name of a [`PrivilegeProfile`], which is also the wire string a caller
+/// receives as the per-instance selection.
+///
+/// Closed on purpose, and extended only by adding a variant here: a package
+/// can declare a profile only under a name this enum offers, so every consumer
+/// can tell a root profile from the others by its name alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrivilegeProfileName {
+    /// `root`: the unit runs as root.
+    Root,
+    /// `replay`: the unit runs as the caller's account with no capability.
+    Replay,
+    /// `af-packet`: the unit captures through `AF_PACKET` sockets.
+    AfPacket,
+    /// `dpdk`: the unit drives a device through DPDK.
+    Dpdk,
+}
+
+impl PrivilegeProfileName {
+    /// Returns the profile name's wire string, which is also its manifest
+    /// spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Replay => "replay",
+            Self::AfPacket => "af-packet",
+            Self::Dpdk => "dpdk",
+        }
+    }
+}
+
+impl FromStr for PrivilegeProfileName {
+    type Err = UnknownPrivilegeProfileName;
+
+    /// Parses exactly one of the four wire strings: case-sensitive, with no
+    /// trimming.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "root" => Ok(Self::Root),
+            "replay" => Ok(Self::Replay),
+            "af-packet" => Ok(Self::AfPacket),
+            "dpdk" => Ok(Self::Dpdk),
+            _ => Err(UnknownPrivilegeProfileName(value.to_string())),
+        }
+    }
+}
+
+/// A string that names no [`PrivilegeProfileName`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not a privilege profile name")]
+pub struct UnknownPrivilegeProfileName(pub String);
+
+/// A capability a privilege profile may keep.
+///
+/// Closed on purpose, and extended only by adding a variant here: package data
+/// can never name an arbitrary capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Capability {
+    /// `CAP_NET_RAW`.
+    NetRaw,
+    /// `CAP_NET_ADMIN`.
+    NetAdmin,
+}
+
+impl Capability {
+    /// Returns the unit-file string this capability renders as, which is
+    /// separate from its manifest spelling exactly as
+    /// [`SystemdTarget::as_unit_str`] is.
+    #[must_use]
+    pub fn as_unit_str(self) -> &'static str {
+        match self {
+            Self::NetRaw => "CAP_NET_RAW",
+            Self::NetAdmin => "CAP_NET_ADMIN",
+        }
+    }
+}
+
+/// A memory-lock limit a privilege profile may set.
+///
+/// Closed on purpose, and extended only by adding a variant here. Memory
+/// locking is granted as this rlimit rather than as `CAP_IPC_LOCK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemlockLimit {
+    /// `LimitMEMLOCK=infinity`.
+    Infinity,
+}
+
+impl MemlockLimit {
+    /// Returns the unit-file string this limit renders as, which is separate
+    /// from its manifest spelling exactly as [`SystemdTarget::as_unit_str`] is.
+    #[must_use]
+    pub fn as_unit_str(self) -> &'static str {
+        match self {
+            Self::Infinity => "infinity",
+        }
+    }
 }
 
 /// A systemd target a unit may order itself against.
@@ -237,14 +435,23 @@ pub enum RunAs {
 
 /// A group a unit's account may additionally join.
 ///
-/// Closed on purpose: package data can name only a group this enum offers,
-/// never an arbitrary one, so what a package may widen a service's access to
-/// is decided here rather than in the package.
+/// Closed on purpose, and extended only by adding a variant here: package data
+/// can name only a group this enum offers, never an arbitrary one, so what a
+/// package may widen a service's access to is decided here rather than in the
+/// package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SupplementaryGroup {
     /// `adm`, the group that owns most of the system logs under `/var/log`.
     Adm,
+    /// `clumit-security-vfio`, the group that owns the VFIO device nodes a
+    /// DPDK unit drives.
+    ///
+    /// Accepted only inside a [`PrivilegeProfile`], never in
+    /// [`UnitTemplate::supplementary_groups`], so the group reaches only the
+    /// unit and the profile that need it.
+    #[serde(rename = "clumit-security-vfio")]
+    SecurityVfio,
 }
 
 impl SupplementaryGroup {
@@ -254,6 +461,7 @@ impl SupplementaryGroup {
     pub fn as_unit_str(self) -> &'static str {
         match self {
             Self::Adm => "adm",
+            Self::SecurityVfio => "clumit-security-vfio",
         }
     }
 }
@@ -445,6 +653,51 @@ pub enum ModuleSpecError {
     /// `main-pid` appeared outside `exec_reload`.
     #[error("the `main-pid` variable is permitted only inside `exec_reload`")]
     MainPidOutsideExecReload,
+    /// The template's own `supplementary_groups` named
+    /// [`SupplementaryGroup::SecurityVfio`], which only a privilege profile may
+    /// name.
+    #[error(
+        "unit template `supplementary_groups` names `clumit-security-vfio`, which only a privilege profile may name"
+    )]
+    SecurityVfioOutsideProfile,
+    /// A template declaring `privilege_profiles` also declared `run_as`.
+    #[error("unit template declares `privilege_profiles` together with `run_as`")]
+    PrivilegeProfilesWithRunAs,
+    /// A template declaring `privilege_profiles` also declared a non-empty
+    /// `supplementary_groups`.
+    #[error("unit template declares `privilege_profiles` together with `supplementary_groups`")]
+    PrivilegeProfilesWithSupplementaryGroups,
+    /// Two privilege profiles shared a name.
+    #[error("unit template declares the privilege profile `{0:?}` more than once")]
+    DuplicatePrivilegeProfile(PrivilegeProfileName),
+    /// A privilege profile's `run_as` disagreed with its name: `root` without
+    /// `run_as`, or `run_as` on a profile not named `root`.
+    #[error("privilege profile `{0:?}` must declare `run_as` exactly when it is named `root`")]
+    RunAsMismatchesProfileName(PrivilegeProfileName),
+    /// A root-run privilege profile declared capabilities, a memory-lock
+    /// limit or groups.
+    #[error(
+        "privilege profile `{0:?}` runs as root and must not declare capabilities, a memory-lock limit or groups"
+    )]
+    PrivilegesInRootProfile(PrivilegeProfileName),
+    /// A privilege profile's `ambient_capabilities` named the same capability
+    /// more than once.
+    #[error("privilege profile `{profile:?}` names the capability `{capability:?}` more than once")]
+    DuplicateProfileCapability {
+        /// The profile carrying the duplicate.
+        profile: PrivilegeProfileName,
+        /// The duplicated capability.
+        capability: Capability,
+    },
+    /// A privilege profile's `supplementary_groups` named the same group more
+    /// than once.
+    #[error("privilege profile `{profile:?}` names the group `{group:?}` more than once")]
+    DuplicateProfileSupplementaryGroup {
+        /// The profile carrying the duplicate.
+        profile: PrivilegeProfileName,
+        /// The duplicated group.
+        group: SupplementaryGroup,
+    },
     /// The registration template's `package_id` was not the enclosing
     /// artifact's `component`.
     #[error(
@@ -578,6 +831,87 @@ fn validate_unit(unit: &UnitTemplate) -> Result<(), ModuleSpecError> {
         }
     }
 
+    validate_privilege_profiles(unit)
+}
+
+/// Validates the privilege-profile rules: the VFIO group is reached only
+/// through a profile, a template with profiles leaves its own account and
+/// groups to them, and every profile is distinct, agrees with its own name,
+/// and repeats nothing.
+///
+/// A template declaring no profile passes every rule but the first.
+fn validate_privilege_profiles(unit: &UnitTemplate) -> Result<(), ModuleSpecError> {
+    // The group grants device access only one profile of one unit needs, so
+    // it is kept off the template's own list, which every instance inherits.
+    if unit
+        .supplementary_groups
+        .contains(&SupplementaryGroup::SecurityVfio)
+    {
+        return Err(ModuleSpecError::SecurityVfioOutsideProfile);
+    }
+    if unit.privilege_profiles.is_empty() {
+        return Ok(());
+    }
+    // A selected profile stands in for the template's account and groups, so
+    // a template declaring both would describe its unit twice.
+    if unit.run_as.is_some() {
+        return Err(ModuleSpecError::PrivilegeProfilesWithRunAs);
+    }
+    if !unit.supplementary_groups.is_empty() {
+        return Err(ModuleSpecError::PrivilegeProfilesWithSupplementaryGroups);
+    }
+
+    let mut names = BTreeSet::new();
+    for profile in &unit.privilege_profiles {
+        if !names.insert(profile.name) {
+            return Err(ModuleSpecError::DuplicatePrivilegeProfile(profile.name));
+        }
+    }
+
+    // Each rule runs over every profile before the next rule starts, so the
+    // reported violation is the first rule's, whichever profile carries it.
+    for profile in &unit.privilege_profiles {
+        // A consumer reads the name `root` as "runs as root", so the name and
+        // the identity the profile renders must agree.
+        let named_root = profile.name == PrivilegeProfileName::Root;
+        if named_root != (profile.run_as == Some(RunAs::Root)) {
+            return Err(ModuleSpecError::RunAsMismatchesProfileName(profile.name));
+        }
+    }
+    for profile in &unit.privilege_profiles {
+        // A root-run unit renders none of these lines, so declaring them
+        // could only misdescribe it.
+        if profile.run_as.is_some()
+            && (!profile.ambient_capabilities.is_empty()
+                || profile.limit_memlock.is_some()
+                || !profile.supplementary_groups.is_empty())
+        {
+            return Err(ModuleSpecError::PrivilegesInRootProfile(profile.name));
+        }
+    }
+    for profile in &unit.privilege_profiles {
+        let mut capabilities = BTreeSet::new();
+        for capability in &profile.ambient_capabilities {
+            if !capabilities.insert(*capability) {
+                return Err(ModuleSpecError::DuplicateProfileCapability {
+                    profile: profile.name,
+                    capability: *capability,
+                });
+            }
+        }
+    }
+    for profile in &unit.privilege_profiles {
+        let mut groups = BTreeSet::new();
+        for group in &profile.supplementary_groups {
+            if !groups.insert(*group) {
+                return Err(ModuleSpecError::DuplicateProfileSupplementaryGroup {
+                    profile: profile.name,
+                    group: *group,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -686,9 +1020,13 @@ fn is_container_name(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::{
-        Arg, ModuleSpec, ModuleSpecError, PlacementClass, RegistrationTemplate, ReloadSpec,
-        RenderVar, RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate, validate,
+        Arg, Capability, MemlockLimit, ModuleSpec, ModuleSpecError, PlacementClass,
+        PrivilegeProfile, PrivilegeProfileName, RegistrationTemplate, ReloadSpec, RenderVar,
+        RestartPolicy, RunAs, SupplementaryGroup, SystemdTarget, UnitTemplate,
+        UnknownPrivilegeProfileName, validate,
     };
     use crate::manifest::ArtifactKind;
 
@@ -716,6 +1054,7 @@ mod tests {
             protect_home: false,
             private_tmp: false,
             no_new_privileges: false,
+            privilege_profiles: Vec::new(),
         }
     }
 
@@ -1121,6 +1460,7 @@ mod tests {
         // unchanged package's bytes did not move when the field was added.
         assert_eq!(unit.limit_nofile, None);
         assert_eq!(unit.run_as, None);
+        assert_eq!(unit.privilege_profiles, []);
         assert!(unit.protect_home);
         assert!(!unit.private_tmp);
         assert!(unit.no_new_privileges);
@@ -1137,6 +1477,367 @@ mod tests {
 
         let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
         assert_eq!(re_encoded, WIRE_SPEC);
+    }
+
+    /// The four profiles the issue's test plan declares, in declared order,
+    /// as wire JSON.
+    const PROFILES_JSON: &str = r#""privilege_profiles":[{"name":"root","run_as":"root"},{"name":"replay"},{"name":"af-packet","ambient_capabilities":["net-raw","net-admin"],"limit_memlock":"infinity"},{"name":"dpdk","limit_memlock":"infinity","supplementary_groups":["clumit-security-vfio"]}]"#;
+
+    /// [`PROFILES_JSON`] as records.
+    fn four_profiles() -> Vec<PrivilegeProfile> {
+        vec![
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Root,
+                run_as: Some(RunAs::Root),
+                ambient_capabilities: Vec::new(),
+                limit_memlock: None,
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Replay,
+                run_as: None,
+                ambient_capabilities: Vec::new(),
+                limit_memlock: None,
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::AfPacket,
+                run_as: None,
+                ambient_capabilities: vec![Capability::NetRaw, Capability::NetAdmin],
+                limit_memlock: Some(MemlockLimit::Infinity),
+                supplementary_groups: Vec::new(),
+            },
+            PrivilegeProfile {
+                name: PrivilegeProfileName::Dpdk,
+                run_as: None,
+                ambient_capabilities: Vec::new(),
+                limit_memlock: Some(MemlockLimit::Infinity),
+                supplementary_groups: vec![SupplementaryGroup::SecurityVfio],
+            },
+        ]
+    }
+
+    /// [`WIRE_SPEC`] with `profiles` — a `"privilege_profiles":...` member —
+    /// added after `no_new_privileges`, where the field serializes.
+    fn wire_with_profiles(profiles: &str) -> String {
+        WIRE_SPEC.replace(
+            r#""no_new_privileges":true}"#,
+            &format!(r#""no_new_privileges":true,{profiles}}}"#),
+        )
+    }
+
+    #[test]
+    fn privilege_profiles_round_trip_only_when_present() {
+        let with_profiles = wire_with_profiles(PROFILES_JSON);
+        assert_ne!(with_profiles, WIRE_SPEC);
+        let decoded: ModuleSpec =
+            serde_json::from_str(&with_profiles).expect("declared profiles must decode");
+        let unit = decoded.unit.as_ref().expect("a unit is declared");
+        assert_eq!(unit.privilege_profiles, four_profiles());
+        let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+        assert_eq!(re_encoded, with_profiles);
+
+        // Every empty list and explicit `null` is a spelling of absence and
+        // does not round-trip back to a key.
+        for (absent, expected) in [
+            (r#""privilege_profiles":[]"#, WIRE_SPEC.to_string()),
+            (
+                r#""privilege_profiles":[{"name":"replay","run_as":null,"ambient_capabilities":[],"limit_memlock":null,"supplementary_groups":[]}]"#,
+                wire_with_profiles(r#""privilege_profiles":[{"name":"replay"}]"#),
+            ),
+        ] {
+            let decoded: ModuleSpec = serde_json::from_str(&wire_with_profiles(absent))
+                .unwrap_or_else(|error| panic!("{absent} must decode: {error}"));
+            let re_encoded = serde_json::to_string(&decoded).expect("serialization must succeed");
+            assert_eq!(re_encoded, expected, "{absent}");
+        }
+
+        for refused in [
+            // Names outside the vocabulary.
+            r#"{"name":"Root","run_as":"root"}"#,
+            r#"{"name":"af_packet"}"#,
+            r#"{"name":"AfPacket"}"#,
+            r#"{"name":""}"#,
+            // Capabilities outside the vocabulary.
+            r#"{"name":"af-packet","ambient_capabilities":["CAP_NET_RAW"]}"#,
+            r#"{"name":"af-packet","ambient_capabilities":["net_raw"]}"#,
+            r#"{"name":"af-packet","ambient_capabilities":["ipc-lock"]}"#,
+            // Memory-lock limits outside the vocabulary.
+            r#"{"name":"dpdk","limit_memlock":"unlimited"}"#,
+            r#"{"name":"dpdk","limit_memlock":0}"#,
+            // A group under its kebab-case spelling rather than its own.
+            r#"{"name":"dpdk","supplementary_groups":["security-vfio"]}"#,
+            // Unknown keys, and a profile without a name.
+            r#"{"name":"replay","user":"clumit-security"}"#,
+            r#"{"name":"replay","capability_bounding_set":["net-raw"]}"#,
+            r#"{"run_as":"root"}"#,
+        ] {
+            let wire = wire_with_profiles(&format!(r#""privilege_profiles":[{refused}]"#));
+            assert!(
+                serde_json::from_str::<ModuleSpec>(&wire).is_err(),
+                "profile {refused} must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn each_privilege_vocabulary_spells_its_manifest_and_unit_value() {
+        fn serde_spelling<T: serde::Serialize>(value: T) -> String {
+            let encoded = serde_json::to_string(&value).expect("serialization must succeed");
+            encoded
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .expect("a unit variant serializes as a string")
+                .to_string()
+        }
+
+        // One `match` per enum, so a new variant fails to compile until it is
+        // given a case here.
+        for name in [
+            PrivilegeProfileName::Root,
+            PrivilegeProfileName::Replay,
+            PrivilegeProfileName::AfPacket,
+            PrivilegeProfileName::Dpdk,
+        ] {
+            let expected = match name {
+                PrivilegeProfileName::Root => "root",
+                PrivilegeProfileName::Replay => "replay",
+                PrivilegeProfileName::AfPacket => "af-packet",
+                PrivilegeProfileName::Dpdk => "dpdk",
+            };
+            assert_eq!(serde_spelling(name), expected);
+            assert_eq!(name.as_str(), expected);
+            assert_eq!(PrivilegeProfileName::from_str(expected), Ok(name));
+            assert_eq!(
+                serde_json::from_str::<PrivilegeProfileName>(&format!("\"{expected}\""))
+                    .expect("the spelling must decode"),
+                name
+            );
+        }
+        for refused in ["", "Root", " root", "af_packet", "root\n"] {
+            assert_eq!(
+                PrivilegeProfileName::from_str(refused),
+                Err(UnknownPrivilegeProfileName(refused.to_string())),
+                "{refused:?}"
+            );
+        }
+
+        for capability in [Capability::NetRaw, Capability::NetAdmin] {
+            let (manifest, unit) = match capability {
+                Capability::NetRaw => ("net-raw", "CAP_NET_RAW"),
+                Capability::NetAdmin => ("net-admin", "CAP_NET_ADMIN"),
+            };
+            assert_eq!(serde_spelling(capability), manifest);
+            assert_eq!(capability.as_unit_str(), unit);
+        }
+
+        // One variant today; the `match` is what makes a second one add a
+        // case here.
+        let limit = MemlockLimit::Infinity;
+        let (manifest, unit) = match limit {
+            MemlockLimit::Infinity => ("infinity", "infinity"),
+        };
+        assert_eq!(serde_spelling(limit), manifest);
+        assert_eq!(limit.as_unit_str(), unit);
+
+        assert_eq!(
+            serde_spelling(SupplementaryGroup::SecurityVfio),
+            "clumit-security-vfio"
+        );
+        assert_eq!(
+            serde_json::from_str::<SupplementaryGroup>(r#""clumit-security-vfio""#)
+                .expect("the group must decode"),
+            SupplementaryGroup::SecurityVfio
+        );
+        assert_eq!(
+            SupplementaryGroup::SecurityVfio.as_unit_str(),
+            "clumit-security-vfio"
+        );
+    }
+
+    #[test]
+    fn privilege_profile_names_lists_declared_order() {
+        let mut unit = review_unit();
+        assert_eq!(unit.privilege_profile_names(), []);
+        unit.privilege_profiles = four_profiles();
+        assert_eq!(
+            unit.privilege_profile_names(),
+            [
+                PrivilegeProfileName::Root,
+                PrivilegeProfileName::Replay,
+                PrivilegeProfileName::AfPacket,
+                PrivilegeProfileName::Dpdk,
+            ]
+        );
+    }
+
+    /// The review unit declaring the four profiles, `edit` applied to them.
+    fn unit_with_profiles(edit: impl FnOnce(&mut Vec<PrivilegeProfile>)) -> UnitTemplate {
+        let mut unit = review_unit();
+        unit.privilege_profiles = four_profiles();
+        edit(&mut unit.privilege_profiles);
+        unit
+    }
+
+    /// The profile named `name` among `profiles`.
+    fn profile_mut(
+        profiles: &mut [PrivilegeProfile],
+        name: PrivilegeProfileName,
+    ) -> &mut PrivilegeProfile {
+        profiles
+            .iter_mut()
+            .find(|profile| profile.name == name)
+            .expect("the fixture declares the profile")
+    }
+
+    #[test]
+    fn the_four_profiles_are_valid() {
+        validate_unit_template(unit_with_profiles(|_| {})).expect("the four profiles are valid");
+    }
+
+    #[test]
+    fn security_vfio_is_refused_outside_a_profile() {
+        // With or without profiles beside it.
+        let mut alone = review_unit();
+        alone.supplementary_groups = vec![SupplementaryGroup::SecurityVfio];
+        let mut beside_adm = review_unit();
+        beside_adm.supplementary_groups =
+            vec![SupplementaryGroup::Adm, SupplementaryGroup::SecurityVfio];
+        let mut with_profiles = unit_with_profiles(|_| {});
+        with_profiles.supplementary_groups = vec![SupplementaryGroup::SecurityVfio];
+        for unit in [alone, beside_adm, with_profiles] {
+            let error = validate_unit_template(unit).expect_err("the group outside a profile");
+            assert!(
+                matches!(error, ModuleSpecError::SecurityVfioOutsideProfile),
+                "got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_with_profiles_declares_no_run_as() {
+        let mut unit = unit_with_profiles(|_| {});
+        unit.run_as = Some(RunAs::Root);
+        let error = validate_unit_template(unit).expect_err("profiles beside run_as");
+        assert!(
+            matches!(error, ModuleSpecError::PrivilegeProfilesWithRunAs),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_template_with_profiles_declares_no_supplementary_groups() {
+        let mut unit = unit_with_profiles(|_| {});
+        unit.supplementary_groups = vec![SupplementaryGroup::Adm];
+        let error = validate_unit_template(unit).expect_err("profiles beside groups");
+        assert!(
+            matches!(
+                error,
+                ModuleSpecError::PrivilegeProfilesWithSupplementaryGroups
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn two_profiles_never_share_a_name() {
+        let unit = unit_with_profiles(|profiles| {
+            let replay = profiles
+                .get(1)
+                .cloned()
+                .expect("the fixture declares replay second");
+            profiles.push(replay);
+        });
+        let error = validate_unit_template(unit).expect_err("a duplicated profile");
+        assert!(
+            matches!(
+                error,
+                ModuleSpecError::DuplicatePrivilegeProfile(PrivilegeProfileName::Replay)
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_runs_as_root_exactly_when_it_is_named_root() {
+        let root_without_run_as = unit_with_profiles(|profiles| {
+            profile_mut(profiles, PrivilegeProfileName::Root).run_as = None;
+        });
+        let run_as_on_replay = unit_with_profiles(|profiles| {
+            profile_mut(profiles, PrivilegeProfileName::Replay).run_as = Some(RunAs::Root);
+        });
+        for (unit, expected) in [
+            (root_without_run_as, PrivilegeProfileName::Root),
+            (run_as_on_replay, PrivilegeProfileName::Replay),
+        ] {
+            let error = validate_unit_template(unit).expect_err("name and run_as disagree");
+            assert!(
+                matches!(error, ModuleSpecError::RunAsMismatchesProfileName(got) if got == expected),
+                "got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_profile_declares_no_further_privilege() {
+        let edits: [fn(&mut PrivilegeProfile); 3] = [
+            |root| root.ambient_capabilities = vec![Capability::NetRaw],
+            |root| root.limit_memlock = Some(MemlockLimit::Infinity),
+            |root| root.supplementary_groups = vec![SupplementaryGroup::Adm],
+        ];
+        for edit in edits {
+            let unit = unit_with_profiles(|profiles| {
+                edit(profile_mut(profiles, PrivilegeProfileName::Root));
+            });
+            let error = validate_unit_template(unit).expect_err("privileges in a root profile");
+            assert!(
+                matches!(
+                    error,
+                    ModuleSpecError::PrivilegesInRootProfile(PrivilegeProfileName::Root)
+                ),
+                "got: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_names_each_capability_once() {
+        let unit = unit_with_profiles(|profiles| {
+            profile_mut(profiles, PrivilegeProfileName::AfPacket)
+                .ambient_capabilities
+                .push(Capability::NetRaw);
+        });
+        let error = validate_unit_template(unit).expect_err("a duplicated capability");
+        assert!(
+            matches!(
+                error,
+                ModuleSpecError::DuplicateProfileCapability {
+                    profile: PrivilegeProfileName::AfPacket,
+                    capability: Capability::NetRaw,
+                }
+            ),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_names_each_group_once() {
+        let unit = unit_with_profiles(|profiles| {
+            profile_mut(profiles, PrivilegeProfileName::Dpdk)
+                .supplementary_groups
+                .push(SupplementaryGroup::SecurityVfio);
+        });
+        let error = validate_unit_template(unit).expect_err("a duplicated group");
+        assert!(
+            matches!(
+                error,
+                ModuleSpecError::DuplicateProfileSupplementaryGroup {
+                    profile: PrivilegeProfileName::Dpdk,
+                    group: SupplementaryGroup::SecurityVfio,
+                }
+            ),
+            "got: {error:?}"
+        );
     }
 
     #[test]

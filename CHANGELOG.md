@@ -16,6 +16,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `ml_dsa_87_key_id` on `payload::UnparsedContainer` and `payload::Payload`.
 - `payload::append_version_2_trailer`, under `test-support`, writes a format-2
   container for tests that show it refused.
+- `module_spec::UnitTemplate::privilege_profiles` lets a package's unit declare
+  the privilege sets it may run with, as `module_spec::PrivilegeProfile`
+  records named from the closed `PrivilegeProfileName` (`root`, `replay`,
+  `af-packet`, `dpdk`; `as_str` and `FromStr` give the wire string, and an
+  unknown one is `UnknownPrivilegeProfileName`). A profile declares `run_as`,
+  `ambient_capabilities` from the closed `Capability` (`net-raw`,
+  `net-admin`), `limit_memlock` from the closed `MemlockLimit` (`infinity`),
+  and `supplementary_groups`. The caller selects one per instance through
+  `render::RenderContext::privilege_profile`, and
+  `UnitTemplate::privilege_profile_names` lists the declared names in order.
+  A selected profile that does not run as root renders `User=`, its
+  `SupplementaryGroups=`, then `AmbientCapabilities=` (only when it keeps a
+  capability) and `CapabilityBoundingSet=` with its capabilities (bare when it
+  keeps none) before `ExecStart=`, and `LimitMEMLOCK=infinity` right after
+  `LimitNOFILE=` (or `RestartSec=`); the `root` profile renders what
+  `run_as: root` renders. The validator refuses profiles beside the template's
+  own `run_as` or `supplementary_groups`, two profiles with one name, a profile
+  whose `run_as` disagrees with its name being `root`, a `root` profile
+  declaring any further privilege, and a capability or group repeated in one
+  profile. Rendering refuses a template with profiles and no selection, a
+  selection the template does not declare, a selection for a template without
+  profiles, and a profile that does not run as root with no service account.
+  A manifest stamped below format version 9 cannot carry profiles.
+- `module_spec::SupplementaryGroup::SecurityVfio`, spelled and rendered
+  `clumit-security-vfio`, is accepted only inside a privilege profile; the
+  template's own `supplementary_groups` refuses it.
+- A producer now stamps manifest format version 9, and this build reads 3
+  through 9. A build that reads only up to 8 refuses a format-9 manifest.
 
 ### Changed
 
@@ -84,6 +112,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and `InvalidKeyId` name the algorithm.
 - The `Package` resource limit's default is 64 GiB + 16 MiB + 4,924 bytes, for
   the larger envelope.
+- `module_spec::UnitTemplate` has the new field `privilege_profiles` and
+  `render::RenderContext` the new field `privilege_profile`, so a struct
+  literal must set them: an empty `privilege_profiles` keeps today's template,
+  and a `privilege_profile` of `None` keeps today's rendering for a template
+  without profiles. `SupplementaryGroup`, `ModuleSpecError`, `RenderError` and
+  `ManifestError` have new variants, so an exhaustive `match` over them must
+  handle those.
 
 ### Fixed
 
