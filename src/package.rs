@@ -49,7 +49,7 @@
 //! A hop that receives packages knows only the namespace it deploys under
 //! before it reads one. [`verify_upload`] runs the same pipeline with the
 //! build and architecture taken from the manifest's first artifact entry once
-//! the signature over that manifest has verified — the statement checks and
+//! both signatures over that manifest have verified — the statement checks and
 //! everything after them then hold every other entry to that build and
 //! architecture — and returns a [`VerifiedUpload`]: metadata only, with every
 //! retained byte released before it returns. Its disk budget is

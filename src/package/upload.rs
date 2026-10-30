@@ -56,7 +56,7 @@ pub fn upload_staging_bound(limits: &ContentLimits, package_len: u64) -> u64 {
 /// a package; the component, version, commit and architecture are statements
 /// the package makes. So this runs the [`verify_contents`](super::verify_contents)
 /// pipeline with those four taken from the manifest's **first** artifact
-/// entry, and only once the signature over that manifest has verified:
+/// entry, and only once both signatures over that manifest have verified:
 ///
 /// 1. `source` is sought to its end to learn its length, then snapshotted
 ///    exactly as [`verify_contents`](super::verify_contents) does, into one

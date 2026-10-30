@@ -544,8 +544,8 @@ impl TrustSet {
 /// deployment namespace it is uploaded under, and nothing else.
 ///
 /// A hop that receives a package learns its component, version, commit and
-/// architecture only from the manifest, and only once the signature over that
-/// manifest has verified, so none of them can be asked for in advance.
+/// architecture only from the manifest, and only once both signatures over that
+/// manifest have verified, so none of them can be asked for in advance.
 /// [`package::verify_upload`](crate::package::verify_upload) takes this in
 /// place of a [`VerifyRequest`] and derives the request from the authenticated
 /// manifest.
