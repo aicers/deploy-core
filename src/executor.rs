@@ -69,6 +69,12 @@ const SPAWN_TEXT_BUSY_RETRIES: u32 = 8;
 const SPAWN_TEXT_BUSY_BACKOFF: Duration = Duration::from_millis(25);
 /// The `ssh` binary name used unless the environment overrides it.
 const SSH: &str = "ssh";
+/// The key exchanges every `ssh` invocation is limited to: the two hybrid
+/// post-quantum methods, by the IANA names every OpenSSH from 9.9 knows.
+const SSH_KEX_ALGORITHMS: &str = "mlkem768x25519-sha256,sntrup761x25519-sha512";
+/// What OpenSSH writes on stderr when a host offers none of the listed key
+/// exchanges.
+const SSH_KEX_NO_MATCH: &str = "no matching key exchange method found";
 /// The `cat` binary used by the elevated read helper to slurp a root-owned
 /// file back through the executor's elevation path.
 const CAT: &str = "cat";
@@ -563,12 +569,40 @@ pub enum ExecutorError {
     /// command exiting non-zero. Detected because the remote wrapper never ran,
     /// so its exit-status marker is absent; a remote command that ran and
     /// returned any exit code (including `255`) is a [`CommandOutput`], not this
-    /// error.
+    /// error. The two key-exchange refusals are reported as their own variants,
+    /// [`ExecutorError::KexUnsupportedLocally`] and
+    /// [`ExecutorError::KexRefusedByHost`].
     #[error("host `{host}`: SSH connection failed: {reason}")]
     Connection {
         /// The host that could not be reached.
         host: String,
         /// Diagnostic text `ssh` wrote to stderr.
+        reason: String,
+    },
+    /// The local `ssh` refused the pinned key-exchange list before it
+    /// connected: it does not know one of the names (OpenSSH before 9.9).
+    #[error(
+        "host `{host}`: the local ssh client does not support the required key exchange methods `{allowed}`: {reason}"
+    )]
+    KexUnsupportedLocally {
+        /// The host the session was for.
+        host: String,
+        /// The key-exchange methods the executor allows, comma-separated.
+        allowed: String,
+        /// Diagnostic text `ssh` wrote to stderr.
+        reason: String,
+    },
+    /// The host's `sshd` offers none of the allowed key-exchange methods.
+    /// No other method is tried.
+    #[error(
+        "host `{host}`: the host offers none of the allowed key exchange methods `{allowed}`, and no other method is tried: {reason}"
+    )]
+    KexRefusedByHost {
+        /// The host that offered no allowed method.
+        host: String,
+        /// The key-exchange methods the executor allows, comma-separated.
+        allowed: String,
+        /// Diagnostic text `ssh` wrote to stderr, which names the host's offer.
         reason: String,
     },
     /// A caller asked for [`Identity::Operator`] on a transport that has no
@@ -1227,7 +1261,8 @@ pub trait Executor {
     /// same resolution site: no prefix for [`Identity::Operator`], `sudo` for
     /// [`Identity::Root`] and `sudo -u <account>` for [`Identity::Service`],
     /// with [`SudoAuth`] choosing `-n` or `-S -p ""`; over SSH, the same `ssh`
-    /// invocation — key, port, host-key policy, and `BatchMode=yes` under
+    /// invocation — key, port, host-key policy, the pinned key exchange,
+    /// disabled connection sharing, and `BatchMode=yes` under
     /// [`SshPrompt::Deny`] — with no terminal requested. The transport is
     /// spawned in the caller's process group, as [`Executor::run`] spawns it,
     /// so a passphrase prompt [`SshPrompt::Allow`] permits still reaches the
@@ -1248,7 +1283,8 @@ pub trait Executor {
     /// start not proven within `limits.elevation_timeout`, and
     /// [`ChannelError::Executor`] carrying whatever [`Executor::run`] would
     /// report for a spawn, transport or elevation failure —
-    /// [`ExecutorError::Connection`], [`ExecutorError::Elevation`] or
+    /// [`ExecutorError::Connection`], [`ExecutorError::KexUnsupportedLocally`],
+    /// [`ExecutorError::KexRefusedByHost`], [`ExecutorError::Elevation`] or
     /// [`ExecutorError::SudoRefused`]. An SSH transport whose remote shell
     /// ran but did not start the command is reported as
     /// [`ExecutorError::SudoRefused`] carrying the remote diagnostic, for the
@@ -2939,6 +2975,15 @@ impl SshExecutor {
     /// host-named error rather than hanging on a prompt. This is driven by the
     /// run's interactivity, not by [`SudoAuth`]: an interactive run may still
     /// satisfy an SSH passphrase prompt even while remote `sudo` uses `-n`.
+    ///
+    /// Every invocation limits the key exchange to [`SSH_KEX_ALGORITHMS`], with
+    /// no fallback: a session that cannot negotiate one of them fails. The list
+    /// is on the command line because OpenSSH uses the first value it obtains
+    /// for an option and reads the command line before any configuration file,
+    /// so an `ssh_config` cannot loosen it. `ControlPath=none` is there too
+    /// because OpenSSH applies `KexAlgorithms` only to a connection it opens
+    /// itself: a session run over a connection-sharing master an `ssh_config`
+    /// names would inherit whatever key exchange that master negotiated.
     fn ssh_command(&self) -> Command {
         let mut cmd = Command::new(&self.ssh_bin);
         cmd.arg("-i")
@@ -2949,7 +2994,11 @@ impl SshExecutor {
             .arg(format!(
                 "StrictHostKeyChecking={}",
                 self.host_key.strict_host_key_checking()
-            ));
+            ))
+            .arg("-o")
+            .arg(format!("KexAlgorithms={SSH_KEX_ALGORITHMS}"))
+            .arg("-o")
+            .arg("ControlPath=none");
         if matches!(self.prompt, SshPrompt::Deny) {
             cmd.arg("-o").arg("BatchMode=yes");
         }
@@ -2963,7 +3012,9 @@ impl SshExecutor {
     /// The remote is wrapped so it reports its own exit status through
     /// [`RC_MARKER`]; a present marker yields a [`CommandOutput`] carrying the
     /// true remote code (even `255`), while its absence means the transport
-    /// failed before the command ran and is an [`ExecutorError::Connection`].
+    /// failed before the command ran and is an [`ExecutorError::Connection`],
+    /// [`ExecutorError::KexUnsupportedLocally`] or
+    /// [`ExecutorError::KexRefusedByHost`].
     fn ssh_run(&self, remote: &str, stdin: Option<&[u8]>) -> Result<CommandOutput, ExecutorError> {
         let mut cmd = self.ssh_command();
         cmd.arg(wrap_with_rc_marker(remote));
@@ -2976,16 +3027,17 @@ impl SshExecutor {
     /// the [`RC_MARKER`] line, and removes that line from its stderr.
     ///
     /// A missing marker means the wrapper never ran — the transport failed
-    /// before the command started — and is an [`ExecutorError::Connection`].
+    /// before the command started — and is an [`ExecutorError::Connection`], or
+    /// [`ExecutorError::KexUnsupportedLocally`] or
+    /// [`ExecutorError::KexRefusedByHost`] when `ssh` says it refused the key
+    /// exchange. A present marker means the stderr is the command's, so nothing
+    /// in it is inspected.
     fn settle_remote_code(
         &self,
         mut output: CommandOutput,
     ) -> Result<CommandOutput, ExecutorError> {
         let Some((pos, code)) = extract_remote_code(&output.stderr) else {
-            return Err(ExecutorError::Connection {
-                host: self.host.clone(),
-                reason: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
+            return Err(self.transport_failure(&output.stderr));
         };
         // Drop the marker line, including the newline the wrapper printed ahead
         // of it, so callers see only the remote command's own stderr.
@@ -2997,6 +3049,33 @@ impl SshExecutor {
         output.stderr.truncate(cut);
         output.code = Some(code);
         Ok(output)
+    }
+
+    /// Classifies the failure of an `ssh` that never ran the remote wrapper
+    /// from the `stderr` it wrote.
+    ///
+    /// OpenSSH quotes the whole value it refused, so the local refusal matches
+    /// only the pinned list: a bad `KexAlgorithms` line in an `ssh_config`
+    /// quotes that file's value and stays [`ExecutorError::Connection`].
+    fn transport_failure(&self, stderr: &[u8]) -> ExecutorError {
+        let stderr = String::from_utf8_lossy(stderr);
+        let host = self.host.clone();
+        let reason = stderr.trim().to_string();
+        if stderr.contains(&format!("Bad SSH2 KexAlgorithms '{SSH_KEX_ALGORITHMS}'")) {
+            ExecutorError::KexUnsupportedLocally {
+                host,
+                allowed: SSH_KEX_ALGORITHMS.to_string(),
+                reason,
+            }
+        } else if stderr.contains(SSH_KEX_NO_MATCH) {
+            ExecutorError::KexRefusedByHost {
+                host,
+                allowed: SSH_KEX_ALGORITHMS.to_string(),
+                reason,
+            }
+        } else {
+            ExecutorError::Connection { host, reason }
+        }
     }
 
     /// Resolves an `(identity, Ssh)` pair into a remote command line, returning
@@ -4230,6 +4309,9 @@ mod tests {
         /// An argument carrying the metacharacters the SSH transport must not
         /// let a remote shell re-split.
         const TRICKY_ARG: &str = "a b\"c'd$e;f|g&h`i(j)";
+        /// The pinned key-exchange list, spelled out so a change to the
+        /// constant fails these tests.
+        const PINNED_KEX: &str = "mlkem768x25519-sha256,sntrup761x25519-sha512";
         /// What a `sudo -n` that wants a password writes before it exits `1`:
         /// classic sudo's wording, then sudo-rs's with and without a terminal
         /// to ask on.
@@ -4374,6 +4456,136 @@ exec /bin/sh -c "$*"
                 "failing-ssh",
                 "#!/bin/sh\necho 'ssh: connect to host 10.0.0.10 port 22: Connection refused' >&2\nexit 255\n",
             )
+        }
+
+        /// A stub `ssh` that writes `text` on stderr and exits `255` without
+        /// ever running a remote command.
+        fn stderr_ssh(dir: &Path, name: &str, text: &str) -> PathBuf {
+            write_script(
+                dir,
+                name,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' {} >&2\nexit 255\n",
+                    super::super::shell_quote(text)
+                ),
+            )
+        }
+
+        /// A stub `ssh` that refuses the pinned list as OpenSSH 10.x does when
+        /// it does not know one of the names.
+        fn kex_unknown_ssh(dir: &Path) -> PathBuf {
+            stderr_ssh(
+                dir,
+                "kex-unknown-ssh",
+                "Unsupported KEX algorithm \"bogus-kex-sha256\"\n\
+                 command-line line 0: Bad SSH2 KexAlgorithms \
+                 'mlkem768x25519-sha256,sntrup761x25519-sha512'.",
+            )
+        }
+
+        /// A stub `ssh` that refuses the pinned list as OpenSSH 9.x does.
+        fn kex_unknown_ssh_9x(dir: &Path) -> PathBuf {
+            stderr_ssh(
+                dir,
+                "kex-unknown-ssh-9x",
+                "command-line line 0: Bad SSH2 KexAlgorithms \
+                 'mlkem768x25519-sha256,sntrup761x25519-sha512'.",
+            )
+        }
+
+        /// A stub `ssh` that fails as OpenSSH does against an `sshd` offering
+        /// neither pinned method.
+        fn kex_mismatch_ssh(dir: &Path) -> PathBuf {
+            stderr_ssh(
+                dir,
+                "kex-mismatch-ssh",
+                "Unable to negotiate with 10.0.0.10 port 22: no matching key exchange \
+                 method found. Their offer: \
+                 curve25519-sha256,ext-info-s,kex-strict-s-v00@openssh.com",
+            )
+        }
+
+        /// A stub `ssh` that fails as OpenSSH does on a bad `KexAlgorithms`
+        /// line in a configuration file, which it quotes instead of the pinned
+        /// list.
+        fn bad_config_ssh(dir: &Path) -> PathBuf {
+            stderr_ssh(
+                dir,
+                "bad-config-ssh",
+                "Unsupported KEX algorithm \"bogus-kex-sha256\"\n\
+                 ~/.ssh/config line 2: Bad SSH2 KexAlgorithms 'bogus-kex-sha256'.\n\
+                 ~/.ssh/config: terminating, 1 bad configuration options",
+            )
+        }
+
+        /// A stub `ssh` that exits `255` having written nothing, as OpenSSH
+        /// does for a host refusal under a lowered `LogLevel`.
+        fn silent_ssh(dir: &Path) -> PathBuf {
+            write_script(dir, "silent-ssh", "#!/bin/sh\nexit 255\n")
+        }
+
+        /// Whether `error` is the local refusal of the pinned list for `mgmt`.
+        fn is_kex_unsupported_locally(error: &ExecutorError) -> bool {
+            matches!(error, ExecutorError::KexUnsupportedLocally { host, allowed, reason }
+                if host == "mgmt" && allowed == PINNED_KEX
+                    && reason.contains("Bad SSH2 KexAlgorithms"))
+        }
+
+        /// Whether `error` is the host refusal of the pinned list by `mgmt`.
+        fn is_kex_refused_by_host(error: &ExecutorError) -> bool {
+            matches!(error, ExecutorError::KexRefusedByHost { host, allowed, reason }
+                if host == "mgmt" && allowed == PINNED_KEX
+                    && reason.contains("Their offer: curve25519-sha256"))
+        }
+
+        /// Whether `error` is the connection failure the configuration-file
+        /// refusal stays.
+        fn is_bad_config_connection(error: &ExecutorError) -> bool {
+            matches!(error, ExecutorError::Connection { host, reason }
+                if host == "mgmt" && reason.contains("'bogus-kex-sha256'"))
+        }
+
+        /// Whether `error` is the connection failure an `ssh` that wrote nothing
+        /// stays.
+        fn is_silent_connection(error: &ExecutorError) -> bool {
+            matches!(error, ExecutorError::Connection { host, reason }
+                if host == "mgmt" && reason.is_empty())
+        }
+
+        /// Whether an error is the one a stub in [`kex_failures`] must produce.
+        type KexFailureCheck = fn(&ExecutorError) -> bool;
+
+        /// A stub per way `ssh` fails on the key exchange, with the check its
+        /// error must pass on every entry point.
+        fn kex_failures(dir: &Path) -> Vec<(&'static str, PathBuf, KexFailureCheck)> {
+            let unsupported: KexFailureCheck = is_kex_unsupported_locally;
+            vec![
+                ("kex unknown", kex_unknown_ssh(dir), unsupported),
+                ("kex unknown 9.x", kex_unknown_ssh_9x(dir), unsupported),
+                (
+                    "kex mismatch",
+                    kex_mismatch_ssh(dir),
+                    is_kex_refused_by_host,
+                ),
+                ("bad config", bad_config_ssh(dir), is_bad_config_connection),
+                ("silent", silent_ssh(dir), is_silent_connection),
+            ]
+        }
+
+        /// Asserts `argv`, one argument per line, carries each pinned option
+        /// once, ahead of the target.
+        fn assert_pinned_options(argv: &str) {
+            let target = argv.find("ops@10.0.0.10\n").expect("the target");
+            for option in [
+                "-o\nKexAlgorithms=mlkem768x25519-sha256,sntrup761x25519-sha512\n",
+                "-o\nControlPath=none\n",
+            ] {
+                assert_eq!(argv.matches(option).count(), 1, "{option}: {argv}");
+                assert!(
+                    argv.find(option).expect("counted above") < target,
+                    "{option} must precede the target: {argv}"
+                );
+            }
         }
 
         /// A stub `sudo` that drops its own flags and execs the wrapped command,
@@ -5277,6 +5489,210 @@ exec "$@"
             }
         }
 
+        /// The errors `run` reports over `stub`, as the operator and as root.
+        fn run_errors_over(stub: PathBuf) -> [ExecutorError; 2] {
+            let ssh = crate::transport::Ssh {
+                user: "ops".to_string(),
+                port: 22,
+                key: PathBuf::from("/dev/null"),
+                host_key: crate::transport::HostKeyPolicy::Strict,
+            };
+            let exec = SshExecutor::from_config(
+                "mgmt",
+                &ssh,
+                "10.0.0.10",
+                SudoAuth::NonInteractive,
+                SshPrompt::Deny,
+            )
+            .with_ssh_bin(stub);
+            [Identity::Operator, Identity::Root].map(|identity| {
+                exec.run(identity, "true", &[])
+                    .expect_err("the transport failed before the command ran")
+            })
+        }
+
+        #[test]
+        fn openssh_10x_local_kex_refusal_is_its_own_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for error in run_errors_over(kex_unknown_ssh(dir.path())) {
+                assert!(is_kex_unsupported_locally(&error), "got: {error:?}");
+            }
+        }
+
+        #[test]
+        fn openssh_9x_local_kex_refusal_is_its_own_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for error in run_errors_over(kex_unknown_ssh_9x(dir.path())) {
+                assert!(is_kex_unsupported_locally(&error), "got: {error:?}");
+            }
+        }
+
+        #[test]
+        fn host_kex_refusal_is_its_own_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for error in run_errors_over(kex_mismatch_ssh(dir.path())) {
+                assert!(is_kex_refused_by_host(&error), "got: {error:?}");
+            }
+        }
+
+        #[test]
+        fn bad_kex_line_in_a_config_file_stays_a_connection_failure() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for error in run_errors_over(bad_config_ssh(dir.path())) {
+                assert!(is_bad_config_connection(&error), "got: {error:?}");
+            }
+        }
+
+        #[test]
+        fn ssh_writing_nothing_stays_a_connection_failure() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for error in run_errors_over(silent_ssh(dir.path())) {
+                assert!(is_silent_connection(&error), "got: {error:?}");
+            }
+        }
+
+        #[test]
+        fn local_kex_refusal_wins_when_stderr_holds_both() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let stub = stderr_ssh(
+                dir.path(),
+                "both-ssh",
+                "no matching key exchange method found\n\
+                 command-line line 0: Bad SSH2 KexAlgorithms \
+                 'mlkem768x25519-sha256,sntrup761x25519-sha512'.",
+            );
+            for error in run_errors_over(stub) {
+                assert!(is_kex_unsupported_locally(&error), "got: {error:?}");
+            }
+        }
+
+        #[test]
+        fn a_commands_own_stderr_is_not_a_kex_refusal() {
+            let bin_dir = tempfile::tempdir().expect("tempdir");
+            let exec = ssh_executor(&bin_dir, SudoAuth::NonInteractive);
+            let output = exec
+                .run(
+                    Identity::Operator,
+                    "sh",
+                    &[
+                        "-c",
+                        "echo \"no matching key exchange method found\" >&2; \
+                         echo \"Bad SSH2 KexAlgorithms\" >&2; exit 3",
+                    ],
+                )
+                .expect("the command ran, so its stderr is its own");
+            assert_eq!(output.code, Some(3));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("no matching key exchange method found\n"),
+                "stderr: {stderr}"
+            );
+            assert!(
+                stderr.contains("Bad SSH2 KexAlgorithms\n"),
+                "stderr: {stderr}"
+            );
+        }
+
+        #[test]
+        fn kex_refusal_messages_name_the_host_and_the_allowed_methods() {
+            let fields = || ("mgmt".to_string(), "a,b".to_string(), "why".to_string());
+            let (host, allowed, reason) = fields();
+            assert_eq!(
+                ExecutorError::KexUnsupportedLocally {
+                    host,
+                    allowed,
+                    reason
+                }
+                .to_string(),
+                "host `mgmt`: the local ssh client does not support the required key \
+                 exchange methods `a,b`: why"
+            );
+            let (host, allowed, reason) = fields();
+            assert_eq!(
+                ExecutorError::KexRefusedByHost {
+                    host,
+                    allowed,
+                    reason
+                }
+                .to_string(),
+                "host `mgmt`: the host offers none of the allowed key exchange methods \
+                 `a,b`, and no other method is tried: why"
+            );
+        }
+
+        #[test]
+        fn every_ssh_entry_point_carries_the_pinned_options() {
+            const END: &str = "--end-of-invocation--";
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log = dir.path().join("argv.log");
+            let plain = fake_ssh(dir.path());
+            let logging = write_script(
+                dir.path(),
+                "logging-ssh",
+                &format!(
+                    "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; echo {END}; }} >> {}\nexec {} \"$@\"\n",
+                    super::super::shell_quote(&log.to_string_lossy()),
+                    super::super::shell_quote(&plain.to_string_lossy()),
+                ),
+            );
+            let config = crate::transport::Ssh {
+                user: "ops".to_string(),
+                port: 22,
+                key: PathBuf::from("/dev/null"),
+                host_key: crate::transport::HostKeyPolicy::Strict,
+            };
+            let dest = dest_under(dir.path(), "landed");
+            let sudo = fake_sudo(dir.path()).to_string_lossy().into_owned();
+            for prompt in [SshPrompt::Deny, SshPrompt::Allow] {
+                let exec = SshExecutor::from_config(
+                    "mgmt",
+                    &config,
+                    "10.0.0.10",
+                    SudoAuth::NonInteractive,
+                    prompt,
+                )
+                .with_ssh_bin(logging.clone())
+                .with_remote_sudo(sudo.clone());
+                exec.run(Identity::Operator, "true", &[]).expect("run");
+                exec.run_with_input(
+                    Identity::Operator,
+                    "/bin/cat",
+                    &[],
+                    b"{}",
+                    RunLimits {
+                        max_stdout: 1 << 20,
+                        max_stderr: 1 << 20,
+                        timeout: std::time::Duration::from_secs(30),
+                    },
+                )
+                .expect("run_with_input");
+                let mut channel = exec
+                    .open_channel(
+                        Identity::Operator,
+                        "/bin/cat",
+                        &[],
+                        ChannelLimits {
+                            elevation_timeout: std::time::Duration::from_secs(30),
+                            max_stderr: 1 << 20,
+                        },
+                    )
+                    .expect("open_channel");
+                drop(channel.take_stdin());
+                channel.wait().expect("the channel ends");
+                exec.put_file(&dest, b"data", current_meta(0o644))
+                    .expect("put_file");
+                exec.fetch_file(Identity::Operator, &dest)
+                    .expect("fetch_file");
+            }
+            let log = std::fs::read_to_string(&log).expect("the recorded invocations");
+            let invocations: Vec<&str> = log.split_terminator(&format!("{END}\n")).collect();
+            // Five entry points under each of the two prompt modes, at the least.
+            assert!(invocations.len() >= 10, "{log}");
+            for argv in invocations {
+                assert_pinned_options(argv);
+            }
+        }
+
         #[test]
         fn ssh_executor_reports_remote_exit_255_as_command_output() {
             let bin_dir = tempfile::tempdir().expect("tempdir");
@@ -5315,6 +5731,7 @@ exec "$@"
                 argv.contains("BatchMode=yes\n"),
                 "a non-interactive run must never prompt: {argv}"
             );
+            assert_pinned_options(&argv);
         }
 
         #[test]
@@ -5347,6 +5764,7 @@ exec "$@"
                 !argv.contains("BatchMode"),
                 "an interactive run may still satisfy a prompt: {argv}"
             );
+            assert_pinned_options(&argv);
         }
 
         #[test]
@@ -5377,6 +5795,7 @@ exec "$@"
                 "host-key policy: {argv}"
             );
             assert!(argv.contains("ops@10.0.0.10\n"), "target: {argv}");
+            assert_pinned_options(&argv);
         }
 
         /// The landing sequence [`Executor::put_file`] runs (RFC 0003 §9.2).
@@ -8158,8 +8577,9 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 SshExecutor, SshPrompt, SudoAuth,
             };
             use super::{
-                SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, password_wanting_sudos,
-                repeating_sudo, sudo_rs_denying_sudo, warning_ssh, write_script,
+                SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, kex_failures,
+                password_wanting_sudos, repeating_sudo, sudo_rs_denying_sudo, warning_ssh,
+                write_script,
             };
 
             /// Limits roomy enough for every test that is not about them.
@@ -8788,6 +9208,7 @@ exec "$@"
                     )
                 };
                 let unreachable = ssh().with_ssh_bin(failing_ssh(dir.path()));
+                let kex_failing = kex_failures(dir.path());
                 let remote = |sudo: &Path| {
                     ssh()
                         .with_ssh_bin(fake_ssh(dir.path()))
@@ -8871,6 +9292,18 @@ exec "$@"
                         ),
                         "{limits:?}: got {error:?}"
                     );
+                    for (label, stub, expected) in &kex_failing {
+                        let exec = ssh().with_ssh_bin(stub.clone());
+                        for identity in [Identity::Operator, Identity::Root] {
+                            let error = exec
+                                .run_with_input(identity, "/bin/cat", &[], b"{}", limits)
+                                .expect_err("the transport failed");
+                            assert!(
+                                matches!(&error, RunWithInputError::Executor(inner) if expected(inner)),
+                                "{label}, {identity:?}, {limits:?}: got {error:?}"
+                            );
+                        }
+                    }
                 }
 
                 let error = InDaemonExecutor::new("mgmt")
@@ -9095,8 +9528,8 @@ exec "$@"
             };
             use super::bounded_runs::{descending_sudo, password_sudo, ssh_with};
             use super::{
-                SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, password_wanting_sudos,
-                repeating_sudo, sudo_rs_denying_sudo, write_script,
+                SUDO_RS_NOT_IN_SUDOERS, failing_ssh, fake_ssh, kex_failures,
+                password_wanting_sudos, repeating_sudo, sudo_rs_denying_sudo, write_script,
             };
 
             /// Limits roomy enough for every test that is not about them.
@@ -9577,6 +10010,9 @@ exec "$@"
                 }
             }
 
+            // One table of failures across every transport; split up, the
+            // shared stubs would be built per part.
+            #[allow(clippy::too_many_lines)]
             #[test]
             fn failures_before_the_start_are_reported_as_run_reports_them() {
                 let dir = tempfile::tempdir().expect("tempdir");
@@ -9649,6 +10085,16 @@ exec "$@"
                             if host == "mgmt" && reason.contains("Connection refused")),
                         "{identity:?}: got {error:?}"
                     );
+                }
+                for (label, stub, expected) in kex_failures(dir.path()) {
+                    let exec = ssh().with_ssh_bin(stub);
+                    for identity in [Identity::Operator, Identity::Root] {
+                        let error = open(&exec, identity);
+                        assert!(
+                            matches!(&error, ChannelError::Executor(inner) if expected(inner)),
+                            "{label}, {identity:?}: got {error:?}"
+                        );
+                    }
                 }
                 let remote = |sudo: &Path| {
                     ssh()

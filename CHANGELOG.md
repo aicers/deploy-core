@@ -20,6 +20,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `__BOOTLER_SUDO_OK__`: the scripts print it from two halves. A test double
   that recognises an elevated run by finding that word in its command line no
   longer finds it.
+- `SshExecutor` passes
+  `-o KexAlgorithms=mlkem768x25519-sha256,sntrup761x25519-sha512` to every `ssh`
+  it runs, so a session either negotiates a hybrid post-quantum key exchange or
+  fails; it never falls back to a classical one, and an `ssh_config` cannot
+  loosen the list. It also passes `-o ControlPath=none`, so a session never runs
+  over a connection-sharing master that an `ssh_config` names, whose key
+  exchange another `ssh` negotiated, and never leaves one behind. A host whose
+  `sshd` offers neither method now fails with the new
+  `ExecutorError::KexRefusedByHost`, and a local `ssh` that does not know both
+  names (OpenSSH before 9.9) with the new
+  `ExecutorError::KexUnsupportedLocally`, each naming the host and the allowed
+  methods; both were `ExecutorError::Connection` before. `ExecutorError` is not
+  `#[non_exhaustive]`, so a `match` over it without a wildcard arm must handle
+  the two new variants.
 
 ### Fixed
 
