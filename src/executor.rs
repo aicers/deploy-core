@@ -5641,7 +5641,7 @@ exec "$@"
                 key: PathBuf::from("/dev/null"),
                 host_key: crate::transport::HostKeyPolicy::Strict,
             };
-            let dest = dir.path().join("landed");
+            let dest = dest_under(dir.path(), "landed");
             let sudo = fake_sudo(dir.path()).to_string_lossy().into_owned();
             for prompt in [SshPrompt::Deny, SshPrompt::Allow] {
                 let exec = SshExecutor::from_config(
