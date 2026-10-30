@@ -123,9 +123,10 @@ mod tests;
 ///   same container from bounded authentication onwards, as
 ///   [`PackageWriteError::Content`]: either signature over anything but M is
 ///   [`VerifyError::BadSignature`](crate::verify::VerifyError::BadSignature)
-///   for its algorithm, Ed25519 checked first, and a key outside `trust`, a revoked key, a withdrawn build, a trust
-///   floor above the manifest format and a stale trust epoch are the
-///   existing [`VerifyError`](crate::verify::VerifyError) variants.
+///   for its algorithm, Ed25519 checked first, and a key outside `trust`, a
+///   revoked key, a withdrawn build, a trust floor above the manifest format
+///   and a stale trust epoch are the existing
+///   [`VerifyError`](crate::verify::VerifyError) variants.
 // The signature is the one the finalization contract fixes: the prepared
 // package, the expectation, the signer's response, and the same trust,
 // request, architecture, limits and staging parent every full-content call
@@ -200,9 +201,9 @@ pub fn finalize_package(
 ///
 /// This is the complete API for constructing genuinely signed image-declaring
 /// packages in a consumer's tests: with an Ed25519 and an ML-DSA-87 test key
-/// minted per test and a `TrustSet` anchoring only those two, and — under the `test-support` feature, in
-/// `[dev-dependencies]` only — real image archives from
-/// `image::test_support::SyntheticImageArchiveBuilder`, the result passes
+/// minted per test and a `TrustSet` anchoring only those two, and — under the
+/// `test-support` feature, in `[dev-dependencies]` only — real image archives
+/// from `image::test_support::SyntheticImageArchiveBuilder`, the result passes
 /// every final check a production package does. Production signing is
 /// detached instead: [`prepare_package`] in one job, the signer in another,
 /// and [`finalize_package`] after the caller has correlated the signer's
