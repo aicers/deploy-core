@@ -49,8 +49,9 @@ const ENVELOPE_OVERHEAD: usize =
 ///    and SHA-256 are those of the copy, and no source path is opened again;
 /// 2. **manifest** — the manifest is derived from those copies as the legacy
 ///    writers derive it, and serialized once into a buffer bounded by
-///    `RawManifest` and by what `Package` leaves once the signature, key ID
-///    and footer a finalized package adds are counted;
+///    `RawManifest` and by what `Package` leaves once the envelope a
+///    finalized package adds is reserved: both signatures, both key IDs and
+///    the footer;
 /// 3. **archive** — the copies, in input order, are written through the
 ///    legacy writers' archive layout, each member held to exactly its copy's
 ///    length, into a private snapshot bounded by `CompressedArchive` and by

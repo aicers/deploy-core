@@ -63,8 +63,9 @@ pub fn upload_staging_bound(limits: &ContentLimits, package_len: u64) -> u64 {
 ///    private directory created in `staging_parent` whose disk budget is
 ///    [`upload_staging_bound`] of that length;
 /// 2. the snapshot's footer is held to `RawManifest` and `CompressedArchive`,
-///    and the signature, the format floor and the typed parse run — nothing
-///    in the manifest is read for any decision before the signature verifies;
+///    the Ed25519 signature is verified and then the ML-DSA-87 one, and only
+///    then do the format floor and the typed parse run — nothing in the
+///    manifest is read for any decision before both signatures verify;
 /// 3. the build is taken from the first artifact entry and the request is the
 ///    namespaced request for it under `request`'s namespace;
 /// 4. the statement checks run exactly as for
@@ -95,8 +96,8 @@ pub fn upload_staging_bound(limits: &ContentLimits, package_len: u64) -> u64 {
 /// - [`ContentError::Upload`] with [`UploadRefusal::NoArtifacts`] when the
 ///   authenticated manifest carries no artifact entry, and with
 ///   [`UploadRefusal::ReservedTarget`] when its first entry names
-///   [`TRUST_TARGET`](crate::verify::TRUST_TARGET) — both decided after the
-///   signature and before every statement check.
+///   [`TRUST_TARGET`](crate::verify::TRUST_TARGET) — both decided after
+///   both signatures verify and before every statement check.
 pub fn verify_upload<R: Read + Seek>(
     source: R,
     trust: &TrustSet,
@@ -200,8 +201,13 @@ fn upload_contents<R: Read + Seek>(
 }
 
 /// What [`verify_upload`] verified: the authenticated manifest, the build
-/// derived from it, the anchor that verified it and the digests of the bytes
-/// it covered.
+/// derived from it, the two anchors that verified it and the digests of the
+/// bytes it covered.
+///
+/// [`key_id`](Self::key_id) names the Ed25519 anchor and
+/// [`ml_dsa_87_key_id`](Self::ml_dsa_87_key_id) the ML-DSA-87 anchor, each
+/// the anchor whose key actually verified that signature, never the
+/// container's hint.
 ///
 /// It owns metadata only: every retained byte was released before
 /// [`verify_upload`] returned. It exists only as that function returns it:
