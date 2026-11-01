@@ -566,7 +566,7 @@ payload fixtures, the synthetic image archive builder in
 only — never under `[dependencies]`, so the fixtures stay out of every
 release build.
 
-## CI requirements
+## Validation
 
 - Run local checks on the host's own operating system: macOS on a Mac,
   Linux on a Linux host. Do not use a container, a virtual machine or
