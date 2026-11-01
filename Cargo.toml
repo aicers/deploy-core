@@ -36,7 +36,11 @@ tempfile = "3"
 thiserror = "2"
 toml = "0.8"
 x509-parser = "0.17"
-zstd = "0.13"
+# Compresses and decompresses the archive block. 0.14.3 is the floor because it
+# is the first release past RUSTSEC-2026-0391 and, through its
+# `zstd-safe = "8.2.0"` requirement, past RUSTSEC-2026-0398 and
+# RUSTSEC-2026-0403.
+zstd = "0.14.3"
 
 [features]
 # Exposes test-only account and payload fixtures, and the synthetic image
