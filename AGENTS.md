@@ -566,18 +566,45 @@ payload fixtures, the synthetic image archive builder in
 only — never under `[dependencies]`, so the fixtures stay out of every
 release build.
 
-## CI requirements
+## Validation
 
-Before pushing, run what CI runs:
+- Run local checks on the host's own operating system: macOS on a Mac,
+  Linux on a Linux host. Do not use a container, a virtual machine or
+  another operating system in its place. A CI job or matrix entry that
+  exists only to cover another operating system or platform is left to
+  CI; every other row applies on any host that can run its commands.
+- A change is documentation-only when every changed path matches the
+  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
+  none matches its `code` filter. For such a change run only the
+  `Markdown` row, and build or test no code.
+- For any other change, run every row of the table below that applies to
+  the host before pushing. Run each test command as written, in full: do
+  not narrow it to the changed files or to selected test names.
 
-```sh
-cargo fmt -- --check --config group_imports=StdExternalCrate
-cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features test-support -- -D warnings
-cargo test
-cargo test --features test-support
-```
+<!-- markdownlint-disable MD013 -->
+| CI job | Local command |
+| --- | --- |
+| `Markdown` | `markdownlint-cli2` |
+| `check` | `cargo fmt -- --check --config group_imports=StdExternalCrate`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy --all-targets --features test-support -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --features test-support` |
+| `test` | `cargo test`, `cargo test --features test-support` |
+| `Platform (macos-latest)` | `cargo build --all-targets --features test-support` |
+| `Platform (ubuntu-24.04-arm)` | `cargo test --features test-support` |
+<!-- markdownlint-enable MD013 -->
 
-Clippy and the tests each run twice because `--all-targets` touches no
-features: code behind `test-support` is invisible to the first run, and
-that feature exists precisely to change what compiles.
+- Every cargo row needs the C toolchain listed under "Build
+  requirements" in `README.md`, because `aws-lc-sys` compiles AWS-LC from
+  source.
+- `Platform (macos-latest)` applies on a Mac only, and
+  `Platform (ubuntu-24.04-arm)` on a Linux aarch64 host only. On a Linux
+  aarch64 host its command is the second command of `test`; run it once.
+- Clippy and the tests each run twice because `--all-targets` touches no
+  features: code behind `test-support` is invisible to the first run, and
+  that feature exists precisely to change what compiles.
+- Left to CI: `Change Filter`, which only classifies the diff, and every
+  `Platform` entry for a platform other than the host's. The shared
+  instruction-block drift check runs in `Markdown`; the generated regions
+  of this file are never edited here.
+- When a CI job fails, rerun that job's command locally; for a test job,
+  rerun the failing tests by name rather than the whole suite.
+- Before requesting review, ensure every CI job passes on the pushed
+  branch.

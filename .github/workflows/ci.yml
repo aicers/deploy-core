@@ -3,6 +3,25 @@ name: CI
 # This crate is consumed by `bootler` at a pinned git rev, so a break here
 # reaches a shipping installer. Until now nothing ran on push or on a pull
 # request at all.
+#
+# CHANGE FILTER: `changes` classifies the run's diff and `check`, `test` and
+# `platforms` gate on its `docs_only` output, so a pull request that only
+# touches inert documentation does not build and test the crate on three
+# platforms. `markdown` is deliberately ungated -- a docs-only change is
+# exactly the change that needs the Markdown lint to run.
+#
+# THE GATE IS FAIL-CLOSED. Each gated job's `if:` runs the job whenever the
+# filter did not positively report docs-only, including when the filter itself
+# failed. Without `!cancelled()` a failing `changes` would skip its dependants
+# instead, and GitHub counts a skipped required status check as a pass -- so a
+# broken filter would wave an untested change through. Detection must fail
+# red, never open.
+#
+# No `CI Gate` job: `main` requires no status check today. If protection is
+# ever added, note that a matrix job skipped at the job level is never
+# expanded, so a docs-only run never reports `Platform (macos-latest)` or
+# `Platform (ubuntu-24.04-arm)`; require an aggregating gate job then, not the
+# expanded matrix contexts.
 
 on:
   pull_request:
@@ -14,6 +33,107 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Change Filter
+    runs-on: ubuntu-latest
+    # Scoped to this job alone. `pull-requests: read` is what
+    # dorny/paths-filter needs to list a pull request's files; without it the
+    # job dies with "Resource not accessible by integration". Declaring the
+    # block here rather than at workflow level leaves every other job's token
+    # exactly as it is today.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      docs_only: ${{ steps.decide.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # a push diffs against its base commit locally
+
+      # A push carries its base in `github.event.before`. That sha is all-zeros
+      # on a branch's first push and can name a commit a force-push discarded,
+      # so establish that it is real and reachable before diffing. Leaving
+      # `sha` empty skips the filter below, which lands on docs_only=false.
+      - name: Resolve the push base
+        id: base
+        if: github.event_name != 'pull_request'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BEFORE}" ] \
+            && [ "${BEFORE}" != '0000000000000000000000000000000000000000' ] \
+            && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null
+          then
+            echo "sha=${BEFORE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Push base missing or unreachable; running the full suite."
+          fi
+
+      # On `pull_request` the action reads the file list from the API and
+      # ignores `base`; on `push` it diffs against the sha resolved above.
+      #
+      # `docs` is the documentation allowlist that AGENTS.md points agents
+      # at: a change is docs-only when every changed path is on it. `code`
+      # names every path a build or a test reads. `all` matches every path,
+      # and exists only for its count.
+      - name: Filter Paths
+        id: filter
+        if: github.event_name == 'pull_request' || steps.base.outputs.sha != ''
+        uses: dorny/paths-filter@v4
+        with:
+          base: ${{ steps.base.outputs.sha }}
+          filters: |
+            docs:
+              # Root and `docs/` Markdown only, not `**/*.md` or `docs/**`:
+              # `tests/image_fixture_inventory.rs` reads INVENTORY.md beside
+              # the fixtures under `assets/test-fixtures/`, enumerates the
+              # directory that holds it, and reads the run transcripts under
+              # `docs/image-archive-interop-runs/` that `inventory.json` names.
+              - "*.md"
+              - "docs/**/*.md"
+              - ".markdownlint*"
+              # The shared-instructions pin is inert to the build; only the
+              # drift check reads it, and that runs in the ungated `markdown`.
+              - ".agent-instructions.toml"
+            code:
+              - "src/**"
+              - "tests/**"
+              - "examples/**"
+              - "assets/**"
+              # Transcripts the fixture inventory test reads (see above).
+              - "docs/image-archive-interop-runs/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - ".clippy.toml"
+              - ".github/workflows/**"
+            all:
+              - "**"
+
+      # Docs-only requires a POSITIVE result: documentation touched, code
+      # untouched, and nothing else touched either. A filter output is true
+      # when ANY changed path matches it, so `docs` alone is true for a pull
+      # request that edits README.md and also some file nobody listed. The
+      # count comparison closes that: every changed path has to be on the
+      # docs allowlist, so a path in neither list falls through to the full
+      # suite. This is an allowlist of the inert, not a denylist.
+      - name: Decide Docs-Only
+        id: decide
+        env:
+          DOCS: ${{ steps.filter.outputs.docs }}
+          CODE: ${{ steps.filter.outputs.code }}
+          DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
+          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
+        run: |
+          if [ "${DOCS}" = "true" ] \
+            && [ "${CODE}" != "true" ] \
+            && [ "${DOCS_COUNT}" = "${ALL_COUNT}" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   markdown:
     name: Markdown
     runs-on: ubuntu-latest
@@ -36,14 +156,13 @@ jobs:
       # job that already exists, and the fleet's other consumers carry it
       # the same way.
       #
-      # `markdown` rather than `check`. This workflow has no change filter,
-      # so there is no `docs_only` gate for the step to inherit -- the
-      # reason that forces this placement in the consumers that do have one,
-      # where AGENTS.md counts as inert documentation and a gated step would
-      # be skipped on exactly the change that causes drift. Here it is
-      # simply the job that already concerns itself with this class of file,
-      # it is where every sibling consumer keeps the step, and it is the job
-      # that would have to stay ungated if a path filter is ever added.
+      # It belongs in THIS job and nowhere else, because it must not
+      # inherit the `docs_only` gate. `Change Filter` counts AGENTS.md and
+      # `.agent-instructions.toml` as inert, so a pull request that edits
+      # only a generated region, or only moves the pin, is docs-only by that
+      # reckoning -- a gated step would skip the check on precisely the
+      # changes that cause drift. This job asks the filter nothing, which is
+      # what makes it the right host.
       #
       # `@main`, as the workflow reference was. The scripts are mechanism
       # and come from wherever this reference points; the blocks are content
@@ -79,6 +198,8 @@ jobs:
 
   check:
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust
@@ -117,6 +238,8 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust
@@ -144,6 +267,8 @@ jobs:
           - os: macos-latest
             command: cargo build --all-targets --features test-support
     runs-on: ${{ matrix.os }}
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust
