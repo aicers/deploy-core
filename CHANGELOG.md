@@ -4,6 +4,28 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `executor::ContainerAccount` names the ten host accounts that containers run
+  as (`clumit-security-pki`, `clumit-security-pkidb`, `clumit-security-web`,
+  `clumit-security-webdb`, `clumit-insight-pki`, `clumit-insight-pkidb`,
+  `clumit-insight-web`, `clumit-insight-webdb`, `clumit-insight-transit`,
+  `clumit-insight-keycloak-tls`), and `as_str` gives the name.
+  `executor::Principal::Container` lets a `FileMeta` name one as an artifact's
+  owner or group. An existing directory whose `FileMeta` owner is a container
+  account is verified and never corrected by `Executor::make_dir`, as one
+  owned by a service account is, and a mismatch is
+  `ExecutorError::DirectoryMismatch`. A container account is not a
+  `ServiceAccount`, and no `Identity` or `Descent` can name one.
+
+### Changed
+
+- `executor::Principal` has the new variant `Container`. `Principal` is not
+  `#[non_exhaustive]`, so a `match` over it without a wildcard arm must handle
+  it.
+
 ## [0.5.0] - 2026-11-03
 
 ### Added
@@ -274,6 +296,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.5.0...main
 [0.5.0]: https://github.com/aicers/deploy-core/compare/0.4.1...0.5.0
 [0.4.1]: https://github.com/aicers/deploy-core/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/aicers/deploy-core/compare/0.3.1...0.4.0

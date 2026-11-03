@@ -549,6 +549,11 @@ Where the crate handles key material or secrets:
   `SupplementaryGroup::SecurityVfio` are a second deliberate exception: the
   crate that validates and renders a unit must close that vocabulary, so
   package data can never name an arbitrary capability, group or account.
+  The closed account sets in `executor`, `ServiceAccount` and
+  `ContainerAccount`, are a further deliberate exception: the crate that
+  runs commands as an account and writes files owned by one must close
+  those sets, so that no runtime string can become an identity or an
+  owner.
   Keep everything else product-neutral: anything else that names a product
   belongs in the caller.
 - Certificate verification lives in `src/roxyd_trust.rs`, which drives

@@ -620,8 +620,9 @@ pub enum ExecutorError {
         host: String,
     },
     /// A directory bootler must create already exists with different ownership
-    /// or mode, and is one a service account can write — so it is verified and
-    /// never repaired (RFC 0003 §9.2, §11.3).
+    /// or mode, and is owned by a service or a container account, which an
+    /// account other than root can write — so it is verified and never repaired
+    /// (RFC 0003 §9.2, §11.3).
     ///
     /// Correcting a directory a lower-privileged account controls means running
     /// a privileged operation over entries that account can manipulate, which is
@@ -828,6 +829,112 @@ impl ServiceAccount {
     }
 }
 
+/// A host account a container runs as, naming the owner or the group of an
+/// artifact written for that container.
+///
+/// The caller never runs a command as one of these accounts: the container
+/// runtime starts the container's process with the account's numeric uid and
+/// gid, and the caller only creates files and directories owned by it. So a
+/// `ContainerAccount` may name the owner or group of what is written, through
+/// [`Principal::Container`], and cannot be what a command runs as — there is no
+/// [`Identity`], [`Descent`] or [`ServiceAccount`] that names one, and no
+/// conversion from this type into any of them. It is not a [`ServiceAccount`]
+/// for the same reason: a service account is an account commands run as.
+///
+/// Closed on the same terms as [`ServiceAccount`]: no variant carries a runtime
+/// value, and there is no `FromStr`, `Deserialize`, `TryFrom` or
+/// `From<String>`/`From<&str>` on it, so an account name read off the host or
+/// out of operator input cannot become one. [`as_str`](Self::as_str) is the
+/// only way it turns into text.
+///
+/// ```
+/// let account = deploy_core::executor::ContainerAccount::InsightWeb;
+/// assert_eq!(account.as_str(), "clumit-insight-web");
+/// let _ = deploy_core::executor::FileMeta::new(
+///     deploy_core::executor::Principal::Container(account),
+///     deploy_core::executor::Principal::Container(account),
+///     0o700,
+/// );
+/// let _ = deploy_core::executor::Identity::Root;
+/// let _ = deploy_core::executor::ServiceAccount::Security;
+/// let _: Option<deploy_core::executor::Descent> = None;
+/// ```
+///
+/// It cannot become an [`Identity`]:
+///
+/// ```compile_fail
+/// let _: deploy_core::executor::Identity = deploy_core::executor::ContainerAccount::InsightWeb.into();
+/// ```
+///
+/// nor a [`ServiceAccount`]:
+///
+/// ```compile_fail
+/// let _: deploy_core::executor::ServiceAccount = deploy_core::executor::ContainerAccount::InsightWeb.into();
+/// ```
+///
+/// nor a [`Descent`]:
+///
+/// ```compile_fail
+/// let _: deploy_core::executor::Descent = deploy_core::executor::ContainerAccount::InsightWeb.into();
+/// ```
+///
+/// and it cannot be parsed from a string:
+///
+/// ```compile_fail
+/// let _: deploy_core::executor::ContainerAccount = "clumit-insight-web".parse().unwrap();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerAccount {
+    /// `clumit-security-pki` — the `clumit-security` namespace's PKI
+    /// containers: bootroot's `OpenBao` server, `step-ca`, their `OpenBao` Agent
+    /// sidecars and bootroot's `step` helper containers.
+    SecurityPki,
+    /// `clumit-security-pkidb` — the `clumit-security` namespace's bootroot
+    /// PostgreSQL.
+    SecurityPkiDb,
+    /// `clumit-security-web` — the `clumit-security` namespace's web
+    /// application container.
+    SecurityWeb,
+    /// `clumit-security-webdb` — that web application's PostgreSQL.
+    SecurityWebDb,
+    /// `clumit-insight-pki` — as [`SecurityPki`](Self::SecurityPki), for the
+    /// `clumit-insight` namespace.
+    InsightPki,
+    /// `clumit-insight-pkidb` — as [`SecurityPkiDb`](Self::SecurityPkiDb), for
+    /// the `clumit-insight` namespace.
+    InsightPkiDb,
+    /// `clumit-insight-web` — the `clumit-insight` namespace's web application
+    /// container.
+    InsightWeb,
+    /// `clumit-insight-webdb` — that web application's PostgreSQL.
+    InsightWebDb,
+    /// `clumit-insight-transit` — an `OpenBao` server used for Transit
+    /// encryption, in the `clumit-insight` namespace.
+    InsightTransit,
+    /// `clumit-insight-keycloak-tls` — a TLS-terminating sidecar container in
+    /// the `clumit-insight` namespace.
+    InsightKeycloakTls,
+}
+
+impl ContainerAccount {
+    /// Returns the account's system user name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContainerAccount::SecurityPki => "clumit-security-pki",
+            ContainerAccount::SecurityPkiDb => "clumit-security-pkidb",
+            ContainerAccount::SecurityWeb => "clumit-security-web",
+            ContainerAccount::SecurityWebDb => "clumit-security-webdb",
+            ContainerAccount::InsightPki => "clumit-insight-pki",
+            ContainerAccount::InsightPkiDb => "clumit-insight-pkidb",
+            ContainerAccount::InsightWeb => "clumit-insight-web",
+            ContainerAccount::InsightWebDb => "clumit-insight-webdb",
+            ContainerAccount::InsightTransit => "clumit-insight-transit",
+            ContainerAccount::InsightKeycloakTls => "clumit-insight-keycloak-tls",
+        }
+    }
+}
+
 /// A host account naming the owner or the group of an artifact bootler writes
 /// (RFC 0003 §9.1).
 ///
@@ -836,14 +943,17 @@ impl ServiceAccount {
 /// account name read off the host or out of operator input cannot become an
 /// identity commands run under; typing an owner as `String` would reopen
 /// exactly that hole for the account artifacts are *owned by*. In production an
-/// owner is `root` or one of the closed [`ServiceAccount`] set — never free
-/// text.
+/// owner is `root`, one of the closed [`ServiceAccount`] set or one of the
+/// closed [`ContainerAccount`] set — never free text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Principal {
-    /// `root`, which owns every artifact bootler writes today.
+    /// `root`, which owns the artifacts no account other than root may write —
+    /// not every artifact.
     Root,
     /// One of the bootler-managed service accounts.
     Service(ServiceAccount),
+    /// One of the container accounts an artifact may be owned by.
+    Container(ContainerAccount),
     /// A numeric uid or gid, so the unprivileged tests can name the id the test
     /// process already runs as.
     ///
@@ -878,6 +988,7 @@ impl Principal {
         match self {
             Principal::Root => "root".to_string(),
             Principal::Service(account) => account.as_str().to_string(),
+            Principal::Container(account) => account.as_str().to_string(),
             #[cfg(any(test, feature = "test-support"))]
             Principal::Fixture(id) => id.to_string(),
         }
@@ -993,10 +1104,12 @@ impl FileMeta {
         format!("{:04o}", self.mode)
     }
 
-    /// Returns whether the metadata describes a service-writable artifact, which
-    /// is verified rather than repaired when it already exists (§9.2).
+    /// Returns whether the metadata describes a service-writable artifact — one
+    /// owned by a service or a container account, which an account other than
+    /// root can write — and so is verified rather than repaired when it already
+    /// exists (§9.2).
     fn is_service_writable(self) -> bool {
-        matches!(self.owner, Principal::Service(_))
+        matches!(self.owner, Principal::Service(_) | Principal::Container(_))
     }
 }
 
@@ -1467,7 +1580,8 @@ pub trait Executor {
     ///   `InstallFailure` — and the CLI renders
     ///   through `Messages` in both locales.
     /// - **Service-writable** directories — those whose `meta.owner` is a
-    ///   [`Principal::Service`] — are verified only. A mismatch is
+    ///   [`Principal::Service`] or a [`Principal::Container`], so an account
+    ///   other than root can write them — are verified only. A mismatch is
     ///   [`ExecutorError::DirectoryMismatch`] naming the path, which *is*
     ///   operator-facing and is rendered through `Messages` in both locales.
     ///
@@ -1714,9 +1828,9 @@ fn landing_argv(dest: &Path, meta: FileMeta) -> Vec<String> {
 /// transports that have no cheaper native path.
 ///
 /// The policy the script runs under is derived from `meta` rather than passed
-/// separately: an owner that is a service account *is* the statement that the
-/// directory is service-writable, so there is no way to ask for a
-/// service-writable directory to be repaired.
+/// separately: an owner that is a service or a container account *is* the
+/// statement that the directory is service-writable, so there is no way to ask
+/// for a service-writable directory to be repaired.
 fn make_dir_through_install<E: Executor + ?Sized>(
     executor: &E,
     dest: &Path,
@@ -2137,34 +2251,33 @@ impl IdKind {
 
 /// Resolves a [`Principal`] to the numeric id `fchown` takes.
 ///
-/// `root` and the test fixture are numeric by construction; only a service
-/// account needs the host consulted, and it is named by a compile-time constant
-/// even then.
+/// `root` and the test fixture are numeric by construction; only a service or a
+/// container account needs the host consulted, and it is named by a
+/// compile-time constant even then.
 ///
 /// In the group position this resolves `id -g <account>` — the *user*'s primary
 /// group — whereas the shell transports pass the same [`Principal`] to
-/// `chown owner:group`, where it names a *group*. The two agree only while a
-/// service account's primary group is the like-named group RFC 0003 §7.1 has
-/// bootroot create alongside it. That is no longer relied on: `crate::accounts`
-/// creates every account with `useradd --user-group` and asserts `id -gn` equals
-/// the account name at Phase 0, on creation and on reuse alike, so an account
-/// whose primary group diverges aborts the install before any write reaches
-/// here. Nothing exercises the difference today in any case, since every
-/// production [`FileMeta`] is still `root:root`.
+/// `chown owner:group`, where it names a *group*. The two agree only while the
+/// account's primary group is the like-named group. That is the caller's
+/// condition to keep: every account named here, service or container, must be
+/// created with a like-named primary group and checked for it before any write
+/// reaches here, so an account whose primary group diverges never gets this
+/// far.
 #[cfg(unix)]
 fn numeric_id<E: Executor + ?Sized>(
     executor: &E,
     principal: Principal,
     kind: IdKind,
 ) -> Result<u32, ExecutorError> {
-    let account = match principal {
+    let name = match principal {
         Principal::Root => return Ok(ROOT_ID),
         #[cfg(any(test, feature = "test-support"))]
         Principal::Fixture(id) => return Ok(id),
-        Principal::Service(account) => account,
+        Principal::Service(account) => account.as_str(),
+        Principal::Container(account) => account.as_str(),
     };
-    let output = executor.run(Identity::Root, ID, &[kind.flag(), account.as_str()])?;
-    parse_id(&output, account.as_str())
+    let output = executor.run(Identity::Root, ID, &[kind.flag(), name])?;
+    parse_id(&output, name)
 }
 
 /// Returns the uid the current process runs as, read once through `id -u`.
@@ -4291,6 +4404,198 @@ mod tests {
             matches!(error, ExecutorError::Spawn { .. }),
             "got: {error:?}"
         );
+    }
+
+    /// Every container account beside the name it must render as.
+    const CONTAINER_ACCOUNTS: [(super::ContainerAccount, &str); 10] = [
+        (super::ContainerAccount::SecurityPki, "clumit-security-pki"),
+        (
+            super::ContainerAccount::SecurityPkiDb,
+            "clumit-security-pkidb",
+        ),
+        (super::ContainerAccount::SecurityWeb, "clumit-security-web"),
+        (
+            super::ContainerAccount::SecurityWebDb,
+            "clumit-security-webdb",
+        ),
+        (super::ContainerAccount::InsightPki, "clumit-insight-pki"),
+        (
+            super::ContainerAccount::InsightPkiDb,
+            "clumit-insight-pkidb",
+        ),
+        (super::ContainerAccount::InsightWeb, "clumit-insight-web"),
+        (
+            super::ContainerAccount::InsightWebDb,
+            "clumit-insight-webdb",
+        ),
+        (
+            super::ContainerAccount::InsightTransit,
+            "clumit-insight-transit",
+        ),
+        (
+            super::ContainerAccount::InsightKeycloakTls,
+            "clumit-insight-keycloak-tls",
+        ),
+    ];
+
+    /// The longest user name `useradd` accepts.
+    const MAX_ACCOUNT_NAME_LEN: usize = 32;
+
+    #[test]
+    fn container_accounts_render_their_names_as_owner_and_group() {
+        use super::{Principal, ServiceAccount};
+
+        for (account, name) in CONTAINER_ACCOUNTS {
+            assert_eq!(account.as_str(), name, "{account:?}");
+            assert_eq!(Principal::Container(account).as_arg(), name, "{account:?}");
+        }
+
+        for (_, name) in CONTAINER_ACCOUNTS {
+            assert!(name.len() <= MAX_ACCOUNT_NAME_LEN, "`{name}` is too long");
+            let mut bytes = name.bytes();
+            let first = bytes.next().expect("a name is never empty");
+            assert!(first.is_ascii_lowercase(), "`{name}` must start with a-z");
+            assert!(
+                bytes
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+                "`{name}` may hold only a-z, 0-9 and -"
+            );
+        }
+
+        let mut names: Vec<&str> = CONTAINER_ACCOUNTS.iter().map(|(_, name)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            CONTAINER_ACCOUNTS.len(),
+            "names must be distinct"
+        );
+
+        let service_names = [
+            ServiceAccount::Security,
+            ServiceAccount::Insight,
+            ServiceAccount::Roxyd,
+        ]
+        .map(ServiceAccount::as_str);
+        for (_, name) in CONTAINER_ACCOUNTS {
+            assert!(
+                !service_names.contains(&name),
+                "`{name}` must not be a service account's name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_container_owner_is_service_writable_and_a_container_group_alone_is_not() {
+        use super::{ContainerAccount, FileMeta, Principal};
+
+        let owned = FileMeta::new(
+            Principal::Container(ContainerAccount::InsightWeb),
+            Principal::Container(ContainerAccount::InsightWeb),
+            0o700,
+        );
+        assert!(owned.is_service_writable());
+
+        let grouped = FileMeta::new(
+            Principal::Root,
+            Principal::Container(ContainerAccount::InsightWeb),
+            0o750,
+        );
+        assert!(
+            !grouped.is_service_writable(),
+            "only the owner decides; a root-owned directory is corrected"
+        );
+    }
+
+    #[cfg(unix)]
+    mod numeric_ids {
+        use super::super::test_support::{RecordedCall, RecordingExecutor};
+        use super::super::{
+            CommandOutput, ContainerAccount, ExecutorError, IdKind, Identity, Principal,
+            ServiceAccount, numeric_id,
+        };
+
+        fn printed(stdout: &[u8]) -> CommandOutput {
+            CommandOutput {
+                code: Some(0),
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn id_call(flag: &str, name: &str) -> RecordedCall {
+            RecordedCall::Run {
+                identity: Identity::Root,
+                command: "id".to_string(),
+                args: vec![flag.to_string(), name.to_string()],
+            }
+        }
+
+        #[test]
+        fn a_container_account_resolves_its_uid_through_id_as_root() {
+            let executor = RecordingExecutor::new();
+            executor.script_run(Ok(printed(b"4242\n")));
+            let account = ContainerAccount::InsightWeb;
+
+            let id = numeric_id(&executor, Principal::Container(account), IdKind::User)
+                .expect("a printed uid resolves");
+
+            assert_eq!(id, 4242);
+            assert_eq!(executor.calls(), vec![id_call("-u", account.as_str())]);
+        }
+
+        #[test]
+        fn a_container_account_resolves_its_gid_through_id_as_root() {
+            let executor = RecordingExecutor::new();
+            executor.script_run(Ok(printed(b"4242\n")));
+            let account = ContainerAccount::InsightWeb;
+
+            let id = numeric_id(&executor, Principal::Container(account), IdKind::Group)
+                .expect("a printed gid resolves");
+
+            assert_eq!(id, 4242);
+            assert_eq!(executor.calls(), vec![id_call("-g", account.as_str())]);
+        }
+
+        #[test]
+        fn an_unknown_container_account_is_a_transfer_error_naming_it() {
+            let executor = RecordingExecutor::new();
+            executor.script_run(Ok(CommandOutput {
+                code: Some(1),
+                stdout: Vec::new(),
+                stderr: b"id: 'clumit-insight-web': no such user\n".to_vec(),
+            }));
+
+            let error = numeric_id(
+                &executor,
+                Principal::Container(ContainerAccount::InsightWeb),
+                IdKind::User,
+            )
+            .expect_err("an unknown account does not resolve");
+
+            match error {
+                ExecutorError::Transfer { path, .. } => {
+                    assert_eq!(path, std::path::Path::new("clumit-insight-web"));
+                }
+                other => panic!("expected Transfer naming the account, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_service_account_resolves_its_uid_through_id_as_root() {
+            let executor = RecordingExecutor::new();
+            executor.script_run(Ok(printed(b"4242\n")));
+
+            let id = numeric_id(
+                &executor,
+                Principal::Service(ServiceAccount::Security),
+                IdKind::User,
+            )
+            .expect("a printed uid resolves");
+
+            assert_eq!(id, 4242);
+            assert_eq!(executor.calls(), vec![id_call("-u", "clumit-security")]);
+        }
     }
 
     #[cfg(unix)]
@@ -7022,6 +7327,37 @@ exit 127
                 let error = daemon()
                     .make_dir(&dir, meta)
                     .expect_err("a service-writable mismatch is a hard error");
+                match error {
+                    ExecutorError::DirectoryMismatch { path, .. } => assert_eq!(path, dir),
+                    other => panic!("expected DirectoryMismatch naming the path, got: {other:?}"),
+                }
+                assert_eq!(
+                    mode_of(&dir),
+                    0o755,
+                    "a verified directory must be left exactly as it was found"
+                );
+            }
+
+            #[test]
+            fn a_container_owned_directory_is_verified_and_never_repaired() {
+                // A directory a container account owns is as writable by an
+                // account other than root as a service-owned one, so it gets the
+                // same verify-only policy: a mismatch is a hard error naming the
+                // path, and the directory is left exactly as it was.
+                let root = tempfile::tempdir().expect("tempdir");
+                let dir = root.path().join("data").join("container");
+                std::fs::create_dir_all(&dir).expect("create");
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                    .expect("mode");
+
+                let meta = FileMeta::new(
+                    Principal::Container(crate::executor::ContainerAccount::InsightWeb),
+                    Principal::Container(crate::executor::ContainerAccount::InsightWeb),
+                    0o700,
+                );
+                let error = daemon()
+                    .make_dir(&dir, meta)
+                    .expect_err("a container-owned mismatch is a hard error");
                 match error {
                     ExecutorError::DirectoryMismatch { path, .. } => assert_eq!(path, dir),
                     other => panic!("expected DirectoryMismatch naming the path, got: {other:?}"),
