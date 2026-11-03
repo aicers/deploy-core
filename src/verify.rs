@@ -2941,6 +2941,129 @@ mod tests {
         assert_eq!(verified.manifest().artifacts().len(), 1);
     }
 
+    /// The default manifest with `"release_build":<value>` written right
+    /// after its `format_version`: the default manifest has no `pinset`, so
+    /// that is the place the serializer puts the key.
+    fn manifest_with_release_build(value: &str) -> Vec<u8> {
+        let unmarked = String::from_utf8(default_manifest()).expect("the fixture is UTF-8");
+        let version = format!(r#""format_version":{MANIFEST_FORMAT_VERSION},"#);
+        let marked = unmarked.replacen(
+            &version,
+            &format!(r#"{version}"release_build":{value},"#),
+            1,
+        );
+        assert_ne!(marked, unmarked, "the key must have been inserted");
+        marked.into_bytes()
+    }
+
+    /// The default manifest marked as a release build.
+    fn marked_manifest() -> Vec<u8> {
+        manifest_with_release_build("true")
+    }
+
+    #[test]
+    fn a_signed_release_build_verifies_and_reports_its_mark() {
+        let pair = keypair();
+        let hint = key_id(&public_key_of(&pair));
+        let package = signed_pkg(
+            &pair,
+            &marked_manifest(),
+            &default_archive(),
+            Some(hint.as_bytes()),
+        );
+        let verified = accepted(&package, &trusting(&pair));
+        assert!(verified.manifest().is_release_build());
+
+        let unmarked = accepted(&default_pkg(&pair), &trusting(&pair));
+        assert!(!unmarked.manifest().is_release_build());
+    }
+
+    #[test]
+    fn a_signed_explicit_false_mark_verifies_as_a_test_build() {
+        // A hand-made manifest may write the key as `false`; the signatures
+        // cover those raw bytes, not the re-serialization that would drop it.
+        let pair = keypair();
+        let hint = key_id(&public_key_of(&pair));
+        let package = signed_pkg(
+            &pair,
+            &manifest_with_release_build("false"),
+            &default_archive(),
+            Some(hint.as_bytes()),
+        );
+        let verified = accepted(&package, &trusting(&pair));
+        assert!(!verified.manifest().is_release_build());
+    }
+
+    #[test]
+    fn changing_the_release_build_mark_breaks_both_signatures() {
+        let pair = keypair();
+        let trust = trusting(&pair);
+        let hint = key_id(&public_key_of(&pair));
+        let ml_dsa_hint = ml_dsa_key_id_of(&pair);
+        let archive = default_archive();
+
+        // Each direction: signed over `signed`, then presented with `changed`.
+        for (signed, changed) in [
+            (marked_manifest(), default_manifest()),
+            (default_manifest(), marked_manifest()),
+        ] {
+            let ed25519 = pair.sign(&signed);
+            let ml_dsa = ml_dsa_signature(&pair, &signed);
+            // The original package verifies, so each refusal below is the
+            // change and nothing else.
+            let original = assemble(
+                &signed,
+                &archive,
+                [
+                    Some(ed25519.as_ref()),
+                    Some(hint.as_bytes()),
+                    Some(&ml_dsa),
+                    Some(ml_dsa_hint.as_bytes()),
+                ],
+            );
+            accepted(&original, &trust);
+
+            // (a) Both original signatures and both hints over the changed
+            // manifest.
+            let swapped = assemble(
+                &changed,
+                &archive,
+                [
+                    Some(ed25519.as_ref()),
+                    Some(hint.as_bytes()),
+                    Some(&ml_dsa),
+                    Some(ml_dsa_hint.as_bytes()),
+                ],
+            );
+            assert!(matches!(
+                refusal(&swapped, &trust),
+                VerifyError::BadSignature {
+                    algorithm: SignatureAlgorithm::Ed25519
+                }
+            ));
+
+            // (b) The Ed25519 signature re-made over the changed manifest,
+            // the original ML-DSA-87 signature kept.
+            let resigned = pair.sign(&changed);
+            let half_resigned = assemble(
+                &changed,
+                &archive,
+                [
+                    Some(resigned.as_ref()),
+                    Some(hint.as_bytes()),
+                    Some(&ml_dsa),
+                    Some(ml_dsa_hint.as_bytes()),
+                ],
+            );
+            assert!(matches!(
+                refusal(&half_resigned, &trust),
+                VerifyError::BadSignature {
+                    algorithm: SignatureAlgorithm::MlDsa87
+                }
+            ));
+        }
+    }
+
     #[test]
     fn a_package_the_writer_emits_carries_no_signature_and_is_bad_signature() {
         // Everything `append_trailer` writes has every envelope pair absent, so

@@ -1595,3 +1595,88 @@ fn changing_the_published_file_changes_nothing_retained() {
         .expect("reads");
     assert_eq!(fresh, original);
 }
+
+// ---------------------------------------------------------------------------
+// The release-build mark
+// ---------------------------------------------------------------------------
+
+/// Prepares `inputs` for `x86_64` under the fixture request in `staging`,
+/// recording `release_build`.
+fn prepare_marked(inputs: &[ArtifactInput], staging: &Dir, release_build: bool) -> PreparedPackage {
+    super::super::prepare_package_with_release_build(
+        inputs,
+        None,
+        None,
+        &request(),
+        TargetArch::X86_64,
+        &ContentLimits::default(),
+        staging.path(),
+        release_build,
+    )
+    .expect("the package prepares")
+}
+
+#[test]
+fn a_package_prepared_as_a_release_build_carries_the_mark_through_upload() {
+    let sources = Dir::new();
+    let inputs = super::super::prepare_fixture::inputs(
+        &sources,
+        &super::super::contents::tests::fixture::mixed(),
+    );
+    let staging = Dir::new();
+    let prepared = prepare_marked(&inputs, &staging, true);
+    let manifest =
+        PayloadManifest::parse(prepared.manifest_bytes(), FORMAT_VERSION).expect("M parses");
+    assert!(manifest.is_release_build());
+
+    let key = Key::new();
+    let finalized = finalize(
+        &prepared,
+        &key.sign(prepared.manifest_bytes()),
+        &key.trust(),
+        &ContentLimits::default(),
+        &Dir::new(),
+    )
+    .expect("the marked package finalizes");
+    assert!(finalized.contents().manifest().is_release_build());
+
+    let upload_staging = Dir::new();
+    let uploaded = super::super::verify_upload(
+        Cursor::new(read_all(finalized.bytes())),
+        &key.trust(),
+        &crate::verify::UploadRequest::new(NAMESPACE).expect("a valid namespace"),
+        &ContentLimits::default(),
+        upload_staging.path(),
+    )
+    .expect("the marked package verifies on upload");
+    assert!(uploaded.manifest().is_release_build());
+}
+
+#[test]
+fn an_unmarked_preparation_keeps_prepare_packages_bytes() {
+    let sources = Dir::new();
+    let inputs = super::super::prepare_fixture::inputs(
+        &sources,
+        &super::super::contents::tests::fixture::mixed(),
+    );
+    let staging = Dir::new();
+    let plain = prepare_package(
+        &inputs,
+        None,
+        None,
+        &request(),
+        TargetArch::X86_64,
+        &ContentLimits::default(),
+        staging.path(),
+    )
+    .expect("the package prepares");
+    let unmarked = prepare_marked(&inputs, &staging, false);
+    let marked = prepare_marked(&inputs, &staging, true);
+    assert_eq!(unmarked.manifest_bytes(), plain.manifest_bytes());
+    assert!(
+        !PayloadManifest::parse(unmarked.manifest_bytes(), FORMAT_VERSION)
+            .expect("M parses")
+            .is_release_build()
+    );
+    assert_ne!(marked.manifest_bytes(), plain.manifest_bytes());
+}

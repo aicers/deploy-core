@@ -1,5 +1,6 @@
-//! Unsigned package preparation: [`prepare_package`], the
-//! [`PreparedPackage`] it returns, its [`persist`](PreparedPackage::persist),
+//! Unsigned package preparation: [`prepare_package`] and
+//! [`prepare_package_with_release_build`], the [`PreparedPackage`] they
+//! return, its [`persist`](PreparedPackage::persist),
 //! and the [`PackageWriteError`] every writer step reports.
 
 use std::fmt;
@@ -119,6 +120,48 @@ pub fn prepare_package(
     limits: &ContentLimits,
     staging_parent: &Path,
 ) -> Result<PreparedPackage, PackageWriteError> {
+    prepare_package_with_release_build(
+        inputs,
+        pinset,
+        trust_set_bytes,
+        request,
+        target_arch,
+        limits,
+        staging_parent,
+        false,
+    )
+}
+
+/// Prepares an unsigned standalone package exactly as [`prepare_package`]
+/// does, recording in M whether the build is a release build.
+///
+/// The producer decides `release_build`; this crate checks neither the
+/// version's form nor any tag. When it is true the derived manifest is marked
+/// with [`PayloadManifest::with_release_build`] before it is serialized into
+/// M, and that is the only difference: the archive, the validation and the
+/// binding are built the same way. With `false`, M is byte-identical to the
+/// one [`prepare_package`] prepares from the same inputs. See
+/// [`PayloadManifest::is_release_build`] for what the record means.
+///
+/// # Errors
+///
+/// Whatever [`prepare_package`] returns for the same inputs, in the same
+/// order; a marked M is longer by the key, so the `RawManifest` and `Package`
+/// limits apply to it as to any other manifest.
+// `prepare_package`'s seven parameters plus the producer's release-build
+// decision: the mark is an input of the manifest step and has nowhere else
+// to come from.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_package_with_release_build(
+    inputs: &[ArtifactInput],
+    pinset: Option<&str>,
+    trust_set_bytes: Option<&[u8]>,
+    request: &VerifyRequest,
+    target_arch: TargetArch,
+    limits: &ContentLimits,
+    staging_parent: &Path,
+    release_build: bool,
+) -> Result<PreparedPackage, PackageWriteError> {
     // 1. Stage the inputs.
     let members = limits.get(LimitResource::OuterMembers);
     if u64::try_from(inputs.len()).map_or(true, |count| count > members) {
@@ -128,7 +171,14 @@ pub fn prepare_package(
     let snapshots = stage_inputs(&scope, inputs, limits)?;
 
     // 2. Build M.
-    let manifest = build_manifest(inputs, &snapshots, pinset, trust_set_bytes, limits)?;
+    let manifest = build_manifest(
+        inputs,
+        &snapshots,
+        pinset,
+        trust_set_bytes,
+        release_build,
+        limits,
+    )?;
 
     // 3. Build A from the same snapshots, then let them go.
     let archive = build_archive(&scope, inputs, &snapshots, manifest.len(), limits)?;
@@ -233,12 +283,14 @@ impl Read for InputReader {
     }
 }
 
-/// Derives the manifest from the snapshots and serializes it once, bounded.
+/// Derives the manifest from the snapshots, marks it a release build when
+/// `release_build` is true, and serializes it once, bounded.
 fn build_manifest(
     inputs: &[ArtifactInput],
     snapshots: &[RetainedBytes],
     pinset: Option<&str>,
     trust_set_bytes: Option<&[u8]>,
+    release_build: bool,
     limits: &ContentLimits,
 ) -> Result<Arc<[u8]>, PackageWriteError> {
     let package = limits.get(LimitResource::Package);
@@ -253,6 +305,11 @@ fn build_manifest(
         .collect();
     let manifest =
         derive_manifest(pinset, trust_set_bytes, &measured).map_err(PackageWriteError::Payload)?;
+    let manifest = if release_build {
+        manifest.with_release_build()
+    } else {
+        manifest
+    };
     let mut buffer = BoundedVec::new(vec![
         Ceiling::whole(
             LimitResource::RawManifest,
