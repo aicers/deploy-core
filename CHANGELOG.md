@@ -4,7 +4,7 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-04
 
 ### Added
 
@@ -296,7 +296,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
-[Unreleased]: https://github.com/aicers/deploy-core/compare/0.5.0...main
+[0.6.0]: https://github.com/aicers/deploy-core/compare/0.5.0...0.6.0
 [0.5.0]: https://github.com/aicers/deploy-core/compare/0.4.1...0.5.0
 [0.4.1]: https://github.com/aicers/deploy-core/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/aicers/deploy-core/compare/0.3.1...0.4.0
