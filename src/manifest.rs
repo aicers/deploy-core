@@ -513,9 +513,14 @@ mod trust_set_codec {
 }
 
 /// The whole payload trailer manifest: the schema version, the pin-set digest
-/// the payload was built from, the release-signing trust-set generation the
+/// the payload was built from, whether the producer recorded it as a release
+/// build (`release_build`), the release-signing trust-set generation the
 /// installer seeds from, the ordered archive member list, plus an ordered list
 /// of artifacts.
+///
+/// `release_build` is written only when it is true, so an unmarked manifest
+/// serializes exactly as it did before the field existed; see
+/// [`PayloadManifest::is_release_build`] for what the record means.
 ///
 /// Constructed through [`PayloadManifest::new`], which enforces the manifest
 /// invariants (non-empty dispositions, unique `archive_path`, a valid `commit`
@@ -534,6 +539,8 @@ pub struct PayloadManifest {
     format_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pinset: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    release_build: bool,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "trust_set_codec::serialize"
@@ -567,12 +574,20 @@ pub struct PayloadManifest {
 /// key's absence in order to reject it. That is not a second validated type
 /// modelling the field — validation happens in `from_parts`, where an absent
 /// list on a versioned manifest is [`ManifestError::MissingArchiveMembers`].
+///
+/// `release_build` is `#[serde(default)]` for the same skew reason as
+/// `pinset`: an absent key reads as `false`, a test build, and a reader
+/// predating the field ignores it. It is not a term of the pre-versioned
+/// baseline conjunction. A value that is not a JSON boolean fails the typed
+/// decode like any other mistyped field.
 #[derive(Deserialize)]
 struct RawManifest {
     #[serde(default)]
     format_version: Option<u32>,
     #[serde(default)]
     pinset: Option<String>,
+    #[serde(default)]
+    release_build: bool,
     #[serde(default)]
     trust_set: Option<String>,
     #[serde(default)]
@@ -788,6 +803,7 @@ impl TryFrom<RawManifest> for PayloadManifest {
         Self::from_parts(
             Some(format_version),
             raw.pinset,
+            raw.release_build,
             raw.archive_members,
             raw_parts(raw.artifacts),
             trust_set,
@@ -987,6 +1003,7 @@ impl PayloadManifest {
         Self::from_parts(
             Some(MANIFEST_FORMAT_VERSION),
             pinset,
+            false,
             Some(archive_members),
             typed_parts(artifacts),
             None,
@@ -1007,8 +1024,9 @@ impl PayloadManifest {
     ///
     /// It takes no member-list parameter: it consumes a manifest that already
     /// carries a list and forwards that field unchanged, exactly as it forwards
-    /// `format_version`, `pinset` and `artifacts`. A parameter here would let a
-    /// caller replace the list an already-validated manifest holds.
+    /// `format_version`, `pinset`, the release-build mark and `artifacts`. A
+    /// parameter here would let a caller replace the list an already-validated
+    /// manifest holds.
     ///
     /// # Errors
     ///
@@ -1019,10 +1037,26 @@ impl PayloadManifest {
         Self::from_parts(
             self.format_version,
             self.pinset,
+            self.release_build,
             self.archive_members,
             typed_parts(self.artifacts),
             Some(generation.to_vec()),
         )
+    }
+
+    /// Marks the manifest as a release build, returning it.
+    ///
+    /// The producer that builds the component decides whether a build is a
+    /// release build; this records its answer and validates nothing, since
+    /// the mark has no invariant. Calling it again changes nothing, and there
+    /// is no way to clear the mark: a producer that does not mark a build
+    /// simply does not call it. It commutes with
+    /// [`PayloadManifest::with_trust_set`]. See
+    /// [`PayloadManifest::is_release_build`] for what the record means.
+    #[must_use]
+    pub fn with_release_build(mut self) -> Self {
+        self.release_build = true;
+        self
     }
 
     /// Reads a manifest block that sits in a container whose footer declared
@@ -1110,6 +1144,7 @@ impl PayloadManifest {
         Self::from_parts(
             format_version,
             raw.pinset,
+            raw.release_build,
             raw.archive_members,
             raw_parts(raw.artifacts),
             trust_set,
@@ -1126,6 +1161,7 @@ impl PayloadManifest {
     fn from_parts(
         format_version: Option<u32>,
         pinset: Option<String>,
+        release_build: bool,
         archive_members: Option<Vec<ArchiveMember>>,
         artifacts: Vec<(PayloadArtifact, ImageSource)>,
         trust_set: Option<Vec<u8>>,
@@ -1220,6 +1256,7 @@ impl PayloadManifest {
         Ok(Self {
             format_version,
             pinset,
+            release_build,
             trust_set,
             archive_members,
             artifacts,
@@ -1242,6 +1279,29 @@ impl PayloadManifest {
     #[must_use]
     pub fn pinset(&self) -> Option<&str> {
         self.pinset.as_deref()
+    }
+
+    /// Returns whether the producer recorded this manifest as a release
+    /// build.
+    ///
+    /// `true` means the producer recorded that the build was made from the
+    /// commit the component's version tag points at, the tag name being the
+    /// build's version in `MAJOR.MINOR.PATCH` form. `false` — the key absent
+    /// from the manifest — means a test build. This crate neither decides nor
+    /// checks the record: it inspects no tag and no version form, and treats a
+    /// marked manifest no differently anywhere.
+    ///
+    /// The record states provenance, not safety, and it is only as trustworthy
+    /// as the manifest that carries it. It is meaningful only on a manifest
+    /// whose package signatures verified — the one
+    /// [`verify_upload`](crate::package::verify_upload) or
+    /// [`verify_package`](crate::verify::verify_package) returns — and not on
+    /// one read with [`PayloadManifest::parse`] or `Deserialize` alone, nor on
+    /// that of a payload read with [`payload::open`](crate::payload::open) or
+    /// its siblings, which parse the manifest without checking any signature.
+    #[must_use]
+    pub fn is_release_build(&self) -> bool {
+        self.release_build
     }
 
     /// Returns the signed trust-set generation container the installer seeds
@@ -1613,6 +1673,187 @@ mod tests {
         let manifest: PayloadManifest =
             serde_json::from_str(&json).expect("an unknown field must be ignored");
         assert_eq!(manifest.pinset(), Some("abc"));
+    }
+
+    /// The unmarked fixture manifest's serialized form, recorded by running
+    /// `serde_json::to_string` over [`fixed_manifest`]'s input on the base
+    /// commit before the release-build field existed. It pins the bytes an
+    /// unmarked manifest had then, independently of the serializer under test.
+    const UNMARKED_FIXED_JSON: &str = r#"{"format_version":9,"pinset":"656add7928cb1eee2d46a23546c477c9447ceb2afe78734239e21a785ddb9aec","trust_set":"YSBzaWduZWQgZ2VuZXJhdGlvbiBjb250YWluZXIsIG9wYXF1ZSB0byB0aGlzIGNyYXRl","archive_members":[{"name":"bin/native","length":12}],"artifacts":[{"component":"example","version":"1.2.3","commit":"0123456789abcdef0123456789abcdef01234567","target_arch":"x86_64","kind":"native-binary","dispositions":["install"],"archive_path":"bin/native","sha256":"abababababababababababababababababababababababababababababababab"}]}"#;
+
+    /// A manifest built from fixed input only, with `release_build` applied
+    /// before the trust set when `marked`: [`PINSET`], [`GENERATION`], one
+    /// member and one artifact whose every field is stated here.
+    fn fixed_manifest(marked: bool) -> PayloadManifest {
+        let artifact = PayloadArtifact {
+            component: "example".to_string(),
+            version: "1.2.3".to_string(),
+            commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            target_arch: TargetArch::X86_64,
+            kind: ArtifactKind::NativeBinary,
+            dispositions: [Disposition::Install].into_iter().collect(),
+            archive_path: "bin/native".to_string(),
+            sha256: "ab".repeat(32),
+            spec: None,
+            image: None,
+        };
+        let manifest = PayloadManifest::new(
+            Some(PINSET.to_string()),
+            vec![ArchiveMember {
+                name: "bin/native".to_string(),
+                length: 12,
+            }],
+            vec![artifact],
+        )
+        .expect("the fixed manifest is valid");
+        let manifest = if marked {
+            manifest.with_release_build()
+        } else {
+            manifest
+        };
+        manifest
+            .with_trust_set(GENERATION)
+            .expect("the fixed generation is non-empty")
+    }
+
+    #[test]
+    fn a_release_build_round_trips() {
+        let manifest = manifest_of(
+            Some(PINSET.to_string()),
+            vec![artifact(
+                "bin/native",
+                ArtifactKind::NativeBinary,
+                &[Disposition::Install],
+            )],
+        )
+        .expect("manifest should be valid")
+        .with_release_build();
+        assert!(manifest.is_release_build());
+
+        let json = serde_json::to_vec(&manifest).expect("serialization should succeed");
+        let decoded: PayloadManifest =
+            serde_json::from_slice(&json).expect("a marked manifest deserializes");
+        assert_eq!(decoded, manifest);
+        assert!(decoded.is_release_build());
+
+        let parsed = PayloadManifest::parse(&json, crate::payload::FORMAT_VERSION)
+            .expect("a marked manifest parses");
+        assert_eq!(parsed, manifest);
+        assert!(parsed.is_release_build());
+    }
+
+    #[test]
+    fn a_new_manifest_is_not_a_release_build() {
+        let manifest = manifest_of(
+            None,
+            vec![artifact(
+                "bin/native",
+                ArtifactKind::NativeBinary,
+                &[Disposition::Install],
+            )],
+        )
+        .expect("manifest should be valid");
+        assert!(!manifest.is_release_build());
+        let twice = manifest.clone().with_release_build().with_release_build();
+        assert_eq!(twice, manifest.with_release_build());
+    }
+
+    #[test]
+    fn an_unmarked_manifest_keeps_its_serialized_bytes() {
+        let unmarked =
+            serde_json::to_string(&fixed_manifest(false)).expect("serialization should succeed");
+        assert_eq!(unmarked, UNMARKED_FIXED_JSON);
+
+        let pinset_entry = format!(r#""pinset":"{PINSET}","#);
+        let marked_expected = UNMARKED_FIXED_JSON.replacen(
+            &pinset_entry,
+            &format!(r#"{pinset_entry}"release_build":true,"#),
+            1,
+        );
+        assert_ne!(marked_expected, UNMARKED_FIXED_JSON);
+        let marked =
+            serde_json::to_string(&fixed_manifest(true)).expect("serialization should succeed");
+        assert_eq!(marked, marked_expected);
+    }
+
+    #[test]
+    fn an_unmarked_manifest_serializes_without_the_field() {
+        let manifest = manifest_of(
+            Some(PINSET.to_string()),
+            vec![artifact(
+                "bin/native",
+                ArtifactKind::NativeBinary,
+                &[Disposition::Install],
+            )],
+        )
+        .expect("manifest should be valid");
+        let json = serde_json::to_string(&manifest).expect("serialization should succeed");
+        assert!(!json.contains("release_build"), "got: {json}");
+    }
+
+    #[test]
+    fn the_release_build_key_reads_as_written() {
+        let entry = entry_json("bin/c", Some(GIT_COMMIT));
+        let with_key = |value: Option<&str>| {
+            let key =
+                value.map_or_else(String::new, |value| format!(r#""release_build":{value},"#));
+            format!(
+                r#"{{"format_version":{MANIFEST_FORMAT_VERSION},{key}{MEMBERS_JSON}"artifacts":[{entry}]}}"#
+            )
+        };
+        for (value, expected) in [(None, false), (Some("false"), false), (Some("true"), true)] {
+            let json = with_key(value);
+            let parsed = PayloadManifest::parse(json.as_bytes(), crate::payload::FORMAT_VERSION)
+                .expect("a boolean or absent mark parses");
+            assert_eq!(parsed.is_release_build(), expected, "{json}");
+            let decoded: PayloadManifest =
+                serde_json::from_str(&json).expect("a boolean or absent mark deserializes");
+            assert_eq!(decoded.is_release_build(), expected, "{json}");
+            // An explicit `false` is dropped when the manifest is written again.
+            let again = serde_json::to_string(&parsed).expect("serialization should succeed");
+            assert_eq!(again.contains("release_build"), expected, "{again}");
+        }
+        for value in ["null", r#""true""#, "1"] {
+            let json = with_key(Some(value));
+            let error = PayloadManifest::parse(json.as_bytes(), crate::payload::FORMAT_VERSION)
+                .expect_err("a non-boolean mark is refused");
+            assert!(
+                matches!(error, ManifestError::Decode(_)),
+                "{value}: {error:?}"
+            );
+            assert!(
+                serde_json::from_str::<PayloadManifest>(&json).is_err(),
+                "{value} must not deserialize"
+            );
+        }
+    }
+
+    #[test]
+    fn marking_and_the_trust_set_commute() {
+        let base = manifest_of(
+            Some(PINSET.to_string()),
+            vec![artifact(
+                "bin/native",
+                ArtifactKind::NativeBinary,
+                &[Disposition::Install],
+            )],
+        )
+        .expect("manifest should be valid");
+        let mark_first = base
+            .clone()
+            .with_release_build()
+            .with_trust_set(GENERATION)
+            .expect("the generation is non-empty");
+        let trust_first = base
+            .with_trust_set(GENERATION)
+            .expect("the generation is non-empty")
+            .with_release_build();
+        assert_eq!(mark_first, trust_first);
+        assert!(mark_first.is_release_build());
+        assert_eq!(
+            serde_json::to_vec(&mark_first).expect("serialization should succeed"),
+            serde_json::to_vec(&trust_first).expect("serialization should succeed"),
+        );
     }
 
     #[test]

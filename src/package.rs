@@ -191,7 +191,7 @@ pub use contents::{
 pub use finalize::{FinalizedPackage, finalize_package, prepare_sign_finalize};
 pub use prepare::{
     DirectoryFault, PackageWriteError, PreparationFault, PreparationFile, PreparedPackage,
-    prepare_package,
+    prepare_package, prepare_package_with_release_build,
 };
 pub use reopen::reopen_prepared;
 pub(crate) use source::RetainedIoFault;

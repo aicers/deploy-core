@@ -4,6 +4,18 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `PayloadManifest::with_release_build` and `PayloadManifest::is_release_build`
+  record and read, inside the signed manifest, that a build was made from the
+  commit its version tag points at, and
+  `package::prepare_package_with_release_build` prepares a package with that
+  record. The record is written only when set, so an unmarked manifest keeps
+  its bytes, the manifest format version is unchanged, and readers built
+  before this release ignore it.
+
 ## [0.4.1] - 2026-11-01
 
 ### Security
@@ -262,6 +274,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.4.1...main
 [0.4.1]: https://github.com/aicers/deploy-core/compare/0.4.0...0.4.1
 [0.4.0]: https://github.com/aicers/deploy-core/compare/0.3.1...0.4.0
 [0.3.1]: https://github.com/aicers/deploy-core/compare/0.3.0...0.3.1
