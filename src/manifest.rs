@@ -1295,9 +1295,10 @@ impl PayloadManifest {
     /// as the manifest that carries it. It is meaningful only on a manifest
     /// whose package signatures verified — the one
     /// [`verify_upload`](crate::package::verify_upload) or
-    /// [`verify_package`](crate::verify::verify_package) returns, or that of an
-    /// opened payload — and not on one read with [`PayloadManifest::parse`] or
-    /// `Deserialize` alone.
+    /// [`verify_package`](crate::verify::verify_package) returns — and not on
+    /// one read with [`PayloadManifest::parse`] or `Deserialize` alone, nor on
+    /// that of a payload read with [`payload::open`](crate::payload::open) or
+    /// its siblings, which parse the manifest without checking any signature.
     #[must_use]
     pub fn is_release_build(&self) -> bool {
         self.release_build
