@@ -52,6 +52,15 @@ const MAX_CONTAINER_NAME_LEN: usize = 255;
 /// [`SupplementaryGroup`] list its account additionally joins, and, through
 /// [`UnitTemplate::privilege_profiles`], the privilege sets a caller selects
 /// among per instance. Nothing in the spec says which profile applies.
+///
+/// The wire form of this type and of every type nested in it is hashed by
+/// [`PayloadManifest::spec_digest`](crate::manifest::PayloadManifest::spec_digest),
+/// a digest separately built consumers must agree on across releases. So
+/// every field added here or at any depth below is
+/// `#[serde(default, skip_serializing_if = ...)]`, absent from the wire form
+/// at its default, and no existing field or variant changes its serialized
+/// form: its key, the representation of its value, or a variant's wire
+/// string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleSpec {

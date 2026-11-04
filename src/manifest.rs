@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::image::{ImageDeclaration, ImageDeclarationError};
 use crate::module_spec::{ModuleSpec, ModuleSpecError};
@@ -122,6 +123,23 @@ pub const GIT_COMMIT_HEX_LEN: usize = 40;
 /// Number of hex characters in a container image digest with its `sha256:`
 /// prefix stripped.
 pub const IMAGE_DIGEST_HEX_LEN: usize = 64;
+
+/// Number of hex characters in [`SpecDigest::short_hex`].
+///
+/// The short form is for names only. A consumer that needs exact identity
+/// compares [`SpecDigest`] values, never short forms, since two digests may
+/// share a prefix.
+pub const SPEC_DIGEST_SHORT_LEN: usize = 12;
+
+/// Label of the document [`PayloadManifest::spec_digest`] hashes.
+///
+/// It names the canonical form. A change that moves the digest of any manifest
+/// that does not use a new spec field takes a new label
+/// (`deploy-core.spec-digest.v2`) and a breaking release.
+const SPEC_DIGEST_LABEL: &str = "deploy-core.spec-digest.v1";
+
+/// Number of hex characters in [`SpecDigest::to_hex`].
+const SPEC_DIGEST_HEX_LEN: usize = 64;
 
 /// Target CPU architecture a payload artifact is built for.
 ///
@@ -1334,6 +1352,211 @@ impl PayloadManifest {
     pub fn artifacts(&self) -> &[PayloadArtifact] {
         &self.artifacts
     }
+
+    /// Computes the digest of the module specs this manifest declares.
+    ///
+    /// It is the SHA-256 of the canonical JSON bytes of the document
+    /// `{"label":"deploy-core.spec-digest.v1","specs":[…]}`, where `specs`
+    /// holds one `{"archive_path": …, "component": …, "spec": …}` entry for
+    /// every artifact that declares a [`ModuleSpec`], sorted by
+    /// `archive_path` compared as bytes. `spec` is the spec in its manifest
+    /// wire form. The bytes are written by converting the document to a
+    /// [`serde_json::Value`], sorting every object's keys at every depth with
+    /// [`serde_json::Value::sort_all_objects`], and writing the sorted value
+    /// without whitespace. So the digest depends neither on artifact order,
+    /// nor on the order in which a spec type declares its fields, nor on
+    /// whether `serde_json`'s `preserve_order` feature is on in the build.
+    ///
+    /// Only module specs are covered. An artifact without a spec contributes
+    /// nothing, and no other field of an artifact or of the manifest is
+    /// included: `version` and `commit` already belong to a consumer's key,
+    /// and the rest follow from the build or change on every rebuild. A
+    /// manifest without any spec — a pre-versioned baseline manifest among
+    /// them — therefore has the fixed digest of the document whose `specs`
+    /// is empty. List order inside a spec is significant: no list is sorted
+    /// or deduplicated, and only object keys are.
+    ///
+    /// The digest is computed on each call from [`Self::artifacts`] and is a
+    /// pure function of this manifest, so it is only as trustworthy as the
+    /// manifest. A consumer that keys a store or a name on it takes it from a
+    /// verified package's manifest
+    /// ([`VerifiedUpload::manifest`](crate::package::VerifiedUpload::manifest)
+    /// or
+    /// [`VerifiedContents::manifest`](crate::package::VerifiedContents::manifest)),
+    /// never from one it parsed without verifying.
+    ///
+    /// # Stability
+    ///
+    /// Programs built against different releases of this crate compute this
+    /// digest for the same package and must agree, so for a manifest that does
+    /// not use a new spec field it does not move between releases. A change
+    /// that moves it — a new spec field that is serialized at its default, or a
+    /// changed key, value representation or variant wire string — is a
+    /// breaking change for every consumer. It needs a new label
+    /// (`deploy-core.spec-digest.v2`) and a breaking release, not a routine
+    /// edit.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the document holds no map with non-string keys and
+    /// no `Serialize` implementation that can fail, so converting it to JSON
+    /// cannot fail.
+    #[must_use]
+    pub fn spec_digest(&self) -> SpecDigest {
+        let digest = Sha256::digest(self.spec_digest_bytes());
+        SpecDigest(digest.into())
+    }
+
+    /// Returns the canonical bytes [`Self::spec_digest`] hashes.
+    fn spec_digest_bytes(&self) -> Vec<u8> {
+        let mut specs: Vec<SpecDigestEntry<'_>> = self
+            .artifacts
+            .iter()
+            .filter_map(|artifact| {
+                artifact.spec.as_ref().map(|spec| SpecDigestEntry {
+                    archive_path: &artifact.archive_path,
+                    component: &artifact.component,
+                    spec,
+                })
+            })
+            .collect();
+        // `archive_path` is unique within a manifest, so the order is total.
+        specs.sort_unstable_by(|a, b| a.archive_path.as_bytes().cmp(b.archive_path.as_bytes()));
+        let document = SpecDigestDocument {
+            label: SPEC_DIGEST_LABEL,
+            specs,
+        };
+        let mut value = serde_json::to_value(&document).expect(
+            "the spec digest document holds only string-keyed structs, enums, sequences, \
+             strings, integers and booleans, none of which fails to serialize",
+        );
+        // Without `preserve_order` a `Map` is already sorted and this does
+        // nothing; with it, this is what makes the bytes equal.
+        value.sort_all_objects();
+        serde_json::to_vec(&value).expect("writing a `serde_json::Value` cannot fail")
+    }
+}
+
+/// The document whose canonical bytes [`PayloadManifest::spec_digest`]
+/// hashes.
+#[derive(Serialize)]
+struct SpecDigestDocument<'a> {
+    /// Always [`SPEC_DIGEST_LABEL`].
+    label: &'static str,
+    /// One entry per artifact that declares a spec, sorted by `archive_path`.
+    specs: Vec<SpecDigestEntry<'a>>,
+}
+
+/// One artifact's contribution to a [`SpecDigestDocument`].
+#[derive(Serialize)]
+struct SpecDigestEntry<'a> {
+    /// The artifact's `archive_path`.
+    archive_path: &'a str,
+    /// The artifact's `component`.
+    component: &'a str,
+    /// The artifact's declared spec, in its wire form.
+    spec: &'a ModuleSpec,
+}
+
+/// A SHA-256 digest of the module specs a manifest declares, as computed by
+/// [`PayloadManifest::spec_digest`].
+///
+/// Compared, ordered and hashed by its bytes. [`Display`](std::fmt::Display)
+/// writes [`Self::to_hex`], and [`Self::from_hex`] reads that form back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SpecDigest([u8; 32]);
+
+impl SpecDigest {
+    /// Returns the digest's 32 bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns the digest as 64 lowercase hex characters.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        crate::payload::to_hex(&self.0)
+    }
+
+    /// Returns the first [`SPEC_DIGEST_SHORT_LEN`] characters of
+    /// [`Self::to_hex`], for use in names.
+    ///
+    /// Two digests may share a short form, so exact identity is compared on
+    /// [`SpecDigest`] values, never on short forms.
+    #[must_use]
+    pub fn short_hex(&self) -> String {
+        let mut hex = self.to_hex();
+        hex.truncate(SPEC_DIGEST_SHORT_LEN);
+        hex
+    }
+
+    /// Parses a digest from exactly 64 lowercase hex characters, the form
+    /// [`Self::to_hex`] writes.
+    ///
+    /// Nothing else is accepted: no uppercase digit, no prefix, no
+    /// surrounding whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpecDigestParseError::Length`] when `value` is not 64
+    /// characters long, and [`SpecDigestParseError::InvalidCharacter`] naming
+    /// the first character that is not a lowercase hex digit otherwise.
+    pub fn from_hex(value: &str) -> Result<Self, SpecDigestParseError> {
+        let length = value.chars().count();
+        if length != SPEC_DIGEST_HEX_LEN {
+            return Err(SpecDigestParseError::Length(length));
+        }
+        if let Some((position, character)) = value
+            .chars()
+            .enumerate()
+            .find(|(_, character)| !matches!(character, '0'..='9' | 'a'..='f'))
+        {
+            return Err(SpecDigestParseError::InvalidCharacter {
+                position,
+                character,
+            });
+        }
+        // Every character is now an ASCII hex digit, so the 64 characters are
+        // 64 bytes and make exactly 32 pairs.
+        let mut bytes = [0_u8; 32];
+        let (pairs, _) = value.as_bytes().as_chunks::<2>();
+        for (byte, [high, low]) in bytes.iter_mut().zip(pairs) {
+            *byte = (lower_hex_nibble(*high) << 4) | lower_hex_nibble(*low);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl std::fmt::Display for SpecDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+/// Returns the value of a lowercase hex digit already checked to be one.
+fn lower_hex_nibble(digit: u8) -> u8 {
+    match digit {
+        b'0'..=b'9' => digit - b'0',
+        // `from_hex` admits only `0-9` and `a-f`.
+        _ => digit - b'a' + 10,
+    }
+}
+
+/// Errors raised by [`SpecDigest::from_hex`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpecDigestParseError {
+    /// The value was not 64 characters long.
+    #[error("spec digest is {0} characters long, expected 64")]
+    Length(usize),
+    /// A character was not a lowercase hex digit.
+    #[error("spec digest has {character:?} at position {position}, expected a lowercase hex digit")]
+    InvalidCharacter {
+        /// Zero-based character position of the first offending character.
+        position: usize,
+        /// The offending character.
+        character: char,
+    },
 }
 
 #[cfg(test)]
@@ -4038,5 +4261,364 @@ mod tests {
             matches!(error, ManifestError::UnsupportedManifestFormat { found: got, .. } if got == found),
             "got: {error:?}"
         );
+    }
+
+    /// Digest tests. Every test here has `spec_digest` in its module path, so
+    /// CI's `cargo test --features serde_json/preserve_order spec_digest` run
+    /// selects all of them.
+    mod spec_digest {
+        use std::fmt::Write as _;
+
+        use super::super::{SPEC_DIGEST_SHORT_LEN, SpecDigest, SpecDigestParseError};
+        use super::{
+            ArtifactKind, Disposition, LEGACY_UNVERSIONED_FOOTER_VERSION, ModuleSpec,
+            PayloadArtifact, PayloadManifest, artifact, entry_json, manifest_of, module_spec,
+        };
+        use crate::module_spec::{
+            Arg, Capability, MemlockLimit, PrivilegeProfile, PrivilegeProfileName,
+            RegistrationTemplate, ReloadSpec, RenderVar, RunAs, SupplementaryGroup,
+        };
+
+        /// The canonical bytes of [`fixture`]'s document: every object's keys
+        /// sorted at every depth, arrays in declared order, no whitespace.
+        const GOLDEN_BYTES: &str = r#"{"label":"deploy-core.spec-digest.v1","specs":[{"archive_path":"bin/example","component":"example","spec":{"placement":"module-hosts","registration":{"cert_group_gid":1000,"package_id":"example","reload":{"docker-sighup":{"container":"example"}},"service_name":"example"},"unit":{"after":["network-online"],"description":"Example module","environment":[["RUST_LOG",{"literal":"info"}],["HOST",{"var":"hostname"}]],"exec_reload":[{"literal":"/bin/kill"},{"literal":"-HUP"},{"var":"main-pid"}],"exec_start":[{"var":"artifact-path"},{"literal":"-c"},{"var":"config-path"}],"limit_nofile":8000,"no_new_privileges":true,"private_tmp":true,"protect_home":true,"restart":"always","restart_sec":5,"run_as":"root","wanted_by":["multi-user"],"wants":["network-online"],"working_directory":{"var":"data-dir"}}}},{"archive_path":"bin/probe","component":"probe","spec":{"placement":"module-hosts","registration":{"package_id":"probe","reload":{"sighup":{"process_path":"/opt/probe/bin/probe"}},"service_name":"probe"},"unit":{"after":["network-online"],"description":"Probe module","environment":[["RUST_LOG",{"literal":"info"}],["HOST",{"var":"hostname"}]],"exec_reload":[{"literal":"/bin/kill"},{"literal":"-HUP"},{"var":"main-pid"}],"exec_start":[{"var":"artifact-path"},{"literal":"-c"},{"var":"config-path"}],"limit_nofile":8000,"no_new_privileges":true,"private_tmp":true,"privilege_profiles":[{"name":"root","run_as":"root"},{"ambient_capabilities":["net-raw","net-admin"],"limit_memlock":"infinity","name":"dpdk","supplementary_groups":["adm"]}],"protect_home":true,"restart":"always","restart_sec":5,"wanted_by":["multi-user"],"wants":["network-online"],"working_directory":{"var":"data-dir"}}}}]}"#;
+
+        /// The SHA-256 of [`GOLDEN_BYTES`].
+        const GOLDEN_DIGEST: &str =
+            "0f32e3da662c793ac0410efbd438b93cf9bfb20e883023af2dc77fab02ed8443";
+
+        /// The canonical bytes of a manifest that declares no spec.
+        const EMPTY_BYTES: &str = r#"{"label":"deploy-core.spec-digest.v1","specs":[]}"#;
+
+        /// The SHA-256 of [`EMPTY_BYTES`].
+        const EMPTY_DIGEST: &str =
+            "5ba9df7eb05a5361b3955ea967385cbb70b38cf0357b289e1bbbf8d17a5bee50";
+
+        /// What a failure of the golden test means.
+        const STABILITY_RULE: &str = "the spec digest of a manifest that uses no new spec field \
+            moved: that is a breaking change for every consumer, which needs the \
+            `deploy-core.spec-digest.v2` label and a breaking release, not a routine edit";
+
+        /// [`module_spec`] for a `probe` component: no `run_as`, a `root` and
+        /// a `dpdk` privilege profile, and a `sighup` reload.
+        fn probe_spec() -> ModuleSpec {
+            let mut spec = module_spec();
+            let unit = spec.unit.as_mut().expect("module_spec carries a unit");
+            unit.description = "Probe module".to_string();
+            unit.run_as = None;
+            unit.privilege_profiles = vec![
+                PrivilegeProfile {
+                    name: PrivilegeProfileName::Root,
+                    run_as: Some(RunAs::Root),
+                    ambient_capabilities: Vec::new(),
+                    limit_memlock: None,
+                    supplementary_groups: Vec::new(),
+                },
+                PrivilegeProfile {
+                    name: PrivilegeProfileName::Dpdk,
+                    run_as: None,
+                    ambient_capabilities: vec![Capability::NetRaw, Capability::NetAdmin],
+                    limit_memlock: Some(MemlockLimit::Infinity),
+                    supplementary_groups: vec![SupplementaryGroup::Adm],
+                },
+            ];
+            spec.registration = RegistrationTemplate {
+                package_id: "probe".to_string(),
+                service_name: "probe".to_string(),
+                reload: ReloadSpec::Sighup {
+                    process_path: "/opt/probe/bin/probe".to_string(),
+                },
+                cert_group_gid: None,
+            };
+            spec
+        }
+
+        /// A `native-binary` artifact at `archive_path` of `component`
+        /// declaring `spec`.
+        fn spec_artifact(archive_path: &str, component: &str, spec: ModuleSpec) -> PayloadArtifact {
+            PayloadArtifact {
+                component: component.to_string(),
+                spec: Some(spec),
+                ..artifact(
+                    archive_path,
+                    ArtifactKind::NativeBinary,
+                    &[Disposition::Install],
+                )
+            }
+        }
+
+        /// The artifacts of the golden fixture, deliberately not in
+        /// `archive_path` order: a spec-declaring `probe`, an artifact
+        /// without a spec, and a spec-declaring `example`.
+        fn fixture_artifacts() -> Vec<PayloadArtifact> {
+            vec![
+                spec_artifact("bin/probe", "probe", probe_spec()),
+                artifact(
+                    "assets/web.tar",
+                    ArtifactKind::StaticAssets,
+                    &[Disposition::Install],
+                ),
+                spec_artifact("bin/example", "example", module_spec()),
+            ]
+        }
+
+        /// A valid manifest of `artifacts`.
+        fn manifest(artifacts: Vec<PayloadArtifact>) -> PayloadManifest {
+            manifest_of(None, artifacts).expect("the fixture manifest must be valid")
+        }
+
+        /// The golden fixture manifest.
+        fn fixture() -> PayloadManifest {
+            manifest(fixture_artifacts())
+        }
+
+        /// The lowercase hex SHA-256 of `bytes`, computed apart from
+        /// [`SpecDigest::to_hex`].
+        fn sha256_hex(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            let mut out = String::new();
+            for byte in Sha256::digest(bytes) {
+                write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            out
+        }
+
+        #[test]
+        fn the_golden_manifest_has_a_fixed_document_and_digest() {
+            let manifest = fixture();
+            let bytes =
+                String::from_utf8(manifest.spec_digest_bytes()).expect("JSON is valid UTF-8");
+            assert_eq!(bytes, GOLDEN_BYTES, "{STABILITY_RULE}");
+            assert_eq!(
+                manifest.spec_digest().to_hex(),
+                GOLDEN_DIGEST,
+                "{STABILITY_RULE}"
+            );
+            assert_eq!(sha256_hex(GOLDEN_BYTES.as_bytes()), GOLDEN_DIGEST);
+        }
+
+        #[test]
+        fn a_manifest_without_specs_has_the_empty_document_digest() {
+            let without = manifest(vec![artifact(
+                "bin/native",
+                ArtifactKind::NativeBinary,
+                &[Disposition::Install],
+            )]);
+            let empty = manifest(Vec::new());
+            let baseline = PayloadManifest::parse(
+                format!(r#"{{"artifacts":[{}]}}"#, entry_json("bin/c", None)).as_bytes(),
+                LEGACY_UNVERSIONED_FOOTER_VERSION,
+            )
+            .expect("baseline manifest should parse");
+            assert_eq!(sha256_hex(EMPTY_BYTES.as_bytes()), EMPTY_DIGEST);
+            for manifest in [without, empty, baseline] {
+                assert_eq!(manifest.spec_digest_bytes(), EMPTY_BYTES.as_bytes());
+                assert_eq!(
+                    manifest.spec_digest().to_hex(),
+                    EMPTY_DIGEST,
+                    "{STABILITY_RULE}"
+                );
+            }
+        }
+
+        #[test]
+        fn permuting_the_artifacts_keeps_the_spec_digest() {
+            let expected = fixture().spec_digest();
+            let artifacts = fixture_artifacts();
+            let orders = [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ];
+            for order in orders {
+                let permuted = order
+                    .iter()
+                    .map(|&index| artifacts.get(index).expect("index in range").clone())
+                    .collect();
+                assert_eq!(
+                    manifest(permuted).spec_digest(),
+                    expected,
+                    "order {order:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn changing_a_spec_changes_the_spec_digest() {
+            let original = fixture().spec_digest();
+
+            let mut changed = fixture_artifacts();
+            let spec = changed
+                .get_mut(0)
+                .and_then(|artifact| artifact.spec.as_mut())
+                .expect("the first fixture artifact declares a spec");
+            spec.registration.cert_group_gid = Some(1001);
+            assert_ne!(manifest(changed).spec_digest(), original);
+
+            let mut swapped = fixture_artifacts();
+            let unit = swapped
+                .get_mut(2)
+                .and_then(|artifact| artifact.spec.as_mut())
+                .and_then(|spec| spec.unit.as_mut())
+                .expect("the third fixture artifact declares a unit");
+            assert_eq!(unit.environment.len(), 2);
+            unit.environment.reverse();
+            assert_ne!(manifest(swapped).spec_digest(), original);
+        }
+
+        #[test]
+        fn changing_what_the_spec_digest_does_not_cover_keeps_it() {
+            let original = fixture().spec_digest();
+
+            let mut added = fixture_artifacts();
+            added.push(artifact(
+                "compose/stack.tar",
+                ArtifactKind::ComposeBundle,
+                &[Disposition::Stage],
+            ));
+            assert_eq!(manifest(added).spec_digest(), original, "added");
+
+            let mut removed = fixture_artifacts();
+            removed.remove(1);
+            assert_eq!(manifest(removed).spec_digest(), original, "removed");
+
+            let mut renamed = fixture_artifacts();
+            let without_spec = renamed.get_mut(1).expect("three fixture artifacts");
+            without_spec.archive_path = "assets/other.tar".to_string();
+            without_spec.component = "other".to_string();
+            without_spec.sha256 = "11".repeat(32);
+            assert_eq!(manifest(renamed).spec_digest(), original, "changed");
+
+            let mut rebuilt = fixture_artifacts();
+            for artifact in rebuilt
+                .iter_mut()
+                .filter(|artifact| artifact.spec.is_some())
+            {
+                artifact.sha256 = "22".repeat(32);
+                artifact.version = "9.9.9".to_string();
+                artifact.commit = Some("fedcba9876543210fedcba9876543210fedcba98".to_string());
+            }
+            assert_eq!(manifest(rebuilt).spec_digest(), original, "rebuilt");
+        }
+
+        #[test]
+        fn a_built_and_a_parsed_manifest_have_the_same_spec_digest() {
+            let built = fixture();
+            let json = serde_json::to_vec(&built).expect("serialization should succeed");
+            let parsed = PayloadManifest::parse(&json, LEGACY_UNVERSIONED_FOOTER_VERSION)
+                .expect("the producer's manifest must parse");
+            assert_eq!(parsed.spec_digest(), built.spec_digest());
+        }
+
+        #[test]
+        fn a_spec_whose_wire_keys_are_reordered_has_the_same_spec_digest() {
+            let built = fixture();
+            let json = serde_json::to_string(&built).expect("serialization should succeed");
+            let in_order = r#""package_id":"probe","service_name":"probe""#;
+            assert_eq!(json.matches(in_order).count(), 1, "got: {json}");
+            let reordered =
+                json.replace(in_order, r#""service_name":"probe","package_id":"probe""#);
+            let parsed =
+                PayloadManifest::parse(reordered.as_bytes(), LEGACY_UNVERSIONED_FOOTER_VERSION)
+                    .expect("a reordered manifest must parse");
+            assert_eq!(parsed.spec_digest(), built.spec_digest());
+        }
+
+        #[test]
+        fn the_fixture_carries_what_the_golden_spec_digest_guards() {
+            // The golden test guards only what its fixture carries, so pin that
+            // the fixture carries both `Arg` forms in `environment`, both
+            // reload variants and a privilege profile list.
+            let manifest = fixture();
+            let specs: Vec<&ModuleSpec> = manifest
+                .artifacts()
+                .iter()
+                .filter_map(|artifact| artifact.spec.as_ref())
+                .collect();
+            assert_eq!(specs.len(), 2);
+            assert!(
+                specs
+                    .iter()
+                    .any(|spec| matches!(spec.registration.reload, ReloadSpec::Sighup { .. }))
+            );
+            assert!(
+                specs.iter().any(|spec| matches!(
+                    spec.registration.reload,
+                    ReloadSpec::DockerSighup { .. }
+                ))
+            );
+            let units = || specs.iter().filter_map(|spec| spec.unit.as_ref());
+            assert!(units().any(|unit| unit.privilege_profiles.len() == 2));
+            assert!(units().any(|unit| {
+                unit.environment
+                    .iter()
+                    .any(|(_, arg)| matches!(arg, Arg::Literal(_)))
+                    && unit
+                        .environment
+                        .iter()
+                        .any(|(_, arg)| matches!(arg, Arg::Var(RenderVar::Hostname)))
+            }));
+        }
+
+        #[test]
+        fn spec_digest_hex_round_trips_and_its_short_form_is_a_prefix() {
+            let digest = fixture().spec_digest();
+            let hex = digest.to_hex();
+            assert_eq!(hex.len(), 64);
+            assert_eq!(digest.to_string(), hex);
+            assert_eq!(SpecDigest::from_hex(&hex), Ok(digest));
+            assert_eq!(digest.short_hex().len(), SPEC_DIGEST_SHORT_LEN);
+            assert_eq!(SPEC_DIGEST_SHORT_LEN, 12);
+            assert!(hex.starts_with(&digest.short_hex()));
+            assert_eq!(digest.short_hex(), hex.get(..12).expect("64 characters"));
+            assert_eq!(
+                crate::payload::to_hex(digest.as_bytes()),
+                hex,
+                "as_bytes and to_hex agree"
+            );
+        }
+
+        #[test]
+        fn spec_digest_from_hex_refuses_anything_but_64_lowercase_hex_characters() {
+            let hex = fixture().spec_digest().to_hex();
+            assert_eq!(
+                SpecDigest::from_hex(hex.get(..63).expect("64 characters")),
+                Err(SpecDigestParseError::Length(63))
+            );
+            assert_eq!(
+                SpecDigest::from_hex(&format!("{hex}0")),
+                Err(SpecDigestParseError::Length(65))
+            );
+            assert_eq!(
+                SpecDigest::from_hex(""),
+                Err(SpecDigestParseError::Length(0))
+            );
+            assert_eq!(
+                SpecDigest::from_hex(&"A".repeat(64)),
+                Err(SpecDigestParseError::InvalidCharacter {
+                    position: 0,
+                    character: 'A',
+                })
+            );
+            let non_hex = format!("{}g", "0".repeat(63));
+            assert_eq!(
+                SpecDigest::from_hex(&non_hex),
+                Err(SpecDigestParseError::InvalidCharacter {
+                    position: 63,
+                    character: 'g',
+                })
+            );
+            let multibyte = format!("{}é", "0".repeat(63));
+            assert_eq!(
+                SpecDigest::from_hex(&multibyte),
+                Err(SpecDigestParseError::InvalidCharacter {
+                    position: 63,
+                    character: 'é',
+                })
+            );
+        }
     }
 }
