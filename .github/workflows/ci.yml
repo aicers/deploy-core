@@ -250,6 +250,14 @@ jobs:
       # changes what compiles. Run the suite under it as well.
       - name: Test (test-support)
         run: cargo test --features test-support
+      # A dependent's build graph can turn on `serde_json/preserve_order`
+      # through feature unification, which changes `serde_json::Map`'s key
+      # order. Without the feature a `Map` is already sorted, so only this run
+      # catches a spec digest whose canonical bytes skip
+      # `Value::sort_all_objects`. Every digest test has `spec_digest` in its
+      # path.
+      - name: Test (spec digest, preserve_order)
+        run: cargo test --features serde_json/preserve_order spec_digest
 
   # The crypto provider builds AWS-LC from source, and the README states its
   # prerequisites per platform. `check` and `test` cover Linux x86_64; this

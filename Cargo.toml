@@ -29,7 +29,9 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["aws-
 # killed at a deadline; std offers no readiness wait or read timeout on a pipe.
 rustix = { version = "1", features = ["event", "fs", "process"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# 1.0.129 is the floor because it is the first release with
+# `Value::sort_all_objects`, which `PayloadManifest::spec_digest` uses.
+serde_json = "1.0.129"
 sha2 = "0.10"
 tar = "0.4"
 tempfile = "3"

@@ -584,14 +584,16 @@ release build.
   `Markdown` row, and build or test no code.
 - For any other change, run every row of the table below that applies to
   the host before pushing. Run each test command as written, in full: do
-  not narrow it to the changed files or to selected test names.
+  not narrow it to the changed files or to selected test names. The
+  `spec_digest` filter of the third `test` command belongs to that
+  command, so running it with its filter is running it in full.
 
 <!-- markdownlint-disable MD013 -->
 | CI job | Local command |
 | --- | --- |
 | `Markdown` | `markdownlint-cli2` |
 | `check` | `cargo fmt -- --check --config group_imports=StdExternalCrate`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy --all-targets --features test-support -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --features test-support` |
-| `test` | `cargo test`, `cargo test --features test-support` |
+| `test` | `cargo test`, `cargo test --features test-support`, `cargo test --features serde_json/preserve_order spec_digest` |
 | `Platform (macos-latest)` | `cargo build --all-targets --features test-support` |
 | `Platform (ubuntu-24.04-arm)` | `cargo test --features test-support` |
 <!-- markdownlint-enable MD013 -->
@@ -602,9 +604,13 @@ release build.
 - `Platform (macos-latest)` applies on a Mac only, and
   `Platform (ubuntu-24.04-arm)` on a Linux aarch64 host only. On a Linux
   aarch64 host its command is the second command of `test`; run it once.
-- Clippy and the tests each run twice because `--all-targets` touches no
-  features: code behind `test-support` is invisible to the first run, and
-  that feature exists precisely to change what compiles.
+- Clippy runs twice and the tests three times. The first two runs of each
+  differ because `--all-targets` touches no features: code behind
+  `test-support` is invisible to the first run, and that feature exists
+  precisely to change what compiles. The third test run turns on
+  `serde_json/preserve_order`, which a dependent's build graph can enable
+  through feature unification, to check that the spec digest's bytes do
+  not depend on it.
 - Left to CI: `Change Filter`, which only classifies the diff, and every
   `Platform` entry for a platform other than the host's. The shared
   instruction-block drift check runs in `Markdown`; the generated regions

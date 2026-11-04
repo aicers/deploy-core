@@ -4,6 +4,29 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `manifest::SpecDigest` and `PayloadManifest::spec_digest` give a SHA-256
+  digest of the module specs a manifest declares, so a store or publisher can
+  tell apart two builds of one component, version and commit whose specs
+  differ. The digest covers each artifact's declared spec together with its
+  archive path and component, and nothing else in the manifest. It does not
+  depend on the order of the artifacts or on whether `serde_json`'s
+  `preserve_order` feature is on in the build, and it does not move between
+  releases for a manifest that does not use a new spec field. `SpecDigest`
+  writes 64 lowercase hex characters, `SpecDigest::short_hex` the first
+  `manifest::SPEC_DIGEST_SHORT_LEN` (12) of them for use in names, and
+  `SpecDigest::from_hex` reads the full form back. The manifest format is
+  unchanged.
+
+### Changed
+
+- deploy-core now requires serde_json 1.0.129 or later, the first release with
+  the `Value::sort_all_objects` the spec digest uses. A build of 0.6.0 accepted
+  any serde_json 1.x.
+
 ## [0.6.0] - 2026-11-04
 
 ### Added
@@ -296,6 +319,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.6.0...main
 [0.6.0]: https://github.com/aicers/deploy-core/compare/0.5.0...0.6.0
 [0.5.0]: https://github.com/aicers/deploy-core/compare/0.4.1...0.5.0
 [0.4.1]: https://github.com/aicers/deploy-core/compare/0.4.0...0.4.1
