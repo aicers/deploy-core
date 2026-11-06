@@ -4,6 +4,26 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `LocalExecutor` and `SshExecutor` require a `mv` that supports `-T` on the
+  target, such as GNU coreutils, uutils, or BusyBox 1.34 or later. Without one,
+  `put_file` and `hard_link_over` fail.
+
+### Fixed
+
+- `Executor::put_file` writes a file directly in a mount point when the mount
+  point is owned by the writer, no one else can write it, and no account other
+  than root and the writer can write the directory it is mounted on, staging in
+  the mount point itself. It used to fail with `ExecutorError::Transfer` for
+  want of a staging directory.
+- On `LocalExecutor` and `SshExecutor`, `put_file` and `hard_link_over` no
+  longer move the staged file into a directory that appears at the destination
+  during the call, or into a directory that a symbolic link planted there
+  points to.
+
 ## [0.7.0] - 2026-11-04
 
 ### Added
@@ -319,6 +339,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   account and payload fixtures, a scriptable recording executor, synthetic
   image archive builders and validators, and signed package fixture support.
 
+[Unreleased]: https://github.com/aicers/deploy-core/compare/0.7.0...main
 [0.7.0]: https://github.com/aicers/deploy-core/compare/0.6.0...0.7.0
 [0.6.0]: https://github.com/aicers/deploy-core/compare/0.5.0...0.6.0
 [0.5.0]: https://github.com/aicers/deploy-core/compare/0.4.1...0.5.0

@@ -108,11 +108,24 @@ const STAT: &str = "stat";
 /// - The staging directory is the nearest ancestor **above the destination's
 ///   own directory** that the writing identity owns, no one else can write, and
 ///   that sits on the destination's own filesystem. Under `sudo` that identity
-///   is root, so this is the root-only staging location §9.2 requires; skipping
-///   the destination's own directory is what closes the TOCTOU, because that
-///   directory may be service-writable. The predicate rejects a candidate
-///   carrying *either* write bit — `-perm -0022` matches all-of, so the
-///   single-predicate spelling would admit `0775`.
+///   is root, so this is the root-only staging location §9.2 requires; starting
+///   the walk above the destination's own directory is what closes the TOCTOU,
+///   because that directory may be service-writable. The predicate rejects a
+///   candidate carrying *either* write bit — `-perm -0022` matches all-of, so
+///   the single-predicate spelling would admit `0775`.
+/// - **A destination directly in a mount point stages in the mount point.**
+///   The walk meets the boundary at its first step there, so it finds nothing,
+///   and only then is the destination's own directory considered: it is used
+///   when its parent is a directory on another filesystem (a non-empty `fsid`
+///   that differs from the destination's), when it passes the same predicate
+///   an ancestor does, and when its parent is owned by root or the writer and
+///   carries neither write bit. The last condition is what keeps the directory
+///   in place: an account able to write the parent could rename the
+///   destination's directory away mid-write and put one of its own at that
+///   path, where the script's path-based `cat`, `chown` and `chmod` would
+///   follow it. A walk that ended anywhere else leaves the parent on the
+///   destination's filesystem, already turned down, so the fallback is never
+///   reached for a deeper directory, and no case the walk resolves changes.
 /// - **The filesystem is compared before anything is written.** The walk climbs
 ///   until it finds a root-only ancestor, and nothing stops it from climbing
 ///   past a mount point to get there. `mv` across a mount boundary is not a
@@ -129,26 +142,35 @@ const STAT: &str = "stat";
 ///   mode. The shell cannot express descriptor-based metadata, so here the
 ///   guarantee is carried by the staging directory being unreachable to anyone
 ///   but the writer — nothing an unprivileged account can touch is ever named.
-/// - `mv` renames over the destination, which replaces a symlink rather than
-///   following it — except for one case `mv` does not share with `rename(2)`:
-///   an existing *directory* at the destination is a target directory to `mv`,
-///   which moves the temporary inside it and exits `0`. `rename(2)` fails
-///   there, so the native path already refuses it; the script has to refuse it
-///   explicitly or the shell transports would report a success that wrote to a
-///   path the caller never named. A guard before the write refuses the ordinary
-///   case, so contents never land inside a directory bootler was not asked to
-///   write into; it follows symlinks, so a symlink pointing at a directory is
-///   refused on the same terms.
+/// - `mv -f -T` renames over the destination, which replaces a symlink rather
+///   than following it. Without `-T`, `mv` treats an existing *directory* at
+///   the destination — or a symlink resolving to one — as a target directory,
+///   moves the temporary inside it and exits `0`, which `rename(2)` never does.
+///   With `-T` it never moves into a directory: one standing at the destination
+///   fails the `mv`, and under `set -e` the trap then removes the temporary,
+///   which is still where it was staged. So nothing this script writes can land
+///   inside a directory it was not asked to write into, however late that
+///   directory appears. Every `mv` a Linux target carries supports `-T` — GNU
+///   coreutils, uutils, busybox 1.34 or later and toybox — and one that does
+///   not fails the write without moving anything; there is no fallback.
+/// - A guard before the write still refuses a directory at the destination,
+///   so the ordinary case fails before anything is staged. It follows
+///   symlinks, so a symlink pointing at a directory is refused on the same
+///   terms: the one exception to [`Executor::put_file`]'s "a symlink is
+///   replaced" contract, kept because `mv -T` cannot replace such a link
+///   uniformly — GNU renames over it, uutils and busybox refuse it. A link
+///   planted after the guard therefore either is replaced, which the check
+///   below confirms, or fails the `mv`; in neither case does anything land in
+///   the directory it points to.
 /// - **The write is confirmed by identity, not by the absence of a directory.**
-///   A directory appearing between that guard and the `mv` cannot be caught by
-///   re-testing `[ -d "$dest" ]` afterwards: an account able to write the
-///   destination's own directory can rename the directory away again before the
-///   re-test runs, and the script would then report success for contents that
-///   landed under a path the caller never named. So the check after the `mv` is
-///   positive — the destination must *be* the object just staged, matched by
-///   inode together with the owner, group and mode applied to it. Nothing an
-///   attacker can put at the destination satisfies that: only one file carries
-///   that inode, and an unprivileged account cannot produce a root-owned one.
+///   An account able to write the destination's own directory can replace
+///   what stands at the destination at any point after the `mv`, so a re-test
+///   of its type would be answering for whatever was put there since, not for
+///   the file just staged. So the check after the `mv` is positive — the
+///   destination must *be* the object just staged, matched by inode together
+///   with the owner, group and mode applied to it. Nothing an attacker can put
+///   at the destination satisfies that: only one file carries that inode, and
+///   an unprivileged account cannot produce a root-owned one.
 ///   Any bypass would have to hard-link the staged file to the destination,
 ///   which is the write succeeding. This confirms *what landed*; it is not what
 ///   keeps the landing atomic, since it runs after the `mv` and an inode number
@@ -205,11 +227,11 @@ const STAT: &str = "stat";
 ///   script's stderr only on a write that failed.
 ///
 /// The `EXIT` trap is the cleanup path: any failure removes the temporary file
-/// rather than leaving one behind for the caller to reason about. In the raced
-/// case the misplaced file is removed when the directory `mv` moved it into is
-/// still at the destination; when it is not, the write is reported failed and
-/// what remains carries the requested owner and mode — for a secret, `0600`
-/// root-owned — inside a directory the attacker already controlled.
+/// rather than leaving one behind for the caller to reason about. A failed
+/// `mv` leaves the temporary in the staging directory, where the trap finds it
+/// by the name it was created under; after a successful `mv` there is nothing
+/// left to remove, because `-T` means the temporary can only have become the
+/// destination entry itself.
 const PUT_FILE_SCRIPT: &str = r#"set -e
 dest=$1; owner=$2; group=$3; mode=$4
 if [ -d "$dest" ]; then
@@ -242,6 +264,18 @@ while :; do
   dir=$up
 done
 if [ -z "$stage" ]; then
+  top=$(dirname "$dest")
+  parent=$(dirname "$top")
+  if [ "$parent" != "$top" ] && [ -d "$parent" ]; then
+    parentfs=$(fsid "$parent")
+    if [ -n "$parentfs" ] && [ "$parentfs" != "$destfs" ] &&
+      [ -n "$(find "$parent" -maxdepth 0 \( -user 0 -o -user "$uid" \) ! -perm -0002 ! -perm -0020 2>/dev/null)" ] &&
+      [ -n "$(find "$top" -maxdepth 0 -user "$uid" ! -perm -0002 ! -perm -0020 2>/dev/null)" ]; then
+      stage=$top
+    fi
+  fi
+fi
+if [ -z "$stage" ]; then
   echo "no staging directory only the writer can write on the filesystem holding $dest" >&2
   exit 1
 fi
@@ -252,10 +286,9 @@ chown "$owner:$group" "$tmp"
 chmod "$mode" "$tmp"
 flush "$tmp"
 ino=$(ls -di "$tmp" | awk '{print $1}')
-mv -f "$tmp" "$dest"
+mv -f -T "$tmp" "$dest"
 flush "$(dirname "$dest")"
 if [ -z "$(find "$dest" -maxdepth 0 -inum "$ino" -user "$owner" -group "$group" -perm "$mode" 2>/dev/null)" ]; then
-  if [ -d "$dest" ]; then rm -f "$dest/${tmp##*/}"; fi
   echo "destination $dest is not the file just written" >&2
   exit 1
 fi
@@ -356,12 +389,18 @@ trap - EXIT INT TERM"#;
 ///   it, and the caller records the backup as taken from this call's success.
 ///   A success reported over a flush that never ran would let that record
 ///   suppress the retake the un-flushed entry is precisely what needs.
-/// - **The landing is confirmed by inode**, exactly as [`PUT_FILE_SCRIPT`]
-///   confirms its own: a directory appearing at the destination between the
-///   guard and the `mv` would otherwise take the temporary *inside* it and exit
-///   `0`, reporting success for a file that landed under a path the caller
-///   never named. `find` does not follow a symlink at the named path, so a
-///   symlink planted there fails the match rather than being resolved through.
+/// - **The rename never moves into a directory, and the landing is confirmed
+///   by inode**, exactly as in [`PUT_FILE_SCRIPT`]. `mv -f -T` fails on a
+///   directory appearing at the destination between the guard and the `mv`,
+///   rather than taking the temporary *inside* it and exiting `0`, and the
+///   trap then removes the temporary from beside the destination, where it
+///   still is. The guard above follows symlinks, so a symlink to a directory
+///   at the destination is refused there; one planted after it is either
+///   replaced or fails the `mv`, depending on the host's `mv`, and nothing
+///   lands in the directory it points to. The check after the `mv` is what
+///   confirms the destination is the file just linked, whatever was put there
+///   since: `find` does not follow a symlink at the named path, so a symlink
+///   planted there fails the match rather than being resolved through.
 /// - **The rename is skipped where it would be a no-op.** `rename(2)` returns
 ///   success and does nothing when both names already refer to one inode,
 ///   which is what a second backup of an unchanged artifact asks for, but `mv`
@@ -420,11 +459,10 @@ if [ -h "$tmp" ] || [ ! -f "$tmp" ]; then
 fi
 ino=$(ls -di "$tmp" | awk '{print $1}')
 if [ -z "$(find "$dest" -maxdepth 0 -inum "$ino" 2>/dev/null)" ]; then
-  mv -f "$tmp" "$dest"
+  mv -f -T "$tmp" "$dest"
 fi
 flush "$dir"
 if [ -z "$(find "$dest" -maxdepth 0 -inum "$ino" 2>/dev/null)" ]; then
-  if [ -d "$dest" ]; then rm -f "$dest/${tmp##*/}"; fi
   echo "destination $dest is not the file just linked" >&2
   exit 1
 fi
@@ -1437,8 +1475,9 @@ pub trait Executor {
     /// filesystem, write it, apply `meta` **before the file is reachable under
     /// its final name**, then `rename` over the destination. So the destination
     /// never exists with the wrong owner or a wider mode, and a symlink at the
-    /// destination is replaced rather than followed. A failure at any step
-    /// leaves no temporary file behind.
+    /// destination is replaced rather than followed. The shell transports
+    /// refuse a destination that is a symbolic link to a directory. A failure
+    /// at any step leaves no temporary file behind.
     ///
     /// The transports differ only in step 3's mechanism, and neither substitutes
     /// for the other: [`InDaemonExecutor`] applies metadata through the open
@@ -1515,7 +1554,8 @@ pub trait Executor {
     /// the publish renames over the name it was given, so an entry planted
     /// there is displaced rather than written through, and whatever it pointed
     /// at is left alone. A copy would have opened it and landed the artifact's
-    /// bytes on the pointed-at file instead of at `dest`.
+    /// bytes on the pointed-at file instead of at `dest`. The shell transports
+    /// refuse a `dest` that is a symbolic link to a directory.
     ///
     /// The two fault models the sequence answers differ, and only one of them
     /// is a claim about `dest`:
@@ -2129,8 +2169,9 @@ fn put_file_natively<E: Executor + ?Sized>(
     })?;
     // The entry the rename created lives in the destination's own directory, so
     // that is what has to be flushed for the landing to survive a crash — not
-    // the staging directory, which is somewhere else entirely and whose lost
-    // temporary entry would be inert anyway.
+    // the staging directory, which is an ancestor unless the destination's
+    // directory is the top of its filesystem, and whose lost temporary entry
+    // would be inert anyway.
     sync_dir(dest_dir).map_err(|source| ExecutorError::Io {
         path: dest_dir.to_path_buf(),
         source,
@@ -2152,10 +2193,12 @@ struct DirFacts {
 
 /// Returns the staging directory for a native write: the nearest ancestor
 /// **above the destination's own directory** that the writing process owns,
-/// no one else can write, and that sits on the destination's own filesystem.
+/// no one else can write, and that sits on the destination's own filesystem —
+/// or, where there is none because the destination's directory is the top of
+/// its filesystem, that directory itself when it passes the same test.
 ///
-/// Skipping the destination's own directory is what closes the TOCTOU that
-/// `O_EXCL` alone does not — under `agent/<svc>/` that directory is
+/// Starting the walk above the destination's own directory is what closes the
+/// TOCTOU that `O_EXCL` alone does not — under `agent/<svc>/` that directory is
 /// service-writable, so an account could replace the temporary file between the
 /// open and the `rename`.
 ///
@@ -2167,6 +2210,17 @@ struct DirFacts {
 /// refused here — before anything is written — rather than discovered when the
 /// move is attempted. The walk stops at the first boundary it meets, because
 /// every ancestor above one is on some other filesystem too.
+///
+/// Together those two rules leave a file directly in a mount point with no
+/// candidate at all, since the walk meets the boundary at its first step. So
+/// when the destination's directory is itself the top of its filesystem, it is
+/// the staging directory if the writer owns it, no one else can write it, and
+/// no account other than root and the writer can write the directory above
+/// it — the last so that it cannot be renamed away and replaced mid-write. A
+/// directory that passes is as safe to stage in as an ancestor: the temporary
+/// is created `0600` and owned by the writer, and reaches the final owner and
+/// mode before the rename. [`mount_point_fallback`] states the rule exactly;
+/// every case the walk resolves resolves as it would without it.
 #[cfg(unix)]
 fn staging_dir(dest: &Path) -> Result<PathBuf, ExecutorError> {
     use std::os::unix::fs::MetadataExt;
@@ -2191,8 +2245,8 @@ fn staging_dir(dest: &Path) -> Result<PathBuf, ExecutorError> {
     })
     .ok_or_else(|| ExecutorError::Transfer {
         path: dest.to_path_buf(),
-        reason: "no staging directory only the writer can write on the destination's filesystem \
-                 above the destination"
+        reason: "no staging directory only the writer can write on the destination's filesystem, \
+                 above the destination's directory or at that directory as a mount point"
             .to_string(),
     })
 }
@@ -2208,24 +2262,63 @@ where
     F: Fn(&Path) -> Option<DirFacts>,
 {
     let dest_dir = dest.parent()?;
-    // Without the destination's own device there is nothing to compare an
+    // Without the destination's own facts there is nothing to compare an
     // ancestor against, so there is no way to promise the landing is a rename.
-    let dest_dev = probe(dest_dir)?.dev;
+    let dest_facts = probe(dest_dir)?;
     let mut candidate = dest_dir.parent();
     while let Some(dir) = candidate {
         // An unreadable ancestor is stepped over, as it always was; a readable
         // one on another device ends the walk, since so is everything above it.
         if let Some(facts) = probe(dir) {
-            if facts.dev != dest_dev {
-                return None;
+            if facts.dev != dest_facts.dev {
+                return mount_point_fallback(dest_dir, dir, dest_facts, facts, uid);
             }
-            if facts.uid == uid && facts.mode & 0o022 == 0 {
+            if writer_only(facts, uid) {
                 return Some(dir.to_path_buf());
             }
         }
         candidate = dir.parent();
     }
     None
+}
+
+/// Returns the destination's own directory as the staging directory when the
+/// walk above it met a filesystem boundary at once, and the directory is safe
+/// to stage in.
+///
+/// `boundary` is the first readable ancestor the walk met on another device,
+/// and the fallback applies only when that ancestor is `dest_dir`'s own parent:
+/// `dest_dir` is then the top of its filesystem, so nothing on that filesystem
+/// lies above it. A boundary met further up means the parent is on the
+/// destination's filesystem and the walk already turned it down, and an
+/// unreadable parent leaves the boundary unestablished; neither qualifies.
+///
+/// `dest_dir` must pass the test an ancestor is held to, so no account but the
+/// writer can replace the temporary in it. Its parent must be writable by no
+/// account other than root and the writer, because an account able to write
+/// the parent could rename `dest_dir` away mid-write and put a directory of its
+/// own at that path. A mounted mount point cannot be renamed, but a device
+/// change also marks a btrfs subvolume root, which can, so the parent is tested
+/// whatever kind of boundary was met.
+#[cfg(unix)]
+fn mount_point_fallback(
+    dest_dir: &Path,
+    boundary: &Path,
+    dest_facts: DirFacts,
+    boundary_facts: DirFacts,
+    uid: u32,
+) -> Option<PathBuf> {
+    let parent_is_safe = (boundary_facts.uid == ROOT_ID || boundary_facts.uid == uid)
+        && boundary_facts.mode & 0o022 == 0;
+    (dest_dir.parent() == Some(boundary) && parent_is_safe && writer_only(dest_facts, uid))
+        .then(|| dest_dir.to_path_buf())
+}
+
+/// Returns whether a directory is owned by `uid` and carries neither the group
+/// nor the other write bit, the test every staging directory passes.
+#[cfg(unix)]
+fn writer_only(facts: DirFacts, uid: u32) -> bool {
+    facts.uid == uid && facts.mode & 0o022 == 0
 }
 
 /// Which of `id`'s two numeric outputs a [`Principal`] is being resolved to.
@@ -5375,6 +5468,10 @@ exec "$@"
         }
 
         #[test]
+        #[cfg_attr(
+            not(target_os = "linux"),
+            ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+        )]
         fn local_executor_satisfies_the_elevation_contract() {
             let dir = tempfile::tempdir().expect("tempdir");
             let sudo = fake_sudo(dir.path());
@@ -5391,6 +5488,10 @@ exec "$@"
         }
 
         #[test]
+        #[cfg_attr(
+            not(target_os = "linux"),
+            ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+        )]
         fn ssh_executor_satisfies_the_elevation_contract() {
             let bin_dir = tempfile::tempdir().expect("tempdir");
             let work = tempfile::tempdir().expect("tempdir");
@@ -5399,6 +5500,10 @@ exec "$@"
         }
 
         #[test]
+        #[cfg_attr(
+            not(target_os = "linux"),
+            ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+        )]
         fn an_elevated_put_file_handles_a_payload_larger_than_the_pipe_buffer() {
             // The landing script reads the payload from stdin; a payload past the
             // pipe buffer would deadlock if stdin were written before the child's
@@ -5926,6 +6031,10 @@ exec "$@"
         }
 
         #[test]
+        #[cfg_attr(
+            not(target_os = "linux"),
+            ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+        )]
         fn every_ssh_entry_point_carries_the_pinned_options() {
             const END: &str = "--end-of-invocation--";
             let dir = tempfile::tempdir().expect("tempdir");
@@ -6278,13 +6387,17 @@ exec "$@"
             }
 
             #[test]
-            fn the_staging_directory_is_never_the_destinations_own_directory() {
+            fn the_staging_directory_is_an_ancestor_when_one_qualifies() {
                 // The destination's own directory may be service-writable, so an
                 // account could replace the temporary between the open and the
                 // rename — a TOCTOU `O_EXCL` alone does not close, because the
                 // attacker can act after the descriptor is open. Staging above
-                // that directory removes the window, so *where* the temporary
-                // goes is the property, not an implementation detail.
+                // that directory removes the window, so wherever an ancestor on
+                // the destination's filesystem qualifies, it is chosen; the
+                // destination's own directory is only ever the staging
+                // directory when it is the top of its filesystem and nothing
+                // above it can qualify. *Where* the temporary goes is the
+                // property, not an implementation detail.
                 let root = tempfile::tempdir().expect("tempdir");
                 let dest = dest_under(root.path(), "config.toml");
                 let dest_dir = dest.parent().expect("dest dir");
@@ -6403,19 +6516,23 @@ exec "$@"
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn a_directory_at_the_destination_fails_the_shell_write() {
-                // `mv` and `rename(2)` part company here: to `mv`, an existing
-                // directory at the destination is a *target directory*, so it
-                // moves the temporary inside and exits 0. Left unchecked the
-                // shell transports would report success for a write that landed
-                // at a path the caller never named, under a directory an
-                // attacker may control, and then disarm the cleanup trap on the
-                // way out — leaving the staged contents there.
+                // `mv` and `rename(2)` part company here: to a plain `mv`, an
+                // existing directory at the destination is a *target
+                // directory*, so it moves the temporary inside and exits 0.
+                // Left unchecked the shell transports would report success for
+                // a write that landed at a path the caller never named, under a
+                // directory an attacker may control. The pre-write guard
+                // refuses this case before anything is staged, and `mv -T`
+                // would refuse it too, so the write fails either way.
                 //
                 // Unlike the transports' other coverage this runs the script for
                 // real rather than asserting its shape, because the failure mode
-                // is `mv`'s behaviour and not the script's text: no reading of
-                // `mv -f "$tmp" "$dest"` reveals it.
+                // is `mv`'s behaviour and not the script's text.
                 let root = tempfile::tempdir().expect("tempdir");
 
                 // First a plain write, so the failure below is the destination
@@ -6452,15 +6569,20 @@ exec "$@"
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn a_directory_planted_after_the_pre_write_guard_fails_the_shell_write() {
                 // The case above stops at the pre-write guard and never reaches
                 // the `mv`. This one gets past that guard and *does*: the script
                 // is held at `cat > "$tmp"` — stdin stays open until the
                 // temporary exists, which is proof the guard and the staging
                 // walk are already behind it — and the directory is planted
-                // there. So `mv` really does move the staged file inside a
-                // directory the script was not asked to write into, and what is
-                // under test is what the script does about it afterwards.
+                // there. A plain `mv` would move the staged file inside it;
+                // `mv -T` refuses instead, so the write fails at the `mv` itself
+                // rather than at the check after it, and the trap removes the
+                // temporary from the staging directory it never left.
                 let root = tempfile::tempdir().expect("tempdir");
                 let dest = dest_under(root.path(), "config.toml");
 
@@ -6478,12 +6600,17 @@ exec "$@"
                     "a directory appearing between the guard and the rename must not report a \
                      successful write"
                 );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !stderr.contains("is not the file just written"),
+                    "the `mv` itself must refuse, before the check after it runs: {stderr}"
+                );
                 assert!(
                     std::fs::read_dir(&dest)
                         .expect("read the planted directory")
                         .next()
                         .is_none(),
-                    "the file `mv` misplaced must be removed while it is still reachable"
+                    "nothing may be moved inside the planted directory"
                 );
                 assert!(
                     strays(root.path()).is_empty(),
@@ -6492,10 +6619,64 @@ exec "$@"
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
+            fn a_symlink_to_a_directory_planted_after_the_pre_write_guard_never_writes_into_it() {
+                // The same interleaving with a symbolic link to a directory in
+                // place of the directory itself. What the host's `mv -T` does
+                // with it differs — GNU coreutils renames over the link, uutils
+                // and busybox refuse it — so either outcome is legitimate. What
+                // is not is the staged file ending up inside the directory the
+                // link points to, which a plain `mv` would do, and which could be
+                // a directory the account planting the link cannot write itself.
+                let root = tempfile::tempdir().expect("tempdir");
+                let dest = dest_under(root.path(), "config.toml");
+                let target = root.path().join("pointed-at");
+                std::fs::create_dir(&target).expect("the directory the link points to");
+
+                let mut child = spawn_landing_script(&dest, 0o640);
+                let mut stdin = child.stdin.take().expect("stdin is piped");
+                stdin.write_all(b"cont").expect("write the first half");
+                await_staging(root.path());
+                std::os::unix::fs::symlink(&target, &dest).expect("plant a symlink mid-write");
+                stdin.write_all(b"ents").expect("write the second half");
+                drop(stdin);
+                let output = child.wait_with_output().expect("the script should finish");
+
+                assert!(
+                    std::fs::read_dir(&target)
+                        .expect("read the pointed-at directory")
+                        .next()
+                        .is_none(),
+                    "nothing may land inside the directory the link points to"
+                );
+                assert!(
+                    strays(root.path()).is_empty(),
+                    "no temporary is left behind anywhere, whichever way `mv` went"
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !stderr.contains("is not the file just written"),
+                    "either the rename replaced the link or the `mv` refused it: {stderr}"
+                );
+                if output.status.success() {
+                    let meta = std::fs::symlink_metadata(&dest).expect("stat dest");
+                    assert!(
+                        meta.file_type().is_file(),
+                        "a successful write replaces the link with the regular file"
+                    );
+                    assert_eq!(mode_of(&dest), 0o640);
+                    assert_eq!(std::fs::read(&dest).expect("read back"), b"contents");
+                }
+            }
+
+            #[test]
             fn the_landing_confirmation_accepts_only_the_file_just_written() {
-                // The interleaving the check above cannot stage is the one where
-                // the directory is *also* renamed away before the script looks
-                // again — an account that can write the destination's own
+                // The interleaving the tests above cannot stage is an entry
+                // replacing the landed file between the `mv` and the check after
+                // it — an account that can write the destination's own
                 // directory can do that, and no test can win that race on
                 // demand. That is exactly why the post-rename check is positive:
                 // it does not ask whether a directory is standing at the
@@ -6816,42 +6997,261 @@ find "$1" -maxdepth 0 {predicate}"#
                 );
             }
 
+            /// Builds a synthetic probe answering for exactly the directories
+            /// `tree` names; every other directory cannot be examined.
+            fn probe_of(
+                tree: Vec<(&'static str, super::super::super::DirFacts)>,
+            ) -> impl Fn(&Path) -> Option<super::super::super::DirFacts> {
+                move |dir: &Path| {
+                    tree.iter()
+                        .find(|(path, _)| Path::new(path) == dir)
+                        .map(|(_, facts)| *facts)
+                }
+            }
+
+            /// Facts for a directory owned by `uid` at `mode` on `dev`.
+            fn facts(uid: u32, mode: u32, dev: u64) -> super::super::super::DirFacts {
+                super::super::super::DirFacts { uid, mode, dev }
+            }
+
+            /// A uid that is neither root's nor the writer's.
+            const OTHER_UID: u32 = 4343;
+
             #[test]
+            fn staging_falls_back_to_a_writer_only_mount_point_at_the_destinations_directory() {
+                // A disk mounted at the destination's own directory leaves the
+                // walk nothing: it starts at the parent, which is already on
+                // the filesystem underneath. The mount point is then the only
+                // directory on the destination's filesystem that can hold the
+                // temporary and keep the landing a rename, and it is as safe as
+                // an ancestor when only the writer can write it and nothing but
+                // root or the writer can write the directory it is mounted on.
+                let dest = Path::new("/srv/app/state.json");
+                for mount_mode in [0o755, 0o700] {
+                    for parent_uid in [FIXTURE_UID, 0] {
+                        let probe = probe_of(vec![
+                            ("/srv/app", facts(FIXTURE_UID, mount_mode, DEST_DEV)),
+                            ("/srv", facts(parent_uid, 0o755, OTHER_DEV)),
+                            ("/", facts(0, 0o755, OTHER_DEV)),
+                        ]);
+                        assert_eq!(
+                            super::super::super::select_staging_dir(dest, FIXTURE_UID, probe),
+                            Some(PathBuf::from("/srv/app")),
+                            "a mount point at {mount_mode:04o} under a parent owned by uid \
+                             {parent_uid} is the staging directory"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn a_mount_point_others_can_write_is_not_a_staging_directory() {
+                // The fallback holds the destination's directory to the same
+                // test as an ancestor, so a mount point anyone but the writer
+                // can write — by a write bit, sticky or not, or by owning it —
+                // is refused like any other candidate.
+                let dest = Path::new("/srv/app/state.json");
+                for (uid, mode) in [
+                    (FIXTURE_UID, 0o775),
+                    (FIXTURE_UID, 0o757),
+                    (FIXTURE_UID, 0o1777),
+                    (OTHER_UID, 0o755),
+                ] {
+                    let probe = probe_of(vec![
+                        ("/srv/app", facts(uid, mode, DEST_DEV)),
+                        ("/srv", facts(FIXTURE_UID, 0o755, OTHER_DEV)),
+                        ("/", facts(0, 0o755, OTHER_DEV)),
+                    ]);
+                    assert_eq!(
+                        super::super::super::select_staging_dir(dest, FIXTURE_UID, probe),
+                        None,
+                        "a mount point owned by uid {uid} at {mode:04o} is not a staging directory"
+                    );
+                }
+            }
+
+            #[test]
+            fn a_mount_point_whose_parent_others_can_write_is_not_a_staging_directory() {
+                // An account able to write the parent could rename the
+                // destination's directory away mid-write and put one of its own
+                // at that path. A mounted mount point cannot be renamed, but a
+                // device change also marks a subvolume root, which can, so the
+                // parent is held to "root or the writer, nobody else" whatever
+                // the boundary is.
+                let dest = Path::new("/srv/app/state.json");
+                for (uid, mode) in [
+                    (FIXTURE_UID, 0o775),
+                    (FIXTURE_UID, 0o777),
+                    (FIXTURE_UID, 0o1777),
+                    (0, 0o775),
+                    (0, 0o777),
+                    (0, 0o1777),
+                    (OTHER_UID, 0o755),
+                ] {
+                    let probe = probe_of(vec![
+                        ("/srv/app", writer_owned(DEST_DEV)),
+                        ("/srv", facts(uid, mode, OTHER_DEV)),
+                        ("/", facts(0, 0o755, OTHER_DEV)),
+                    ]);
+                    assert_eq!(
+                        super::super::super::select_staging_dir(dest, FIXTURE_UID, probe),
+                        None,
+                        "a mount point whose parent is owned by uid {uid} at {mode:04o} is not \
+                         a staging directory"
+                    );
+                }
+            }
+
+            #[test]
+            fn the_staging_fallback_applies_only_at_the_destinations_own_mount_point() {
+                // Where the walk ends further up — at a boundary above the
+                // parent, or at `/` — the parent is on the destination's
+                // filesystem and the walk turned it down. The destination's
+                // directory is then not the top of its filesystem, and staging
+                // there would put the temporary in a directory a service account
+                // may be able to swap, so it is never chosen, however it is
+                // owned.
+                let dest = Path::new("/srv/app/state.json");
+                let boundary_above_the_parent = probe_of(vec![
+                    ("/srv/app", writer_owned(DEST_DEV)),
+                    ("/srv", facts(FIXTURE_UID, 0o775, DEST_DEV)),
+                    ("/", facts(0, 0o755, OTHER_DEV)),
+                ]);
+                assert_eq!(
+                    super::super::super::select_staging_dir(
+                        dest,
+                        FIXTURE_UID,
+                        boundary_above_the_parent
+                    ),
+                    None,
+                    "a destination directory below the top of its filesystem is never used"
+                );
+
+                let one_filesystem_to_the_root = probe_of(vec![
+                    ("/srv/app", writer_owned(DEST_DEV)),
+                    ("/srv", facts(FIXTURE_UID, 0o775, DEST_DEV)),
+                    ("/", facts(0, 0o755, DEST_DEV)),
+                ]);
+                assert_eq!(
+                    super::super::super::select_staging_dir(
+                        dest,
+                        FIXTURE_UID,
+                        one_filesystem_to_the_root
+                    ),
+                    None,
+                    "a walk that reaches `/` without a qualifying ancestor finds nothing"
+                );
+            }
+
+            #[test]
+            fn a_mount_point_whose_parent_cannot_be_examined_is_not_a_staging_directory() {
+                // The walk steps over an unreadable parent and meets the
+                // boundary only further up. Nothing then establishes that the
+                // destination's directory is the top of its filesystem, nor
+                // who can write the directory above it, so the fallback does
+                // not apply.
+                let dest = Path::new("/srv/app/state.json");
+                let probe = probe_of(vec![
+                    ("/srv/app", writer_owned(DEST_DEV)),
+                    ("/", facts(0, 0o755, OTHER_DEV)),
+                ]);
+                assert_eq!(
+                    super::super::super::select_staging_dir(dest, FIXTURE_UID, probe),
+                    None,
+                    "a parent that cannot be examined establishes no boundary"
+                );
+            }
+
+            /// Writes a `df` stub into `bin` that reports the destination's
+            /// filesystem for exactly the directories in `dest_fs` and another
+            /// filesystem for every other directory, standing for a mount
+            /// boundary a non-root CI cannot create for real.
+            ///
+            /// The script calls `df -P <dir>`, so the directory is `$2`, and it
+            /// reads the device and the mount point off the second line.
+            fn write_df_stub(bin: &Path, dest_fs: &[&Path]) {
+                let tests: Vec<String> = dest_fs
+                    .iter()
+                    .map(|dir| {
+                        format!(
+                            "[ \"$2\" = {} ]",
+                            super::super::super::shell_quote(&dir.to_string_lossy())
+                        )
+                    })
+                    .collect();
+                write_script(
+                    bin,
+                    "df",
+                    &format!(
+                        "#!/bin/sh\n\
+                         printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'\n\
+                         if {}; then\n\
+                           printf '/dev/dest 1 1 1 1%% /dest\\n'\n\
+                         else\n\
+                           printf '/dev/other 1 1 1 1%% /other\\n'\n\
+                         fi\n",
+                        tests.join(" || ")
+                    ),
+                );
+            }
+
+            /// Prepends `bin` to this process's `PATH`, for a child's
+            /// environment only.
+            fn path_with(bin: &Path) -> String {
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                )
+            }
+
+            /// Asserts that the landing script refused for want of a staging
+            /// directory, before anything was written anywhere under `root`.
+            fn assert_staging_refused(output: &std::process::Output, dest: &Path, root: &Path) {
+                assert!(
+                    !output.status.success(),
+                    "a write with no staging directory must be refused"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("no staging directory"),
+                    "the refusal must name the selection rule: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    !dest.exists(),
+                    "a write that could not stage must not reach the destination"
+                );
+                assert!(
+                    strays(root).is_empty(),
+                    "a refusal before the move leaves no temporary behind"
+                );
+            }
+
+            #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_walk_refuses_a_staging_directory_on_another_filesystem() {
                 // The script's half of the same rule. A non-root CI cannot mount
                 // anything, so the boundary is introduced where the script reads
                 // it: `df` is stubbed on `PATH` to report a different filesystem
                 // for every ancestor above the destination's own directory. The
-                // script must then fail *before* `mv` — no temporary anywhere,
-                // nothing at the destination.
+                // destination's directory is group-writable, so the mount-point
+                // fallback refuses it too. The script must then fail *before*
+                // `mv` — no temporary anywhere, nothing at the destination.
                 let root = tempfile::tempdir().expect("tempdir");
                 let bin = root.path().join("bin");
                 std::fs::create_dir(&bin).expect("bin");
                 let dest = dest_under(root.path(), "config.toml");
                 let dest_dir = dest.parent().expect("dest dir").to_path_buf();
+                std::fs::set_permissions(&dest_dir, std::fs::Permissions::from_mode(0o775))
+                    .expect("mode");
                 // Only the destination's own directory reports the destination's
                 // filesystem; every ancestor the walk would consider reports
                 // another one.
-                write_script(
-                    &bin,
-                    "df",
-                    &format!(
-                        "#!/bin/sh\n\
-                         printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'\n\
-                         if [ \"$2\" = '{}' ]; then\n\
-                           printf '/dev/dest 1 1 1 1%% /dest\\n'\n\
-                         else\n\
-                           printf '/dev/other 1 1 1 1%% /other\\n'\n\
-                         fi\n",
-                        dest_dir.display()
-                    ),
-                );
+                write_df_stub(&bin, &[&dest_dir]);
 
-                let path = format!(
-                    "{}:{}",
-                    bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                );
                 let mut child = std::process::Command::new("sh")
                     .args([
                         "-c".to_string(),
@@ -6862,7 +7262,7 @@ find "$1" -maxdepth 0 {predicate}"#
                         id_now("-g").to_string(),
                         "0644".to_string(),
                     ])
-                    .env("PATH", path)
+                    .env("PATH", path_with(&bin))
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -6876,23 +7276,130 @@ find "$1" -maxdepth 0 {predicate}"#
                     .expect("write contents");
                 let output = child.wait_with_output().expect("the script should finish");
 
-                assert!(
-                    !output.status.success(),
-                    "staging across a filesystem boundary must be refused"
+                assert_staging_refused(&output, &dest, root.path());
+            }
+
+            #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
+            fn the_shell_walk_stages_in_a_writer_only_mount_point_at_the_destinations_directory() {
+                // The boundary of the test above, with the destination's
+                // directory writable by the writer alone and the directory
+                // above it — the tempdir — writable by nobody else either. The
+                // walk still finds nothing, and the mount point itself is then
+                // the staging directory, so the write lands by a rename within
+                // it. The `sync` stub records each flush's operand, which is
+                // where the temporary is seen to have been staged.
+                let root = tempfile::tempdir().expect("tempdir");
+                let bin = root.path().join("bin");
+                std::fs::create_dir(&bin).expect("bin");
+                let log = root.path().join("sync.log");
+                write_script(
+                    &bin,
+                    "sync",
+                    &format!(
+                        "#!/bin/sh\necho \"$1\" >>{}\nexit 0\n",
+                        super::super::super::shell_quote(&log.to_string_lossy())
+                    ),
                 );
+                let dest = dest_under(root.path(), "state.json");
+                let dest_dir = dest.parent().expect("dest dir").to_path_buf();
+                std::fs::set_permissions(&dest_dir, std::fs::Permissions::from_mode(0o755))
+                    .expect("mode");
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("mode");
+                write_df_stub(&bin, &[&dest_dir]);
+
+                let output =
+                    run_landing_script_with_stubs(&dest, b"state-bytes", 0o600, Some(&bin));
+
                 assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("no staging directory"),
-                    "the refusal must name the selection rule: {}",
+                    output.status.success(),
+                    "a writer-only mount point is a staging directory: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                assert!(
-                    !dest.exists(),
-                    "a write that could not stage must not reach the destination"
-                );
+                assert_eq!(std::fs::read(&dest).expect("read back"), b"state-bytes");
+                assert_eq!(mode_of(&dest), 0o600);
                 assert!(
                     strays(root.path()).is_empty(),
-                    "a refusal before the move leaves no temporary behind"
+                    "a successful write leaves no temporary behind"
                 );
+                let calls = std::fs::read_to_string(&log).expect("the stub was called");
+                let first = calls.lines().next().expect("a flush ran");
+                let staged = Path::new(first);
+                assert_eq!(
+                    staged.parent(),
+                    Some(dest_dir.as_path()),
+                    "the temporary must have been staged in the mount point itself, got {calls:?}"
+                );
+                assert!(
+                    staged
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".bootler.")),
+                    "the first flush must name the temporary, got {calls:?}"
+                );
+            }
+
+            #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
+            fn the_shell_walk_falls_back_only_at_the_destinations_own_mount_point() {
+                // Here the boundary is one level further up: `top` and `inner`
+                // are both on the destination's filesystem, and `top` is
+                // group-writable, so the walk turns it down and then meets the
+                // boundary. `inner` would pass the ownership test, but it is
+                // not the top of its filesystem — its parent is on the same one
+                // and was already refused — so it is never the staging
+                // directory.
+                let root = tempfile::tempdir().expect("tempdir");
+                let bin = root.path().join("bin");
+                std::fs::create_dir(&bin).expect("bin");
+                let top = root.path().join("top");
+                let inner = top.join("inner");
+                std::fs::create_dir_all(&inner).expect("dest dir");
+                std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o775))
+                    .expect("mode");
+                std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755))
+                    .expect("mode");
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("mode");
+                let dest = inner.join("file");
+                write_df_stub(&bin, &[&inner, &top]);
+
+                let output = run_landing_script_with_stubs(&dest, b"contents", 0o644, Some(&bin));
+
+                assert_staging_refused(&output, &dest, root.path());
+            }
+
+            #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
+            fn the_shell_fallback_refuses_a_mount_point_whose_parent_others_can_write() {
+                // The layout of the success case, but the directory the mount
+                // point sits in is world-writable. An account able to write it
+                // could rename the destination's directory away mid-write and
+                // plant its own, where the script's path-based `chown` and
+                // `chmod` would follow, so the fallback is refused.
+                let root = tempfile::tempdir().expect("tempdir");
+                let bin = root.path().join("bin");
+                std::fs::create_dir(&bin).expect("bin");
+                let dest = dest_under(root.path(), "state.json");
+                let dest_dir = dest.parent().expect("dest dir").to_path_buf();
+                std::fs::set_permissions(&dest_dir, std::fs::Permissions::from_mode(0o755))
+                    .expect("mode");
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777))
+                    .expect("mode");
+                write_df_stub(&bin, &[&dest_dir]);
+
+                let output = run_landing_script_with_stubs(&dest, b"contents", 0o644, Some(&bin));
+
+                assert_staging_refused(&output, &dest, root.path());
             }
 
             /// A `sudo`/`ssh` stub that dumps the argv it was handed into
@@ -7040,6 +7547,15 @@ find "$1" -maxdepth 0 {predicate}"#
                     script.contains(r#"dirname "$(dirname "$dest")""#),
                     "staging must start above the destination's own directory: {script}"
                 );
+                assert!(
+                    script.contains(r#"mv -f -T "$tmp" "$dest""#),
+                    "the rename must never move into a directory at the destination: {script}"
+                );
+                assert!(
+                    !script.contains(r#"rm -f "$dest/"#),
+                    "nothing of the script's can be inside a directory at the destination, so \
+                     there is nothing to remove there: {script}"
+                );
                 let chown_at = script.find("chown").expect("chown");
                 let chmod_at = script.find("chmod").expect("chmod");
                 let rename_at = script.find("mv -f").expect("rename");
@@ -7051,12 +7567,13 @@ find "$1" -maxdepth 0 {predicate}"#
                     script.contains(r#"trap 'rm -f "$tmp"' EXIT"#),
                     "a failure must leave no temporary behind: {script}"
                 );
-                // The pre-write guard is one thing; what the write actually
-                // rests on is the check *after* the rename being positive. A
-                // second `[ -d "$dest" ]` would be bypassable — an account able
-                // to write the destination's own directory can rename the
-                // directory away between the `mv` and the re-test — so the
-                // destination has to be identified as the object just staged.
+                // The pre-write guard and `mv -T` are one thing; what the
+                // write's success actually rests on is the check *after* the
+                // rename being positive. A re-test of the destination's type
+                // would be bypassable — an account able to write the
+                // destination's own directory can replace what stands there
+                // between the `mv` and the re-test — so the destination has to
+                // be identified as the object just staged.
                 let confirm_at = script.find("-inum").expect("an identity check");
                 assert!(
                     confirm_at > rename_at,
@@ -7067,11 +7584,6 @@ find "$1" -maxdepth 0 {predicate}"#
                         .contains(r#"-user "$owner" -group "$group" -perm "$mode""#),
                     "identity is inode plus the metadata just applied, so no file an \
                      unprivileged account can create satisfies it: {script}"
-                );
-                assert!(
-                    script[confirm_at..].contains(r#"rm -f "$dest/"#),
-                    "the file `mv` misplaced must be removed when it is still reachable: \
-                     {script}"
                 );
             }
 
@@ -7124,6 +7636,10 @@ find "$1" -maxdepth 0 {predicate}"#
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_flush_survives_every_sync_a_target_can_carry() {
                 // The three run-time behaviours the fallback is selected against,
                 // plus the absence the floor itself can meet. None of them may
@@ -8070,6 +8586,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_killed_before_the_rename_leaves_the_old_backup() {
                 // The same fault model on the transports that run the sequence
                 // as a script, injected where it really happens: the process is
@@ -8092,6 +8612,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_killed_before_the_flush_leaves_the_new_backup() {
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", INCOMING);
@@ -8111,6 +8635,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_killed_before_a_first_backup_lands_leaves_none() {
                 // The other half of the fault model on the transports that run
                 // the sequence as a script: with no backup to preserve, absence
@@ -8170,6 +8698,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn a_stale_shell_candidate_is_stepped_over_rather_than_reused() {
                 // The native recovery test's counterpart, with the collision
                 // staged rather than hoped for: the leftovers are planted under
@@ -8234,6 +8766,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn a_shell_candidate_that_is_a_directory_is_neither_followed_nor_removed() {
                 // The one occupied candidate `ln` does not refuse. Handed a
                 // directory, or a symlink to one, it links the source *inside*
@@ -8303,6 +8839,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn a_shell_host_without_link_refuses_the_backup_rather_than_linking_with_ln() {
                 // The other end of the same requirement. `link` is not POSIX,
                 // so a host may carry none — and the only other way to make a
@@ -8379,6 +8919,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_with_no_free_candidate_fails_rather_than_walking_forever() {
                 // The shell half of the bound, held to the same number the
                 // native side walks: a script that kept trying would hang the
@@ -8421,6 +8965,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn a_link_failure_that_is_not_occupancy_is_reported_as_itself() {
                 // Only an occupied candidate advances the walk. A link that
                 // fails for any other reason — a directory that cannot be
@@ -8470,6 +9018,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn a_host_with_no_working_sync_fails_the_backup_rather_than_claiming_one() {
                 // The flush is a required step, not a best effort, and this is
                 // the only way it can fail on the shell transports: a `sync`
@@ -8523,11 +9075,16 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_refuses_a_directory_at_the_destination() {
-                // `mv` would move the temporary *inside* a directory sitting at
-                // the destination and exit `0`, so the backup would be reported
-                // taken under a path nobody named. It is refused before the link
-                // instead, and nothing is left behind by the refusal.
+                // A plain `mv` would move the temporary *inside* a directory
+                // sitting at the destination and exit `0`, so the backup would
+                // be reported taken under a path nobody named. It is refused
+                // before the link instead, and nothing is left behind by the
+                // refusal.
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", RUNNING);
                 let previous = artifact.with_file_name("roxyd.previous");
@@ -8560,6 +9117,66 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
+            fn a_directory_planted_after_the_link_fails_the_shell_backup() {
+                // The guard above runs before the link; a directory appearing
+                // at the destination after it is what `mv -T` is for. The
+                // `link` stub links for real and then plants the directory, so
+                // the script meets it at the rename: a plain `mv` would move
+                // the temporary inside it, while `mv -T` fails, and the trap
+                // removes the temporary from beside the destination.
+                let root = tempfile::tempdir().expect("tempdir");
+                let artifact = seed(root.path(), "roxyd", RUNNING);
+                let previous = artifact.with_file_name("roxyd.previous");
+                let stubs = root.path().join("stubs");
+                std::fs::create_dir(&stubs).expect("stub directory");
+                write_script(
+                    &stubs,
+                    "link",
+                    &format!(
+                        "#!/bin/sh\n{} \"$@\" || exit\nmkdir {}\n",
+                        super::super::super::shell_quote(&on_path("link").to_string_lossy()),
+                        super::super::super::shell_quote(&previous.to_string_lossy())
+                    ),
+                );
+
+                let output = run_link_script(&artifact, &previous, Some(&stubs));
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !output.status.success(),
+                    "a directory at the destination must fail the backup"
+                );
+                assert!(
+                    !stderr.contains("is not the file just linked"),
+                    "the `mv` itself must refuse, before the check after it runs: {stderr}"
+                );
+                assert!(
+                    std::fs::read_dir(&previous)
+                        .expect("read the planted directory")
+                        .next()
+                        .is_none(),
+                    "nothing may be moved inside the planted directory"
+                );
+                assert_eq!(
+                    strays(artifact.parent().expect("dir")),
+                    [] as [std::path::PathBuf; 0]
+                );
+                assert_eq!(
+                    std::fs::metadata(&artifact).expect("stat").nlink(),
+                    1,
+                    "the temporary link is removed, leaving the artifact its only name"
+                );
+            }
+
+            #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_replaces_a_symlink_at_the_destination() {
                 // The same on the transports that run the sequence as a
                 // script: `mv` renames over the symlink rather than following
@@ -8590,6 +9207,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_links_the_artifact_and_replaces_an_older_backup() {
                 let root = tempfile::tempdir().expect("tempdir");
                 let artifact = seed(root.path(), "roxyd", INCOMING);
@@ -8631,6 +9252,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn re_linking_an_unchanged_artifact_never_reaches_mv() {
                 // GNU `mv` refuses two names for one inode with `are the same
                 // file` instead of passing POSIX's no-op rename through to
@@ -8678,6 +9303,10 @@ exec sh -c "$script" _ "$source" "$dest""#;
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn the_shell_sequence_refuses_every_source_that_is_not_a_regular_file() {
                 let root = tempfile::tempdir().expect("tempdir");
                 let target = seed(root.path(), "roxyd", RUNNING);
@@ -8740,6 +9369,15 @@ exec sh -c "$script" _ "$source" "$dest""#;
                 );
                 let link_at = script.find(r#"link "$source" "$tmp""#).expect("the link");
                 let rename_at = script.find("mv -f").expect("the rename");
+                assert!(
+                    script.contains(r#"mv -f -T "$tmp" "$dest""#),
+                    "the rename must never move into a directory at the destination: {script}"
+                );
+                assert!(
+                    !script.contains(r#"rm -f "$dest/"#),
+                    "nothing of the script's can be inside a directory at the destination, so \
+                     there is nothing to remove there: {script}"
+                );
                 let flush_at = script
                     .find(r#"flush "$dir""#)
                     .expect("the directory is flushed");
@@ -8851,8 +9489,9 @@ exec sh -c "$script" _ "$source" "$dest""#;
 
             #[test]
             fn the_native_sequence_refuses_a_directory_at_the_destination() {
-                // The shell transports guard this before the link because `mv`
-                // would move the temporary *inside* the directory and exit `0`.
+                // The shell transports guard this before the link, and rename
+                // with `mv -T`, because a plain `mv` would move the temporary
+                // *inside* the directory and exit `0`.
                 // The native sequence needs no guard — `rename(2)` cannot move
                 // a file into a directory, so it fails instead — but the
                 // outcome must be the same one on both: a failure, nothing
@@ -11086,6 +11725,10 @@ exec "$@"
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn put_file_lands_exactly_the_payload_whether_or_not_sudo_reads_the_password() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let asking = password_sudo(dir.path());
@@ -11117,6 +11760,10 @@ exec "$@"
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn an_empty_password_lands_no_leading_newline() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let not_asking = descending_sudo(dir.path());
@@ -11180,6 +11827,10 @@ exec "$@"
             }
 
             #[test]
+            #[cfg_attr(
+                not(target_os = "linux"),
+                ignore = "the landing scripts need a `mv` with `-T`, which macOS lacks, and they target Linux hosts"
+            )]
             fn sudo_rs_s_line_after_a_right_password_is_not_the_commands() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let sudo = sudo_rs_password_sudo(dir.path());
