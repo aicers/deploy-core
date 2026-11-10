@@ -6,11 +6,6 @@ Do not edit them here — change the wording upstream, tag a release, and
 re-run its sync. The drift check in CI fails if this copy diverges.
 
 <!-- BEGIN shared:workflow -->
-## Language
-
-- Code, comments, commit messages, PR descriptions, and issues are written
-  in English.
-
 ## Commit messages
 
 - Title: preferably under 50 characters, start with an imperative verb
