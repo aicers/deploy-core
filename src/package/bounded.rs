@@ -277,8 +277,7 @@ pub(crate) mod seam {
         SEAM.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .map(|seam| seam.reservations.clone())
-                .unwrap_or_default()
+                .map_or_default(|seam| seam.reservations.clone())
         })
     }
 
@@ -292,8 +291,7 @@ pub(crate) mod seam {
         SEAM.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .map(|seam| seam.passed.clone())
-                .unwrap_or_default()
+                .map_or_default(|seam| seam.passed.clone())
         })
     }
 

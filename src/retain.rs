@@ -121,8 +121,7 @@ pub(crate) enum RetentionError {
 }
 
 fn describe_path(path: Option<&Path>) -> String {
-    path.map(|path| format!(" at {}", path.display()))
-        .unwrap_or_default()
+    path.map_or_default(|path| format!(" at {}", path.display()))
 }
 
 impl RetentionError {

@@ -672,8 +672,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>, TrustError> {
 
 fn file_name(path: &Path) -> std::ffi::OsString {
     path.file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default()
+        .map_or_default(std::ffi::OsStr::to_os_string)
 }
 
 #[cfg(test)]

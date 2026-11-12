@@ -224,8 +224,7 @@ pub(crate) mod seam {
         SEAM.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .map(|seam| seam.observed.clone())
-                .unwrap_or_default()
+                .map_or_default(|seam| seam.observed.clone())
         })
     }
 
