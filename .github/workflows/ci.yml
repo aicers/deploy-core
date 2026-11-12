@@ -17,17 +17,21 @@ name: CI
 # broken filter would wave an untested change through. Detection must fail
 # red, never open.
 #
-# No `CI Gate` job: `main` requires no status check today. If protection is
-# ever added, note that a matrix job skipped at the job level is never
-# expanded, so a docs-only run never reports `Platform (macos-latest)` or
-# `Platform (ubuntu-24.04-arm)`; require an aggregating gate job then, not the
-# expanded matrix contexts.
+# `CI Gate` IS THE REQUIRED STATUS CHECK, not the individual jobs. A matrix job
+# skipped at the job level is never expanded, so a docs-only run never reports
+# `Platform (macos-latest)` or `Platform (ubuntu-24.04-arm)`, and a protection
+# rule naming the expanded contexts would wait forever for statuses that never
+# come. `CI Gate` always reports, under one stable name.
 
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && '-dispatch' || (github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '') }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,103 +40,64 @@ jobs:
   changes:
     name: Change Filter
     runs-on: ubuntu-latest
-    # Scoped to this job alone. `pull-requests: read` is what
-    # dorny/paths-filter needs to list a pull request's files; without it the
-    # job dies with "Resource not accessible by integration". Declaring the
-    # block here rather than at workflow level leaves every other job's token
-    # exactly as it is today.
+    # Scoped to this job alone. The filter only reads the checked-out
+    # history, so `contents: read` is all it needs. Declaring the block here
+    # rather than at workflow level leaves every other job's token exactly
+    # as it is today.
     permissions:
       contents: read
-      pull-requests: read
     outputs:
-      docs_only: ${{ steps.decide.outputs.docs_only }}
+      docs_only: ${{ steps.scope.outputs.docs-only }}
     steps:
+      # The full history, because the action diffs locally and does not
+      # fetch: a pull request against its merge-base with the base branch,
+      # a push to `main` against `github.event.before`, and a dispatched
+      # branch against its merge-base with `main`.
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0 # a push diffs against its base commit locally
+          fetch-depth: 0
 
-      # A push carries its base in `github.event.before`. That sha is all-zeros
-      # on a branch's first push and can name a commit a force-push discarded,
-      # so establish that it is real and reachable before diffing. Leaving
-      # `sha` empty skips the filter below, which lands on docs_only=false.
-      - name: Resolve the push base
-        id: base
-        if: github.event_name != 'pull_request'
-        env:
-          BEFORE: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          if [ -n "${BEFORE}" ] \
-            && [ "${BEFORE}" != '0000000000000000000000000000000000000000' ] \
-            && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null
-          then
-            echo "sha=${BEFORE}" >> "$GITHUB_OUTPUT"
-          else
-            echo "Push base missing or unreachable; running the full suite."
-          fi
-
-      # On `pull_request` the action reads the file list from the API and
-      # ignores `base`; on `push` it diffs against the sha resolved above.
+      # `docs-paths` is the documentation allowlist that AGENTS.md points
+      # agents at, on top of the action's built-in list (`*.md`, `LICENSE`,
+      # `.agent-instructions.toml`, `.markdownlint*`). `not-docs-paths`
+      # names every path a build or a test reads, and wins over the
+      # allowlist.
       #
-      # `docs` is the documentation allowlist that AGENTS.md points agents
-      # at: a change is docs-only when every changed path is on it. `code`
-      # names every path a build or a test reads. `all` matches every path,
-      # and exists only for its count.
-      - name: Filter Paths
-        id: filter
-        if: github.event_name == 'pull_request' || steps.base.outputs.sha != ''
-        uses: dorny/paths-filter@v4
+      # Docs-only requires a POSITIVE result: every changed path is on the
+      # allowlist and none is on `not-docs-paths`, so a path in neither list
+      # falls through to the full suite. This is an allowlist of the inert,
+      # not a denylist. Anything the action cannot establish also runs the
+      # full suite.
+      #
+      # `docs-paths`: Root and `docs/` Markdown only, not `**/*.md` or
+      # `docs/**`: `tests/image_fixture_inventory.rs` reads INVENTORY.md
+      # beside the fixtures under `assets/test-fixtures/`, enumerates the
+      # directory that holds it, and reads the run transcripts under
+      # `docs/image-archive-interop-runs/` that `inventory.json` names.
+      #
+      # `not-docs-paths`, `docs/image-archive-interop-runs/**`: Transcripts
+      # the fixture inventory test reads (see above).
+      #
+      # The shared-instructions pin is inert to the build; only the drift
+      # check reads it, and that runs in the ungated `markdown`.
+      - id: scope
+        uses: aicers/agent-instructions/change-scope@main
         with:
-          base: ${{ steps.base.outputs.sha }}
-          filters: |
-            docs:
-              # Root and `docs/` Markdown only, not `**/*.md` or `docs/**`:
-              # `tests/image_fixture_inventory.rs` reads INVENTORY.md beside
-              # the fixtures under `assets/test-fixtures/`, enumerates the
-              # directory that holds it, and reads the run transcripts under
-              # `docs/image-archive-interop-runs/` that `inventory.json` names.
-              - "*.md"
-              - "docs/**/*.md"
-              - ".markdownlint*"
-              # The shared-instructions pin is inert to the build; only the
-              # drift check reads it, and that runs in the ungated `markdown`.
-              - ".agent-instructions.toml"
-            code:
-              - "src/**"
-              - "tests/**"
-              - "examples/**"
-              - "assets/**"
-              # Transcripts the fixture inventory test reads (see above).
-              - "docs/image-archive-interop-runs/**"
-              - "Cargo.toml"
-              - "Cargo.lock"
-              - ".clippy.toml"
-              - ".github/workflows/**"
-            all:
-              - "**"
-
-      # Docs-only requires a POSITIVE result: documentation touched, code
-      # untouched, and nothing else touched either. A filter output is true
-      # when ANY changed path matches it, so `docs` alone is true for a pull
-      # request that edits README.md and also some file nobody listed. The
-      # count comparison closes that: every changed path has to be on the
-      # docs allowlist, so a path in neither list falls through to the full
-      # suite. This is an allowlist of the inert, not a denylist.
-      - name: Decide Docs-Only
-        id: decide
-        env:
-          DOCS: ${{ steps.filter.outputs.docs }}
-          CODE: ${{ steps.filter.outputs.code }}
-          DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
-          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
-        run: |
-          if [ "${DOCS}" = "true" ] \
-            && [ "${CODE}" != "true" ] \
-            && [ "${DOCS_COUNT}" = "${ALL_COUNT}" ]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          fi
+          docs-paths: |
+            *.md
+            docs/**/*.md
+            .markdownlint*
+            .agent-instructions.toml
+          not-docs-paths: |
+            src/**
+            tests/**
+            examples/**
+            assets/**
+            docs/image-archive-interop-runs/**
+            Cargo.toml
+            Cargo.lock
+            .clippy.toml
+            .github/workflows/**
 
   markdown:
     name: Markdown
@@ -140,13 +105,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         id: checkout
+      # No `globs` input. The `globs` and `ignores` of the root
+      # `.markdownlint-cli2.yaml` are the one place that decides which files
+      # are linted, here and in a local bare `markdownlint-cli2` alike; they
+      # are recursive, so anything added under a directory is linted. The
+      # action's default `*.{md,markdown}` is only added to them and changes
+      # nothing.
       - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v24
-        with:
-          # Recursive. The action's default glob is `*.{md,markdown}` --
-          # repository root only -- so anything added under a directory
-          # later would go unlinted without this.
-          globs: "**/*.md"
+        uses: DavidAnson/markdownlint-cli2-action@v25
 
       # The shared instruction-block drift check, which used to be a job of
       # its own calling `check-drift.yml` as a reusable workflow. Actions is
@@ -283,3 +249,42 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build or test
         run: ${{ matrix.command }}
+
+  # `always()`, deliberately, and not `!cancelled()`: a cancelled run would
+  # otherwise skip this job, and GitHub counts a skipped required check as a
+  # pass. Running through cancellation lets the assertions below see the
+  # cancelled results and report red. `markdown` is among the needs although
+  # it is not gated, so that the gate covers it too.
+  gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs: [changes, markdown, check, test, platforms]
+    if: ${{ always() }}
+    steps:
+      # A filter that errored is a defect, not a tolerable outcome. The gated
+      # jobs did still run (their `if:` fails closed), but the breakage has to
+      # be visible rather than absorbed.
+      - name: Assert the change filter succeeded
+        if: ${{ needs.changes.result != 'success' }}
+        run: |
+          echo "Change Filter: ${{ needs.changes.result }}" >&2
+          exit 1
+
+      # `skipped` is a pass here, and only here: it is what a gated job
+      # reports on a docs-only change. `cancelled` is not.
+      - name: Assert every job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "${RESULTS}"
+          bad="$(printf '%s' "${RESULTS}" \
+            | jq -r 'to_entries[]
+                     | select(.value.result != "success" and .value.result != "skipped")
+                     | "  \(.key): \(.value.result)"')"
+          if [ -n "${bad}" ]; then
+            echo "Not green:" >&2
+            echo "${bad}" >&2
+            exit 1
+          fi
