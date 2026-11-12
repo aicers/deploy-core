@@ -172,8 +172,7 @@ pub(crate) fn record() -> Vec<Step> {
     SEAM.with(|seam| {
         seam.borrow()
             .as_ref()
-            .map(|seam| seam.record.clone())
-            .unwrap_or_default()
+            .map_or_default(|seam| seam.record.clone())
     })
 }
 

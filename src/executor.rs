@@ -8006,8 +8006,7 @@ exit 127
             /// utilities.
             fn on_path(name: &str) -> PathBuf {
                 std::env::var_os("PATH")
-                    .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-                    .unwrap_or_default()
+                    .map_or_default(|path| std::env::split_paths(&path).collect::<Vec<_>>())
                     .into_iter()
                     .map(|dir| dir.join(name))
                     .find(|candidate| {
@@ -8182,14 +8181,9 @@ exec sh -c "$script" _ "$source" "$dest""#;
                             .map(|kind| kind.word())
                             .collect::<Vec<_>>()
                             .join(" "),
-                        victim
-                            .map(|entry| entry.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        victim_dir
-                            .map(|entry| entry.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        path.map(|entry| entry.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
+                        victim.map_or_default(|entry| entry.to_string_lossy().into_owned()),
+                        victim_dir.map_or_default(|entry| entry.to_string_lossy().into_owned()),
+                        path.map_or_default(|entry| entry.to_string_lossy().into_owned()),
                         LINK_ASIDE_SCRIPT.to_string(),
                     ])
                     .output()
@@ -12077,8 +12071,7 @@ exec "$@"
                     .map(|word| String::from_utf8_lossy(word).into_owned())
                     .collect::<Vec<_>>()
                     .split_last()
-                    .map(|(_, words)| words.to_vec())
-                    .unwrap_or_default()
+                    .map_or_default(|(_, words)| words.to_vec())
             }
 
             /// Returns the words before `shell`.
