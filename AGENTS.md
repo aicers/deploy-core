@@ -579,10 +579,12 @@ release build.
   another operating system in its place. A CI job or matrix entry that
   exists only to cover another operating system or platform is left to
   CI; every other row applies on any host that can run its commands.
-- A change is documentation-only when every changed path matches the
-  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
-  none matches its `code` filter. For such a change run only the
-  `Markdown` row, and build or test no code.
+- A change is documentation-only when the `changes` job in
+  `.github/workflows/ci.yml` counts every changed path as documentation:
+  each is on the built-in list of `aicers/agent-instructions/change-scope`
+  or on its `docs-paths` input, and none is on its `not-docs-paths` input.
+  For such a change run only the `Markdown` row, and build or test no
+  code.
 - For any other change, run every row of the table below that applies to
   the host before pushing. Run each test command as written, in full: do
   not narrow it to the changed files or to selected test names. The
@@ -612,8 +614,9 @@ release build.
   `serde_json/preserve_order`, which a dependent's build graph can enable
   through feature unification, to check that the spec digest's bytes do
   not depend on it.
-- Left to CI: `Change Filter`, which only classifies the diff, and every
-  `Platform` entry for a platform other than the host's. The shared
+- Left to CI: `Change Filter`, which only classifies the diff, `CI Gate`,
+  which only collects the other jobs' results, and every `Platform` entry
+  for a platform other than the host's. The shared
   instruction-block drift check runs in `Markdown`; the generated regions
   of this file are never edited here.
 - When a CI job fails, rerun that job's command locally; for a test job,
