@@ -3,6 +3,7 @@ name = "deploy-core"
 version = "0.8.0"
 edition = "2024"
 repository = "https://github.com/aicers/deploy-core"
+publish = false
 
 [dependencies]
 # Ed25519 package signatures, the roxyd key match and the chain check's

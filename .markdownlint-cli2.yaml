@@ -3,6 +3,9 @@ globs:
 ignores:
   - "node_modules/**"
   - ".github/**"
+  # release-plz writes CHANGELOG.md and expands each `(#N)` into a link
+  # that runs past the line-length limit.
+  - "CHANGELOG.md"
 config:
   # Organisation-wide baseline: CHANGELOG files in Keep a Changelog format
   # repeat `Added` and `Fixed` under every version. `siblings_only` allows
