@@ -952,6 +952,13 @@ pub enum ContainerAccount {
     /// `clumit-insight-keycloak-tls` — a TLS-terminating sidecar container in
     /// the `clumit-insight` namespace.
     InsightKeycloakTls,
+    /// `clumit-security-transit` — as [`InsightTransit`](Self::InsightTransit),
+    /// for the `clumit-security` namespace.
+    SecurityTransit,
+    /// `clumit-security-keycloak-tls` — as
+    /// [`InsightKeycloakTls`](Self::InsightKeycloakTls), for the
+    /// `clumit-security` namespace.
+    SecurityKeycloakTls,
 }
 
 impl ContainerAccount {
@@ -969,6 +976,8 @@ impl ContainerAccount {
             ContainerAccount::InsightWebDb => "clumit-insight-webdb",
             ContainerAccount::InsightTransit => "clumit-insight-transit",
             ContainerAccount::InsightKeycloakTls => "clumit-insight-keycloak-tls",
+            ContainerAccount::SecurityTransit => "clumit-security-transit",
+            ContainerAccount::SecurityKeycloakTls => "clumit-security-keycloak-tls",
         }
     }
 }
@@ -4500,7 +4509,7 @@ mod tests {
     }
 
     /// Every container account beside the name it must render as.
-    const CONTAINER_ACCOUNTS: [(super::ContainerAccount, &str); 10] = [
+    const CONTAINER_ACCOUNTS: [(super::ContainerAccount, &str); 12] = [
         (super::ContainerAccount::SecurityPki, "clumit-security-pki"),
         (
             super::ContainerAccount::SecurityPkiDb,
@@ -4528,6 +4537,14 @@ mod tests {
         (
             super::ContainerAccount::InsightKeycloakTls,
             "clumit-insight-keycloak-tls",
+        ),
+        (
+            super::ContainerAccount::SecurityTransit,
+            "clumit-security-transit",
+        ),
+        (
+            super::ContainerAccount::SecurityKeycloakTls,
+            "clumit-security-keycloak-tls",
         ),
     ];
 
